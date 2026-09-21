@@ -55,6 +55,7 @@ xiaohongshu-skills/
 # git worktrees
 .worktrees/
 .claude/
+.codex/
 .pnpm-store/
 
 # shopping 数据中间产物（可由 scripts/fetch-*.mjs 重新生成）
