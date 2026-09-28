@@ -52,7 +52,7 @@ describe('synthesizeSpeechGenieDetailed', () => {
     expect(String(url)).not.toContain('test//agent');
   });
 
-  it('带上 X-Client-Token 鉴权头与 emotion', async () => {
+  it('带上 X-Client-Token 鉴权头，不再发 emotion（Nano 无情绪参数）', async () => {
     const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
     vi.stubGlobal('fetch', fetchMock);
     await synthesizeSpeechGenieDetailed('测试文本', char, apiConfig, { emotion: 'sad' });
@@ -60,7 +60,7 @@ describe('synthesizeSpeechGenieDetailed', () => {
     expect(init.headers['X-Client-Token']).toBe('tok');
     const body = JSON.parse(init.body);
     expect(body.text).toBe('测试文本');
-    expect(body.emotion).toBe('sad');
+    expect(body).not.toHaveProperty('emotion');
   });
 
   it('发送前已剥掉语音标签与字幕，只剩正文', async () => {
@@ -75,20 +75,19 @@ describe('synthesizeSpeechGenieDetailed', () => {
     expect(JSON.parse(init.body).text).toBe('今天真开心');
   });
 
-  it('503 busy 抛出可读的中文错误', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(503, '{"error":"busy"}', 'application/json')));
-    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/忙/);
+  it('503 synth_failed 抛出合成失败错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(503, '{"error":"synth_failed"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/失败/);
   });
 
-  it('504 抛出超时错误', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(504, '{"error":"synth_timeout"}', 'application/json')));
-    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/超时/);
+  it('504 nano_unavailable 抛出服务暂时不可用错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(504, '{"error":"nano_unavailable"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/暂时不可用/);
   });
 
-  it('413 抛出文本过长错误', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(413, '{"error":"chunk_too_long"}', 'application/json')));
-    // ERROR_TEXT.chunk_too_long 的文案是「太长」，不是「过长」——断言要跟实现一致。
-    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/太长/);
+  it('413 bad_request 抛出请求格式不正确错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(413, '{"error":"bad_request"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/格式不正确/);
   });
 });
 

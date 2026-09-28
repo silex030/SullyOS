@@ -4,7 +4,7 @@
  * 走主代理中转 `${agentUrl}/agent/v1/tts` → main-agent → VPS 适配层 → Genie。
  * 适配层已把情绪表、队列、分块与 WAV 包裹做完，这里负责：
  *   1. 剥掉所有 TTS 专属标记（Genie 不支持任何 inline cue）
- *   2. 组请求体（text + emotion）
+ *   2. 组请求体（text；Nano 无情绪参数）
  *   3. 把错误码翻成人话
  *   4. audio/wav → Blob + Blob URL
  *
@@ -18,17 +18,9 @@ import { readAgentRoutingConfig } from './agentRouting';
 
 const ERROR_TEXT: Record<string, string> = {
   bad_request: '请求格式不正确',
-  bad_emotion: '情绪值格式不正确',
   empty: '没有可朗读的文字',
-  warming_up: '语音服务正在准备中，请稍后',
-  busy: '语音正忙，稍后再试',
-  lock_timeout: '语音排队超时',
-  synth_timeout: '语音合成超时',
   synth_failed: '语音合成失败',
-  reference_missing: '参考音频缺失',
-  chunk_too_long: '这段文字太长，无法朗读',
-  too_many_chunks: '这段文字段落太多，无法朗读',
-  genie_unavailable: '语音服务暂时不可用',
+  nano_unavailable: '语音服务暂时不可用',
 };
 
 /**
@@ -85,7 +77,7 @@ export async function synthesizeSpeechGenieDetailed(
     const res = await fetch(`${base}/agent/v1/tts`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ text: spoken, emotion: resolveGenieEmotion(options, apiConfig) }),
+      body: JSON.stringify({ text: spoken }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(await readErrorText(res));
