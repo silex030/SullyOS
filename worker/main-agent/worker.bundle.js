@@ -464,35 +464,66 @@ async function runAgentLoop(env, messages, emit, llmOverride) {
 }
 
 // 配置走 main-agent 的 env 对象（与 getJsonEnv / providersOf 同一套读法），不是 process.env。
+/** 从 44 字节 RIFF 头估算秒数；头不全/非标返回 null（放行不断链）。 */
+function wavDurationSeconds(wav) {
+  try {
+    if (wav.length < 44) return null;
+    const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+    if (riff !== 'RIFF') return null;
+    const byteRate = view.getUint32(28, true);
+    const dataSize = view.getUint32(40, true);
+    if (!byteRate || !dataSize) return null;
+    return dataSize / byteRate;
+  } catch {
+    return null;
+  }
+}
 async function ttsProxy(request, env) {
-  const speakUrl = (env?.GENIE_SPEAK_URL || '').trim() || 'http://127.0.0.1:9882/speak';
+  const nanoUrl = (env?.NANO_TTS_URL || '').trim() || 'http://127.0.0.1:18083/api/generate';
+  const demoId = (env?.NANO_DEMO_ID || '').trim() || 'demo-30';
   let payload;
   try {
     payload = await request.json();
   } catch {
     return json({ error: 'bad_request' }, 400);
   }
-  // 不在这里检查 payload.text：空文本与非法请求体是两个不同的错误码，
-  // 由 /speak 统一裁决，代理不预判、不改写。
+  const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
+  if (!text) return json({ error: 'empty' }, 400);
+  // Nano 无情绪参数：调用方仍可传 emotion，本代理直接忽略（不校验、不转发）。
   try {
-    const upstream = await fetch(speakUrl, {
+    const form = new FormData();
+    form.append('text', text);
+    form.append('demo_id', demoId);
+    form.append('seed', '7');
+    form.append('max_new_frames', '200');
+    const upstream = await fetch(nanoUrl, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: form,
       signal: AbortSignal.timeout(150000),
     });
-    // arrayBuffer 也要在 try 内：上游回 body 时断线会抛，不能漏成宿主 500。
-    const body = await upstream.arrayBuffer();
+    let data;
+    try {
+      data = await upstream.json();
+    } catch {
+      return json({ error: 'synth_failed' }, 502);
+    }
+    if (!upstream.ok || typeof data?.audio_base64 !== 'string' || !data.audio_base64) {
+      return json({ error: 'synth_failed' }, 502);
+    }
+    const wav = Uint8Array.from(atob(data.audio_base64), (c) => c.charCodeAt(0));
+    // 时长守卫：复读循环的音频远长于文本应有长度，直接拒收（seed 抽风已实测）。
+    const seconds = wavDurationSeconds(wav);
+    if (seconds !== null && seconds > text.length * 0.6 + 4) {
+      console.warn(`[tts] reject overlong audio: chars=${text.length} seconds=${seconds.toFixed(1)}`);
+      return json({ error: 'synth_failed' }, 502);
+    }
     const out = new Headers();
-    const ct = upstream.headers.get('content-type');
-    if (ct) out.set('content-type', ct);
+    out.set('content-type', 'audio/wav');
     out.set('access-control-allow-origin', '*');
-    out.set('access-control-expose-headers', 'X-Genie-Resolved-Emotion');
-    const resolved = upstream.headers.get('x-genie-resolved-emotion');
-    if (resolved) out.set('X-Genie-Resolved-Emotion', resolved);
-    return new Response(body, { status: upstream.status, headers: out });
+    return new Response(wav, { status: 200, headers: out });
   } catch {
-    return json({ error: 'genie_unavailable' }, 502);
+    return json({ error: 'nano_unavailable' }, 502);
   }
 }
 

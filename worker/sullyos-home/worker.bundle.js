@@ -99,28 +99,6 @@ function mergePlateEntries(base, incoming) {
 }
 
 // worker/sullyos-home/src/speak.ts
-function wrapPcmAsWav(pcm) {
-  const wav = new Uint8Array(44 + pcm.length);
-  const view = new DataView(wav.buffer);
-  const writeAscii = (offset, text) => {
-    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
-  };
-  writeAscii(0, "RIFF");
-  view.setUint32(4, 36 + pcm.length, true);
-  writeAscii(8, "WAVE");
-  writeAscii(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, 32e3, true);
-  view.setUint32(28, 64e3, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeAscii(36, "data");
-  view.setUint32(40, pcm.length, true);
-  wav.set(pcm, 44);
-  return wav;
-}
 async function speakFallback(trySpeak) {
   try {
     const url = await trySpeak();
@@ -212,26 +190,22 @@ var src_default = {
       if (!body || typeof body.text !== "string" || !body.text.trim())
         return Response.json({ error: "bad_request" }, { status: 400 });
       const text = body.text;
-      const ttsBase = env.GENIE_TTS_URL ?? "http://127.0.0.1:9882";
-      const character = env.GENIE_TTS_CHARACTER ?? "ether";
+      const nanoUrl = env.NANO_TTS_URL ?? "http://127.0.0.1:18083/api/generate";
+      const demoId = env.NANO_DEMO_ID ?? "demo-30";
       const trySpeak = async () => {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 3e4);
         try {
-          const res = await fetch(`${ttsBase}/tts`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ character_name: character, text, split_sentence: true }),
-            signal: ctrl.signal
-          });
+          const form = new FormData();
+          form.append("text", text);
+          form.append("demo_id", demoId);
+          form.append("seed", "7");
+          form.append("max_new_frames", "200");
+          const res = await fetch(nanoUrl, { method: "POST", body: form, signal: ctrl.signal });
           if (!res.ok) throw new Error(`tts upstream ${res.status}`);
-          const buf = new Uint8Array(await res.arrayBuffer());
-          if (!buf.length) throw new Error("tts empty audio");
-          const wav = wrapPcmAsWav(buf);
-          let bin = "";
-          for (let i = 0; i < wav.length; i += 1) bin += String.fromCharCode(wav[i]);
-          const mime = res.headers.get("content-type") ?? "audio/wav";
-          return `data:${mime};base64,${btoa(bin)}`;
+          const data = await res.json();
+          if (typeof data?.audio_base64 !== "string" || !data.audio_base64) throw new Error("tts empty audio");
+          return `data:audio/wav;base64,${data.audio_base64}`;
         } finally {
           clearTimeout(timer);
         }

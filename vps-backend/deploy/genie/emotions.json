@@ -1,9 +1,0 @@
-{
-  "calm":      { "wav": "emo-calm.wav",      "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "happy":     { "wav": "emo-happy.wav",     "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "sad":       { "wav": "emo-sad.wav",       "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "angry":     { "wav": "emo-angry.wav",     "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "surprised": { "wav": "emo-surprised.wav", "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "fearful":   { "wav": "emo-fearful.wav",   "text": "今天过得怎么样，想不想听我讲讲今天遇到的事？" },
-  "fluent":    { "wav": "emo-fluent.wav",    "text": "下午三点一刻开会，会上的资料我先发你。" }
-}
