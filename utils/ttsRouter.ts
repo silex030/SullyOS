@@ -35,7 +35,7 @@ export const assertTtsLanguageSupported = (
   languageBoost?: string,
 ): void => {
   if (isGenieVoiceEnabled(apiConfig) && (languageBoost || '').trim()) {
-    throw new Error('Genie 自建语音目前只支持中文（含中英混读），请先关闭其他朗读语种');
+    throw new Error('MOSS 自建语音目前只支持中文（含中英混读），请先关闭其他朗读语种');
   }
   if ((languageBoost || '').trim().toLowerCase() !== 'yue') return;
   const provider = resolveTtsProvider(apiConfig);
