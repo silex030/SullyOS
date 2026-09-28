@@ -331,57 +331,49 @@ describe('POST /v1/tts', () => {
         expect(res.status).toBe(403);
     });
 
-    it('把 body 原样转发到适配层并回传音频', async () => {
+    it('把 text/demo/seed/帧数组成 multipart 并把 base64 解回 wav', async () => {
         const wav = new Uint8Array([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4]).buffer;
+        const audioB64 = Buffer.from(wav).toString('base64');
         const calls: Array<{ url: string; init: any }> = [];
         vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
             calls.push({ url: String(url), init });
-            return new Response(wav, { status: 200, headers: { 'content-type': 'audio/wav' } });
+            return new Response(JSON.stringify({ audio_base64: audioB64 }), {
+                status: 200, headers: { 'content-type': 'application/json' },
+            });
         }));
         const res = await postTts({ text: '你好', emotion: 'happy' });
         expect(res.status).toBe(200);
         expect(res.headers.get('content-type')).toContain('audio/wav');
         expect(res.headers.get('access-control-allow-origin')).toBe('*');
-        expect(res.headers.get('access-control-expose-headers')).toContain('X-Genie-Resolved-Emotion');
-        expect(calls[0].url).toBe('http://127.0.0.1:9882/speak');
-        expect(JSON.parse(calls[0].init.body)).toEqual({ text: '你好', emotion: 'happy' });
-    });
-
-    it('X-Genie-Resolved-Emotion 响应头在成功时被转发给浏览器', async () => {
-        vi.stubGlobal('fetch', vi.fn(async () => new Response(new ArrayBuffer(64), {
-            status: 200,
-            headers: {
-                'content-type': 'audio/wav',
-                'X-Genie-Resolved-Emotion': 'calm',
-            },
-        })));
-        const res = await postTts({ text: 'x' });
-        expect(res.status).toBe(200);
-        expect(res.headers.get('x-genie-resolved-emotion')).toBe('calm');
+        expect(res.headers.get('x-genie-resolved-emotion')).toBeNull();
+        expect(calls[0].url).toBe('http://127.0.0.1:18083/api/generate');
+        const body = calls[0].init.body as FormData;
+        expect(body.get('text')).toBe('你好');
+        expect(body.get('demo_id')).toBe('demo-30');
+        expect(body.get('seed')).toBe('7');
+        expect(body.get('max_new_frames')).toBe('200');
+        const out = new Uint8Array(await res.arrayBuffer());
+        expect(out[0]).toBe(0x52);
     });
 
     it.each([
-        [400, 'empty'],
-        [400, 'bad_request'],
-        [400, 'bad_emotion'],
-        [413, 'chunk_too_long'],
-        [413, 'too_many_chunks'],
-        [503, 'warming_up'],
-        [503, 'busy'],
-        [504, 'lock_timeout'],
-        [504, 'synth_timeout'],
-        [500, 'reference_missing'],
-        [500, 'synth_failed'],
-    ])('上游 %i %s 原样透传', async (status, code) => {
-        const body = JSON.stringify({ error: code });
-        vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
-            status,
-            headers: { 'content-type': 'application/json' },
-        })));
-
+        [400, 502, 'synth_failed'],
+        [500, 502, 'synth_failed'],
+        [503, 502, 'synth_failed'],
+    ])('上游非 200 一律 502 synth_failed（Nano 用 status 表达失败）', async (status, want, code) => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('oops', { status })));
         const res = await postTts({ text: 'x' });
-        expect(res.status).toBe(status);
-        expect(await res.text()).toBe(body);
+        expect(res.status).toBe(want);
+        expect(await res.json()).toEqual({ error: code });
+    });
+
+    it('空文本直接 400 empty，不打上游', async () => {
+        const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+        vi.stubGlobal('fetch', fetchMock);
+        const res = await postTts({ text: '  ' });
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'empty' });
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('适配层不可达时返回 502 而不是抛异常', async () => {
