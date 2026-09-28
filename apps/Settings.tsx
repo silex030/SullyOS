@@ -3225,7 +3225,7 @@ const Settings: React.FC = () => {
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
                     <div className="space-y-2">
                         {([
-                            [true, 'GenieTTS 自建语音', '中文克隆，走 VPS 自建服务'],
+                            [true, 'MOSS 自建语音', '中文克隆，走 VPS 自建服务'],
                             [false, '语音合成 API', 'MiniMax / 鱼声 / ElevenLabs 三家'],
                         ] as const).map(([isGenie, name, desc]) => {
                             const active = localGenieEnabled === isGenie;
@@ -3410,7 +3410,7 @@ const Settings: React.FC = () => {
                     </div>
                 </div>
                 </>) : (
-                    <p className="text-[11px] text-slate-400 pl-1 leading-relaxed">当前使用 Genie 自建语音，切回 API 可继续使用三家引擎</p>
+                    <p className="text-[11px] text-slate-400 pl-1 leading-relaxed">当前使用 MOSS 自建语音，切回 API 可继续使用三家引擎</p>
                 )}
 
                 {/* 语音提示词（高级）—— 自定义注入角色 system prompt 的「语音表演指南」，按服务商分别保存 */}

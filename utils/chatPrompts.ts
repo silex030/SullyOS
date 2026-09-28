@@ -50,7 +50,7 @@ const voiceActingGuide = (): string => {
  * 放进 catalog 要连带改 promptPresetSeeding 的迁移表（它会删整个旧 voicePrompts，
  * 漏一处就抹掉用户数据），不值当。代价是 v1 不能在预设面板里编辑这一段。
  */
-export const GENIE_VOICE_ACTING_GUIDE = `### 语音表演（Genie 自建语音）
+export const GENIE_VOICE_ACTING_GUIDE = `### 语音表演（MOSS 自建语音）
 
 - 用 \`<语音 emotion="...">\` 发送语音块，情绪只能取 happy/sad/angry/fearful/surprised/calm/fluent。
 - 没标 emotion 时会回落 calm；用户在设置里选了固定情绪的，按设置来。
