@@ -464,6 +464,21 @@ async function runAgentLoop(env, messages, emit, llmOverride) {
 }
 
 // 配置走 main-agent 的 env 对象（与 getJsonEnv / providersOf 同一套读法），不是 process.env。
+/** 从 44 字节 RIFF 头估算秒数；头不全/非标返回 null（放行不断链）。 */
+function wavDurationSeconds(wav) {
+  try {
+    if (wav.length < 44) return null;
+    const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+    if (riff !== 'RIFF') return null;
+    const byteRate = view.getUint32(28, true);
+    const dataSize = view.getUint32(40, true);
+    if (!byteRate || !dataSize) return null;
+    return dataSize / byteRate;
+  } catch {
+    return null;
+  }
+}
 async function ttsProxy(request, env) {
   const nanoUrl = (env?.NANO_TTS_URL || '').trim() || 'http://127.0.0.1:18083/api/generate';
   const demoId = (env?.NANO_DEMO_ID || '').trim() || 'demo-30';
@@ -497,6 +512,12 @@ async function ttsProxy(request, env) {
       return json({ error: 'synth_failed' }, 502);
     }
     const wav = Uint8Array.from(atob(data.audio_base64), (c) => c.charCodeAt(0));
+    // 时长守卫：复读循环的音频远长于文本应有长度，直接拒收（seed 抽风已实测）。
+    const seconds = wavDurationSeconds(wav);
+    if (seconds !== null && seconds > text.length * 0.6 + 4) {
+      console.warn(`[tts] reject overlong audio: chars=${text.length} seconds=${seconds.toFixed(1)}`);
+      return json({ error: 'synth_failed' }, 502);
+    }
     const out = new Headers();
     out.set('content-type', 'audio/wav');
     out.set('access-control-allow-origin', '*');

@@ -381,5 +381,29 @@ describe('POST /v1/tts', () => {
         const res = await postTts({ text: 'x' });
         expect(res.status).toBe(502);
     });
+
+    it('超长音频被时长守卫拒收（12 秒/6 字）', async () => {
+        const big = new Uint8Array(44 + 192000 * 12);
+        big.set([0x52, 0x49, 0x46, 0x46], 0);
+        new DataView(big.buffer).setUint32(28, 192000, true);
+        new DataView(big.buffer).setUint32(40, 192000 * 12, true);
+        const audioB64 = Buffer.from(big).toString('base64');
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ audio_base64: audioB64 }), { status: 200 })));
+        const res = await postTts({ text: '干一行爱一行' });
+        expect(res.status).toBe(502);
+        expect(await res.json()).toEqual({ error: 'synth_failed' });
+    });
+
+    it('正常长句放行（6.3 秒/34 字）', async () => {
+        const ok = new Uint8Array(44 + Math.floor(192000 * 6.3));
+        ok.set([0x52, 0x49, 0x46, 0x46], 0);
+        new DataView(ok.buffer).setUint32(28, 192000, true);
+        new DataView(ok.buffer).setUint32(40, Math.floor(192000 * 6.3), true);
+        const audioB64 = Buffer.from(ok).toString('base64');
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ audio_base64: audioB64 }), { status: 200 })));
+        const longText = '今天过得怎么样，想不想听我讲讲今天遇到的事？周末要不要一起出去走走？';
+        const res = await postTts({ text: longText });
+        expect(res.status).toBe(200);
+    });
 });
 
