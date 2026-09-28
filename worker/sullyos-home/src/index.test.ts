@@ -194,11 +194,13 @@ describe('POST /home/speak', () => {
     vi.unstubAllGlobals();
   });
 
-  it('Genie-TTS 成功时返回 WAV data URL，并使用 ether 角色', async () => {
-    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => new Response(new Uint8Array([1, 2, 3]), {
-      status: 200,
-      headers: { 'content-type': 'audio/wav' },
-    }));
+  it('Nano 成功时返回 WAV data URL，并以 multipart 直传文本', async () => {
+    const wav = new Uint8Array([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4]);
+    const audioB64 = Buffer.from(wav).toString('base64');
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => new Response(
+      JSON.stringify({ audio_base64: audioB64 }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
     vi.stubGlobal('fetch', fetchMock);
 
     const res = await call(authedEnv(makeDb()), '/home/speak', {
@@ -209,22 +211,18 @@ describe('POST /home/speak', () => {
 
     expect(res.status).toBe(200);
     expect(result.fallback).toBe(false);
-    expect(result.audioUrl).toMatch(/^data:audio\/wav;base64,/);
-    const encodedAudio = result.audioUrl!.split(',')[1];
-    const decodedAudio = Buffer.from(encodedAudio, 'base64');
-    expect(Array.from(decodedAudio.subarray(0, 4))).toEqual([0x52, 0x49, 0x46, 0x46]);
+    expect(result.audioUrl).toBe(`data:audio/wav;base64,${audioB64}`);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(String(url).endsWith(':9882/tts')).toBe(true);
-    const requestBody = JSON.parse(String(init.body)) as {
-      character_name: string;
-      split_sentence: boolean;
-    };
-    expect(requestBody.character_name).toBe('ether');
-    expect(requestBody.split_sentence).toBe(true);
+    expect(String(url)).toBe('http://127.0.0.1:18083/api/generate');
+    const form = init.body as FormData;
+    expect(form.get('text')).toBe('你好');
+    expect(form.get('demo_id')).toBe('demo-30');
+    expect(form.get('seed')).toBe('7');
+    expect(form.get('max_new_frames')).toBe('200');
   });
 
-  it('Genie-TTS 404 时回退纯文本', async () => {
+  it('Nano 404 时回退纯文本', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('not found', { status: 404 })));
 
     const res = await call(authedEnv(makeDb()), '/home/speak', {
@@ -237,7 +235,7 @@ describe('POST /home/speak', () => {
     expect(result.audioUrl).toBeNull();
   });
 
-  it('Genie-TTS 请求异常时回退纯文本', async () => {
+  it('Nano 请求异常时回退纯文本', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('boom')));
 
     const res = await call(authedEnv(makeDb()), '/home/speak', {
