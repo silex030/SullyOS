@@ -120,3 +120,10 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - **全 App 每秒重渲染**：`VirtualTime` 只有 hours/minutes/day（没有秒），但时钟 effect 每秒 `setState` 一个新对象 → OSContext value 每秒变、所有消费者跟着重渲染。改成「分钟或日期变了才写状态」。
   - **公网入口恢复（重要）**：`/etc/caddy/Caddyfile` 曾被整站反代覆盖，8830-8841 全部只剩本机可达，公网打 `/agent/health` 之类会 302 到 Hermes 登录页。已按仓库模板补回 10 条 `handle_path` 路由（Hermes 面板降为 `handle` 兜底）。**注意 `/home/*` 必须用 `handle` 而不是 `handle_path`**——8837 自身路由就带 `/home` 前缀，剥掉前缀会 404。备份在 `/etc/caddy/Caddyfile.bak-20261021-2031`。
   - **小红书采集一直失败**：`camofox`（127.0.0.1:9377）从来没在这台机器上装过（无镜像、无源码目录、无数据目录），采集器每 10 分钟报一条 `fetch failed`，累计 267 次。按调查结论选了「停用服务」：`systemctl disable --now xhs-session`（8836 已释放，回滚一条命令）。要真恢复小红书，得走完整小项目：装 camofox → 扫码 → 配 Caddy `/xhs-api` → 前端改地址。
+
+- 🚀 **2026-10-21 前端改为自托管（脱离 Vercel）**：
+  - 起因：线上 `ethernet.bot.cd` 其实是 **Vercel**（`server: Vercel`），而 Vercel 项目**没跟 `ethernet` 分支联动**（GitHub Actions 里 ethernet 上零部署运行，`deploy-pages.yml` 只听 main/master），所以 push 完界面根本不更新。实测抓产物：Vercel 那份 `Settings` chunk 里还是旧文案。
+  - 现状：前端由 VPS 自己托管。`vite build` → `rsync -a --delete dist/ /opt/sullyos/frontend-dist/`，Caddy 直接 `file_server` 出站，**改完不用 reload、不用第三方平台**。旧产物备份在 `/opt/sullyos/frontend-dist.bak-20261021`。
+  - Caddy：新增 `(SULLYOS_BACKEND)` 片段（10 条 handle_path/handle），前端站与 Hermes 面板都 `import` 它 → 同域前端用相对路径 `/agent/...` 就能调后端，无跨域、不用改 App 设置。配置备份 `/etc/caddy/Caddyfile.bak-20261021-2031`。
+  - ⚠️ DNSHE 面板坑：记录名要填 **`@`** 才是「本子域」；填 `ethernet` 会生成 `ethernet.ethernet.bot.cd`。当前生效地址即 `https://ethernet.ethernet.bot.cd`（用户改 @ 后换 `https://ethernet.bot.cd`，Caddyfile 里那段已备好注释）。
+  - 验证口径：`curl` 首页 200 + 抓 `/assets/index-*.js` → 取 `Settings-*.js` chunk → `grep` 当天新文案。这个手法能区分「真上线」和「以为上线」。
