@@ -125,5 +125,6 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - 起因：线上 `ethernet.bot.cd` 其实是 **Vercel**（`server: Vercel`），而 Vercel 项目**没跟 `ethernet` 分支联动**（GitHub Actions 里 ethernet 上零部署运行，`deploy-pages.yml` 只听 main/master），所以 push 完界面根本不更新。实测抓产物：Vercel 那份 `Settings` chunk 里还是旧文案。
   - 现状：前端由 VPS 自己托管。`vite build` → `rsync -a --delete dist/ /opt/sullyos/frontend-dist/`，Caddy 直接 `file_server` 出站，**改完不用 reload、不用第三方平台**。旧产物备份在 `/opt/sullyos/frontend-dist.bak-20261021`。
   - Caddy：新增 `(SULLYOS_BACKEND)` 片段（10 条 handle_path/handle），前端站与 Hermes 面板都 `import` 它 → 同域前端用相对路径 `/agent/...` 就能调后端，无跨域、不用改 App 设置。配置备份 `/etc/caddy/Caddyfile.bak-20261021-2031`。
-  - ⚠️ DNSHE 面板坑：记录名要填 **`@`** 才是「本子域」；填 `ethernet` 会生成 `ethernet.ethernet.bot.cd`。当前生效地址即 `https://ethernet.ethernet.bot.cd`（用户改 @ 后换 `https://ethernet.bot.cd`，Caddyfile 里那段已备好注释）。
+  - ✅ **正式入口：`https://link.ethernet.bot.cd`**（Let's Encrypt 证书自动签发，2026-10-21 五项实测通过）。过渡地址 `https://ethernet.ethernet.bot.cd` 也保留在 Caddyfile 里，未删。
+  - ⚠️ DNSHE 面板坑：记录名填的是**相对本子域的名字**。在 `ethernet.bot.cd` 这个子域下，记录名 `link` → `link.ethernet.bot.cd`；填 `@` 才是本子域自身；填 `ethernet` 会变成 `ethernet.ethernet.bot.cd`（用户第一次就踩了这个）。DNSHE 免费版 API（`api005.dnshe.com`，X-API-Key/X-API-Secret）虽然可用，但用户那把 Secret 少一位（63 位）认证失败，最后是手工在面板改的。
   - 验证口径：`curl` 首页 200 + 抓 `/assets/index-*.js` → 取 `Settings-*.js` chunk → `grep` 当天新文案。这个手法能区分「真上线」和「以为上线」。
