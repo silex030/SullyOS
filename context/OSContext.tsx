@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
 import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile, MemoryPalaceFeatureFlags } from '../types';
 import { DB } from '../utils/db';
+import { safeParseJson } from '../utils/safeJson';
 import type { AvatarTouchRecord } from '../utils/avatarTouch';
 import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
 import { buildMalformedImageDiagnostics, extractImagesInPlace, deepCloneForExport, parseImageDataUrlForBackup, type BackupObjectPath, type MalformedBackupImageDiagnostic } from '../utils/backupExport';
@@ -868,9 +869,18 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const [virtualTime, setVirtualTime] = useState<VirtualTime>(getRealTime());
   
   // Real-time Clock Sync
+  // 注意：VirtualTime 只有 hours/minutes/day（没有秒），所以每秒 setState 一次纯属浪费——
+  // 它会让 OSContext 的 value 每秒变一次，所有 useOS() 的组件跟着每秒重渲染（全仓 12 个
+  // 文件直接用 virtualTime，间接受影响的更多）。这里保留 1s 的 tick 以便跨分钟边界及时，
+  // 但只有真的换了分钟才写状态。
   useEffect(() => {
       const timer = setInterval(() => {
-          setVirtualTime(getRealTime());
+          const next = getRealTime();
+          setVirtualTime(prev => (
+              prev.hours === next.hours && prev.minutes === next.minutes && prev.day === next.day
+                  ? prev
+                  : next
+          ));
       }, 1000);
       return () => clearInterval(timer);
   }, []);
@@ -4077,8 +4087,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   : undefined,
               
               socialAppData: (mode === 'text_only' || mode === 'media_only' || mode === 'full') ? {
-                  charHandles: JSON.parse(localStorage.getItem('spark_char_handles') || '{}'),
-                  userProfile: sparkSocialProfile ? JSON.parse(sparkSocialProfile) : undefined,
+                  // 容错解析：这两个键是 localStorage 里的裸字符串，写坏一个就会让整次导出失败
+                  // （用户看到「导出失败」却不知道该删哪个键）。导出路径上宁可丢这一小块。
+                  // 泛型不显式写：让 TS 从 fallback 推断，好跟 FullBackupData.socialAppData 的类型对齐。
+                  charHandles: safeParseJson(localStorage.getItem('spark_char_handles'), {}),
+                  userProfile: sparkSocialProfile ? safeParseJson(sparkSocialProfile, undefined) : undefined,
                   userId: localStorage.getItem('spark_user_id') || undefined,
                   userBg: sparkUserBg || undefined
               } : undefined,
@@ -4705,7 +4718,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // VAPID 私钥、opencode 密码等绝不能进包。只清值、留结构（地址/模型保留），
           // 恢复后用户重填一次 Key。动过手就在包上打标，导入端据此提醒。
           // 详见 utils/backupSecrets.ts（新增密钥字段时先补那里的清单）。
-          if (stripBackupSecrets(backupData)) {
+          if (stripBackupSecrets(backupData, {
+              // 只有用户在导出面板显式勾了「包含主动消息 2.0 的后端连接」才留那两把钥匙；
+              // 其余密钥照旧一律清零。
+              keepBackendConnection: !!exportOptions.includeBackendConnection,
+          })) {
               (backupData as Record<string, any>).secretsRedacted = true;
           }
 

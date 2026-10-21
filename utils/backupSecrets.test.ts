@@ -196,3 +196,46 @@ describe('backup secrets redaction', () => {
     expect(hasBackupSecrets(data)).toBe(false);
   });
 });
+
+describe('keepBackendConnection（导出面板勾选「包含主动消息后端连接」）', () => {
+  const withAmsg2 = (): any => ({
+    amsg2GlobalConfig: {
+      workerUrl: 'https://worker.example.workers.dev',
+      userId: 'u-1',
+      serverToken: 'server-token-abc',
+      masterKey: 'master-key-xyz',
+      instantChatEnabled: true,
+    },
+    apiConfig: apiConfig(),
+  });
+
+  it('默认：Worker 的共享密钥与主密钥一律清零（地址与用户 id 留着）', () => {
+    const data = withAmsg2();
+    stripBackupSecrets(data);
+    expect(data.amsg2GlobalConfig.serverToken).toBe('');
+    expect(data.amsg2GlobalConfig.masterKey).toBe('');
+    expect(data.amsg2GlobalConfig.workerUrl).toBe('https://worker.example.workers.dev');
+    expect(data.amsg2GlobalConfig.userId).toBe('u-1');
+  });
+
+  it('勾选后：这两把钥匙保留，但其它密钥（LLM API Key）仍然清零', () => {
+    const data = withAmsg2();
+    stripBackupSecrets(data, { keepBackendConnection: true });
+    expect(data.amsg2GlobalConfig.serverToken).toBe('server-token-abc');
+    expect(data.amsg2GlobalConfig.masterKey).toBe('master-key-xyz');
+    expect(data.apiConfig.apiKey).toBe('');
+  });
+
+  it('keepBackendConnection 不会把「没勾选的其它东西」也放行', () => {
+    const data: any = {
+      cloudBackupConfig: { password: 'p@ss', githubToken: 'ghp_x' },
+      pushVapid: { vapidPrivateKey: 'priv' },
+      amsg2GlobalConfig: { workerUrl: 'w', serverToken: 's', masterKey: 'm' },
+    };
+    stripBackupSecrets(data, { keepBackendConnection: true });
+    expect(data.cloudBackupConfig.password).toBe('');
+    expect(data.cloudBackupConfig.githubToken).toBe('');
+    expect(data.pushVapid.vapidPrivateKey).toBe('');
+    expect(data.amsg2GlobalConfig.serverToken).toBe('s');
+  });
+});

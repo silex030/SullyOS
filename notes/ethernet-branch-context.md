@@ -110,3 +110,13 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - **备份安全修复（本仓版本色于上游）**：`amsg2GlobalConfig` 导出时此前无条件带 `workerUrl / serverToken / masterKey / userId`——分享备份等于交出 Worker 钥匙。现改为默认剥离，备份面板加「包含主动消息 2.0 的后端连接」勾选项（默认关）；导入侧（本地文件 + WebDAV 云恢复）文件里带连接时先弹确认并显示地址，不点头只还原偏好。改动 5 文件，测试 21 条（`utils/backupRoundtrip.test.ts`）。
   - ⚠️ **全量 vitest 在这台 8 核机上必须限并发**：默认池会把 `utils/chatPrompts.apprules.test.ts`（60s 上限）压成超时假红。门禁用 `pnpm vitest run --minWorkers=1 --maxWorkers=4`（512 文件 / 6292 用例，约 3.5 分钟）。
   - 📌 遗留：`heartbeat.sqlite` / `sullyos-home.sqlite` 仍在 `vps-backend/data/`（git 工作树内），没设 `HEARTBEAT_DB_PATH` / `HOME_DB_PATH`；语音仍不可用（18083 无服务），用户计划换别的 TTS 模型。
+
+- 🧰 **2026-10-21 维护轮之二（模型名 / bundle 同步 / 备份健壮性 / 见面上限 / 公网入口 / 小红书）**：
+  - **`.env` 的 LLM_MODEL 写错**：写成 `deepseek-v4-flash`，供应商 37 个模型里只有 `deepseek-v4.1-flash`（少了 `.1`）。已改。注意前端是自带凭据（`body.llm` 随请求直传），env 只是兜底；而 env 里那把 `LLM_API_KEY` 实测已失效（供应商回 `Invalid credential`），兜底通道目前等于死的——需要重新签一把。
+  - **worker bundle 与源码失同步（线上跑旧码）**：入库的 `worker/amsg/worker.bundle.js` 比 src 落后 590 行 / 8 文件（`googleSelection` 透传在源码 2 处、在入库 bundle 0 处），但两边版本常量都是 `2026-09-15`，所以程序自认最新、测试也不会红。VPS 后端正是按 `config/services.js` 的 `bundle` 字段加载这些产物 → **线上跑的就是三天前代码**。已重建并提交；新增 `pnpm check:workers`（`scripts/check-worker-bundles.mjs`）：跑一遍 build 后比对 git 状态，不同步就退出码 1。
+  - **备份链路两处裸 `JSON.parse`**（`socialAppData.charHandles` / `userProfile`）：任一 localStorage 键被写坏就让整次导出失败，且报错只说「导出失败」。新增 `utils/safeJson.ts`（`safeParseJson` / `tryParseJson` + 8 条用例）替换，导出不再被一个坏键炸掉。
+  - **备份文案与实际行为不符（纠正）**：`utils/backupSecrets.ts` 打包前会清零所有密钥（LLM/TTS/WebDAV 密码/VAPID 私钥/opencode 密码…）并打 `secretsRedacted` 标，所以包里**根本没有明文密钥**。原有文案写「包含明文密钥」是错的，已改成「包含聊天/角色/设置，密钥已脱敏」。同时给 `stripBackupSecrets` 加 `keepBackendConnection` 选项：只有用户勾了「包含主动消息后端连接」才留 serverToken/masterKey，其余密钥无论如何都清零（3 条新用例）。
+  - **见面导出 OOM**：`DateApp.handleExportAllHistory` 原传 `Number.MAX_SAFE_INTEGER`，把该角色全部见面记录（含内联图片）一次性读进内存。改成上限 8000 条，超出只导最近一批并 toast 告知（游标是倒序，取到的是最新）。
+  - **全 App 每秒重渲染**：`VirtualTime` 只有 hours/minutes/day（没有秒），但时钟 effect 每秒 `setState` 一个新对象 → OSContext value 每秒变、所有消费者跟着重渲染。改成「分钟或日期变了才写状态」。
+  - **公网入口恢复（重要）**：`/etc/caddy/Caddyfile` 曾被整站反代覆盖，8830-8841 全部只剩本机可达，公网打 `/agent/health` 之类会 302 到 Hermes 登录页。已按仓库模板补回 10 条 `handle_path` 路由（Hermes 面板降为 `handle` 兜底）。**注意 `/home/*` 必须用 `handle` 而不是 `handle_path`**——8837 自身路由就带 `/home` 前缀，剥掉前缀会 404。备份在 `/etc/caddy/Caddyfile.bak-20261021-2031`。
+  - **小红书采集一直失败**：`camofox`（127.0.0.1:9377）从来没在这台机器上装过（无镜像、无源码目录、无数据目录），采集器每 10 分钟报一条 `fetch failed`，累计 267 次。按调查结论选了「停用服务」：`systemctl disable --now xhs-session`（8836 已释放，回滚一条命令）。要真恢复小红书，得走完整小项目：装 camofox → 扫码 → 配 Caddy `/xhs-api` → 前端改地址。

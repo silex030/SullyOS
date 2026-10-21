@@ -723,12 +723,23 @@ const DateApp: React.FC = () => {
         if (!char || historyBusy) return;
         setHistoryBusy(true);
         try {
-            // 导出属于用户主动操作，可以完整扫描该角色消息索引；只收集 source=date，避免把图片聊天读进内存。
-            const allDateMessages = await DB.getRecentMessagesByCharIdAndSource(char.id, 'date', Number.MAX_SAFE_INTEGER);
+            // 导出属于用户主动操作，可以完整扫描该角色消息索引；只收集 source=date，避免把图片聊天读进来。
+            // 但**必须给游标一个上限**：以前这里传 Number.MAX_SAFE_INTEGER，等于把该角色所有见面
+            // 记录（含内联图片）一次性读进内存，手机上很容易 OOM 崩掉。这里按条数封顶，超了就
+            // 导出最近的一批并明确告知（getRecentMessagesByCharIdAndSource 是倒序游标，取到的是最新）。
+            const DATE_HISTORY_EXPORT_LIMIT = 8000;
+            const fetched = await DB.getRecentMessagesByCharIdAndSource(
+                char.id, 'date', DATE_HISTORY_EXPORT_LIMIT + 1,
+            );
+            const truncated = fetched.length > DATE_HISTORY_EXPORT_LIMIT;
+            const allDateMessages = truncated ? fetched.slice(0, DATE_HISTORY_EXPORT_LIMIT) : fetched;
             const allGroups = buildDateHistoryGroups(allDateMessages, historyView, historySortOrder);
             if (allGroups.length === 0) {
                 addToast('暂无可导出的见面记录', 'info');
                 return;
+            }
+            if (truncated) {
+                addToast(`记录太多，本次只导出最近 ${DATE_HISTORY_EXPORT_LIMIT} 条`, 'info');
             }
             const result = await shareOrDownloadFile({
                 content: formatDateHistoryExport(char.name, allGroups, historyView),

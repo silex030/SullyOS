@@ -1495,16 +1495,17 @@ const Settings: React.FC = () => {
 
   const handleExport = async (mode: 'text_only' | 'media_only' | 'full') => {
       try {
-          // 二次确认：整包备份（full / text_only）本就包含你的 API 密钥等设置——这是预期行为，
-          // 但绝不能发给别人。media_only 只有媒体、不含密钥，视为可分享。
+          // 二次确认。注意文案要跟真实行为一致：打包前 utils/backupSecrets.ts 会把所有
+          // API Key / VAPID 私钥 / WebDAV 密码清零并在包上打 secretsRedacted 标，
+          // 所以包里**没有**明文密钥——这里提示的是隐私（你的聊天与角色），别再写"含密钥"。
           if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
               const includesSettings = mode !== 'media_only';
               const includesBackend = includesSettings && exportBackendConnection;
               const msg = includesBackend
-                  ? '该导出数据包含了明文密钥，以及主动消息 2.0 的后端连接（Worker 地址与主密钥）。拿到这个文件的人可以连上你那台 Worker，请不要发送给任何人'
+                  ? '该备份包含你的聊天记录、角色与设置，并额外带上了主动消息 2.0 的后端连接（Worker 地址与用户 id）。拿到这个文件的人可以连上你那台 Worker，请不要发送给任何人'
                   : includesSettings
-                  ? '该导出数据包含了明文密钥，请不要发送给任何人'
-                  : '该导出内容安全，可以用于分享';
+                  ? '该备份包含你的聊天记录、角色与设置（API 密钥已自动脱敏，不会写进文件）。请不要随意发送给不信任的人'
+                  : '该导出内容只有图片与媒体文件，可以用于分享';
               if (!window.confirm(`${msg}\n\n点「确定」继续导出，「取消」中止。`)) {
                   return;
               }

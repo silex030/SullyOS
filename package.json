@@ -8,6 +8,7 @@
     "build": "pnpm run build:workers && vite build",
     "preview": "vite preview",
     "build:workers": "node scripts/build-workers.mjs",
+    "check:workers": "node scripts/check-worker-bundles.mjs",
     "test": "vitest",
     "test:run": "vitest run",
     "dev:sync": "node scripts/watch-sync.mjs",

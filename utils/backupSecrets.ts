@@ -70,8 +70,12 @@ function stripOpaqueMap(hit: { hit: boolean }, map: any): void {
 
 /**
  * 就地脱敏备份载荷。返回 true = 动过手（调用方应在包上标记 secretsRedacted）。
+ *
+ * @param opts.keepBackendConnection 用户在导出面板显式勾了「包含主动消息 2.0 的后端连接」时传
+ *   true：Worker 的共享密钥与主密钥留着不抹。其余密钥（LLM/TTS/WebDAV/VAPID…）无论如
+ *   何一律清零——那几样跟"换设备恢复连接"无关，留着只增加泄漏面。
  */
-export function stripBackupSecrets(data: any): boolean {
+export function stripBackupSecrets(data: any, opts: { keepBackendConnection?: boolean } = {}): boolean {
   if (!data || typeof data !== 'object') return false;
   const hit = { hit: false };
 
@@ -91,15 +95,16 @@ export function stripBackupSecrets(data: any): boolean {
   blankField(hit, data.pushVapid, 'vapidPrivateKey');
   blankField(hit, data.instantPushConfig, 'clientToken');
   blankField(hit, data.cloudBackupConfig, 'password');
-  blankField(hit, data.cloudBackupConfig, 'githubToken');
-  blankField(hit, data.remoteVectorConfig, 'supabaseAnonKey');
+  blankField(hit, data.cloudBackupConfig, 'githubToken');  blankField(hit, data.remoteVectorConfig, 'supabaseAnonKey');
   if (data.memoryPalaceConfig && typeof data.memoryPalaceConfig === 'object') {
     blankField(hit, data.memoryPalaceConfig.embedding, 'apiKey');
     blankField(hit, data.memoryPalaceConfig.lightLLM, 'apiKey');
     blankField(hit, data.memoryPalaceConfig.rerank, 'apiKey');
   }
-  blankField(hit, data.amsg2GlobalConfig, 'serverToken');
-  blankField(hit, data.amsg2GlobalConfig, 'masterKey');
+  if (!opts.keepBackendConnection) {
+    blankField(hit, data.amsg2GlobalConfig, 'serverToken');
+    blankField(hit, data.amsg2GlobalConfig, 'masterKey');
+  }
   stripRealtimeConfig(hit, data.realtimeConfig);
   blankField(hit, data.browserConfig, 'braveKey');
 

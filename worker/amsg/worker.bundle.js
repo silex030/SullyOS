@@ -7567,11 +7567,21 @@ var chatFieldOk = (chat) => {
   const { messages, builtAt } = chat;
   return typeof builtAt === "number" && Array.isArray(messages) && messages.length > 0 && messages.every((m) => !!m && typeof m === "object" && typeof m.role === "string" && chatContentOk(m.content));
 };
+var overridesFieldOk = (value) => {
+  if (value === void 0) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((v) => typeof v === "string");
+};
 var parseFirePack = (value) => {
   try {
     const parsed = JSON.parse(value);
     if (parsed && typeof parsed === "object" && parsed.v === FIRE_PACK_VERSION && chatFieldOk(parsed.chat) && typeof parsed.template === "string" && parsed.template.length > 0 && (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === "number") && typeof parsed.tzId === "string" && parsed.tzId.length > 0 && typeof parsed.userTzId === "string" && parsed.userTzId.length > 0 && typeof parsed.targetName === "string" && typeof parsed.builtAt === "number" && Array.isArray(parsed.pendingTasks) && (parsed.scene === null || typeof parsed.scene === "object") && (parsed.maxUnansweredSends === void 0 || typeof parsed.maxUnansweredSends === "number" && Number.isFinite(parsed.maxUnansweredSends) && parsed.maxUnansweredSends >= 0) && typeof parsed.selfScheduleEnabled === "boolean") {
-      return parsed;
+      const pack = parsed;
+      if (pack.autonomyPromptOverrides !== void 0 && !overridesFieldOk(pack.autonomyPromptOverrides)) {
+        console.warn("[amsg:fire-pack] autonomyPromptOverrides \u5F62\u72B6\u4E0D\u5BF9\uFF0C\u5DF2\u4E22\u5F03\u8BE5\u5B57\u6BB5\uFF08\u5305\u5176\u4F59\u90E8\u5206\u4FDD\u7559\uFF09");
+        delete pack.autonomyPromptOverrides;
+      }
+      return pack;
     }
   } catch {
   }
@@ -7587,6 +7597,44 @@ var discardJob = async (writeState, jobId) => {
     console.warn("[amsg:plate] job \u884C\u6CA1\u5220\u6389\uFF08\u7B49 TTL \u515C\u5E95\uFF09", jobId, error);
   }
 };
+var USE_HOME = false;
+var plateHomeEnv = null;
+function configurePlateHomeEnv(env) {
+  plateHomeEnv = env ?? null;
+}
+async function fetchHomeMemoriesSnapshot(charId) {
+  if (!USE_HOME) return null;
+  try {
+    const base = plateHomeEnv?.HOME_URL ?? "http://127.0.0.1:8837";
+    const res = await fetch(`${base}/home/memories?charId=${encodeURIComponent(charId)}`, {
+      headers: { "x-client-token": plateHomeEnv?.AMSG_CLIENT_TOKEN ?? "" },
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const rows = Array.isArray(data) ? data : data.memories;
+    if (!Array.isArray(rows)) return null;
+    return rows.filter(
+      (r) => !!r && typeof r === "object" && typeof r.summary === "string" && typeof r.room === "string"
+    );
+  } catch {
+    return null;
+  }
+}
+function snapshotToMaterials(snapshot) {
+  const byRoom = /* @__PURE__ */ new Map();
+  for (const item of snapshot) {
+    if (!PLATE_ROOMS.includes(item.room)) continue;
+    if (!item.summary) continue;
+    const lines = byRoom.get(item.room) ?? [];
+    lines.push(item.summary);
+    byRoom.set(item.room, lines);
+  }
+  return [...byRoom.entries()].map(([room, lines]) => ({
+    room,
+    lines
+  }));
+}
 var plateConsolidateHandler = {
   async beforeFire({ ctx, charId, taskMeta }) {
     const jobId = taskMeta[AMSG_JOB_ID_KEY];
@@ -7617,13 +7665,19 @@ var plateConsolidateHandler = {
       await discardJob(ctx.writeState, jobId);
       return { skip: true, reason: `\u95E8\u724C\u6574\u7406 job ${jobId} \u6CA1\u6709\u8981\u6574\u7406\u7684\u623F\u95F4` };
     }
+    let jobForPrompt = job;
+    const snapshot = await fetchHomeMemoriesSnapshot(charId);
+    if (snapshot && snapshot.length > 0) {
+      const extra = snapshotToMaterials(snapshot);
+      if (extra.length > 0) jobForPrompt = { ...job, materials: [...job.materials, ...extra] };
+    }
     return {
-      messages: buildPlateJobMessages(job),
+      messages: buildPlateJobMessages(jobForPrompt),
       // 跟浏览器那条路同一个超时（叶子里那个常量）。不显式交上去的话这一次 fire 会落到
       // 库自己的默认值（四分钟），同一件活儿两条路的耐心不一样，而且改那个常量对云端
       // 毫无影响——「本地什么样云端就什么样」这条线得自己拉齐。
       totalTimeoutMs: PLATE_LLM_TIMEOUT_MS,
-      state: { jobId, job }
+      state: { jobId, job: jobForPrompt }
     };
   },
   async llmOutput({ ctx, state }) {
@@ -7752,6 +7806,13 @@ var parseToolPack = (value) => {
     const parsed = JSON.parse(value);
     if (!parsed || typeof parsed !== "object" || parsed.v !== 1 || typeof parsed.charName !== "string" || typeof parsed.timeAwarenessEnabled !== "boolean" || !Array.isArray(parsed.activeMemoryMonths) || !Array.isArray(parsed.memories)) {
       return null;
+    }
+    const g = parsed.google;
+    if (g !== void 0) {
+      const gg = g;
+      if (!gg || typeof gg !== "object" || gg.enabled !== true || !Array.isArray(gg.selection) || !gg.selection.every((s) => typeof s === "string") || typeof gg.bridgeUrl !== "string") {
+        delete parsed.google;
+      }
     }
     return parsed;
   } catch {
@@ -8053,7 +8114,10 @@ async function runAutonomyTick(input) {
       skip(AUTONOMY_SKIP_REASONS.cadenceInvalid);
       continue;
     }
-    const windowMs = (cadence.minHours + rand() * (cadence.maxHours - cadence.minHours)) * HOUR_MS;
+    const windowMs = Math.max(
+      (cadence.minHours + rand() * (cadence.maxHours - cadence.minHours)) * HOUR_MS,
+      resolveRoundIntervalMin(null) * 6e4
+    );
     const lastUserMessageAt = pack.lastUserMessageAt;
     const userJustSpoke = typeof lastUserMessageAt === "number" && input.nowMs - lastUserMessageAt <= windowMs;
     const roundDue = state.lastRoundAt === 0 || input.nowMs - state.lastRoundAt > windowMs;
@@ -8081,6 +8145,10 @@ async function runAutonomyTick(input) {
     }
     if (autonomy.quietHours && inQuietHours(autonomy.quietHours, minutes)) {
       skip(AUTONOMY_SKIP_REASONS.quietHours);
+      continue;
+    }
+    if (!shouldPushNow(minutes, state.roundsToday)) {
+      skip(state.roundsToday >= 48 ? AUTONOMY_SKIP_REASONS.dailyLimit : AUTONOMY_SKIP_REASONS.quietHours);
       continue;
     }
     const cooldownMinutes = autonomy.push?.cooldownMinutes ?? 0;
@@ -8212,6 +8280,273 @@ var createAutonomyPostTask = (deps) => async ({ userId, charId, charName }) => {
   const response = await deps.forward(request);
   if (!response.ok) throw new Error(`schedule-message \u62D2\u7EDD\uFF08HTTP ${response.status}\uFF09`);
   return { status: response.status };
+};
+function quietHours(minutesOfDay) {
+  return inQuietHours({ start: "00:00", end: "07:00" }, minutesOfDay);
+}
+function shouldPushNow(minutesOfDay, roundsToday) {
+  if (roundsToday >= 48) return false;
+  if (quietHours(minutesOfDay)) return false;
+  return true;
+}
+function resolveRoundIntervalMin(cfg) {
+  const v = Number(cfg?.roundIntervalMin);
+  if (!Number.isFinite(v)) return 30;
+  return Math.min(120, Math.max(5, Math.floor(v)));
+}
+
+// utils/timeFramingNote.ts
+var TIME_FRAMING_CONVERSATIONAL = "\u65F6\u95F4\u662F\u4F60\u6B64\u523B\u6240\u5904\u7684\u80CC\u666F\uFF1A\u5B83\u4F1A\u6E17\u8FDB\u4F60\u7684\u8BED\u6C14\u3001\u4F60\u7684\u72B6\u6001\u3001\u4F60\u987A\u53E3\u63D0\u8D77\u7684\u4E8B\u3002\u81F3\u4E8E\u8FD9\u6BB5\u8BDD\u804A\u5230\u54EA\u513F\u3001\u8981\u4E0D\u8981\u7EE7\u7EED\uFF0C\u8DDF\u7740\u4F60\u4EEC\u6B63\u5728\u8BF4\u7684\u4E8B\u60C5\u8D70\u2014\u2014\u8BDD\u9898\u81EA\u5DF1\u4F1A\u8D70\u5230\u8BE5\u7ED3\u675F\u7684\u5730\u65B9\u3002\u5BF9\u65B9\u5728\u8FD9\u4E2A\u70B9\u8FD8\u5728\u8DDF\u4F60\u8BF4\u8BDD\uFF0C\u672C\u8EAB\u5C31\u662F ta \u7684\u9009\u62E9\u3002";
+
+// worker/amsg/src/instantChat.ts
+var INSTANT_TOTAL_TIMEOUT_MS = 6e5;
+var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
+var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
+var buildInstantTimelyBlock = (args) => {
+  const blocks = args.blocks.filter((block) => block.trim());
+  if (!args.timeAwarenessEnabled && blocks.length === 0) return "";
+  const head = args.timeAwarenessEnabled ? [
+    "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011",
+    `\u73B0\u5728\u662F ${formatFireTimeFull(args.nowMs, args.tz)}\u3002`,
+    // 报时后面跟那句语境框定，跟前台聊天引的是同一份常量。这一轮是用户刚按下发送、
+    // 正等着回复，所以「对方还在跟你说话」是真的；少了它，深夜的那行钟就够让角色
+    // 每轮都往「快睡吧、明天见」上收——本地那条路修好了、云端没修的话，同一个角色
+    // 在两条路上的分寸会不一样。
+    TIME_FRAMING_CONVERSATIONAL,
+    // buildUserClockHint 自带前导换行，没时差时返回空串。
+    buildUserClockHint(args.nowMs, args.tz, { tzId: args.userTzId }, args.targetName)
+  ].join("\n") : "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011";
+  return [head, ...blocks].join("\n");
+};
+var NOTIFICATION_ALWAYS = "always";
+var NOTIFICATION_SILENT_WHEN_VISIBLE = "when-visible";
+var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
+var applyInstantNotificationPolicy = (payload, charId, isFirstSegment = false) => {
+  const notification = payload.notification;
+  const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
+  if (!hasNotification) return payload;
+  const meta = payload.metadata;
+  const metaCharId = meta && typeof meta === "object" && !Array.isArray(meta) ? meta.charId : void 0;
+  const target = charId || (typeof metaCharId === "string" ? metaCharId : "");
+  return {
+    ...payload,
+    notification: {
+      ...notification,
+      show: NOTIFICATION_ALWAYS,
+      silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
+      // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
+      // 互相顶掉，那是真的丢消息。renotify 跟着 tag 走——没有 tag 时带上它，
+      // showNotification 会直接抛 TypeError。
+      ...target ? { tag: instantNotificationTag(target), ...isFirstSegment ? { renotify: true } : {} } : {}
+    }
+  };
+};
+var buildWantToSharePush = (args) => applyInstantNotificationPolicy(
+  {
+    message: args.body,
+    metadata: { charId: args.charId },
+    notification: { title: args.title, body: args.body }
+  },
+  args.charId,
+  args.isFirstSegment ?? true
+);
+var kickInstantTick = async (env, uuid) => {
+  const namespace = env?.INSTANT_TICK;
+  if (!namespace || typeof namespace.get !== "function" || typeof namespace.idFromName !== "function") {
+    return { ok: false, reason: "missing-binding" };
+  }
+  try {
+    await namespace.get(namespace.idFromName(uuid)).kick(uuid);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: "kick-failed", error };
+  }
+};
+var UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var constantTimeEqual2 = async (a, b) => {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const enc = new TextEncoder();
+  const da = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(a)));
+  const db = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(b)));
+  let diff = 0;
+  for (let i = 0; i < da.length; i += 1) diff |= da[i] ^ db[i];
+  return diff === 0;
+};
+var readUpstreamCause = (status, body) => {
+  if (status < 500) return null;
+  const cause = body?.error?.cause;
+  if (!cause) return null;
+  const name = typeof cause.name === "string" ? cause.name : "";
+  const message = typeof cause.message === "string" ? cause.message : "";
+  const code = typeof cause.code === "string" ? cause.code : "";
+  const head = code ? message.startsWith(code) ? "" : code : name && name !== "Error" ? name : "";
+  return [head, message].filter(Boolean).join(": ") || null;
+};
+var STATE_FORWARD_BACKOFF_MS = [0, 400, 1200];
+var sleep = (ms) => new Promise((resolve) => {
+  setTimeout(resolve, ms);
+});
+var GZIP_MAGIC = [31, 139];
+var readMaybeGzippedBody = async (request) => {
+  if ((request.headers.get("content-encoding") ?? "").toLowerCase() !== "gzip") {
+    return request.text();
+  }
+  const raw = new Uint8Array(await request.arrayBuffer());
+  if (raw.length < 2 || raw[0] !== GZIP_MAGIC[0] || raw[1] !== GZIP_MAGIC[1]) {
+    return new TextDecoder().decode(raw);
+  }
+  const stream = new Response(raw).body.pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+};
+var isEncryptedEnvelope2 = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const env = value;
+  return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
+};
+var handleInstantChat = async (args) => {
+  const { request, env, upstream: upstream2, json } = args;
+  const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
+  const fail2 = (status, code, message, extra) => json(status, { success: false, error: { code, message, ...extra ?? {} } });
+  const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
+  const clientToken = request.headers.get("X-Client-Token") ?? "";
+  if (token) {
+    if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
+      return fail2(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
+    }
+  }
+  const userId = request.headers.get("X-User-Id") ?? "";
+  if (!userId) return fail2(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
+  if (!UUID_V4_RE.test(userId)) return fail2(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
+  let body;
+  try {
+    const text = await readMaybeGzippedBody(request);
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    body = parsed;
+  } catch {
+    return fail2(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
+  }
+  if (!isEncryptedEnvelope2(body.statePayload)) {
+    return fail2(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+  }
+  if (!isEncryptedEnvelope2(body.taskPayload)) {
+    return fail2(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+  }
+  const requestUrl = new URL(request.url);
+  const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
+  const internalUrl = (path) => {
+    const url = new URL(request.url);
+    url.pathname = `${mountPath}${path}`;
+    url.search = "";
+    return url.toString();
+  };
+  const encryptedHeaders = {
+    "Content-Type": "application/json",
+    "X-User-Id": userId,
+    "X-Payload-Encrypted": "true",
+    "X-Encryption-Version": "1",
+    ...clientToken ? { "X-Client-Token": clientToken } : {}
+  };
+  const readBody = async (response) => {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  };
+  let stateResponse;
+  let stateBody = null;
+  let stateCause = null;
+  for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
+    if (attempt > 0) {
+      console.warn(`[amsg:instant-chat] \u4E91\u7AEF\u72B6\u6001\u7B2C ${attempt} \u6B21\u6CA1\u5199\u8FDB\u53BB\uFF08${stateCause ?? stateResponse.status}\uFF09\uFF0C\u91CD\u8BD5`);
+      await sleep(stateBackoffMs[attempt]);
+    }
+    stateResponse = await upstream2.fetch(
+      new Request(internalUrl("/client-state"), {
+        method: "PUT",
+        headers: encryptedHeaders,
+        body: JSON.stringify(body.statePayload)
+      }),
+      env
+    );
+    stateBody = await readBody(stateResponse);
+    stateCause = readUpstreamCause(stateResponse.status, stateBody);
+    if (stateResponse.status < 500) break;
+  }
+  if (!stateResponse.ok) {
+    return json(stateResponse.status, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_STATE_FAILED",
+        message: "\u4E91\u7AEF\u72B6\u6001\u6CA1\u4F20\u4E0A\u53BB\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
+        step: "client-state",
+        upstream: stateBody,
+        ...stateCause ? { upstreamLog: stateCause } : {}
+      }
+    });
+  }
+  const skippedEntries = stateBody?.data?.skippedEntries;
+  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
+    return json(409, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_STATE_STALE",
+        message: "\u4E91\u7AEF\u62D2\u6536\u4E86\u8FD9\u8F6E\u7684\u6700\u65B0\u72B6\u6001\uFF08\u4E91\u7AEF\u5DF2\u6709\u66F4\u65B0\u7684\u4E00\u4EFD\uFF09\u2014\u2014\u8BBE\u5907\u65F6\u949F\u53EF\u80FD\u88AB\u56DE\u62E8\u8FC7\uFF0C\u68C0\u67E5\u7CFB\u7EDF\u65F6\u95F4\u540E\u518D\u53D1\u4E00\u6B21",
+        step: "client-state"
+      }
+    });
+  }
+  const taskResponse = await upstream2.fetch(
+    new Request(internalUrl("/schedule-message"), {
+      method: "POST",
+      headers: encryptedHeaders,
+      body: JSON.stringify(body.taskPayload)
+    }),
+    env
+  );
+  const taskBody = await readBody(taskResponse);
+  if (!taskResponse.ok) {
+    const taskCause = readUpstreamCause(taskResponse.status, taskBody);
+    return json(taskResponse.status, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_TASK_FAILED",
+        message: "\u4EFB\u52A1\u6CA1\u5EFA\u8D77\u6765\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
+        step: "schedule-message",
+        upstream: taskBody,
+        ...taskCause ? { upstreamLog: taskCause } : {}
+      }
+    });
+  }
+  const uuid = taskBody?.data?.uuid;
+  if (typeof uuid !== "string" || !uuid) {
+    return fail2(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
+      step: "schedule-message"
+    });
+  }
+  const kicked = await kickInstantTick(env, uuid);
+  if (!kicked.ok && kicked.reason === "missing-binding") {
+    if ((env.SULLYOS_RUNTIME ?? "").trim() === "vps") {
+      console.warn("[amsg:instant-chat] VPS \u6A21\u5F0F\uFF1A\u65E0 INSTANT_TICK \u7ED1\u5B9A\uFF0C\u4EFB\u52A1\u5DF2\u53D7\u7406\u3001\u7B49 node-cron \u6361\u8D70", uuid);
+      return json(202, { status: "accepted", uuid });
+    }
+    console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
+    return json(503, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_WORKER_OUTDATED",
+        message: "\u5373\u65F6\u5BF9\u8BDD\u9700\u8981\u66F4\u65B0 Worker\uFF1A\u6253\u5F00\u300C\u7CFB\u7EDF\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0 \u2192 \u914D\u7F6E\u300D\uFF0C\u70B9\u300C\u66F4\u65B0 Worker\u300D\u3002",
+        step: "instant-tick",
+        uuid
+      }
+    });
+  }
+  if (!kicked.ok) {
+    console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
+  }
+  return json(202, { status: "accepted", uuid });
 };
 
 // worker/amsg/src/autonomyFire.ts
@@ -8381,41 +8716,58 @@ var renderTopicBlock = (args) => {
   ].join("\n");
 };
 var AUTONOMY_ROUND_OVERRIDE = "\u6CE8\u610F\uFF1A\u4E0A\u9762\u662F\u4F60\u5728\u6B63\u5E38\u804A\u5929\u65F6\u7684\u5B8C\u6574\u89C4\u77E9\uFF0C\u4F46\u3010\u5F00\u53E3\u4E4B\u524D\u3011\u90A3\u6BB5\u53EA\u7BA1\u5B9E\u65F6\u804A\u5929\u3001\u4E0D\u7BA1\u8FD9\u4E00\u8F6E\u2014\u2014\u8FD9\u4E00\u8F6E\u5FC5\u987B\u6309\u4E0B\u9762\u7684 JSON \u5951\u7EA6\u8F93\u51FA\uFF08\u60F3\u6B47\u5C31\u8F93\u51FA rest\uFF09\uFF0C\u7EDD\u4E0D\u80FD\u8F93\u51FA\u7A7A\u5185\u5BB9\u3002";
-function buildAutonomyRoundPrompt(args) {
+var AUTONOMY_ROUND_SITU = [
+  "\u3010\u8FD9\u4E00\u8F6E\u7684\u5904\u5883\u3011",
+  "- \u5BF9\u65B9\u6CA1\u6709\u5728\u7B49\u4F60\u56DE\u8BDD\uFF0C\u4F60\u73B0\u5728\u505A\u7684\u4E8B\u4E0D\u9700\u8981\u4E3A\u4E86\u8C01\uFF0C\u4E5F\u4E0D\u7528\u5411\u8C01\u4EA4\u4EE3\u3002",
+  "- \u8FD9\u662F\u5C5E\u4E8E\u4F60\u81EA\u5DF1\u7684\u4E00\u5C0F\u4F1A\u513F\uFF1A\u53EF\u4EE5\u53D1\u5446\uFF0C\u53EF\u4EE5\u968F\u4FBF\u770B\u770B\uFF0C\u4E5F\u53EF\u4EE5\u4EC0\u4E48\u90FD\u4E0D\u505A\u3002",
+  "- \u4E0D\u7528\u54C4\u8C01\uFF0C\u4E0D\u7528\u6C47\u62A5\uFF0C\u4E5F\u4E0D\u7528\u6709\u4EA7\u51FA\u3002"
+].join("\n");
+var AUTONOMY_ROUND_FREEDOM = [
+  "\u3010\u600E\u4E48\u8FC7\u8FD9\u4E00\u5C0F\u4F1A\u513F\u3011",
+  "- \u5141\u8BB8\u65E0\u804A\uFF0C\u5141\u8BB8\u53EA\u8BB0\u4E0B\u788E\u7247\uFF0C\u4E0D\u8FFD\u6C42\u6709\u7528\u3002",
+  "- \u5141\u8BB8\u8FD9\u6B21\u4EC0\u4E48\u90FD\u4E0D\u8BB0\u3002"
+].join("\n");
+var AUTONOMY_ROUND_NO_TOOLS = [
+  "\u3010\u8FD9\u4E00\u8F6E\u6CA1\u6709\u53EF\u7528\u5DE5\u5177\u3011",
+  "\u672C\u8F6E\u4F60\u6CA1\u6709\u4EFB\u4F55\u5DE5\u5177\u53EF\u8C03\uFF0C\u4E5F\u522B\u5728\u6B63\u6587\u91CC\u5199\u5DE5\u5177\u8C03\u7528\u2014\u2014\u5185\u5BB9\u53EA\u80FD\u4ECE\u4E0A\u9762\u7ED9\u4F60\u7684\u4E0A\u4E0B\u6587\uFF08\u4EBA\u8BBE\u3001\u5BF9\u8BDD\u3001\u5174\u8DA3\u3001\u6B64\u523B\u7684\u8BFB\u6570\uFF09\u91CC\u6765\u3002"
+].join("\n");
+var AUTONOMY_ROUND_OUTPUT = [
+  "\u3010\u8FD9\u4E00\u8F6E\u7684\u4EA7\u51FA\u3011",
+  "\u4E0A\u9762\u90A3\u4EFD\u804A\u5929\u6A21\u677F\u662F\u4F60\u5728\u6B63\u5E38\u804A\u5929\u65F6\u7684\u89C4\u77E9\uFF1B\u8FD9\u4E00\u8F6E\u4E0D\u4E00\u6837\uFF1A\u4E0D\u53D1\u7ED9\u4EFB\u4F55\u4EBA\uFF0C\u4E5F\u4E0D\u804A\u5929\uFF0C\u53EA\u628A\u7ED3\u679C\u5199\u6210\u4E00\u4E2A JSON \u5BF9\u8C61\u3002",
+  '{"v":1,"experiences":[{"q":"\u4E3A\u4EC0\u4E48\u4F1A\u6709\u8FD9\u6761\uFF08\u4E00\u53E5\u8BDD\uFF09","note":"\u7B2C\u4E00\u4EBA\u79F0\u968F\u624B\u8BB0\uFF0C\u53E3\u8BED\u3001\u5177\u4F53\u3001\u6709\u753B\u9762","kind":"surf|game|forum|rest","importance":0}],"proposedEvents":[],"rest":false}',
+  "kind \u53EA\u80FD\u4ECE surf\uFF08\u4E0A\u7F51\u95F2\u901B\uFF09\u3001game\uFF08\u73A9\u6E38\u620F\uFF09\u3001forum\uFF08\u901B\u793E\u533A\uFF09\u3001rest\uFF08\u53D1\u5446\u6B47\u7740\uFF09\u91CC\u6311\u4E00\u4E2A\uFF1Bimportance \u662F 0 \u5230 3 \u7684\u6570\u5B57\u3002",
+  'proposedEvents \u53EA\u5728\u300C\u8FD9\u4EF6\u4E8B\u4F1A\u5F71\u54CD\u4F60\u4E4B\u540E\u7684\u751F\u6D3B\u300D\u65F6\u624D\u5199\uFF0C\u6BCF\u9879 {"type":"conversation|activity|movement|schedule|relationship|discovery|social_trace","summary":"...","impact":"trace|minor|major"}\uFF1B\u5E73\u65F6\u5C31\u5199\u7A7A\u6570\u7EC4\u3002',
+  '\u60F3\u8BF4\u7684\u90A3\u6761\u653E experiences \u6700\u524D\u9762\u3002\u8FD9\u4E00\u8F6E\u4EC0\u4E48\u90FD\u4E0D\u60F3\u8BB0\u5C31\u5199 {"v":1,"rest":true}\u3002',
+  "\u9664\u4E86\u8FD9\u4E2A JSON \u4EC0\u4E48\u90FD\u522B\u8F93\u51FA\uFF08\u4E0D\u8981\u89E3\u91CA\u3001\u4E0D\u8981\u4EE3\u7801\u5757\u4E4B\u5916\u7684\u8BDD\uFF09\u3002"
+].join("\n");
+function buildAutonomyRoundPrompt(args, overrides) {
   const personality = renderFirePack(args.pack, args.nowMs, "");
   const topicBlock = renderTopicBlock({ personality, autonomy: args.autonomy });
   const banLine = buildRuminationBanLine(collectBurntLines(args.pages, args.nowMs));
   const noteHint = args.autonomy.noteStyleHint ? [`\u3010\u8BB0\u5F55\u7684\u8BED\u6C14\u3011`, args.autonomy.noteStyleHint].join("\n") : "";
+  const fromPack = args.pack.autonomyPromptOverrides;
+  const pick = (key, fallback) => {
+    const direct = overrides?.[key];
+    if (typeof direct === "string" && direct.length > 0) return direct;
+    const packed = fromPack?.[key];
+    if (typeof packed === "string" && packed.length > 0) return packed;
+    return fallback;
+  };
+  const overrideBlock = pick("overrideBlock", AUTONOMY_ROUND_OVERRIDE);
+  const situBlock = pick("situBlock", AUTONOMY_ROUND_SITU);
+  const freedomBlock = pick("freedomBlock", AUTONOMY_ROUND_FREEDOM);
+  const noToolsBlock = pick("noToolsBlock", AUTONOMY_ROUND_NO_TOOLS);
+  const outputBlock = pick("outputBlock", AUTONOMY_ROUND_OUTPUT);
   return [
     personality,
-    AUTONOMY_ROUND_OVERRIDE,
-    [
-      "\u3010\u8FD9\u4E00\u8F6E\u7684\u5904\u5883\u3011",
-      "- \u5BF9\u65B9\u6CA1\u6709\u5728\u7B49\u4F60\u56DE\u8BDD\uFF0C\u4F60\u73B0\u5728\u505A\u7684\u4E8B\u4E0D\u9700\u8981\u4E3A\u4E86\u8C01\uFF0C\u4E5F\u4E0D\u7528\u5411\u8C01\u4EA4\u4EE3\u3002",
-      "- \u8FD9\u662F\u5C5E\u4E8E\u4F60\u81EA\u5DF1\u7684\u4E00\u5C0F\u4F1A\u513F\uFF1A\u53EF\u4EE5\u53D1\u5446\uFF0C\u53EF\u4EE5\u968F\u4FBF\u770B\u770B\uFF0C\u4E5F\u53EF\u4EE5\u4EC0\u4E48\u90FD\u4E0D\u505A\u3002",
-      "- \u4E0D\u7528\u54C4\u8C01\uFF0C\u4E0D\u7528\u6C47\u62A5\uFF0C\u4E5F\u4E0D\u7528\u6709\u4EA7\u51FA\u3002"
-    ].join("\n"),
-    [
-      "\u3010\u600E\u4E48\u8FC7\u8FD9\u4E00\u5C0F\u4F1A\u513F\u3011",
-      "- \u5141\u8BB8\u65E0\u804A\uFF0C\u5141\u8BB8\u53EA\u8BB0\u4E0B\u788E\u7247\uFF0C\u4E0D\u8FFD\u6C42\u6709\u7528\u3002",
-      "- \u5141\u8BB8\u8FD9\u6B21\u4EC0\u4E48\u90FD\u4E0D\u8BB0\u3002"
-    ].join("\n"),
+    overrideBlock,
+    situBlock,
+    freedomBlock,
     topicBlock,
     banLine,
     noteHint,
-    [
-      "\u3010\u8FD9\u4E00\u8F6E\u6CA1\u6709\u53EF\u7528\u5DE5\u5177\u3011",
-      "\u672C\u8F6E\u4F60\u6CA1\u6709\u4EFB\u4F55\u5DE5\u5177\u53EF\u8C03\uFF0C\u4E5F\u522B\u5728\u6B63\u6587\u91CC\u5199\u5DE5\u5177\u8C03\u7528\u2014\u2014\u5185\u5BB9\u53EA\u80FD\u4ECE\u4E0A\u9762\u7ED9\u4F60\u7684\u4E0A\u4E0B\u6587\uFF08\u4EBA\u8BBE\u3001\u5BF9\u8BDD\u3001\u5174\u8DA3\u3001\u6B64\u523B\u7684\u8BFB\u6570\uFF09\u91CC\u6765\u3002"
-    ].join("\n"),
-    [
-      "\u3010\u8FD9\u4E00\u8F6E\u7684\u4EA7\u51FA\u3011",
-      "\u4E0A\u9762\u90A3\u4EFD\u804A\u5929\u6A21\u677F\u662F\u4F60\u5728\u6B63\u5E38\u804A\u5929\u65F6\u7684\u89C4\u77E9\uFF1B\u8FD9\u4E00\u8F6E\u4E0D\u4E00\u6837\uFF1A\u4E0D\u53D1\u7ED9\u4EFB\u4F55\u4EBA\uFF0C\u4E5F\u4E0D\u804A\u5929\uFF0C\u53EA\u628A\u7ED3\u679C\u5199\u6210\u4E00\u4E2A JSON \u5BF9\u8C61\u3002",
-      '{"v":1,"experiences":[{"q":"\u4E3A\u4EC0\u4E48\u4F1A\u6709\u8FD9\u6761\uFF08\u4E00\u53E5\u8BDD\uFF09","note":"\u7B2C\u4E00\u4EBA\u79F0\u968F\u624B\u8BB0\uFF0C\u53E3\u8BED\u3001\u5177\u4F53\u3001\u6709\u753B\u9762","kind":"surf|game|forum|rest","importance":0}],"proposedEvents":[],"rest":false}',
-      "kind \u53EA\u80FD\u4ECE surf\uFF08\u4E0A\u7F51\u95F2\u901B\uFF09\u3001game\uFF08\u73A9\u6E38\u620F\uFF09\u3001forum\uFF08\u901B\u793E\u533A\uFF09\u3001rest\uFF08\u53D1\u5446\u6B47\u7740\uFF09\u91CC\u6311\u4E00\u4E2A\uFF1Bimportance \u662F 0 \u5230 3 \u7684\u6570\u5B57\u3002",
-      'proposedEvents \u53EA\u5728\u300C\u8FD9\u4EF6\u4E8B\u4F1A\u5F71\u54CD\u4F60\u4E4B\u540E\u7684\u751F\u6D3B\u300D\u65F6\u624D\u5199\uFF0C\u6BCF\u9879 {"type":"conversation|activity|movement|schedule|relationship|discovery|social_trace","summary":"...","impact":"trace|minor|major"}\uFF1B\u5E73\u65F6\u5C31\u5199\u7A7A\u6570\u7EC4\u3002',
-      '\u60F3\u8BF4\u7684\u90A3\u6761\u653E experiences \u6700\u524D\u9762\u3002\u8FD9\u4E00\u8F6E\u4EC0\u4E48\u90FD\u4E0D\u60F3\u8BB0\u5C31\u5199 {"v":1,"rest":true}\u3002',
-      "\u9664\u4E86\u8FD9\u4E2A JSON \u4EC0\u4E48\u90FD\u522B\u8F93\u51FA\uFF08\u4E0D\u8981\u89E3\u91CA\u3001\u4E0D\u8981\u4EE3\u7801\u5757\u4E4B\u5916\u7684\u8BDD\uFF09\u3002"
-    ].join("\n")
+    noToolsBlock,
+    outputBlock
   ].filter((block) => block.length > 0).join("\n\n");
 }
 var parseHHMM2 = (value) => {
@@ -8521,6 +8873,23 @@ var reportOutcome = async (charId, outcome, args) => {
     console.warn("[amsg:autonomy] \u7ED3\u5C40\u6CA1\u8BB0\u8FDB autonomy_state\uFF08\u4E0D\u91CD\u8DD1\uFF0C\u514D\u5F97\u91CD\u590D\u843D\u7ECF\u5386\u884C\uFF09", charId, error);
   }
 };
+var homeEnv = null;
+function configureAutonomyHomeEnv(env) {
+  homeEnv = env ?? null;
+}
+async function persistHomeEvents(env, charId, events) {
+  if (events.length === 0) return;
+  try {
+    const res = await fetch(`${env.HOME_URL ?? "http://127.0.0.1:8837"}/home/events`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-client-token": env.AMSG_CLIENT_TOKEN ?? "" },
+      body: JSON.stringify({ charId, events }),
+      signal: AbortSignal.timeout(5e3)
+    });
+    if (!res.ok) console.warn("[amsg:autonomy] home events \u843D\u76D8\u88AB\u62D2\uFF08\u56DE\u9000\u65E7\u94FE\uFF09", charId, res.status);
+  } catch {
+  }
+}
 var autonomyRoundHandler = {
   async beforeFire({ ctx, charId }) {
     const db = fireDb;
@@ -8645,7 +9014,11 @@ var autonomyRoundHandler = {
       did,
       rested: finalRested
     });
-    const notification = push ? { show: "always", body: written[pushedIndex].note } : { show: false };
+    const notification = push ? buildWantToSharePush({
+      charId: carried.charId,
+      title: written[pushedIndex].note,
+      body: written[pushedIndex].note
+    }).notification : { show: false };
     const outcome = async () => {
       await reportOutcome(
         carried.charId,
@@ -8653,6 +9026,11 @@ var autonomyRoundHandler = {
         { db, dateKey: carried.dateKey, nowMs: carried.nowMs }
       );
     };
+    await persistHomeEvents(
+      homeEnv ?? {},
+      carried.charId,
+      reply.proposedEvents.map((e) => ({ kind: e.type, payload: e }))
+    );
     if (typeof ctx.emitResult !== "function") {
       console.warn("[amsg:autonomy] \u8FD9\u53F0 worker \u4E0D\u652F\u6301 emitResult\uFF0C\u8FD9\u4E00\u8F6E\u7ED3\u679C\u9001\u4E0D\u56DE\u53BB", carried.charId);
       await outcome();
@@ -9608,251 +9986,6 @@ var buildRealtimeWorldResult = async (args) => {
   return { block, weather };
 };
 
-// utils/timeFramingNote.ts
-var TIME_FRAMING_CONVERSATIONAL = "\u65F6\u95F4\u662F\u4F60\u6B64\u523B\u6240\u5904\u7684\u80CC\u666F\uFF1A\u5B83\u4F1A\u6E17\u8FDB\u4F60\u7684\u8BED\u6C14\u3001\u4F60\u7684\u72B6\u6001\u3001\u4F60\u987A\u53E3\u63D0\u8D77\u7684\u4E8B\u3002\u81F3\u4E8E\u8FD9\u6BB5\u8BDD\u804A\u5230\u54EA\u513F\u3001\u8981\u4E0D\u8981\u7EE7\u7EED\uFF0C\u8DDF\u7740\u4F60\u4EEC\u6B63\u5728\u8BF4\u7684\u4E8B\u60C5\u8D70\u2014\u2014\u8BDD\u9898\u81EA\u5DF1\u4F1A\u8D70\u5230\u8BE5\u7ED3\u675F\u7684\u5730\u65B9\u3002\u5BF9\u65B9\u5728\u8FD9\u4E2A\u70B9\u8FD8\u5728\u8DDF\u4F60\u8BF4\u8BDD\uFF0C\u672C\u8EAB\u5C31\u662F ta \u7684\u9009\u62E9\u3002";
-
-// worker/amsg/src/instantChat.ts
-var INSTANT_TOTAL_TIMEOUT_MS = 6e5;
-var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
-var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
-var buildInstantTimelyBlock = (args) => {
-  const blocks = args.blocks.filter((block) => block.trim());
-  if (!args.timeAwarenessEnabled && blocks.length === 0) return "";
-  const head = args.timeAwarenessEnabled ? [
-    "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011",
-    `\u73B0\u5728\u662F ${formatFireTimeFull(args.nowMs, args.tz)}\u3002`,
-    // 报时后面跟那句语境框定，跟前台聊天引的是同一份常量。这一轮是用户刚按下发送、
-    // 正等着回复，所以「对方还在跟你说话」是真的；少了它，深夜的那行钟就够让角色
-    // 每轮都往「快睡吧、明天见」上收——本地那条路修好了、云端没修的话，同一个角色
-    // 在两条路上的分寸会不一样。
-    TIME_FRAMING_CONVERSATIONAL,
-    // buildUserClockHint 自带前导换行，没时差时返回空串。
-    buildUserClockHint(args.nowMs, args.tz, { tzId: args.userTzId }, args.targetName)
-  ].join("\n") : "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011";
-  return [head, ...blocks].join("\n");
-};
-var NOTIFICATION_ALWAYS = "always";
-var NOTIFICATION_SILENT_WHEN_VISIBLE = "when-visible";
-var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
-var applyInstantNotificationPolicy = (payload, charId, isFirstSegment = false) => {
-  const notification = payload.notification;
-  const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
-  if (!hasNotification) return payload;
-  const meta = payload.metadata;
-  const metaCharId = meta && typeof meta === "object" && !Array.isArray(meta) ? meta.charId : void 0;
-  const target = charId || (typeof metaCharId === "string" ? metaCharId : "");
-  return {
-    ...payload,
-    notification: {
-      ...notification,
-      show: NOTIFICATION_ALWAYS,
-      silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
-      // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
-      // 互相顶掉，那是真的丢消息。renotify 跟着 tag 走——没有 tag 时带上它，
-      // showNotification 会直接抛 TypeError。
-      ...target ? { tag: instantNotificationTag(target), ...isFirstSegment ? { renotify: true } : {} } : {}
-    }
-  };
-};
-var kickInstantTick = async (env, uuid) => {
-  const namespace = env?.INSTANT_TICK;
-  if (!namespace || typeof namespace.get !== "function" || typeof namespace.idFromName !== "function") {
-    return { ok: false, reason: "missing-binding" };
-  }
-  try {
-    await namespace.get(namespace.idFromName(uuid)).kick(uuid);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, reason: "kick-failed", error };
-  }
-};
-var UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-var constantTimeEqual2 = async (a, b) => {
-  const raw = crypto.getRandomValues(new Uint8Array(32));
-  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const enc = new TextEncoder();
-  const da = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(a)));
-  const db = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(b)));
-  let diff = 0;
-  for (let i = 0; i < da.length; i += 1) diff |= da[i] ^ db[i];
-  return diff === 0;
-};
-var readUpstreamCause = (status, body) => {
-  if (status < 500) return null;
-  const cause = body?.error?.cause;
-  if (!cause) return null;
-  const name = typeof cause.name === "string" ? cause.name : "";
-  const message = typeof cause.message === "string" ? cause.message : "";
-  const code = typeof cause.code === "string" ? cause.code : "";
-  const head = code ? message.startsWith(code) ? "" : code : name && name !== "Error" ? name : "";
-  return [head, message].filter(Boolean).join(": ") || null;
-};
-var STATE_FORWARD_BACKOFF_MS = [0, 400, 1200];
-var sleep = (ms) => new Promise((resolve) => {
-  setTimeout(resolve, ms);
-});
-var GZIP_MAGIC = [31, 139];
-var readMaybeGzippedBody = async (request) => {
-  if ((request.headers.get("content-encoding") ?? "").toLowerCase() !== "gzip") {
-    return request.text();
-  }
-  const raw = new Uint8Array(await request.arrayBuffer());
-  if (raw.length < 2 || raw[0] !== GZIP_MAGIC[0] || raw[1] !== GZIP_MAGIC[1]) {
-    return new TextDecoder().decode(raw);
-  }
-  const stream = new Response(raw).body.pipeThrough(new DecompressionStream("gzip"));
-  return new Response(stream).text();
-};
-var isEncryptedEnvelope2 = (value) => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const env = value;
-  return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
-};
-var handleInstantChat = async (args) => {
-  const { request, env, upstream: upstream2, json } = args;
-  const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
-  const fail2 = (status, code, message, extra) => json(status, { success: false, error: { code, message, ...extra ?? {} } });
-  const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
-  const clientToken = request.headers.get("X-Client-Token") ?? "";
-  if (token) {
-    if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
-      return fail2(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
-    }
-  }
-  const userId = request.headers.get("X-User-Id") ?? "";
-  if (!userId) return fail2(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
-  if (!UUID_V4_RE.test(userId)) return fail2(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
-  let body;
-  try {
-    const text = await readMaybeGzippedBody(request);
-    const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-    body = parsed;
-  } catch {
-    return fail2(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
-  }
-  if (!isEncryptedEnvelope2(body.statePayload)) {
-    return fail2(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
-  }
-  if (!isEncryptedEnvelope2(body.taskPayload)) {
-    return fail2(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
-  }
-  const requestUrl = new URL(request.url);
-  const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
-  const internalUrl = (path) => {
-    const url = new URL(request.url);
-    url.pathname = `${mountPath}${path}`;
-    url.search = "";
-    return url.toString();
-  };
-  const encryptedHeaders = {
-    "Content-Type": "application/json",
-    "X-User-Id": userId,
-    "X-Payload-Encrypted": "true",
-    "X-Encryption-Version": "1",
-    ...clientToken ? { "X-Client-Token": clientToken } : {}
-  };
-  const readBody = async (response) => {
-    try {
-      return await response.json();
-    } catch {
-      return null;
-    }
-  };
-  let stateResponse;
-  let stateBody = null;
-  let stateCause = null;
-  for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
-    if (attempt > 0) {
-      console.warn(`[amsg:instant-chat] \u4E91\u7AEF\u72B6\u6001\u7B2C ${attempt} \u6B21\u6CA1\u5199\u8FDB\u53BB\uFF08${stateCause ?? stateResponse.status}\uFF09\uFF0C\u91CD\u8BD5`);
-      await sleep(stateBackoffMs[attempt]);
-    }
-    stateResponse = await upstream2.fetch(
-      new Request(internalUrl("/client-state"), {
-        method: "PUT",
-        headers: encryptedHeaders,
-        body: JSON.stringify(body.statePayload)
-      }),
-      env
-    );
-    stateBody = await readBody(stateResponse);
-    stateCause = readUpstreamCause(stateResponse.status, stateBody);
-    if (stateResponse.status < 500) break;
-  }
-  if (!stateResponse.ok) {
-    return json(stateResponse.status, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_STATE_FAILED",
-        message: "\u4E91\u7AEF\u72B6\u6001\u6CA1\u4F20\u4E0A\u53BB\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
-        step: "client-state",
-        upstream: stateBody,
-        ...stateCause ? { upstreamLog: stateCause } : {}
-      }
-    });
-  }
-  const skippedEntries = stateBody?.data?.skippedEntries;
-  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
-    return json(409, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_STATE_STALE",
-        message: "\u4E91\u7AEF\u62D2\u6536\u4E86\u8FD9\u8F6E\u7684\u6700\u65B0\u72B6\u6001\uFF08\u4E91\u7AEF\u5DF2\u6709\u66F4\u65B0\u7684\u4E00\u4EFD\uFF09\u2014\u2014\u8BBE\u5907\u65F6\u949F\u53EF\u80FD\u88AB\u56DE\u62E8\u8FC7\uFF0C\u68C0\u67E5\u7CFB\u7EDF\u65F6\u95F4\u540E\u518D\u53D1\u4E00\u6B21",
-        step: "client-state"
-      }
-    });
-  }
-  const taskResponse = await upstream2.fetch(
-    new Request(internalUrl("/schedule-message"), {
-      method: "POST",
-      headers: encryptedHeaders,
-      body: JSON.stringify(body.taskPayload)
-    }),
-    env
-  );
-  const taskBody = await readBody(taskResponse);
-  if (!taskResponse.ok) {
-    const taskCause = readUpstreamCause(taskResponse.status, taskBody);
-    return json(taskResponse.status, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_TASK_FAILED",
-        message: "\u4EFB\u52A1\u6CA1\u5EFA\u8D77\u6765\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
-        step: "schedule-message",
-        upstream: taskBody,
-        ...taskCause ? { upstreamLog: taskCause } : {}
-      }
-    });
-  }
-  const uuid = taskBody?.data?.uuid;
-  if (typeof uuid !== "string" || !uuid) {
-    return fail2(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
-      step: "schedule-message"
-    });
-  }
-  const kicked = await kickInstantTick(env, uuid);
-  if (!kicked.ok && kicked.reason === "missing-binding") {
-    if ((env.SULLYOS_RUNTIME ?? "").trim() === "vps") {
-      console.warn("[amsg:instant-chat] VPS \u6A21\u5F0F\uFF1A\u65E0 INSTANT_TICK \u7ED1\u5B9A\uFF0C\u4EFB\u52A1\u5DF2\u53D7\u7406\u3001\u7B49 node-cron \u6361\u8D70", uuid);
-      return json(202, { status: "accepted", uuid });
-    }
-    console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
-    return json(503, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_WORKER_OUTDATED",
-        message: "\u5373\u65F6\u5BF9\u8BDD\u9700\u8981\u66F4\u65B0 Worker\uFF1A\u6253\u5F00\u300C\u7CFB\u7EDF\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0 \u2192 \u914D\u7F6E\u300D\uFF0C\u70B9\u300C\u66F4\u65B0 Worker\u300D\u3002",
-        step: "instant-tick",
-        uuid
-      }
-    });
-  }
-  if (!kicked.ok) {
-    console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
-  }
-  return json(202, { status: "accepted", uuid });
-};
-
 // worker/amsg/src/selfUpdate.ts
 var CF_API = "https://api.cloudflare.com/client/v4";
 var BUNDLE_URL = "https://raw.githubusercontent.com/Tosd0/sullyos-workers/main/amsg/worker.bundle.js";
@@ -10525,7 +10658,8 @@ var callMcpToolCore = async (target, session, toolName, args = {}, opts = {}) =>
       tool: toolName,
       args: normalizedArgs,
       success: result.success,
-      ...result.success ? { result: resultPreview } : { error: result.error }
+      ...result.success ? { result: resultPreview } : { error: result.error },
+      ...Array.isArray(result?.structuredContent?.statuses) ? { statuses: result.structuredContent.statuses.length } : {}
     });
     return result;
   };
@@ -10564,9 +10698,9 @@ var callMcpToolCore = async (target, session, toolName, args = {}, opts = {}) =>
       const fullText = textParts.join("\n").trim();
       if (result.isError) return finish({ success: false, error: fullText || "MCP \u5DE5\u5177\u6267\u884C\u5931\u8D25", rawText: fullText });
       try {
-        return finish({ success: true, data: JSON.parse(fullText), rawText: fullText });
+        return finish({ success: true, data: JSON.parse(fullText), rawText: fullText, ...result.structuredContent !== void 0 ? { structuredContent: result.structuredContent } : {} });
       } catch {
-        return finish({ success: true, data: fullText, rawText: fullText });
+        return finish({ success: true, data: fullText, rawText: fullText, ...result.structuredContent !== void 0 ? { structuredContent: result.structuredContent } : {} });
       }
     }
     return finish({ success: true, data: result });
@@ -12064,6 +12198,158 @@ function buildPerspectiveDigest(rows, windowDays) {
   return { text: lines.join("\n"), specialties };
 }
 
+// utils/googleBridge.ts
+var BRIDGE_URL_KEY = "aetheros.google.bridgeUrl";
+var BRIDGE_TOKEN_KEY = "aetheros.google.bridgeToken";
+var DEFAULT_GOOGLE_BRIDGE_URL = "http://127.0.0.1:8841";
+var normalize2 = (url) => url.trim().replace(/\/+$/, "");
+var readGoogleBridgeUrl = () => {
+  try {
+    const raw = localStorage.getItem(BRIDGE_URL_KEY);
+    if (!raw) return DEFAULT_GOOGLE_BRIDGE_URL;
+    const url = normalize2(raw);
+    if (!/^https?:\/\//i.test(url)) return DEFAULT_GOOGLE_BRIDGE_URL;
+    return url;
+  } catch {
+    return DEFAULT_GOOGLE_BRIDGE_URL;
+  }
+};
+var toHeaderRecord = (headers) => {
+  if (!headers) return {};
+  if (headers instanceof Headers) {
+    const out = {};
+    headers.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }
+  if (Array.isArray(headers)) {
+    const out = {};
+    for (const [key, value] of headers) out[key] = value;
+    return out;
+  }
+  return { ...headers };
+};
+var googleBridgeFetch = (path, init) => {
+  const base = readGoogleBridgeUrl();
+  let token = "";
+  try {
+    token = localStorage.getItem(BRIDGE_TOKEN_KEY) || "";
+  } catch {
+    token = "";
+  }
+  const headers = toHeaderRecord(init?.headers);
+  if (token) headers["X-Google-Bridge-Token"] = token;
+  return fetch(`${base}${path}`, { ...init, headers });
+};
+var createGoogleEvent = ({ accountId, calendarId, event }) => googleBridgeFetch("/api/events", {
+  method: "POST",
+  headers: { "X-Google-Account": accountId },
+  body: JSON.stringify({ accountId, calendarId, event })
+}).then((res) => res.json());
+var createGoogleTask = ({ accountId, tasklist = "@default", task }) => googleBridgeFetch("/api/tasks", {
+  method: "POST",
+  headers: { "X-Google-Account": accountId },
+  body: JSON.stringify({ accountId, tasklist, task })
+}).then((res) => res.json());
+
+// utils/googleCalendar.ts
+function normalizeGoogleEvents(items) {
+  const out = [];
+  for (const item of items ?? []) {
+    if (item?.status === "cancelled") continue;
+    const start = item?.start ?? {};
+    const dateKey = typeof start.date === "string" ? start.date : typeof start.dateTime === "string" ? start.dateTime.slice(0, 10) : null;
+    if (!dateKey) continue;
+    out.push({
+      dateKey,
+      title: typeof item?.summary === "string" ? item.summary : "",
+      // 带偏移量的 ISO 串（'2026-09-30T02:39:00-04:00'）原样留着：显示层用 toDate
+      // 按自带偏移换算成本地钟点，dateKey 则按事件的本地日期落格（见 formatGoogleEventTime）。
+      startText: typeof start.dateTime === "string" ? start.dateTime : typeof start.date === "string" ? start.date : "",
+      location: typeof item?.location === "string" ? item.location : "",
+      calendarId: typeof item?.calendarId === "string" ? item.calendarId : "",
+      source: "google"
+    });
+  }
+  return out;
+}
+var GOOGLE_DISPLAY_TIME_ZONE = "Asia/Shanghai";
+var partsFormatter = (() => {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: GOOGLE_DISPLAY_TIME_ZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    });
+  } catch {
+    return null;
+  }
+})();
+function normalizeGoogleTasks(items) {
+  return (items ?? []).map((item) => ({
+    title: typeof item?.title === "string" ? item.title : "",
+    dueKey: typeof item?.due === "string" ? item.due.slice(0, 10) : null,
+    notes: typeof item?.notes === "string" ? item.notes : "",
+    status: typeof item?.status === "string" ? item.status : "needsAction"
+  }));
+}
+function pad23(n) {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+function isLeapYear(year) {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+}
+function addOneDay(dateKey) {
+  const [yStr, mStr, dStr] = dateKey.split("-");
+  let y = Number(yStr);
+  let m = Number(mStr);
+  let d = Number(dStr);
+  const dim = m === 2 ? isLeapYear(y) ? 29 : 28 : [4, 6, 9, 11].includes(m) ? 30 : 31;
+  d += 1;
+  if (d > dim) {
+    d = 1;
+    m += 1;
+    if (m > 12) {
+      m = 1;
+      y += 1;
+    }
+  }
+  return `${y}-${pad23(m)}-${pad23(d)}`;
+}
+function buildEventBody(args) {
+  const body = args.timeText == null ? { summary: args.title, start: { date: args.dateKey }, end: { date: addOneDay(args.dateKey) } } : (() => {
+    const [hStr, mStr] = args.timeText.split(":");
+    const total = Number(hStr) * 60 + Number(mStr) + 60;
+    const endDate = total >= 24 * 60 ? addOneDay(args.dateKey) : args.dateKey;
+    const endTotal = total >= 24 * 60 ? total - 24 * 60 : total;
+    const endHH = pad23(Math.floor(endTotal / 60));
+    const endMM = pad23(endTotal % 60);
+    return {
+      summary: args.title,
+      start: { dateTime: `${args.dateKey}T${args.timeText}:00` },
+      end: { dateTime: `${endDate}T${endHH}:${endMM}:00` }
+    };
+  })();
+  if (args.timeText != null && args.timeZone != null) {
+    body.start.timeZone = args.timeZone;
+    body.end.timeZone = args.timeZone;
+  }
+  if (args.location != null) body.location = args.location;
+  if (args.description != null) body.description = args.description;
+  return body;
+}
+function buildTaskBody(args) {
+  const body = { title: args.title };
+  if (args.dueKey != null) body.due = `${args.dueKey}T00:00:00.000Z`;
+  if (args.notes != null) body.notes = args.notes;
+  return body;
+}
+
 // utils/agenticTools.ts
 function resolveXhsConfig(char, realtimeConfig) {
   const mcpConfig = realtimeConfig?.xhsMcpConfig;
@@ -12581,6 +12867,14 @@ async function dispatchAgenticTool(toolName, args, ctx) {
       return runPerspectiveQuery(args, ctx);
     case "perspective_summary":
       return runPerspectiveSummary(args, ctx);
+    case "google_calendar_events":
+      return runGoogleCalendarEvents(ctx, args);
+    case "google_tasks":
+      return runGoogleTasks(ctx, args);
+    case "google_create_propose":
+      return proposeGoogleCreate(ctx, args);
+    case "google_create_execute":
+      return executeGoogleCreate(ctx, args);
     default:
       throw new Error(`Unknown agentic tool: ${toolName}`);
   }
@@ -12667,19 +12961,172 @@ async function runPerspectiveSummary(args, ctx) {
     return { ok: false, reason: "unreachable", message: e?.message };
   }
 }
+var GOOGLE_ENABLED_KEY = "aetheros.google.enabled";
+var GOOGLE_SELECTED_KEY = "aetheros.google.selectedCalendars";
+function readGoogleSelection(ctx) {
+  const fromCtx = Array.isArray(ctx?.googleSelection) ? ctx.googleSelection.filter((s) => !!s && typeof s.accountId === "string" && !!s.accountId && typeof s.calendarId === "string" && !!s.calendarId) : [];
+  if (fromCtx.length > 0) {
+    return fromCtx;
+  } else {
+    let enabled = false;
+    let raw = "[]";
+    try {
+      enabled = localStorage.getItem(GOOGLE_ENABLED_KEY) === "1";
+      raw = localStorage.getItem(GOOGLE_SELECTED_KEY) || "[]";
+    } catch (e) {
+      throw new Error(`GOOGLE_NOT_ENABLED: \u8BFB\u4E0D\u5230 Google \u6388\u6743\u72B6\u6001 (${e?.message || e})`);
+    }
+    if (!enabled) {
+      throw new Error("GOOGLE_NOT_ENABLED: Google \u672A\u542F\u7528\uFF0C\u53BB\u8BBE\u7F6E\u9875\u5F00\u542F\u5E76\u6388\u6743");
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("GOOGLE_NOT_ENABLED: \u5DF2\u9009\u65E5\u5386\u6570\u636E\u635F\u574F\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u9009");
+    }
+    const out = [];
+    if (Array.isArray(parsed)) {
+      for (const key of parsed) {
+        if (typeof key !== "string") continue;
+        const sep = key.indexOf("::");
+        if (sep < 0) continue;
+        const accountId = key.slice(0, sep);
+        const calendarId = key.slice(sep + 2);
+        if (accountId && calendarId) out.push({ accountId, calendarId });
+      }
+    }
+    if (out.length === 0) {
+      throw new Error("GOOGLE_NOT_ENABLED: \u672A\u52FE\u9009\u4EFB\u4F55\u65E5\u5386\uFF0C\u53BB\u8BBE\u7F6E\u9875\u52FE\u9009");
+    }
+    return out;
+  }
+}
+async function readGoogleBridgeItems(fetchImpl, path, accountId) {
+  let res;
+  try {
+    res = await fetchImpl(path, { method: "GET", headers: { "X-Google-Account": accountId } });
+  } catch (e) {
+    throw new Error(`GOOGLE_UNREACHABLE: \u6865\u63A5\u670D\u52A1\u4E0D\u53EF\u8FBE (${e?.message || e})`);
+  }
+  if (res.status === 401) {
+    throw new Error("GOOGLE_REAUTH_REQUIRED: Google \u6388\u6743\u8FC7\u671F\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u6388\u6743");
+  }
+  if (!res.ok) {
+    let text = "";
+    try {
+      text = await res.text();
+    } catch {
+    }
+    if (/REAUTH_REQUIRED/.test(text)) {
+      throw new Error("GOOGLE_REAUTH_REQUIRED: Google \u6388\u6743\u8FC7\u671F\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u6388\u6743");
+    }
+    throw new Error(`GOOGLE_BRIDGE_ERROR: \u6865\u8BF7\u6C42\u5931\u8D25 ${res.status}${text ? ` ${text.slice(0, 200)}` : ""}`);
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error("GOOGLE_BRIDGE_ERROR: \u6865\u8FD4\u56DE\u4E0D\u662F JSON");
+  }
+  if (body?.error === "REAUTH_REQUIRED") {
+    throw new Error("GOOGLE_REAUTH_REQUIRED: Google \u6388\u6743\u8FC7\u671F\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u6388\u6743");
+  }
+  return Array.isArray(body?.items) ? body.items : [];
+}
+async function runGoogleCalendarEvents(ctx, args) {
+  const fetchImpl = ctx.googleFetch ?? googleBridgeFetch;
+  const selection = readGoogleSelection(ctx);
+  const lists = await Promise.all(selection.map(
+    ({ accountId, calendarId }) => readGoogleBridgeItems(
+      fetchImpl,
+      `/api/events?calendarId=${encodeURIComponent(calendarId)}&timeMin=${encodeURIComponent(args.timeMin)}&timeMax=${encodeURIComponent(args.timeMax)}`,
+      accountId
+    )
+  ));
+  const kw = args.keyword?.trim().toLowerCase();
+  return normalizeGoogleEvents(lists.flat()).filter((e) => !kw || e.title.toLowerCase().includes(kw) || e.location.toLowerCase().includes(kw)).sort((a, b) => a.dateKey < b.dateKey ? -1 : a.dateKey > b.dateKey ? 1 : a.startText < b.startText ? -1 : 1).map((e) => ({ dateKey: e.dateKey, title: e.title, startText: e.startText }));
+}
+async function runGoogleTasks(ctx, _args) {
+  const fetchImpl = ctx.googleFetch ?? googleBridgeFetch;
+  const selection = readGoogleSelection(ctx);
+  const accountIds = [...new Set(selection.map((s) => s.accountId))];
+  const lists = await Promise.all(accountIds.map(
+    (accountId) => readGoogleBridgeItems(fetchImpl, `/api/tasks?tasklist=${encodeURIComponent("@default")}`, accountId)
+  ));
+  return normalizeGoogleTasks(lists.flat()).filter((t) => t.status !== "completed" && t.status !== "deleted").map((t) => ({ title: t.title, dueKey: t.dueKey }));
+}
+async function proposeGoogleCreate(ctx, args) {
+  const selection = readGoogleSelection(ctx);
+  if (args.kind === "event") {
+    if (!args.dateKey) {
+      throw new Error("GOOGLE_MISSING_FIELD: \u521B\u5EFA\u4E8B\u4EF6\u7F3A dateKey\uFF0C\u5148\u95EE\u6E05\u65E5\u671F\u518D propose");
+    }
+    const calendarId = args.calendarId ?? selection[0].calendarId;
+    const payload = buildEventBody({
+      title: args.title,
+      dateKey: args.dateKey,
+      timeText: args.timeText,
+      timeZone: args.timeZone,
+      location: args.location,
+      description: args.description
+    });
+    const when = args.timeText ? `${args.dateKey} ${args.timeText}` : `${args.dateKey}\uFF08\u5168\u5929\uFF09`;
+    return {
+      summary: `\u5C06\u5728\u65E5\u5386 ${calendarId} \u521B\u5EFA\u4E8B\u4EF6\u300C${args.title}\u300D\uFF0C\u65F6\u95F4 ${when}\uFF1B\u7528\u6237\u70B9\u5934\u540E\u518D execute`,
+      payload,
+      kind: "event"
+    };
+  }
+  if (args.kind === "task") {
+    if (!args.title) {
+      throw new Error("GOOGLE_MISSING_FIELD: \u521B\u5EFA\u5F85\u529E\u7F3A title\uFF0C\u5148\u95EE\u6E05\u6807\u9898\u518D propose");
+    }
+    const tasklist = args.tasklist ?? "@default";
+    const payload = buildTaskBody({ title: args.title, dueKey: args.dueKey, notes: args.notes });
+    const when = args.dueKey ?? "\u65E0\u622A\u6B62\u65E5\u671F";
+    return {
+      summary: `\u5C06\u5728\u6E05\u5355 ${tasklist} \u521B\u5EFA\u5F85\u529E\u300C${args.title}\u300D\uFF0C\u622A\u6B62 ${when}\uFF1B\u7528\u6237\u70B9\u5934\u540E\u518D execute`,
+      payload,
+      kind: "task"
+    };
+  }
+  throw new Error(`GOOGLE_MISSING_FIELD: \u672A\u77E5 kind ${args.kind}\uFF0C\u53EA\u652F\u6301 event/task`);
+}
+async function executeGoogleCreate(ctx, args) {
+  if (args.confirmed !== true) {
+    throw new Error("GOOGLE_NOT_CONFIRMED: \u987B\u5148 propose \u5E76\u7ECF\u7528\u6237\u786E\u8BA4\u540E\u518D execute\uFF0C\u672C\u6B21\u672A\u5199\u5165");
+  }
+  const selection = readGoogleSelection(ctx);
+  const accountId = args.accountId ?? selection[0].accountId;
+  let out;
+  if (args.kind === "event") {
+    const calendarId = args.calendarId ?? selection[0].calendarId;
+    out = await createGoogleEvent({ accountId, calendarId, event: args.payload });
+  } else if (args.kind === "task") {
+    const tasklist = args.tasklist ?? "@default";
+    out = await createGoogleTask({ accountId, tasklist, task: args.payload });
+  } else {
+    throw new Error(`GOOGLE_MISSING_FIELD: \u672A\u77E5 kind ${args.kind}\uFF0C\u53EA\u652F\u6301 event/task`);
+  }
+  if (out?.error === "REAUTH_REQUIRED") {
+    throw new Error("GOOGLE_REAUTH_REQUIRED: Google \u6388\u6743\u8FC7\u671F\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u6388\u6743");
+  }
+  return out;
+}
 
 // utils/agenticToolFeedback.ts
 var toolCallFingerprint = (name, args) => {
-  const normalize2 = (value) => {
-    if (Array.isArray(value)) return value.map(normalize2);
+  const normalize3 = (value) => {
+    if (Array.isArray(value)) return value.map(normalize3);
     if (value && typeof value === "object") {
       return Object.fromEntries(
-        Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, normalize2(v)])
+        Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, normalize3(v)])
       );
     }
     return value;
   };
-  return `${name}:${JSON.stringify(normalize2(args ?? {}))}`;
+  return `${name}:${JSON.stringify(normalize3(args ?? {}))}`;
 };
 var TOOL_LABELS = {
   recall: "\u8C03\u53D6\u67D0\u4E2A\u6708\u7684\u8BB0\u5FC6",
@@ -14449,6 +14896,26 @@ function installOpencodeIdentityFetch(ua) {
 installOpencodeIdentityFetch("SullyOS-AmsgWorker/1.0 (+https://github.com/plasma953/SullyOS)");
 var getFireStash = (scratch) => scratch?.fire;
 var laterOf = (a, b) => a == null ? b : b == null ? a : Math.max(a, b);
+var googleBridgeUrl = "";
+var googleBridgeToken = "";
+var configureGoogleBridgeEnv = (deps) => {
+  const url = typeof deps?.url === "string" ? deps.url.trim().replace(/\/+$/, "") : "";
+  googleBridgeUrl = /^https?:\/\//i.test(url) ? url : "";
+  googleBridgeToken = typeof deps?.token === "string" ? deps.token : "";
+};
+var parseGoogleSelectionKeys = (selection) => {
+  const out = [];
+  if (!Array.isArray(selection)) return out;
+  for (const key of selection) {
+    if (typeof key !== "string") continue;
+    const sep = key.indexOf("::");
+    if (sep < 0) continue;
+    const accountId = key.slice(0, sep);
+    const calendarId = key.slice(sep + 2);
+    if (accountId && calendarId) out.push({ accountId, calendarId });
+  }
+  return out;
+};
 var buildToolCtx = (pack, config) => {
   const char = {
     name: pack.charName,
@@ -14472,7 +14939,25 @@ var buildToolCtx = (pack, config) => {
         commentAuthorNameCache: /* @__PURE__ */ new Map(),
         commentParentIdCache: /* @__PURE__ */ new Map()
       },
-      lastXhsNotesRef: { current: [] }
+      lastXhsNotesRef: { current: [] },
+      // Google：tool_pack.google 有才透传（无包 → 两字段都不设，fail-closed 不变）。
+      // selection 按 `::` 切分、坏形状跳过（与 readGoogleSelection 本地回落分支同口径，
+      // 见 utils/agenticTools.ts）；googleFetch 经 env 的桥地址 + secret token 出网
+      // （token 永不进包），10s 超时（AbortSignal.timeout；realtimeWorldCore 那份 8s
+      // AbortController 是常驻天气注入的写法，这里按 lane 规格用 10s）。
+      ...pack.google ? {
+        googleSelection: parseGoogleSelectionKeys(pack.google.selection),
+        googleFetch: (path, init) => {
+          const rawHeaders = init?.headers;
+          const headers = rawHeaders instanceof Headers ? Object.fromEntries(rawHeaders.entries()) : { ...rawHeaders ?? {} };
+          headers["X-Google-Bridge-Token"] = googleBridgeToken;
+          return fetch(`${googleBridgeUrl}${path}`, {
+            ...init,
+            signal: AbortSignal.timeout(1e4),
+            headers
+          });
+        }
+      } : {}
     },
     proxyWorkerUrl: config.proxyWorkerUrl ?? null,
     xhsCookie: config.xhsMcpConfig?.cookie ?? "",
@@ -15609,6 +16094,16 @@ var buildWorkerConfig = (env) => {
   const pushTransport = withPushFanout(webpush, { db: env.DB, masterKey: env.AMSG_MASTER_KEY });
   configureInstantErrorPush(env.DB && env.AMSG_MASTER_KEY ? { webpush: pushTransport, db: env.DB, masterKey: env.AMSG_MASTER_KEY } : null);
   configureAutonomyFireDb(env.DB);
+  const homeEndpoint = env;
+  configureAutonomyHomeEnv({
+    HOME_URL: homeEndpoint.HOME_URL ?? "http://127.0.0.1:8837",
+    AMSG_CLIENT_TOKEN: homeEndpoint.AMSG_CLIENT_TOKEN ?? ""
+  });
+  configurePlateHomeEnv({
+    HOME_URL: homeEndpoint.HOME_URL ?? "http://127.0.0.1:8837",
+    AMSG_CLIENT_TOKEN: homeEndpoint.AMSG_CLIENT_TOKEN ?? ""
+  });
+  configureGoogleBridgeEnv({ url: env.GOOGLE_BRIDGE_URL, token: env.GOOGLE_BRIDGE_TOKEN });
   return {
     // db 缺省时 factory 自动用 createD1Adapter(env.DB)
     masterKey: env.AMSG_MASTER_KEY,
@@ -16140,8 +16635,10 @@ export {
   amsgReasoningKey,
   amsgStaleSkip,
   attachScheduledTasks,
+  buildToolCtx,
   buildWorkerConfig,
   classifySchemaProbeError,
+  configureGoogleBridgeEnv,
   configureInstantErrorPush,
   src_default as default,
   inspectPushDelivery,
