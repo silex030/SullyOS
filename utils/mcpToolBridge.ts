@@ -65,16 +65,50 @@ const LAZY_DESC_MAX = 80;
 /** 懒加载宽松参数 schema：模型把参数塞进 args 对象，校验层负责按真实 schema 还原 */
 const LAZY_STUB_PARAMETERS = { type: 'object', additionalProperties: true } as const;
 
+/**
+ * 规范化 schema 的对象键序（深拷贝，数组顺序原样保留）。
+ *
+ * 为什么要做：供应商通常把工具定义算进输入上下文，而 JSON 对象的键序取决于「当时怎么拼出来的」。
+ * 同一台服务器重新发现工具、或上游返回字段顺序不同，就可能让 schema 的字节序列变化，
+ * 白白打断前缀复用。只排对象键——enum / required / oneOf 这类数组的顺序有语义，排序会改含义。
+ */
+const canonicalSchema = (value: any): any => {
+    if (Array.isArray(value)) return value.map(canonicalSchema);
+    if (value && typeof value === 'object') {
+        const out: Record<string, any> = {};
+        for (const key of Object.keys(value).sort()) out[key] = canonicalSchema(value[key]);
+        return out;
+    }
+    return value;
+};
+
+/**
+ * 名字映射的输入规范化：每台服务器内部的工具按原名排。
+ *
+ * 为什么不排服务器：跨服务器重名时「先占先得」的归属今天由**配置顺序**决定（用户可持久化、
+ * 已被云端/历史引用）。改成按 id 排会让裸名换主，等于悄悄改工具名指向 —— 属于功能性变更，
+ * 不是缓存优化能顺手做的（审计明确提醒过）。所以这里只消除「发现返回顺序」这个真正的随机源：
+ * 同一台服务器本次发现先给 b 后给 a，映射结果必须一样。
+ * 输出数组另外按暴露名排序（见 buildMcpOpenAITools），顺序稳定与归属稳定分开处理。
+ */
+const canonicalServers = (servers: McpServerConfig[]): McpServerConfig[] =>
+    servers.map(server => ({
+        ...server,
+        tools: [...(server.tools || [])].sort((a, b) => `${a.name}`.localeCompare(`${b.name}`)),
+    }));
+
 export const buildMcpOpenAITools = (
     charId?: string,
     opts: BuildMcpOpenAIToolsOpts = {},
 ): { tools: OpenAIMcpTool[]; resolve: Map<string, ResolvedMcpTool> } => {
-    const servers = getEnabledMcpServers(charId);
+    const servers = canonicalServers(getEnabledMcpServers(charId));
     const resolve: Map<string, ResolvedMcpTool> = buildMcpNameMap(servers);
     const tools: OpenAIMcpTool[] = [];
     const multi = servers.length > 1;
     const expand = new Set(opts.expandTools || []);
-    for (const [exposed, { server, tool }] of resolve) {
+    // 输出按暴露名排序：工具集合相同、发现顺序不同时，数组逐项一致（前缀缓存稳定）。
+    const ordered = [...resolve.entries()].sort(([a], [b]) => a.localeCompare(b));
+    for (const [exposed, { server, tool }] of ordered) {
         const lazyStub = !!opts.lazy && !expand.has(exposed);
         tools.push({
             type: 'function',
@@ -85,7 +119,7 @@ export const buildMcpOpenAITools = (
                     : buildToolDescription(server, tool, multi),
                 parameters: lazyStub
                     ? LAZY_STUB_PARAMETERS
-                    : (tool.inputSchema || { type: 'object', properties: {} }),
+                    : canonicalSchema(tool.inputSchema || { type: 'object', properties: {} }),
             },
         });
     }
@@ -116,12 +150,26 @@ const buildToolDescription = (server: McpServerConfig, t: McpToolDef, multi: boo
  * charId：只列对该角色可见的服务器，与 buildMcpOpenAITools 的过滤保持一致。
  */
 export const buildMcpSystemBlock = (userName: string = '用户', charId?: string): string => {
-    const servers = getEnabledMcpServers(charId);
+    const servers = canonicalServers(getEnabledMcpServers(charId));
     if (!servers.length) return '';
+    // 清单与真实 tools 同源排序（暴露名）：两处顺序不一致时模型会对不上名字。
+    const resolve = buildMcpNameMap(servers);
+    const exposedByServer = new Map<string, Array<{ exposed: string; toolName: string }>>();
+    for (const [exposed, { server, toolName }] of resolve) {
+        const list = exposedByServer.get(server.id) || [];
+        list.push({ exposed, toolName });
+        exposedByServer.set(server.id, list);
+    }
     const lines = servers.map(s => {
-        const names = (s.tools || []).map(t => t.name).join('、');
+        const names = (exposedByServer.get(s.id) || [])
+            .sort((a, b) => a.exposed.localeCompare(b.exposed))
+            .map(entry => entry.toolName)
+            .join('、');
         return `- ${s.name}: ${names}`;
     });
+    // 清单只是给人看的列表：按服务器名排一遍，配置顺序变化不会重排这段稳定前缀。
+    // （真实 tools 数组的归属仍按配置顺序，见 canonicalServers 的说明。）
+    lines.sort((a, b) => a.localeCompare(b));
     return `
 
 ---

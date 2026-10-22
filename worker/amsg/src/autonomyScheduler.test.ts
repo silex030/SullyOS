@@ -11,20 +11,27 @@ import { FIRE_KIND_HANDLERS } from './fireKinds';
 import { AUTONOMY_FIRE_SKIP, autonomyRoundHandler, configureAutonomyFireDb } from './autonomyFire';
 import {
   AUTONOMY_FAIL_LIMIT,
+  AUTONOMY_PLAN_META_KEY,
   AUTONOMY_SKIP_REASONS,
   autonomyDateKey,
   autonomyConfigHash,
   buildAutonomyScheduleRequest,
   createAutonomyPostTask,
   encryptPayloadMirror,
+  readAutonomyGuardrailsForUser,
+  readAutonomyGuardrailsForUserDetailed,
   reportAutonomyOutcome,
+  runAutonomyPlanQueue,
   runAutonomyTick,
   scanAutonomyPacks,
   shouldPushNow,
+  startOfAutonomyDayMs,
   type AutonomyTickPack,
 } from './autonomyScheduler';
+import type { AutonomyPlanRecord } from '../../../utils/airp/lifeWorkflow';
 import {
   claimAutonomyTick,
+  claimGlobalAutonomyBudget,
   emptyAutonomyState,
   ensureAutonomySchema,
   resetAutonomySchemaCacheForTesting,
@@ -50,6 +57,10 @@ const baseAutonomy = (overrides: Partial<ResolvedAirpAutonomy> = {}): ResolvedAi
   autonomyLevel: 2,
   mcpAllow: [],
   writable: false,
+  guardrails: {
+    version: 1, perCharPerDay: 2, sameKindMinGapMinutes: 120,
+    globalPerDay: 6, reserveTokensPerRun: 1600, paused: false,
+  },
   ...overrides,
 });
 
@@ -149,6 +160,8 @@ const tick = (
     rand01: options.rand01 ?? (() => 0),
     db,
     packs,
+    // 假库没有护栏行 → absent → 默认值（和线上 index.ts 传 env.AMSG_MASTER_KEY 同口径）。
+    masterKey: MASTER,
     postTask: options.postTask ?? (async () => ({ status: 200 })),
   });
 
@@ -716,5 +729,516 @@ describe('home round policy', () => {
     const { db } = createStateDb([{ ...emptyAutonomyState(CHAR_ID), lastRoundAt: NOW - 10 * 60_000 }]);
     const result = await tick(db, tickPack(baseAutonomy({ cadence: { minHours: 0.1, maxHours: 0.1 } })));
     expect(result.skipped).toEqual([{ charId: CHAR_ID, reason: AUTONOMY_SKIP_REASONS.spacingWindow }]);
+  });
+});
+
+// ─── P5：生活工作流队列 ─────────────────────────────────────────────────
+
+const planRow = (over: Partial<AutonomyPlanRecord> = {}): Record<string, unknown> => {
+  const plan: AutonomyPlanRecord = {
+    id: 'plan-1',
+    charId: CHAR_ID,
+    kind: 'diary',
+    status: 'proposed',
+    purpose: '把今天下午的事记下来',
+    title: '今天的一点小事',
+    maxChars: 400,
+    trigger: { kind: 'now' },
+    scheduledAt: NOW - 1000,
+    expiresAt: NOW + 60 * 60_000,
+    createdAt: NOW - 3 * 60 * 60_000,
+    updatedAt: NOW - 3 * 60 * 60_000,
+    source: 'autonomy_round',
+    sourceRef: 'round-1',
+    basis: 'virtual',
+    evidence: [],
+    dedupeKey: 'wf:diary:abc',
+    attempts: 0,
+    leaseUntil: 0,
+    ...over,
+  };
+  return {
+    id: plan.id, char_id: plan.charId, kind: plan.kind, status: plan.status,
+    purpose: plan.purpose, title: plan.title, note_hint: plan.noteHint ?? null,
+    max_chars: plan.maxChars, trigger_kind: plan.trigger.kind,
+    trigger_value: plan.trigger.kind === 'idle' ? String(plan.trigger.afterMinutes) : null,
+    scheduled_at: plan.scheduledAt, expires_at: plan.expiresAt,
+    created_at: plan.createdAt, updated_at: plan.updatedAt,
+    source: plan.source, source_ref: plan.sourceRef, basis: plan.basis,
+    evidence_json: JSON.stringify(plan.evidence), predecessor_id: null,
+    dedupe_key: plan.dedupeKey, attempts: plan.attempts, lease_until: plan.leaseUntil,
+    last_error: null,
+  };
+};
+
+/** 计划队列专用假库：按 SQL 关键字喂行 / 控制认领结果，记录所有语句。 */
+const createPlanDb = (opts: {
+  due?: Array<Record<string, unknown>>;
+  pending?: Array<Record<string, unknown>>;
+  globalUsed?: number;
+  charUsed?: number;
+  lastKindAt?: number;
+  reserved?: number;
+  claimGlobal?: boolean;
+  insertRun?: boolean;
+  claimPlan?: boolean;
+} = {}) => {
+  const statements: Array<{ sql: string; args: unknown[] }> = [];
+  const db = {
+    prepare(sql: string) {
+      const stmt = {
+        _args: [] as unknown[],
+        bind(...args: unknown[]) {
+          stmt._args = args;
+          return stmt;
+        },
+        async run() {
+          statements.push({ sql, args: stmt._args });
+          if (sql.includes('INSERT OR IGNORE INTO autonomy_plan_runs')) {
+            return { success: true, meta: { changes: (opts.insertRun ?? true) ? 1 : 0 } };
+          }
+          if (sql.includes("SET status = 'scheduled'")) {
+            return { success: true, meta: { changes: (opts.claimPlan ?? true) ? 1 : 0 } };
+          }
+          if (sql.includes("SET used = CASE WHEN date = ?")) {
+            return { success: true, meta: { changes: (opts.claimGlobal ?? true) ? 1 : 0 } };
+          }
+          if (sql.includes("SET status = 'cancelled'")) {
+            return { success: true, meta: { changes: 1 } };
+          }
+          return { success: true, meta: { changes: 0 } };
+        },
+        async first() {
+          statements.push({ sql, args: stmt._args });
+          if (sql.includes('COUNT(*) AS total FROM autonomy_plans')) return { total: opts.charUsed ?? 0 };
+          if (sql.includes('MAX(scheduled_at) AS last_at')) return { last_at: opts.lastKindAt ?? 0 };
+          if (sql.includes('FROM autonomy_global_state')) {
+            return { date: '2026-07-25', used: opts.globalUsed ?? 0 };
+          }
+          if (sql.includes('SUM(reserved_tokens)')) return { total: opts.reserved ?? 0 };
+          return null;
+        },
+        async all() {
+          statements.push({ sql, args: stmt._args });
+          if (sql.includes("status IN (?, ?)") && sql.includes('ORDER BY created_at DESC')) {
+            return { results: opts.pending ?? [] };
+          }
+          if (sql.includes("status = 'proposed' AND scheduled_at <= ?")) {
+            return { results: opts.due ?? [] };
+          }
+          return { results: [] };
+        },
+      };
+      return stmt;
+    },
+  };
+  return { db, statements };
+};
+
+const planQueueArgs = (
+  db: unknown,
+  over: Partial<Parameters<typeof runAutonomyPlanQueue>[0]> = {},
+  postTask: (args: unknown) => Promise<unknown> = async () => ({ status: 200 }),
+): Parameters<typeof runAutonomyPlanQueue>[0] => ({
+  db: db as never,
+  userId: USER_ID,
+  charId: CHAR_ID,
+  charName: CHAR_NAME,
+  pack: packFor(baseAutonomy()),
+  nowMs: NOW,
+  lastUserMessageAt: null,
+  autonomous: baseAutonomy(),
+  sharedGuardrails: baseAutonomy().guardrails,
+  postTask: postTask as never,
+  ...over,
+});
+
+describe('生活工作流队列（P5）', () => {
+  it('到点计划 → 建一条带计划 metadata 的任务；全局额度 + 预留都落地', async () => {
+    const { db, statements } = createPlanDb({ due: [planRow()] });
+    const posts: any[] = [];
+    const result = await runAutonomyPlanQueue(
+      planQueueArgs(db, {}, async (args) => { posts.push(args); return { status: 200 }; }),
+    );
+
+    expect(result.scheduled).toEqual(['plan-1']);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].plan).toMatchObject({ id: 'plan-1', kind: 'diary', status: 'scheduled' });
+    expect(statements.some((s) => s.sql.includes('INSERT OR IGNORE INTO autonomy_plan_runs'))).toBe(true);
+    expect(statements.some((s) => s.sql.includes('INSERT OR IGNORE INTO autonomy_global_state'))).toBe(true);
+  });
+
+  it('用户重新开口 → 取消还没开始的，绝不建任务', async () => {
+    const { db } = createPlanDb({
+      pending: [planRow()],
+      due: [planRow()],
+    });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(
+      db,
+      { lastUserMessageAt: NOW - 60_000 },
+      async (args) => { posts.push(args); return { status: 200 }; },
+    ));
+    expect(posts).toEqual([]);
+    expect(result.scheduled).toEqual([]);
+    expect(result.cancelled).toBe(1);
+  });
+
+  it('同一句用户消息催出来的计划不会被它自己马上撤掉（真实 msg id 对齐）', async () => {
+    // 时钟偏差场景：消息时间戳 (NOW-30s) 比计划 createdAt (NOW-60s) 新 —— 只比时间戳会误撤。
+    const { db } = createPlanDb({
+      pending: [planRow({ sourceRef: 'chat:char-lumen:m77' })],
+      due: [planRow({ sourceRef: 'chat:char-lumen:m77' })],
+    });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(
+      db,
+      {
+        lastUserMessageAt: NOW - 30_000,
+        pack: { ...packFor(baseAutonomy()), lastUserMessageId: 77 },
+      },
+      async (args) => { posts.push(args); return { status: 200 }; },
+    ));
+    expect(result.cancelled).toBe(0);
+    expect(result.scheduled).toEqual(['plan-1']);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('换了一条新的用户消息 → 旧计划照样按「重新开口」取消', async () => {
+    const { db } = createPlanDb({
+      pending: [planRow({ sourceRef: 'chat:char-lumen:m77' })],
+      due: [planRow({ sourceRef: 'chat:char-lumen:m77' })],
+    });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(
+      db,
+      {
+        lastUserMessageAt: NOW - 30_000,
+        pack: { ...packFor(baseAutonomy()), lastUserMessageId: 78 },
+      },
+      async (args) => { posts.push(args); return { status: 200 }; },
+    ));
+    expect(result.cancelled).toBe(1);
+    expect(posts).toEqual([]);
+  });
+
+  it('全局 6 次满了 → plan-global-limit（共享计数说了算）', async () => {
+    const { db } = createPlanDb({ due: [planRow()], globalUsed: 6 });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(db, {}, async (args) => { posts.push(args); return {}; }));
+    expect(posts).toEqual([]);
+    expect(result.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planGlobalLimit);
+  });
+
+  it('每角色 2 次 / 同类 2h / 总暂停 都在队列里生效', async () => {
+    const daily = createPlanDb({ due: [planRow()], charUsed: 2 });
+    expect((await runAutonomyPlanQueue(planQueueArgs(daily.db))).skipped[0].reason)
+      .toBe(AUTONOMY_SKIP_REASONS.planDailyLimit);
+
+    const gap = createPlanDb({ due: [planRow()], lastKindAt: NOW - 30 * 60_000 });
+    expect((await runAutonomyPlanQueue(planQueueArgs(gap.db))).skipped[0].reason)
+      .toBe(AUTONOMY_SKIP_REASONS.planKindGap);
+
+    const paused = createPlanDb({ due: [planRow()] });
+    expect((await runAutonomyPlanQueue(planQueueArgs(paused.db, {
+      sharedGuardrails: { ...baseAutonomy().guardrails, paused: true },
+    }))).skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.paused);
+  });
+
+  it('能力被关掉 → 排队前就拦，不建任务、不占次数（等到点才拦等于白烧一次排程）', async () => {
+    // 显式 none：一类都不许
+    const noneDb = createPlanDb({ due: [planRow()] });
+    const nonePosts: unknown[] = [];
+    const noneResult = await runAutonomyPlanQueue(planQueueArgs(
+      noneDb.db,
+      { autonomous: { ...baseAutonomy(), capabilityMode: 'none', capabilities: [] } },
+      async (args) => { nonePosts.push(args); return {}; },
+    ));
+    expect(nonePosts).toEqual([]);
+    expect(noneResult.scheduled).toEqual([]);
+    expect(noneResult.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planCapability);
+    // 计划被标成 failed（终态，不再重复尝试），不是静静地留在 proposed
+    expect(noneDb.statements.some((s) => s.sql.includes('UPDATE autonomy_plans') && s.args.includes('failed'))).toBe(true);
+
+    // 白名单只放行 schedule_write：diary 计划仍被拒，plan 计划才放行
+    const deniedDb = createPlanDb({ due: [planRow({ kind: 'diary' })] });
+    expect((await runAutonomyPlanQueue(planQueueArgs(deniedDb.db, {
+      autonomous: { ...baseAutonomy(), capabilityMode: 'allowlist', capabilities: ['schedule_write'] },
+    }))).skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planCapability);
+
+    const allowedDb = createPlanDb({ due: [planRow({ kind: 'plan' })] });
+    const allowedPosts: unknown[] = [];
+    const allowed = await runAutonomyPlanQueue(planQueueArgs(allowedDb.db, {
+      autonomous: { ...baseAutonomy(), capabilityMode: 'allowlist', capabilities: ['schedule_write'] },
+    }, async (args) => { allowedPosts.push(args); return { status: 200 }; }));
+    expect(allowed.scheduled).toEqual(['plan-1']);
+    expect(allowedPosts).toHaveLength(1);
+  });
+
+  it('全局名额抢不到 → 不建任务（多设备/多 cron 只有一方成功）', async () => {
+    const { db } = createPlanDb({ due: [planRow()], claimGlobal: false });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(db, {}, async (args) => { posts.push(args); return {}; }));
+    expect(posts).toEqual([]);
+    expect(result.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planGlobalLimit);
+  });
+
+  it('计划认领失败 → 退全局名额、预留释放，不建任务', async () => {
+    const { db, statements } = createPlanDb({ due: [planRow()], claimPlan: false });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(db, {}, async (args) => { posts.push(args); return {}; }));
+    expect(posts).toEqual([]);
+    expect(result.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planNotPending);
+    expect(statements.some((s) => s.sql.includes('used - 1'))).toBe(true);
+    expect(statements.some((s) => s.args.includes('released'))).toBe(true);
+  });
+
+  it('建任务超时 → 计划/执行都标 unknown（终态，不自动重试）', async () => {
+    const { db, statements } = createPlanDb({ due: [planRow()] });
+    const result = await runAutonomyPlanQueue(planQueueArgs(db, {}, async () => {
+      throw new Error('ETIMEDOUT');
+    }));
+    expect(result.scheduled).toEqual([]);
+    expect(result.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planPostFailed);
+    const runUpdate = statements.find((s) => s.sql.includes('UPDATE autonomy_plan_runs') && s.args.includes('unknown'));
+    expect(runUpdate).toBeTruthy();
+    const settle = statements.find((s) => s.sql.includes('UPDATE autonomy_plans') && s.args.includes('unknown'));
+    expect(settle).toBeTruthy();
+  });
+});
+
+describe('共享护栏（用户级全局配置）', () => {
+  it('扫描时把共享护栏挂在包上（cron 不需要额外传 masterKey）', async () => {
+    const key = await deriveUserEncryptionKey(USER_ID, MASTER);
+    const pack = packFor(baseAutonomy());
+    const packRow = {
+      user_id: USER_ID, namespace: `amsg:char:${CHAR_ID}`, key: 'fire_pack',
+      value: await encryptForStorage(JSON.stringify(pack), key),
+    };
+    const guardRow = {
+      user_id: USER_ID, namespace: 'amsg:global', key: 'autonomy_guardrails',
+      value: await encryptForStorage(JSON.stringify({ version: 1, globalPerDay: 3, paused: true }), key),
+    };
+    const db = {
+      prepare(sql: string) {
+        const stmt = {
+          bind() { return stmt; },
+          async all() {
+            return { results: sql.includes('namespace = ? AND key = ?') ? [guardRow] : [packRow] };
+          },
+        };
+        return stmt;
+      },
+    };
+    const result = await scanAutonomyPacks({ db: db as never, masterKey: MASTER });
+    expect(result.packs[0].sharedGuardrails).toMatchObject({ globalPerDay: 3, paused: true });
+  });
+
+  it('总暂停 → 整跳跳过（不建回合、不排计划）', async () => {
+    const { db } = createStateDb();
+    const posted: unknown[] = [];
+    const result = await tick(db, [{
+      userId: USER_ID, charId: CHAR_ID, charName: CHAR_NAME,
+      pack: packFor(baseAutonomy()),
+      sharedGuardrails: { ...baseAutonomy().guardrails, paused: true },
+    }], { postTask: async (args) => { posted.push(args); return {}; } });
+    expect(posted).toEqual([]);
+    expect(result.built).toEqual([]);
+    expect(result.skipped).toEqual([{ charId: CHAR_ID, reason: AUTONOMY_SKIP_REASONS.paused }]);
+  });
+  it('读云端加密行 → 归一后的护栏；缺行回落默认', async () => {
+    const key = await deriveUserEncryptionKey(USER_ID, MASTER);
+    const value = await encryptForStorage(JSON.stringify({ version: 1, globalPerDay: 4, paused: true }), key);
+    const db = {
+      prepare() {
+        const stmt = {
+          bind() { return stmt; },
+          async first() { return { value }; },
+          async run() { return {}; },
+          async all() { return { results: [] }; },
+        };
+        return stmt;
+      },
+    };
+    const loaded = await readAutonomyGuardrailsForUser(db as never, MASTER, USER_ID);
+    expect(loaded.globalPerDay).toBe(4);
+    expect(loaded.paused).toBe(true);
+
+    const empty = {
+      prepare() {
+        const stmt = {
+          bind() { return stmt; },
+          async first() { return null; },
+          async run() { return {}; },
+          async all() { return { results: [] }; },
+        };
+        return stmt;
+      },
+    };
+    expect((await readAutonomyGuardrailsForUser(empty as never, MASTER, USER_ID)).globalPerDay).toBe(6);
+    // 没有 master key = 「读不出来」，不是「用户没暂停」：必须保守暂停（fail-closed）
+    expect((await readAutonomyGuardrailsForUser(empty as never, '', USER_ID)).paused).toBe(true);
+  });
+
+  it('角色时区当日 0 点', () => {
+    // 上海 2026-07-25 20:00 → 当日 0 点 = 2026-07-24T16:00:00Z
+    expect(new Date(startOfAutonomyDayMs(NOW, 'Asia/Shanghai')).toISOString())
+      .toBe('2026-07-24T16:00:00.000Z');
+  });
+
+  it('计划任务 metadata 随 /schedule-message 上云（不加新 kind）', async () => {
+    const { db } = createPlanDb({ due: [planRow()] });
+    const posts: any[] = [];
+    await runAutonomyPlanQueue(planQueueArgs(db, {}, async (args) => { posts.push(args); return {}; }));
+    const request = await buildAutonomyScheduleRequest({
+      userId: USER_ID, charId: CHAR_ID, charName: CHAR_NAME, masterKey: MASTER,
+      plan: posts[0].plan,
+    });
+    const payload = await decryptPayload(
+      await request.json() as { iv: string; authTag: string; encryptedData: string },
+      await deriveUserEncryptionKey(USER_ID, MASTER),
+    ) as Record<string, any>;
+    expect(payload.metadata.amsgKind).toBe(AUTONOMOUS_ROUND_KIND);
+    expect(payload.metadata[AUTONOMY_PLAN_META_KEY]).toMatchObject({
+      planId: 'plan-1', kind: 'diary', title: '今天的一点小事', maxChars: 400,
+    });
+  });
+});
+
+describe('护栏 fail-closed（发布阻断项 1）', () => {
+  const dbWith = (first: unknown) => ({
+    prepare() {
+      const stmt = {
+        bind() { return stmt; },
+        async first() { return first; },
+        async run() { return {}; },
+        async all() { return { results: [] }; },
+      };
+      return stmt;
+    },
+  });
+
+  it('行不存在 = 新用户 → absent，允许默认值（paused=false, 6 次/天）', async () => {
+    const read = await readAutonomyGuardrailsForUserDetailed(dbWith(null) as never, MASTER, USER_ID);
+    expect(read.status).toBe('absent');
+    expect(read.guardrails.paused).toBe(false);
+    expect(read.guardrails.globalPerDay).toBe(6);
+  });
+
+  it('缺 master key → unreadable + 保守暂停（不再回落 paused:false）', async () => {
+    const read = await readAutonomyGuardrailsForUserDetailed(dbWith(null) as never, '', USER_ID);
+    expect(read.status).toBe('unreadable');
+    expect(read.guardrails.paused).toBe(true);
+    expect((await readAutonomyGuardrailsForUser(dbWith(null) as never, '', USER_ID)).paused).toBe(true);
+  });
+
+  it('密文坏 → unreadable + 暂停；不把用户的总暂停吞掉', async () => {
+    const read = await readAutonomyGuardrailsForUserDetailed(
+      dbWith({ value: 'not-a-ciphertext' }) as never, MASTER, USER_ID,
+    );
+    expect(read.status).toBe('unreadable');
+    expect(read.guardrails.paused).toBe(true);
+    expect((await readAutonomyGuardrailsForUser(dbWith({ value: 'not-a-ciphertext' }) as never, MASTER, USER_ID)).paused).toBe(true);
+  });
+
+  it('DB 抛错 → unreadable（不是默认配置）', async () => {
+    const broken = {
+      prepare() {
+        const stmt = {
+          bind() { return stmt; },
+          async first(): Promise<unknown> { throw new Error('D1_ERROR'); },
+        };
+        return stmt;
+      },
+    };
+    const read = await readAutonomyGuardrailsForUserDetailed(broken as never, MASTER, USER_ID);
+    expect(read.status).toBe('unreadable');
+    expect(read.guardrails.paused).toBe(true);
+  });
+
+  it('包上带 sharedGuardrailsUnreadable → 整跳跳过，且不建任务、不排计划', async () => {
+    const { db } = createStateDb();
+    const posted: unknown[] = [];
+    const result = await tick(db, [{
+      userId: USER_ID, charId: CHAR_ID, charName: CHAR_NAME,
+      pack: packFor(baseAutonomy()),
+      sharedGuardrailsUnreadable: true,
+    }], { postTask: async (args) => { posted.push(args); return {}; } });
+    expect(posted).toEqual([]);
+    expect(result.built).toEqual([]);
+    expect(result.skipped).toEqual([{ charId: CHAR_ID, reason: AUTONOMY_SKIP_REASONS.guardrailsUnreadable }]);
+  });
+
+  it('扫描时单行解不开 → 该用户标记 unreadable（其他用户不受影响）', async () => {
+    const key = await deriveUserEncryptionKey(USER_ID, MASTER);
+    const pack = packFor(baseAutonomy());
+    const packRow = {
+      user_id: USER_ID, namespace: `amsg:char:${CHAR_ID}`, key: 'fire_pack',
+      value: await encryptForStorage(JSON.stringify(pack), key),
+    };
+    const guardRow = {
+      user_id: USER_ID, namespace: 'amsg:global', key: 'autonomy_guardrails',
+      value: await encryptForStorage('{broken', key),
+    };
+    const db = {
+      prepare(sql: string) {
+        const stmt = {
+          bind() { return stmt; },
+          async all() { return { results: sql.includes('namespace = ? AND key = ?') ? [guardRow] : [packRow] }; },
+        };
+        return stmt;
+      },
+    };
+    const result = await scanAutonomyPacks({ db: db as never, masterKey: MASTER });
+    expect(result.packs[0].sharedGuardrailsUnreadable).toBe(true);
+    expect(result.packs[0].sharedGuardrails).toBeUndefined();
+  });
+});
+
+describe('全局预算 0 / 非法额度（发布阻断项 4）', () => {
+  it('limit=0 时不放行，跨日也一样', async () => {
+    const statements: string[] = [];
+    const db = {
+      prepare(sql: string) {
+        statements.push(sql);
+        const stmt = {
+          bind() { return stmt; },
+          async run() { return { meta: { changes: 1 } }; },
+        };
+        return stmt;
+      },
+    };
+    expect(await claimGlobalAutonomyBudget(db as never, {
+      userId: USER_ID, dateKey: '2026-07-25', limit: 0, nowMs: NOW,
+    })).toBe(false);
+    expect(await claimGlobalAutonomyBudget(db as never, {
+      userId: USER_ID, dateKey: '2026-07-26', limit: -3, nowMs: NOW,
+    })).toBe(false);
+    // 一次 SQL 都不该发：连「跨日无条件 +1」的机会都不给
+    expect(statements).toEqual([]);
+  });
+
+  it('计划队列遇到 globalPerDay=0 → 不建任务（当面额度也是 0）', async () => {
+    const { db } = createPlanDb({ due: [planRow()] });
+    const posts: unknown[] = [];
+    const result = await runAutonomyPlanQueue(planQueueArgs(db, {
+      sharedGuardrails: { ...baseAutonomy().guardrails, globalPerDay: 0 },
+    }, async (args) => { posts.push(args); return {}; }));
+    expect(posts).toEqual([]);
+    expect(result.skipped[0].reason).toBe(AUTONOMY_SKIP_REASONS.planGlobalLimit);
+  });
+});
+
+describe('人工重试不再被固定幂等键挡死（发布阻断项 2）', () => {
+  it('insertAutonomyPlanRun 让 released 旧行让出唯一键，但保留那行做审计', async () => {
+    const { db, statements } = createPlanDb({ due: [planRow()], insertRun: false });
+    await runAutonomyPlanQueue(planQueueArgs(db, {}, async () => ({ status: 200 })));
+    // 不再 DELETE：认领过又退回这件事本身就值得留痕（否则事后分不清「没认领过」和「认领后又退了」）。
+    const del = statements.find((s) => s.sql.includes('DELETE FROM autonomy_plan_runs'));
+    expect(del).toBeFalsy();
+    const relabel = statements.find((s) => s.sql.includes("status = 'released'")
+      && s.sql.includes("idempotency_key = idempotency_key || ':released:' || id"));
+    expect(relabel).toBeTruthy();
+    expect(relabel!.args).toContain('plan:plan-1');
   });
 });

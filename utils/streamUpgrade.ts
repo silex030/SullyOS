@@ -47,7 +47,12 @@ export function upgradeChatBodyToStream(bodyStr: string): string | null {
     if (parsed.stream === true) return null;  // 调用方自己开了流式：不碰
     parsed.stream = true;
     // include_usage：让末尾 chunk 带 usage，token 计费徽标 / API 调用记录不缺数
-    parsed.stream_options = { include_usage: true };
+    //（缺了它，缓存读写字段永远不会到达，前端只能显示「未提供」）。
+    // 合并而不是整块覆盖：调用方可能已经设了别的流式选项。
+    const prevOptions = parsed.stream_options && typeof parsed.stream_options === 'object' && !Array.isArray(parsed.stream_options)
+        ? parsed.stream_options
+        : {};
+    parsed.stream_options = { ...prevOptions, include_usage: true };
     return JSON.stringify(parsed);
 }
 

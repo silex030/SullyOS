@@ -4415,9 +4415,46 @@ export interface AutonomyHeartbeat {
     wokeAt: number;
     did: 'surf' | 'game' | 'forum' | 'rest' | 'mixed';
     toolsUsed: string[];
-    usage: { prompt?: number; completion?: number; total: number };
+    /** 缓存的读/写计数只在供应商真的报了时才有值（缺失 ≠ 0，见 utils/llmUsage.ts）。 */
+    usage: {
+        prompt?: number;
+        completion?: number;
+        total: number;
+        cachedTokens?: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+    };
     pushed: 0 | 1;
     outboxed: number;
+}
+
+/**
+ * 角色自主生活工作流在客户端的可查看记录（DB v79）。
+ *
+ * 一份记录 = 云端 autonomy_plans 的一行在客户端的投影：角色「想做/做过什么」，
+ * 带来源与状态。`resultText` 只可能出现在 completed 上，且永远是角色的**虚拟经历**
+ * （basis='virtual'），不得当成现实观测转述；`failed`/`unknown` 不写结果，也不假装完成。
+ * 与 D1 同 id，重投 put 覆盖即幂等。
+ */
+export interface AutonomyWorkflowPlanRecord {
+    id: string;
+    charId: string;
+    kind: 'diary' | 'plan' | 'interest_note';
+    status: 'proposed' | 'scheduled' | 'running' | 'completed' | 'cancelled' | 'failed' | 'unknown';
+    title: string;
+    purpose: string;
+    basis: 'inference' | 'virtual';
+    source: 'autonomy_round' | 'chat_reply' | 'user';
+    sourceRef: string;
+    scheduledAt: number;
+    expiresAt: number;
+    createdAt: number;
+    updatedAt: number;
+    /** completed 才有：角色自己写成的那一小段（虚拟经历）。 */
+    resultText?: string;
+    /** completed 才有：产物里提到的后续打算（仍是角色自己的话）。 */
+    resultPlans?: string[];
+    lastError?: string;
 }
 
 export interface FullBackupData {
@@ -4485,6 +4522,7 @@ export interface FullBackupData {
     airpWorlds?: AirpWorldDoc[];               // AIRP 世界事实/知识（按角色物化的世界文档，keyPath charId）
     autonomousOutbox?: AutonomousOutboxEntry[];     // AIRP 自主生活转述账本（DB v77）
     autonomousHeartbeats?: AutonomyHeartbeat[];     // AIRP 自主生活心跳（DB v77）
+    autonomyWorkflowPlans?: AutonomyWorkflowPlanRecord[]; // 角色自主生活工作流的可查看记录（DB v79）
     vrPostOffice?: Record<string, string>;     // 邮局本机配置：身份 deviceId / 后端地址（存 localStorage）
     vrSignal?: Record<string, string>;         // 信号坠落处本机记录：句子归属「你·角色」+ 反复用清单（存 localStorage）
     worldHomeLocal?: Record<string, string>;   // 家园本机配置：全局 API + 文风收藏（存 localStorage）

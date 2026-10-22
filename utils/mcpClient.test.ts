@@ -213,11 +213,13 @@ describe('buildMcpOpenAITools', () => {
         const b = mkServer({ name: 'BBB' });
         saveMcpServers([a, b]);
         const { tools, resolve } = buildMcpOpenAITools();
-        expect(tools.map(t => t.function.name)).toEqual(['search', 'BBB_search']);
+        // 输出数组按暴露名排序（C8：同一集合不因配置/发现顺序抖动），
+        // 所以这里比较集合，不比较下标顺序。
+        expect(new Set(tools.map(t => t.function.name))).toEqual(new Set(['search', 'BBB_search']));
         expect(resolve.get('search')!.server.id).toBe(a.id);
         expect(resolve.get('BBB_search')!.server.id).toBe(b.id);
         // 多服务器时描述里带来源，帮模型区分
-        expect(tools[0].function.description).toContain('[AAA]');
+        expect(tools.find(t => t.function.name === 'search')!.function.description).toContain('[AAA]');
     });
 
     it('未启用 / 未发现工具的服务器不注入', () => {
@@ -229,11 +231,14 @@ describe('buildMcpOpenAITools', () => {
         const common = mkServer({ name: '通用', tools: [{ name: 'web_search' }] });
         const bound = mkServer({ name: '记忆库', charIds: ['char_a'], tools: [{ name: 'breath' }] });
         saveMcpServers([common, bound]);
-        expect(buildMcpOpenAITools('char_a').tools.map(t => t.function.name)).toEqual(['web_search', 'breath']);
+        // 顺序按暴露名排序，不按配置顺序；断言集合 + 按名字取回。
+        expect(new Set(buildMcpOpenAITools('char_a').tools.map(t => t.function.name)))
+            .toEqual(new Set(['web_search', 'breath']));
         expect(buildMcpOpenAITools('char_b').tools.map(t => t.function.name)).toEqual(['web_search']);
         // 单服务器可见时描述不带 [来源] 前缀（multi 按角色可见数算）
         expect(buildMcpOpenAITools('char_b').tools[0].function.description).not.toContain('[通用]');
-        expect(buildMcpOpenAITools('char_a').tools[0].function.description).toContain('[通用]');
+        expect(buildMcpOpenAITools('char_a').tools.find(t => t.function.name === 'web_search')!
+            .function.description).toContain('[通用]');
     });
 });
 

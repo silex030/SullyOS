@@ -3,6 +3,8 @@ import {
   applyAutonomyLevel,
   isCapabilityEnabled,
   selectCapabilities,
+  selectCapabilityPolicy,
+  setCapabilityMode,
   toggleCapability,
   formatAirpEventTime,
   formatAirpEventRow,
@@ -10,9 +12,13 @@ import {
   AIRP_RISK_LABELS,
 } from '../../components/character/AirpPanel';
 import { AIRP_CAPABILITIES } from '../../utils/airp/capabilityCatalog';
-import { mergeAirpSettings, type AirpSettings } from '../../utils/airp/settings';
+import { mergeAirpSettings, type AirpCapabilityPolicy, type AirpSettings } from '../../utils/airp/settings';
 
 const ALL_IDS = ['a', 'b', 'c'];
+
+const ALL_POLICY: AirpCapabilityPolicy = { mode: 'all', allow: [] };
+const NONE_POLICY: AirpCapabilityPolicy = { mode: 'none', allow: [] };
+const allow = (...ids: string[]): AirpCapabilityPolicy => ({ mode: 'allowlist', allow: ids });
 
 const FULL: AirpSettings = {
   enabled: true,
@@ -91,65 +97,107 @@ describe('applyAutonomyLevel（换档位只动 autonomyLevel，别的 airp 字�
   });
 });
 
-describe('isCapabilityEnabled（空白名单 = 全部能力可用，与运行时归并同口径）', () => {
-  it('空数组对任何 id 都为真', () => {
-    expect(isCapabilityEnabled([], 'a')).toBe(true);
-    expect(isCapabilityEnabled([], 'not-in-catalog')).toBe(true);
+describe('isCapabilityEnabled（按显式 all / allowlist / none 判定勾选态）', () => {
+  it('all 对任何 id 都为真（含目录外 id）', () => {
+    expect(isCapabilityEnabled(ALL_POLICY, 'a')).toBe(true);
+    expect(isCapabilityEnabled(ALL_POLICY, 'not-in-catalog')).toBe(true);
   });
 
-  it('非空白名单按 id 精确匹配', () => {
-    expect(isCapabilityEnabled(['a', 'b'], 'a')).toBe(true);
-    expect(isCapabilityEnabled(['a', 'b'], 'c')).toBe(false);
+  it('allowlist 按 id 精确匹配', () => {
+    expect(isCapabilityEnabled(allow('a', 'b'), 'a')).toBe(true);
+    expect(isCapabilityEnabled(allow('a', 'b'), 'c')).toBe(false);
+  });
+
+  it('none 对任何 id 都为假，残留 allow 不许复活', () => {
+    expect(isCapabilityEnabled(NONE_POLICY, 'a')).toBe(false);
+    expect(isCapabilityEnabled({ mode: 'none', allow: ['a'] }, 'a')).toBe(false);
   });
 });
 
-describe('toggleCapability（勾选 = 显式白名单；勾满收敛回空 = 全部可用）', () => {
-  it('从空（全可用）取消一项 → 显式列出其余项', () => {
-    expect(toggleCapability([], 'b', ALL_IDS)).toEqual(['a', 'c']);
+describe('toggleCapability（勾选 = 显式白名单；勾满 = all，清空 = none）', () => {
+  it('从 all 取消一项 → allowlist 列出其余项', () => {
+    expect(toggleCapability(ALL_POLICY, 'b', ALL_IDS)).toEqual(allow('a', 'c'));
   });
 
-  it('把刚才取消的项勾回来 → 收敛回空数组（全部可用）', () => {
-    expect(toggleCapability(['a', 'c'], 'b', ALL_IDS)).toEqual([]);
+  it('把刚才取消的项勾回来 → 回到 all', () => {
+    expect(toggleCapability(allow('a', 'c'), 'b', ALL_IDS)).toEqual(ALL_POLICY);
   });
 
-  it('显式白名单里取消一项 → 只删该项', () => {
-    expect(toggleCapability(['a', 'b'], 'a', ALL_IDS)).toEqual(['b']);
+  it('allowlist 里取消一项 → 只删该项', () => {
+    expect(toggleCapability(allow('a', 'b'), 'a', ALL_IDS)).toEqual(allow('b'));
   });
 
-  it('显式白名单里补上最后缺的一项 → 收敛回空数组', () => {
-    expect(toggleCapability(['b', 'c'], 'a', ALL_IDS)).toEqual([]);
+  it('allowlist 里补上最后缺的一项 → 回到 all', () => {
+    expect(toggleCapability(allow('b', 'c'), 'a', ALL_IDS)).toEqual(ALL_POLICY);
+  });
+
+  it('从 none 勾上一个 → allowlist 只有它（不是 all）', () => {
+    expect(toggleCapability(NONE_POLICY, 'a', ALL_IDS)).toEqual(allow('a'));
+  });
+
+  it('allowlist 取消最后一项 → none，不许悄悄变回 all', () => {
+    expect(toggleCapability(allow('a'), 'a', ALL_IDS)).toEqual(NONE_POLICY);
   });
 
   it('不修改入参（纯函数）', () => {
-    const ids = ['a'];
-    toggleCapability(ids, 'b', ALL_IDS);
-    expect(ids).toEqual(['a']);
+    const policy = allow('a');
+    toggleCapability(policy, 'b', ALL_IDS);
+    expect(policy).toEqual(allow('a'));
   });
 
   it('白名单里混进目录外 id 时，不会误判为「勾满」而丢配置', () => {
-    expect(toggleCapability(['ghost'], 'a', ALL_IDS)).toEqual(['ghost', 'a']);
+    expect(toggleCapability(allow('ghost'), 'a', ALL_IDS)).toEqual(allow('ghost', 'a'));
   });
 
-  it('在空态勾选目录外 id：目录内仍全勾，不产生多余项', () => {
-    expect(toggleCapability([], 'ghost', ALL_IDS)).toEqual(['a', 'b', 'c', 'ghost']);
+  it('all 态点目录外 id：有效集合不变，仍是 all', () => {
+    expect(toggleCapability(ALL_POLICY, 'ghost', ALL_IDS)).toEqual(ALL_POLICY);
   });
 });
 
-describe('selectCapabilities（面板读白名单：损坏 / 导入的非数组值不炸渲染）', () => {
-  it('字符串数组原样透传', () => {
-    expect(selectCapabilities({ capabilities: ['a', 'b'] })).toEqual(['a', 'b']);
+describe('setCapabilityMode（面板上的「全部允许 / 全部禁止」）', () => {
+  it('切到 all 直接清空白名单', () => {
+    expect(setCapabilityMode(allow('a'), 'all', ALL_IDS)).toEqual(ALL_POLICY);
   });
 
-  it('非数组脏值（字符串 / 数字 / null / undefined）→ []', () => {
-    expect(selectCapabilities({ capabilities: 'oops' })).toEqual([]);
-    expect(selectCapabilities({ capabilities: 42 })).toEqual([]);
-    expect(selectCapabilities({ capabilities: null })).toEqual([]);
-    expect(selectCapabilities(undefined)).toEqual([]);
+  it('切到 none 直接禁用全部，且不保留任何 id', () => {
+    expect(setCapabilityMode(ALL_POLICY, 'none', ALL_IDS)).toEqual(NONE_POLICY);
+  });
+
+  it('切到 allowlist 时沿用当前有效集合（从 all 就是全勾）', () => {
+    expect(setCapabilityMode(ALL_POLICY, 'allowlist', ALL_IDS)).toEqual(allow('a', 'b', 'c'));
+  });
+
+  it('从 none 切到 allowlist 仍是 none（空 allowlist 不等于全开）', () => {
+    expect(setCapabilityMode(NONE_POLICY, 'allowlist', ALL_IDS)).toEqual(NONE_POLICY);
+  });
+});
+
+describe('selectCapabilities / selectCapabilityPolicy（面板读权限：损坏 / 导入的非数组值不炸渲染）', () => {
+  it('旧字符串数组读成 allowlist，内容原样透传', () => {
+    expect(selectCapabilities({ capabilities: ['a', 'b'] })).toEqual(['a', 'b']);
+    expect(selectCapabilityPolicy({ capabilities: ['a', 'b'] })).toEqual(allow('a', 'b'));
+  });
+
+  it('旧空数组读成 all（迁移保留原语义）', () => {
+    expect(selectCapabilityPolicy({ capabilities: [] })).toEqual(ALL_POLICY);
+    expect(selectCapabilityPolicy(undefined)).toEqual(ALL_POLICY);
+  });
+
+  it('显式 none 读成 none', () => {
+    expect(selectCapabilityPolicy({ capabilityMode: 'none', capabilities: [] })).toEqual(NONE_POLICY);
+  });
+
+  it('非数组脏值（字符串 / 数字 / null / undefined）→ 空列表 + all（不炸渲染）', () => {
+    for (const raw of [{ capabilities: 'oops' }, { capabilities: 42 }, { capabilities: null }, undefined]) {
+      expect(selectCapabilities(raw)).toEqual([]);
+      expect(selectCapabilityPolicy(raw)).toEqual(ALL_POLICY);
+    }
   });
 
   it('与 mergeAirpSettings 同口径（归并等价）', () => {
     for (const raw of [{ capabilities: ['a', 5, 'b'] }, { capabilities: {} }, 'junk', null, undefined]) {
       expect(selectCapabilities(raw)).toEqual(mergeAirpSettings(raw).capabilities);
+      expect(selectCapabilityPolicy(raw).allow).toEqual(mergeAirpSettings(raw).capabilities);
     }
   });
 });

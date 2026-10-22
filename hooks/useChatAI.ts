@@ -3,6 +3,7 @@ import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, GroupProf
 import { DB } from '../utils/db';
 import { ChatPrompts } from '../utils/chatPrompts';
 import { safeFetchJson, safeResponseJson } from '../utils/safeApi';
+import { observeFinalChatRequest } from '../utils/requestPrefixObserver';
 import { KeepAlive } from '../utils/keepAlive';
 import { ContextBuilder } from '../utils/context';
 import { ChatParser } from '../utils/chatParser';
@@ -51,6 +52,13 @@ import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatRead
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOLS, AMSG2_TOOL_NAMES, createAmsg2ToolSession, executeAmsg2Tool, isAmsg2GlobalReady } from '../utils/amsg2ToolBridge';
+import { mergeAutonomySettings } from '../utils/airp/autonomySettings';
+import { chatLifeWorkflowAvailability } from '../utils/airp/chatLifeWorkflow';
+import {
+    CHAT_LIFE_WORKFLOW_TOOLS,
+    CHAT_LIFE_WORKFLOW_TOOL_NAMES,
+    executeChatLifeWorkflowTool,
+} from '../utils/airp/chatLifeWorkflowClient';
 import { bleEngine } from '../utils/bleEngine';
 import { BT_TOOL_NAMES, BT_TOOLS, executeBleSendCommand } from '../utils/bleToolBridge';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
@@ -1199,6 +1207,23 @@ export const useChatAI = ({
             // 这里不需要额外判断（下面的 Instant Push 分支只为历史配置兜底保留）。
             let amsg2ExpiredIds: string[] = [];
             let amsg2Notices: Amsg2ExpiredNoticeRecord[] = [];
+            // P5 生活工作流：角色可以在正常聊天里顺带提一条「之后想为自己做的小事」。
+            //
+            // 注入条件是**设置终值**（自主开着 + 写入总闸开着 + 至少一类白名单动作被放行），
+            // 与后台调度/到点执行读的是同一份权限代理；模型说的话不参与这个判定。
+            // 工具本身不带正文、不带网址/工具名/权限字段——正文由后台那次独立请求生成。
+            // sourceRef 锚在**这一轮真实用户消息 id** 上（不是时间戳）：服务端据此去重/溯源，
+            // 「这条计划是哪句话引出的」才追得回来。拿不到 id 才退回时间戳（旧消息/导入数据）。
+            const latestUserMsgRef = [...contextMsgs].reverse()
+                .find((m) => m.role === 'user' && typeof (m as { id?: unknown }).id === 'number') as { id?: number } | undefined;
+            const lifeWorkflowSourceRef = latestUserMsgRef?.id != null
+                ? `chat:${char.id}:m${latestUserMsgRef.id}`
+                : `chat:${char.id}:t${Date.now().toString(36)}`;
+            const chatLifeWorkflowToolsInjected = chatLifeWorkflowAvailability(mergeAutonomySettings(char)).allowed;
+            if (chatLifeWorkflowToolsInjected) {
+                baseReqBody.tools = [...(baseReqBody.tools || []), ...CHAT_LIFE_WORKFLOW_TOOLS];
+                if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
+            }
             if (amsg2ToolsInjected) {
                 baseReqBody.tools = [...(baseReqBody.tools || []), ...AMSG2_TOOLS];
                 if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
@@ -1460,7 +1485,7 @@ export const useChatAI = ({
                 spendLlmCall();
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                     method: 'POST', headers, signal: turnSignal,
-                    body: JSON.stringify({ ...baseReqBody, messages: withAmsg2TaskContext(baseReqBody.messages) })
+                    body: JSON.stringify(observeFinalChatRequest(char.id, baseUrl, { ...baseReqBody, messages: withAmsg2TaskContext(baseReqBody.messages) }))
                 }, 2, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: '聊天回复' }, streamHooks);
             } catch (e) {
                 let requestError: unknown = e;
@@ -1479,7 +1504,7 @@ export const useChatAI = ({
                         spendLlmCall();
                         data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                             method: 'POST', headers, signal: turnSignal,
-                            body: JSON.stringify(buildClaudeProxyCompatibilityBody(attemptedBody)),
+                            body: JSON.stringify(observeFinalChatRequest(char.id, `${baseUrl}:claude-compat`, buildClaudeProxyCompatibilityBody(attemptedBody))),
                         }, 0, 0, { appName: '消息', charId: char.id, charName: char.name, purpose: 'Claude 中转兼容重试' }, streamHooks);
                         requestError = null;
                     } catch (compatError) {
@@ -1503,6 +1528,14 @@ export const useChatAI = ({
                     ...baseReqBody,
                     messages: withAmsg2TaskContext(baseReqBody.messages),
                 });
+                // 这条路把 tools 全删了，生活工作流工具也不在：明确告诉模型这一轮没有可用工具，
+                // 不要声称「已经记下/撤销」。宁可它不提，也不能让它用正文假装登记成功。
+                if (chatLifeWorkflowToolsInjected) {
+                    fallbackBody.messages = [
+                        ...(fallbackBody.messages || []),
+                        { role: 'system', content: '这一轮没有可用工具：不要声称已经记下或撤销任何安排。' },
+                    ];
+                }
                 spendLlmCall();
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
                     method: 'POST', headers, signal: turnSignal,
@@ -1762,7 +1795,7 @@ export const useChatAI = ({
             //       createOrder 被拦截 —— 下单付款必须用户在结账卡上点。
             //     · 通用 MCP: 工具名命中 mcpToolResolve 映射就分发给对应服务器 (utils/mcpClient),
             //       结果只回填循环不落卡片。两类工具可同时在场, 按名字各走各的。
-            if ((payload.flags.luckinChatActive || mcpToolResolve || amsg2ToolsInjected || btToolsInjected) && data.choices?.[0]?.message?.tool_calls?.length) {
+            if ((payload.flags.luckinChatActive || mcpToolResolve || amsg2ToolsInjected || btToolsInjected || chatLifeWorkflowToolsInjected) && data.choices?.[0]?.message?.tool_calls?.length) {
                 // 每轮工具轮数上限：优先用户设置；接通用 MCP 时取两者较大值，保证 master 侧 12 轮预算。
                 const MAX_LOOPS = mcpToolResolve ? Math.max(mcpSettings.maxToolLoops, MCP_CHAT_MAX_TOOL_LOOPS) : mcpSettings.maxToolLoops;
                 // 懒加载展开重填（二次请求）的预算：与主循环共享 maxToolLoops 上限，防死循环
@@ -1918,6 +1951,24 @@ export const useChatAI = ({
                         // 主动消息 2.0 工具
                         if (AMSG2_TOOL_NAMES.has(fname)) {
                             await runAmsg2ToolCall(tc, fname, args, loopMessages);
+                            continue;
+                        }
+                        // 生活工作流提议（P5）：一次鉴权登记请求，回话只说「后台已排队」。
+                        // 失败/被拒都在工具回话里收口，不抛、不重试、不影响这一轮回复。
+                        if (CHAT_LIFE_WORKFLOW_TOOL_NAMES.has(fname)) {
+                            try {
+                                const lifeText = await executeChatLifeWorkflowTool(args, {
+                                    charId: char.id,
+                                    sourceRef: lifeWorkflowSourceRef,
+                                });
+                                loopMessages.push(buildToolResultMessage(tc, lifeText) as any);
+                            } catch (e) {
+                                console.warn('[life-workflow] 工具执行异常（不影响本轮回复）', e);
+                                loopMessages.push(buildToolResultMessage(
+                                    tc,
+                                    '这一次没有登记成功。不要向对方提起这件事，也不要重试，继续正常聊天。',
+                                ) as any);
+                            }
                             continue;
                         }
                         // 蓝牙外设工具

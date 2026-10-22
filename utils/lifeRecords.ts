@@ -373,12 +373,30 @@ const MEDICAL_TONE_GUIDE = `**关于健康话题的分寸**：
   - 你判断真的不对劲：不许打马虎眼糊弄过去。镇定地、包容地、用符合你人设的口吻明确提醒对方重视或就医。语气可以有人设，判断不能有水分。
 - 若你本身是 AI / 机器人设定，无需装作不懂，按你的设定自然发挥。`;
 
+/** 生活记录注入的两段：固定说明进稳定前缀，实时摘要进易变尾段（C7）。 */
+export interface LifeRecordPromptParts {
+    /** 固定的用途说明 / 医疗分寸 / 代记纪律：变化极慢，可长期复用。 */
+    stable: string;
+    /** 今日用药、收支、锻炼、生理期第 N 天等实时摘要 + 一次性否决反馈：每轮都可能变。 */
+    dynamic: string;
+}
+
+interface LifeRecordChunks {
+    header: string;
+    data: string;
+    firePackNote: string;
+    medical: string;
+    tools: string;
+    feedback: string;
+    hasContent: boolean;
+}
+
 /**
- * 构建「生活记录」system prompt section。
- * 总开关关闭返回 ''（连指令说明都不给角色看）。
+ * 内部：把生活记录拆成固定块 / 动态块。
+ * 总开关关闭、或没有任何启用的模块时 hasContent=false（连指令说明都不给角色看）。
  * 会顺带取走该角色名下的否决反馈（注入一次后清除 pendingFeedback）。
  */
-export const buildLifeRecordInjection = async (
+const buildLifeRecordChunks = async (
     char: CharacterProfile,
     userName: string,
     // forFirePack = 这份注入是给主动消息打包的（模板提前打好、到点才渲染）。摘要数据照给，
@@ -387,16 +405,17 @@ export const buildLifeRecordInjection = async (
     //  - 否决反馈：这段是注入即消费的（读完就把 pendingFeedback 清掉）。打包时读一次，
     //    用户下次真正聊天时就看不到了——那句「我理解错了」永远没人说出口。
     opts: { forFirePack: boolean },
-): Promise<string> => {
+): Promise<LifeRecordChunks> => {
+    const empty: LifeRecordChunks = { header: '', data: '', firePackNote: '', medical: '', tools: '', feedback: '', hasContent: false };
     const forFirePack = opts.forFirePack;
-    if (!isLifeRecordOn(char)) return '';
+    if (!isLifeRecordOn(char)) return empty;
     const today = lifeToday();
 
     // 全局隐藏优先级高于角色小开关：隐藏的模块数据、指令说明、医疗引导一律不注入
     const settings = await DB.getLifeRecordSettings().catch(() => null);
     const hidden = getHiddenLifeModules(settings);
     const moduleActive = (m: LifeRecordModule) => isLifeModuleOn(char, m) && !hidden.has(m);
-    if (!(['period', 'med', 'expense', 'exercise', 'order'] as LifeRecordModule[]).some(moduleActive)) return '';
+    if (!(['period', 'med', 'expense', 'exercise', 'order'] as LifeRecordModule[]).some(moduleActive)) return empty;
 
     const [records, plans, txs] = await Promise.all([
         DB.getAllLifeRecords().catch(() => [] as LifeRecord[]),
@@ -404,8 +423,9 @@ export const buildLifeRecordInjection = async (
         moduleActive('expense') ? DB.getAllTransactions().catch(() => [] as BankTransaction[]) : Promise.resolve([] as BankTransaction[]),
     ]);
 
-    let s = `\n### ${userName} 的生活记录（潜意识背景）\n`;
-    s += `以下是 ${userName} 的近期生活状态。这些信息沉淀在你的潜意识里，是你理解 TA 的身体、情绪与状态的背景依据——**不要主动点破、不要逐条复述、不要表现得像在看报表**。只在自然的时机让关心自然流露（例如 TA 说累了，而你"隐约记得"TA 正处在生理期第 2 天）。\n\n`;
+    // 固定说明：用途框定（不含任何实时读数）。
+    let header = `\n### ${userName} 的生活记录（潜意识背景）\n`;
+    header += `这次上下文里带着 ${userName} 的近期生活状态。这些信息沉淀在你的潜意识里，是你理解 TA 的身体、情绪与状态的背景依据——**不要主动点破、不要逐条复述、不要表现得像在看报表**。只在自然的时机让关心自然流露（例如 TA 说累了，而你"隐约记得"TA 正处在生理期第 2 天）。\n\n`;
 
     // fire_pack 里一律写绝对日期：这份摘要是打包那一刻存下来的，到点渲染时可能已经隔了
     // 几小时甚至几天，「今日待服」「第 N 天」那种说法会被角色照着念成过时的事实。
@@ -414,14 +434,17 @@ export const buildLifeRecordInjection = async (
     if (moduleActive('med')) dataLines.push(buildMedSummary(plans, records, today, forFirePack));
     if (moduleActive('expense')) dataLines.push(buildExpenseSummary(txs, today, forFirePack));
     if (moduleActive('exercise')) dataLines.push(buildExerciseSummary(records, settings, today, forFirePack));
-    s += `${dataLines.join('\n')}\n`;
+    // 实时摘要：日期口径的状态（今日已练 / 第 N 天 / 本周支出）每天甚至每小时都会变。
+    const data = `${dataLines.join('\n')}\n`;
+    let firePackNote = '';
     if (forFirePack) {
-        s += `\n（以上记录截至 ${fmtCN(today)}。请对照当前时间自行判断这些事离现在有多久，不要默认它们就发生在今天。）\n`;
+        firePackNote = `\n（以上记录截至 ${fmtCN(today)}。请对照当前时间自行判断这些事离现在有多久，不要默认它们就发生在今天。）\n`;
     }
-    s += '\n';
 
+    // 医疗分寸：固定引导文案。
+    let medical = '';
     if (moduleActive('period') || moduleActive('med')) {
-        s += `${MEDICAL_TONE_GUIDE}\n\n`;
+        medical = `${MEDICAL_TONE_GUIDE}\n\n`;
     }
 
     // 代记指令说明（按小开关裁剪；关掉的模块连用法都不教）
@@ -437,25 +460,68 @@ export const buildLifeRecordInjection = async (
     if (moduleActive('order') && !forFirePack) {
         tools.push(`- 你想主动给 ${userName} 点外卖（只限 TA 提过想吃 / 你们正在聊的食物） → \`[[LIFE:ORDER|店名|商品×数量;商品×数量|金额|备注]]\`（金额纯数字，从你的默认银行卡代扣（扣你的钱）；没办卡或余额不足时不要输出指令；一天最多一单）`);
     }
+    let toolBlock = '';
     if (tools.length > 0 && !forFirePack) {
-        s += `**代记工具**：只有当 ${userName} 在对话中**明确说出**以下事实时，才单独起一行输出对应指令、帮 TA 顺手记一笔（一次一条）：\n${tools.join('\n')}\n`;
-        s += `TA 只是暗示、开玩笑、或在说过去 / 别人的事时，一律不要记录。记录成功后系统会插入一张卡片，TA 可以确认或否决；被否决说明你理解错了。平时不要把这些指令挂在嘴边，也不要替 TA 补记你只是猜测的事。\n`;
-        s += `**一件事只记一次**：上面摘要里已经出现的状态（如「生理期第 N 天」「今日已练」「✓已服」、已列出的支出）都说明这件事**已经记过了**——不要再输出指令重复记，也不要因为翻到 TA 之前提过这件事就补记。聊天记录里出现过的 [生活记录：…] 卡片就是你之前记的。只有 TA 明确说**又**发生了新的一次（比如「晚上又跑了一次」），才再记一条。\n`;
+        toolBlock += `**代记工具**：只有当 ${userName} 在对话中**明确说出**以下事实时，才单独起一行输出对应指令、帮 TA 顺手记一笔（一次一条）：\n${tools.join('\n')}\n`;
+        toolBlock += `TA 只是暗示、开玩笑、或在说过去 / 别人的事时，一律不要记录。记录成功后系统会插入一张卡片，TA 可以确认或否决；被否决说明你理解错了。平时不要把这些指令挂在嘴边，也不要替 TA 补记你只是猜测的事。\n`;
+        toolBlock += `**一件事只记一次**：生活状态摘要里已经出现的状态（如「生理期第 N 天」「今日已练」「✓已服」、已列出的支出）都说明这件事**已经记过了**——不要再输出指令重复记，也不要因为翻到 TA 之前提过这件事就补记。聊天记录里出现过的 [生活记录：…] 卡片就是你之前记的。只有 TA 明确说**又**发生了新的一次（比如「晚上又跑了一次」），才再记一条。\n`;
     }
 
-    // 否决反馈（一次性）：上次代记被用户否决 → 告诉角色它弄错了，注入后即清除
+    // 否决反馈（一次性）：上次代记被用户否决 → 告诉角色它弄错了，注入后即清除。
+    // 属于「本轮才知道」的反馈，归动态段（不烤进稳定前缀）。
+    let feedback = '';
     const pendingFb = forFirePack
         ? []
         : records.filter(r => r.recordedBy === char.id && r.reviewStatus === 'rejected' && r.pendingFeedback);
     if (pendingFb.length > 0) {
-        s += `\n**【记录反馈】**你之前帮 ${userName} 记的这些被 TA **否决**了——你理解错了，这些事并没有发生（记录已撤销）：\n`;
-        pendingFb.forEach(r => { s += `- ${summarizeLifeRecord(r.module, r.kind, r.payload)}（${fmtCN(r.date)}）\n`; });
-        s += `修正你的认知，接下来视语境自然地认个错或带过即可，不要长篇道歉。\n`;
+        feedback += `\n**【记录反馈】**你之前帮 ${userName} 记的这些被 TA **否决**了——你理解错了，这些事并没有发生（记录已撤销）：\n`;
+        pendingFb.forEach(r => { feedback += `- ${summarizeLifeRecord(r.module, r.kind, r.payload)}（${fmtCN(r.date)}）\n`; });
+        feedback += `修正你的认知，接下来视语境自然地认个错或带过即可，不要长篇道歉。\n`;
         // 注入即消费：失败也不重试（下轮还会再取到就重复念叨，宁可丢）
         pendingFb.forEach(r => { DB.saveLifeRecord({ ...r, pendingFeedback: false }).catch(() => {}); });
     }
 
-    return s;
+    return { header, data, firePackNote, medical, tools: toolBlock, feedback, hasContent: true };
+};
+
+/**
+ * 拆分版注入（C7）：固定说明进稳定前缀，实时摘要进易变尾段。
+ * 调用方（chatPrompts）负责把 stable 放 system 首条、dynamic 放历史之后的系统段。
+ * 两段为空串时表示整块不注入，调用方直接跳过即可。
+ */
+export const buildLifeRecordPromptParts = async (
+    char: CharacterProfile,
+    userName: string,
+    opts: { forFirePack: boolean },
+): Promise<LifeRecordPromptParts> => {
+    const chunks = await buildLifeRecordChunks(char, userName, opts);
+    if (!chunks.hasContent) return { stable: '', dynamic: '' };
+    return {
+        stable: chunks.header + chunks.medical + chunks.tools,
+        dynamic: chunks.data + chunks.firePackNote + chunks.feedback,
+    };
+};
+
+/**
+ * 旧接口（保留给既有调用方 / 测试）：按原顺序拼成一整块。
+ * 新代码请用 buildLifeRecordPromptParts —— 整块塞进稳定前缀会让「今日已练 / 第 N 天」
+ * 这类每天变的摘要每轮打断前缀复用。
+ */
+export const buildLifeRecordInjection = async (
+    char: CharacterProfile,
+    userName: string,
+    opts: { forFirePack: boolean },
+): Promise<string> => {
+    const chunks = await buildLifeRecordChunks(char, userName, opts);
+    if (!chunks.hasContent) return '';
+    // 与拆分前逐字一致：header → 摘要 → fire_pack 说明 → 医疗分寸 → 代记说明 → 否决反馈
+    return chunks.header
+        + chunks.data
+        + chunks.firePackNote
+        + '\n'
+        + chunks.medical
+        + chunks.tools
+        + chunks.feedback;
 };
 
 // ═══════════════════════════════════════════════════════════

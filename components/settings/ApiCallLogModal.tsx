@@ -20,6 +20,7 @@ import type {
     PromptBlockStat,
 } from '../../utils/apiCallLog';
 import { shareOrDownloadFile } from '../../utils/shareExport';
+import { describeCacheTotal, describeEntryCache } from './apiCallLogCacheView';
 
 interface ApiCallLogModalProps {
     isOpen: boolean;
@@ -214,6 +215,24 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                 );
             })()}
 
+            {/* 缓存汇总只覆盖「供应商真的报了缓存」的那部分记录；缺值的记录不进分母，
+                也绝不按 0 计——否则看起来像缓存完全没命中。 */}
+            {entries.length > 0 && (() => {
+                const cache = describeCacheTotal(entries);
+                return (
+                    <div className="mb-3 -mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1 px-1 text-[10px] text-slate-400">
+                        <span>缓存命中 <b className="font-semibold text-slate-600">{cache.hitTokens}</b></span>
+                        <span>命中率 <b className="font-semibold text-slate-600">{cache.hitRate}</b></span>
+                        <span className="text-slate-300">
+                            缓存读数覆盖 {cache.coverage} 条 · 命中率分母覆盖 {cache.rateCoverage} 条
+                        </span>
+                        {cache.hitRate === '未提供' && (
+                            <span className="text-slate-300">缺输入 Token 或缓存字段的记录不参与计算，不按 0 计</span>
+                        )}
+                    </div>
+                );
+            })()}
+
             {loading ? (
                 <div className="py-10 text-center text-sm text-slate-400">加载中…</div>
             ) : entries.length === 0 ? (
@@ -302,6 +321,25 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                                             </span>
                                         </div>
                                     )}
+                                    {/* 缓存读数：缺字段一律「未提供」，不写 0；命中率只认
+                                        cachedTokens（prompt 子集）语义，Anthropic 式缓存读/写单独列 */}
+                                    {(() => {
+                                        const cache = describeEntryCache(e);
+                                        return (
+                                            <div className="col-span-2 flex items-baseline gap-1.5 min-w-0">
+                                                <span className="text-[10px] text-slate-400 shrink-0">缓存</span>
+                                                {cache.hasAny ? (
+                                                    <span className="text-slate-600 break-all">
+                                                        命中 {cache.hitTokens}
+                                                        <span className="text-slate-400"> · 命中率 {cache.hitRate}</span>
+                                                        <span className="text-slate-400"> · 读 {cache.readTokens} · 写 {cache.writeTokens}</span>
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-slate-400">未提供（这次响应没有缓存字段）</span>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
                                 </div>
                                 {hasBreakdown && (
                                     <div className="mt-1.5 text-[10px] text-slate-300 select-none">
@@ -425,6 +463,15 @@ const OneShotCapturePanel: React.FC<{
                     : capture.usageStatus == null
                         ? '旧记录未采集'
                         : '接口未返回';
+    const captureCache = useMemo(
+        () => describeEntryCache({
+            promptTokens: capture?.promptTokens,
+            cachedTokens: capture?.cachedTokens,
+            cacheReadTokens: capture?.cacheReadTokens,
+            cacheWriteTokens: capture?.cacheWriteTokens,
+        }),
+        [capture],
+    );
     const fixedSections = useMemo(
         () => capture?.sections.filter(section => section.kind === 'system') || [],
         [capture],
@@ -561,6 +608,13 @@ const OneShotCapturePanel: React.FC<{
                             </div>
                             <div className="mt-2 border-t border-emerald-100/70 pt-2 text-[9px] leading-relaxed text-slate-400">
                                 辅助计数：请求 JSON {fmt(capture.totalChars)} 字符（非 Token） · {capture.messageCount} 条消息 · {capture.sections.length} 个分区
+                            </div>
+                            {/* 缓存读数与列表用同一口径：缺值「未提供」，命中率只认 cachedTokens */}
+                            <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[9px] text-slate-400">
+                                <span>缓存命中 <b className="font-semibold text-slate-600">{captureCache.hitTokens}</b></span>
+                                <span>命中率 <b className="font-semibold text-slate-600">{captureCache.hitRate}</b></span>
+                                <span>缓存读 {captureCache.readTokens}</span>
+                                <span>缓存写 {captureCache.writeTokens}</span>
                             </div>
                         </div>
 

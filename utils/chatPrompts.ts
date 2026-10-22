@@ -18,7 +18,7 @@ import { getElevenLabsModel, getTtsProvider, getVoicePromptOverride, isGenieVoic
 import { isElevenLabsV3Model } from './elevenLabsTts';
 import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
-import { buildLifeRecordInjection } from './lifeRecords';
+import { buildLifeRecordPromptParts, type LifeRecordPromptParts } from './lifeRecords';
 import { isWorkerReachableUrl } from './amsgToolPack';
 import { isPerspectiveEnabled } from './perspective';
 import { isAmsg2EnabledForChar } from './amsg2Tasks';
@@ -26,6 +26,8 @@ import { getCharNameById } from './charNameRegistry';
 import { getLocalDateKey } from './localDate';
 import { getUpcomingAnniversaries } from './anniversaryEngine';
 import { getDailyScheduleForChar } from './dailySchedule';
+import { buildChatPerceptionSnapshot } from './airp/perceptionPrompt';
+import { buildPendingPlansBlock } from './airp/pendingPlansPrompt';
 import { formatRelativeAge } from './groupChat/relativeTime';
 import { isBlobRef } from './blobRef';
 import { BILIBILI_FRAME_COUNT } from './bilibiliCard';
@@ -699,13 +701,17 @@ ${groupLogStr}\n`;
             }
         })();
 
-        // 7. 生活记录（档案 App）注入 — 总开关关闭时 buildLifeRecordInjection 直接返回 ''
+        // 7. 生活记录（档案 App）注入 —— 拆两段（C7）：
+        //    stable：用途框定 / 医疗分寸 / 代记纪律（固定文案，长期可复用）；
+        //    dynamic：今日用药、收支、锻炼、生理期第 N 天等实时摘要（每天甚至每小时都变）。
+        //    整块留在 stable 会让这几十行摘要每轮打断后面的规则前缀，所以只搬动态部分到尾段。
+        //    总开关关闭时两段都是空串，与旧行为一致（连指令说明都不给）。
         //    fire_pack 只要摘要数据，不要代记工具说明：后台生成时用户没在说话，那时候
         //    输出的 [[LIFE:...]] 只可能是把历史里早就记过的事再记一遍。
-        const lifeRecordPromise: Promise<string> = buildLifeRecordInjection(char, userProfile.name, { forFirePack })
+        const lifeRecordPromise: Promise<LifeRecordPromptParts> = buildLifeRecordPromptParts(char, userProfile.name, { forFirePack })
             .catch(e => {
                 console.error('Failed to inject life record context:', e);
-                return '';
+                return { stable: '', dynamic: '' };
             });
 
         // 8. Google 日程近期摘要（volatile：日程类易变，随轮次变）。
@@ -721,7 +727,7 @@ ${groupLogStr}\n`;
             }
         })();
 
-        const [realtimeText, schedule, groupContextText, notionDiaryText, feishuDiaryText, notionNotesText, lifeRecordText, anniversaryText, scheduleWeather, googleText] =
+        const [realtimeText, schedule, groupContextText, notionDiaryText, feishuDiaryText, notionNotesText, lifeRecordParts, anniversaryText, scheduleWeather, googleText] =
             await Promise.all([
                 timed('realtime', realtimePromise),
                 timed('schedule', schedulePromise),
@@ -736,11 +742,14 @@ ${groupLogStr}\n`;
             ]);
 
         // ── 拼接：易变的进 volatileState，稳定的进 baseSystemPrompt ──
-        // 0a. 时光契约档案（stable：约定与纪念日是长期背景知识，不随轮次变化）
-        if (anniversaryText) {
-            baseSystemPrompt += anniversaryText;
-        }
         volatileState += realtimeText;
+        // 0a. 时光契约档案（volatile）：约定本身是长期背景，但这一段输出的是相对倒计时
+        //     （「就是今天」「3 天后」）与未来 7 天窗口 —— 每天、以及有新约定进窗时都会变。
+        //     放 stable 等于每天把后面的全部规则与历史前缀作废一次（C7）。
+        //     信息一条不少，只是移到历史之后的状态段里。
+        if (anniversaryText) {
+            volatileState += anniversaryText;
+        }
 
         // 2a. 日程注入（完整今日日程 + 当前时段 + 意识流独白，每轮都可能变）
         //     fire_pack 不烤：改由 worker 到点用 AMSG_SLOT_SCENE 现挑时段（见 amsgFireScene）。
@@ -771,6 +780,60 @@ ${groupLogStr}\n`;
 
         // 2c. Google 日程近期摘要（易变，随轮次变 → volatileState；stable 不落）。
         if (googleText) volatileState += googleText;
+
+        // 2d. P4/L2 感知小快照：只用**上面已经取到的**快照归一，不新增请求/轮询。
+        //
+        //     为什么默认是空的：这一段的前提是「同一件事不许说两遍」。本地这条路里
+        //     天气/热搜已经由 realtimeText 说过、日程与当前槽位已经由日程注入说过、
+        //     用户日程已经由 googleText 说过，所以它们都作为 alreadyRendered 传进去。
+        //     真正会冒出内容的是「现拉失败但缓存还在」这类情形（例如 realtimeText 空、
+        //     而并行的天气读数拿到了）——那时才补一小段，且带认知边界句。
+        //     fire_pack / 即时对话不烤这一段：它们由 worker 到点现取（否则会把打包那一刻
+        //     的天气/日程烤进模板，正是本文件开头警告的「隔天还在祝七夕快乐」）。
+        if (!forFirePack && !timelyByWorker) {
+            try {
+                const perceptionSlot = schedule ? getCurrentSlot(schedule, charNow) : null;
+                const perceptionBlock = buildChatPerceptionSnapshot({
+                    nowMs: Date.now(),
+                    tzId: charTz || 'UTC',
+                    charId: char.id ?? '',
+                    alreadyRendered: [
+                        ...(realtimeText ? (['weather', 'news'] as const) : []),
+                        ...(googleText ? (['calendar'] as const) : []),
+                        ...(schedule ? (['activity'] as const) : []),
+                    ],
+                    enabled: {
+                        weather: config.weatherEnabled === true,
+                        news: config.newsEnabled === true,
+                        calendar: true,
+                        activity: scheduleFeatureOn,
+                    },
+                    weather: scheduleWeather && config.weatherEnabled
+                        ? {
+                            city: scheduleWeather.city,
+                            description: scheduleWeather.description ?? '',
+                            ...(typeof scheduleWeather.temp === 'number' ? { temp: scheduleWeather.temp } : {}),
+                            // 缓存读数的年龄不进快照文案；用当前时刻会让 TTL 判据失去意义，
+                            // 所以按「刚取到」记（fetchWeather 自己按城市缓存 30 分钟）。
+                            observedAt: Date.now(),
+                        }
+                        : null,
+                    news: [],
+                    calendar: [],
+                    activity: perceptionSlot && perceptionSlot.activity
+                        ? {
+                            label: perceptionSlot.activity,
+                            ...(perceptionSlot.startTime ? { startLabel: perceptionSlot.startTime } : {}),
+                            observedAt: Date.now(),
+                        }
+                        : null,
+                });
+                if (perceptionBlock) volatileState += `\n${perceptionBlock}\n`;
+            } catch (e) {
+                // 感知只是锦上添花：它坏了不许拖垮提示词。
+                console.error('Failed to build perception snapshot:', e);
+            }
+        }
 
         // 2b. 音乐氛围（复用同一份 schedule）
         //     - 同步：从 schedule 里算 char 当前"正在听"哪首歌
@@ -818,12 +881,31 @@ ${groupLogStr}\n`;
             console.error('Failed to inject music atmosphere:', e);
         }
 
-        // 群聊背景带时间戳、随群消息实时滚动 → 易变；日记标题/生活记录变化很慢 → 稳定。
+        // 群聊背景带时间戳、随群消息实时滚动 → 易变；日记标题变化很慢 → 稳定。
+        // 生活记录拆两段：固定说明留 stable，实时摘要（今日/第 N 天）进 volatile。
         volatileState += groupContextText;
+        volatileState += lifeRecordParts.dynamic;
+
+        // 2e. 角色自己排着的生活安排（P5 最后一公里）：只读本地既有记录，不新增请求。
+        //
+        //     取消工具要求 planId，而 planId 只在 propose 成功的回执里出现过一次。没有
+        //     这一段，角色下一轮想撤也拿不出编号 —— 工具参数要 id、角色永远拿不到 id。
+        //     数据来自 `airp_workflow_plans`（结果回程与聊天工具回执都写它）；fire_pack
+        //     不烤这一段：后台回合没有工具，排期到点由 worker 自己读计划行。
+        if (!forFirePack && char.id) {
+            try {
+                const pendingPlans = await DB.getWorkflowPlansByChar(char.id, 20);
+                const plansBlock = buildPendingPlansBlock({ plans: pendingPlans, nowMs: Date.now() });
+                if (plansBlock) volatileState += `\n${plansBlock}\n`;
+            } catch (e) {
+                // 少一段说明不影响这一轮回复；别让读库失败拖垮提示词。
+                console.warn('Failed to inject pending life plans:', e);
+            }
+        }
         baseSystemPrompt += notionDiaryText;
         baseSystemPrompt += feishuDiaryText;
         baseSystemPrompt += notionNotesText;
-        baseSystemPrompt += lifeRecordText;
+        baseSystemPrompt += lifeRecordParts.stable;
 
         // 彼方常驻设定：仅对启用了「彼方」的角色注入。让角色在聊天里始终知道彼方是什么，
         // 不再依赖累积的 vr_card 动态 / 记忆总结（那些会被压缩、丢掉"彼方=VR游戏"的框定，

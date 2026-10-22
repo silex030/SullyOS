@@ -14,7 +14,7 @@ import {
   RealtimeConfig,
   UserProfile,
 } from '../types';
-import { getLastRealUserMessageAt } from './amsg2ExpireGuard';
+import { getLastRealUserMessage, getLastRealUserMessageAt } from './amsg2ExpireGuard';
 import { AMSG_BUNDLE_VERSION } from './amsgBundleVersion';
 import { buildTaskInstruction, resolveSendAtMs } from './amsgFireSchedule';
 import {
@@ -583,6 +583,8 @@ const buildTimeGapHint = async (charId: string) => {
     // 满血链路会把它放进 fire_pack，worker 到点用「fire 时刻」重算，不吃排程时的陈旧值。
     // 「真实用户消息」判定与防穿帮闸共用同一叶子 helper（见 amsg2ExpireGuard）。
     lastUserMessageAt: getLastRealUserMessageAt(recentMessages),
+    // 同一条消息的 id：取消待办计划时用来认「这条计划就是回复这一句提的」。
+    lastUserMessageId: getLastRealUserMessage(recentMessages)?.id ?? null,
     recentMessages,
   };
 };
@@ -655,7 +657,7 @@ export const buildFirePack = async (
   },
 ): Promise<AmsgFirePack> => {
   const templateStub = opts?.templateStub === true;
-  const [{ recentMessages, lastUserMessageAt }, library, schedule] = await Promise.all([
+  const [{ recentMessages, lastUserMessageAt, lastUserMessageId }, library, schedule] = await Promise.all([
     buildTimeGapHint(char.id),
     // 表情库只喂系统提示词/近史渲染：占位模板路径整库都不用读（表情记录带图片数据，
     // 全表 getAll 不便宜）。
@@ -825,6 +827,7 @@ export const buildFirePack = async (
     v: FIRE_PACK_VERSION,
     template,
     lastUserMessageAt,
+    lastUserMessageId,
     // 角色的时间参照系（见上面的 tzId / userTzId）：前者是角色自己的钟，后者是用户那边的，
     // worker 渲染时两者各管各的一行，绝不混用。
     tzId,
@@ -852,6 +855,9 @@ export const buildFirePack = async (
     // 无条件写：worker 侧调度器靠包内 enabled 自判，缺字段的语义是「未知/旧包」而不是
     // 「用户关了自主」——省略会让「设置没变过」和「设置被关掉」在云端长得一样。
     // mergeAutonomySettings 本地纯函数、无 IO，打包路径不受影响。
+    // P5：`guardrails`（每角色次数/同类间隔/token 预留）已包含在这份终值里；
+    // 全局额度与总暂停**刻意不随包走**——它们只认云端共享行（amsg:global/autonomy_guardrails），
+    // 由 worker 调度器直接读，避免每个角色各自带一份「全局额度」。
     autonomy: mergeAutonomySettings(char),
     // P6 写链：用户在预设面板改写过的 autonomy 块随包下发（只写改写过的键，
     // 未改写不写字段，旧包行为不变；读不到预设表也不写，整包不受影响）。
@@ -2777,6 +2783,59 @@ export const ActiveMsgClient = {
       throw new Error(describeInstantChatFailure(status, body));
     }
     return { uuid: body.uuid, clientTaskId };
+  },
+
+  /**
+   * P5：把聊天里提出的一条生活工作流登记到云端（POST /chat-life-workflow）。
+   *
+   * 只交出提案本身（想做什么/为什么/什么时候），**不含正文**——正文由后台那次独立
+   * 请求生成。返回 HTTP 状态与原始 body，让调用方按回执翻成一句工具结果；
+   * 失败不在这里 throw 成主链路错误。
+   */
+  async submitChatLifeWorkflow(body: {
+    v: number;
+    charId: string;
+    sourceRef: string;
+    action?: 'propose' | 'cancel';
+    planId?: string;
+    proposals?: unknown[];
+  }): Promise<{ status: number; body: any }> {
+    const config = await ensureWorkerReady();
+    // 有界超时：这次登记发生在工具循环里，worker 慢/挂不能拖住这一轮正文。
+    // AbortSignal 真的取消网络请求（不是 race 一个已废弃的 promise 就完事）；
+    // 超时后调用方按「未确认」收口，绝不自动重试（未知送达不重复登记）。
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(1500) : undefined;
+    return fetchWithAuthRaw('chat-life-workflow', config, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    }, '生活工作流');
+  },
+
+  /**
+   * 全局自主生活护栏的**原子条件写**（POST /autonomy-guardrails/patch）。
+   *
+   * 为什么不走普通 `writeClientStateValue`：那条是 last-write-wins 的整对象覆盖，
+   * 两台设备同时保存时后写的会把远端刚按下的暂停改回未暂停。专用路由在 D1 里做
+   * 条件 UPDATE（期望基线 + 暂态粘性），冲突直接 409，一个字都不写。
+   *
+   * `allowUnpause` 只在用户明确点开总开关时传 true；其余情况服务端会保住 paused。
+   */
+  async patchGlobalGuardrails(body: {
+    patch: Record<string, unknown>;
+    expected?: { kind: 'absent' } | { kind: 'value'; value: Record<string, unknown> } | null;
+    allowUnpause?: boolean;
+  }): Promise<{ status: number; body: any }> {
+    const config = await ensureWorkerReady();
+    // 保存是用户主动点的，给足时间但仍有界：worker 慢/挂不能把设置页卡死。
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(8000) : undefined;
+    return fetchWithAuthRaw('autonomy-guardrails/patch', config, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
+    }, '保存全局护栏');
   },
 
   // 同角色活跃会话租约：只 PUT 这一条几十字节的 chat_presence，不复用胖 fire_pack。

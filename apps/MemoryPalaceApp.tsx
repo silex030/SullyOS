@@ -17,6 +17,12 @@ import {
     DEFAULT_CHARACTER_ACCOMMODATION,
 } from '../utils/memoryPalace';
 import type { Anticipation, MigrationProgress, DigestResult, MemoryLink, EventBox, DigestReport } from '../utils/memoryPalace';
+// 清空结果的显式三态与「只重试云端」入口直接取自 wipe.ts（barrel 未导出，避免动公共 index）。
+import {
+    describeRemoteWipeOutcome,
+    retryRemoteWipe,
+    type WipeResult,
+} from '../utils/memoryPalace/wipe';
 import { confirmExportSafety } from '../utils/exportGuard';
 import type { CharacterAccommodationPolicy, CharacterProfile, MemoryPalaceWaterlinePreset, Message } from '../types';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
@@ -437,6 +443,16 @@ const StatusMessage: React.FC<{ msg: string | null | undefined; style?: React.CS
     );
 };
 
+/** 一键清空结果里的表名 → 人话（记忆节点才是"一条记忆"，其余是衍生数据） */
+const WIPE_STORE_LABELS: Record<string, string> = {
+    memory_nodes: '记忆',
+    memory_vectors: '向量',
+    memory_links: '关联',
+    memory_batches: '批次',
+    anticipations: '期盼',
+    event_boxes: '事件盒',
+};
+
 const ROOM_COLORS: Record<MemoryRoom, string> = {
     living_room: '#22c55e',
     bedroom: '#ec4899',
@@ -794,7 +810,12 @@ export default function MemoryPalaceApp() {
 
     // 一键清空
     const [wiping, setWiping] = useState(false);
-    const [wipeResult, setWipeResult] = useState<string | null>(null);
+    /**
+     * 清空结果显式分项：本地 / 高水位 / 云端三态各自独立。
+     * 之前是一个拼好的字符串，云端失败会被写成"0 行"（看起来像成功）。
+     */
+    const [wipeOutcome, setWipeOutcome] = useState<WipeResult | null>(null);
+    const [wipeError, setWipeError] = useState<string | null>(null);
 
     // 导出记忆（接入外置记忆库）
     const [exporting, setExporting] = useState(false);
@@ -2057,7 +2078,7 @@ export default function MemoryPalaceApp() {
     const handleWipeAll = async (includeRemote: boolean) => {
         const firstPrompt = includeRemote
             ? '即将清空【本地 + 云端 Supabase】所有记忆宫殿数据，包括：\n\n' +
-              '- 所有角色的记忆节点、向量、关联、事件盒\n- 高水位标记\n- 云端 memory_vectors 全表\n\n' +
+              '- 所有角色的记忆节点、向量、关联、事件盒\n- 高水位标记（本地 + 索引镜像两份）\n- 云端 memory_vectors 全表\n\n' +
               '此操作不可撤销。确定继续？'
             : '即将清空【本地】所有记忆宫殿数据（云端保留）。\n\n' +
               '包括所有角色的记忆节点、向量、关联、事件盒、高水位标记。\n\n' +
@@ -2066,32 +2087,43 @@ export default function MemoryPalaceApp() {
         if (!confirm('再次确认：真的要清空？')) return;
 
         setWiping(true);
-        setWipeResult(null);
+        setWipeOutcome(null);
+        setWipeError(null);
         try {
             const result = await wipeAllMemoryPalace({
                 remoteConfig: includeRemote ? remoteVectorConfig : undefined,
                 skipRemote: !includeRemote,
             });
-            // 友好分项：记忆节点才是"一条记忆"，其余是衍生数据
-            const STORE_LABELS: Record<string, string> = {
-                memory_nodes: '记忆',
-                memory_vectors: '向量',
-                memory_links: '关联',
-                memory_batches: '批次',
-                anticipations: '期盼',
-                event_boxes: '事件盒',
-            };
-            const parts: string[] = [];
-            for (const [store, count] of Object.entries(result.local)) {
-                if (count > 0) parts.push(`${STORE_LABELS[store] || store} ${count}`);
+            setWipeOutcome(result);
+            if (result.remote.status === 'failed') {
+                // 本地已清完、云端失败：单独提示，界面上留「重试云端清空」。
+                addToast('本地已清空，云端向量删除失败，可单独重试', 'error');
             }
-            const breakdown = parts.length > 0 ? `（${parts.join('、')}）` : '';
-            const msg = `本地已清空${breakdown}；高水位 ${result.highWatermarks} 条`
-                + (result.remoteAttempted ? `；云端向量 ${result.remote} 行` : '；云端未清');
-            setWipeResult(msg);
             await loadStats();
         } catch (e: any) {
-            setWipeResult(`[err]清空失败：${e?.message || e}`);
+            setWipeError(`[err]清空失败：${e?.message || e}`);
+        } finally {
+            setWiping(false);
+        }
+    };
+
+    /** 只重试云端清空：本地已经清过，不重复清本地。 */
+    const handleRetryRemoteWipe = async () => {
+        if (!remoteVectorConfig?.enabled || !remoteVectorConfig?.initialized) {
+            addToast('云端向量存储未启用或未初始化', 'error');
+            return;
+        }
+        setWiping(true);
+        try {
+            const remote = await retryRemoteWipe(remoteVectorConfig);
+            setWipeOutcome((prev) => (prev ? { ...prev, remote, remoteAttempted: remote.status !== 'skipped' } : prev));
+            if (remote.status === 'success') {
+                addToast('云端向量已清空', 'success');
+            } else if (remote.status === 'failed') {
+                addToast(`云端清空仍失败：${remote.error ?? '未知原因'}`, 'error');
+            }
+        } catch (e: any) {
+            setWipeError(`[err]云端清空失败：${e?.message || e}`);
         } finally {
             setWiping(false);
         }
@@ -4804,19 +4836,48 @@ create table if not exists memory_vectors (
                         <span>危险区：一键清空向量记忆</span>
                     </div>
                     <div style={{ fontSize: 11, color: '#7f1d1d', marginBottom: 12, lineHeight: 1.7 }}>
-                        清空【所有角色】的记忆节点、向量、关联、事件盒、便利贴、期盼、高水位标记。
-                        可选择同时清空云端 Supabase <code>memory_vectors</code> 全表。
+                        清空【所有角色】的记忆节点、向量、关联、事件盒、便利贴、期盼、高水位标记（本地键与索引镜像两份一起清）。
+                        可选择同时清空云端 Supabase <code>memory_vectors</code> 全表；云端失败不会影响本地结果，可单独点「重试云端清空」。
                         <b> 此操作不可撤销。</b>
                     </div>
 
-                    {wipeResult && (
-                        <div style={{
-                            fontSize: 12, marginBottom: 10,
-                            color: wipeResult.startsWith('[err]') ? '#dc2626' : '#166534',
-                        }}>
-                            <StatusMessage msg={wipeResult} />
+                    {wipeError && (
+                        <div style={{ fontSize: 12, marginBottom: 10, color: '#dc2626' }}>
+                            <StatusMessage msg={wipeError} />
                         </div>
                     )}
+
+                    {!wipeError && wipeOutcome && (() => {
+                        // 本地 / 云端分开报：云端失败不能混进"清空成功"里，行数未知也不写 0。
+                        const remoteFailed = wipeOutcome.remote.status === 'failed';
+                        const pendingRemote = wipeOutcome.remote.status === 'skipped' && !!remoteVectorConfig?.enabled && !!remoteVectorConfig?.initialized;
+                        const parts: string[] = [];
+                        for (const [store, count] of Object.entries(wipeOutcome.local)) {
+                            if (count > 0) parts.push(`${WIPE_STORE_LABELS[store] || store} ${count}`);
+                        }
+                        const breakdown = parts.length > 0 ? `（${parts.join('、')}）` : '';
+                        const text = `${remoteFailed ? '[warn]' : '[ok]'}本地已清空${breakdown}；高水位 ${wipeOutcome.highWatermarks} 条；${describeRemoteWipeOutcome(wipeOutcome.remote)}`;
+                        const canRetryRemote = remoteFailed && !!remoteVectorConfig?.enabled && !!remoteVectorConfig?.initialized;
+                        return (
+                            <div style={{ fontSize: 12, marginBottom: 10, color: remoteFailed ? '#b45309' : pendingRemote ? '#6b7280' : '#166534' }}>
+                                <StatusMessage msg={text} />
+                                {canRetryRemote && (
+                                    <button
+                                        onClick={handleRetryRemoteWipe}
+                                        disabled={wiping}
+                                        style={{
+                                            marginTop: 8, padding: '7px 12px', borderRadius: 10,
+                                            border: '1px solid #fbbf24', background: 'white',
+                                            color: '#b45309', fontWeight: 700, fontSize: 12,
+                                            cursor: wiping ? 'not-allowed' : 'pointer',
+                                        }}
+                                    >
+                                        {wiping ? '重试中…' : '重试云端清空'}
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })()}
 
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                         <button

@@ -11,7 +11,7 @@ import {
     VRWorldNovel, VRNovelAnnotation, CustomCreatorPart, VRMusicRoomState, VRGuestbookState, VRScript, VRStagedPlay, VRLetter,
     WorldProfile, WorldEpisode, StoryTheaterEntry, StoryTheaterPreset, StoryTheaterMask, PromptPreset,
     PresetPack, PresetRegexKit,
-    AutonomousOutboxEntry, AutonomyHeartbeat
+    AutonomousOutboxEntry, AutonomyHeartbeat, AutonomyWorkflowPlanRecord
 } from '../types';
 import type { ShoppingOrder } from './shoppingTypes';
 import type { AirpCommittedEvent } from './airp/commit';
@@ -40,7 +40,8 @@ const DB_NAME = 'AetherOS_Data';
 // v76：AIRP 世界事实/知识（airp_world）。独立 store，随备份动态枚举自动带走。
 // v77：AIRP 自主生活转述账本 + 心跳（autonomous_outbox / autonomous_heartbeats）。独立 store，随备份动态枚举自动带走。
 // v78：预设套组（preset_packs + preset_pack_active）+ 正则脚本（preset_regexes）。独立 store，随备份动态枚举自动带走。
-const DB_VERSION = 78; // v78: 预设套组 + 正则脚本
+// v79：角色自主生活工作流的可查看记录（airp_workflow_plans）。独立 store，随备份动态枚举自动带走。
+const DB_VERSION = 79; // v79: 自主生活工作流记录
 
 const STORE_CHARACTERS = 'characters';
 const STORE_CHAR_GROUPS = 'character_groups'; // 角色分组定义（角色通过 groupId 指向；与群聊 groups 无关）
@@ -73,6 +74,7 @@ const STORE_AIRP_EVENTS = 'airp_events'; // v75: AIRP 世界事件流（角色�
 const STORE_AIRP_WORLD = 'airp_world'; // v76: AIRP 世界事实/知识（按角色物化的当前世界状态，keyPath charId）
 const STORE_AUTONOMOUS_OUTBOX = 'autonomous_outbox'; // v77: AIRP 自主生活转述账本（told/pushed 记账，keyPath id）
 const STORE_AUTONOMOUS_HEARTBEATS = 'autonomous_heartbeats'; // v77: AIRP 自主生活心跳（面板只读，keyPath id）
+const STORE_AUTONOMY_WORKFLOW_PLANS = 'airp_workflow_plans'; // v79: 自主生活工作流的可查看记录（角色想过/做过的低风险小事，keyPath id）
 const STORE_XHS_STOCK = 'xhs_stock';
 const STORE_XHS_ACTIVITIES = 'xhs_activities';
 const STORE_XHS_OWNED_POSTS = 'xhs_owned_posts';
@@ -404,6 +406,11 @@ export const openDB = (): Promise<IDBDatabase> => {
       if (!db.objectStoreNames.contains(STORE_AUTONOMOUS_HEARTBEATS)) {
           const heartbeatStore = db.createObjectStore(STORE_AUTONOMOUS_HEARTBEATS, { keyPath: 'id' });
           heartbeatStore.createIndex('charId', 'charId', { unique: false });
+      }
+      // v79: 自主生活工作流记录（与 D1 autonomy_plans 同 id，重投 put 覆盖即幂等）
+      if (!db.objectStoreNames.contains(STORE_AUTONOMY_WORKFLOW_PLANS)) {
+          const workflowPlanStore = db.createObjectStore(STORE_AUTONOMY_WORKFLOW_PLANS, { keyPath: 'id' });
+          workflowPlanStore.createIndex('charId', 'charId', { unique: false });
       }
 
       // ─── Memory Palace (记忆宫殿) stores ───
@@ -2414,6 +2421,38 @@ export const DB = {
       });
   },
 
+  // ─── 自主生活工作流记录（v79）───
+  // 角色「想做/做过什么」的可查看记录。按 id put 覆盖：云端同一份结果重投不翻倍。
+  getWorkflowPlansByChar: async (charId: string, limit = 30): Promise<AutonomyWorkflowPlanRecord[]> => {
+      const db = await openDB();
+      if (!db.objectStoreNames.contains(STORE_AUTONOMY_WORKFLOW_PLANS)) return [];
+      return new Promise((resolve, reject) => {
+          const transaction = db.transaction(STORE_AUTONOMY_WORKFLOW_PLANS, 'readonly');
+          const request = transaction.objectStore(STORE_AUTONOMY_WORKFLOW_PLANS).index('charId').getAll(charId);
+          request.onsuccess = () => {
+              const all = (request.result || []) as AutonomyWorkflowPlanRecord[];
+              // 新提议在前；同一时刻按 id 稳定排序，免得刷新后顺序跳。
+              all.sort((a, b) => (b.createdAt - a.createdAt) || a.id.localeCompare(b.id));
+              resolve(all.slice(0, limit));
+          };
+          request.onerror = () => reject(request.error);
+      });
+  },
+
+  saveWorkflowPlans: async (plans: AutonomyWorkflowPlanRecord[]): Promise<void> => {
+      if (plans.length === 0) return;
+      const db = await openDB();
+      if (!db.objectStoreNames.contains(STORE_AUTONOMY_WORKFLOW_PLANS)) return;
+      return new Promise((resolve, reject) => {
+          const transaction = db.transaction(STORE_AUTONOMY_WORKFLOW_PLANS, 'readwrite');
+          const store = transaction.objectStore(STORE_AUTONOMY_WORKFLOW_PLANS);
+          for (const plan of plans) store.put(plan);
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error || new Error('saveWorkflowPlans aborted'));
+      });
+  },
+
   getAllGames: async (): Promise<GameSession[]> => {
       const db = await openDB();
       if (!db.objectStoreNames.contains(STORE_GAMES)) return [];
@@ -3408,7 +3447,7 @@ export const DB = {
           });
       };
 
-      const [characters, characterGroups, messages, themes, emojis, emojiCategories, assets, galleryImages, userProfiles, diaries, tasks, anniversaries, roomTodos, roomNotes, groups, journalStickers, socialPosts, courses, games, worldbooks, storyTheaters, storyTheaterPresets, storyTheaterMasks, novels, bankTx, bankData, xhsActivities, xhsOwnedPosts, xhsStockImages, songs, quizzes, tarotReadings, shoppingOrders, guidebookSessions, scheduledMessages, lifeSimStates, handbooks, trackers, trackerEntries, hotNewsSnapshots, vrNovels, vrAnnotations, customCreatorParts, vrMusic, vrGuestbook, vrScripts, vrStagedPlays, vrPresets, vrLetters, vrSettings, worlds, worldEpisodes, lifeRecords, medPlans, lifeRecordSettings, promptPresets, airpEvents, airpWorlds, autonomousOutbox, autonomousHeartbeats] = await Promise.all([
+      const [characters, characterGroups, messages, themes, emojis, emojiCategories, assets, galleryImages, userProfiles, diaries, tasks, anniversaries, roomTodos, roomNotes, groups, journalStickers, socialPosts, courses, games, worldbooks, storyTheaters, storyTheaterPresets, storyTheaterMasks, novels, bankTx, bankData, xhsActivities, xhsOwnedPosts, xhsStockImages, songs, quizzes, tarotReadings, shoppingOrders, guidebookSessions, scheduledMessages, lifeSimStates, handbooks, trackers, trackerEntries, hotNewsSnapshots, vrNovels, vrAnnotations, customCreatorParts, vrMusic, vrGuestbook, vrScripts, vrStagedPlays, vrPresets, vrLetters, vrSettings, worlds, worldEpisodes, lifeRecords, medPlans, lifeRecordSettings, promptPresets, airpEvents, airpWorlds, autonomousOutbox, autonomousHeartbeats, autonomyWorkflowPlans] = await Promise.all([
           getAllFromStore(STORE_CHARACTERS),
           getAllFromStore(STORE_CHAR_GROUPS),
           getAllFromStore(STORE_MESSAGES),
@@ -3469,6 +3508,7 @@ export const DB = {
           getAllFromStore(STORE_AIRP_WORLD),
           getAllFromStore(STORE_AUTONOMOUS_OUTBOX),
           getAllFromStore(STORE_AUTONOMOUS_HEARTBEATS),
+          getAllFromStore(STORE_AUTONOMY_WORKFLOW_PLANS),
       ]);
 
       const userProfile = userProfiles.length > 0 ? {
@@ -3522,6 +3562,7 @@ export const DB = {
           airpWorlds,
           autonomousOutbox,
           autonomousHeartbeats,
+          autonomyWorkflowPlans,
           worldHomeLocal: exportWorldHomeLocal(), // 家园本机配置：全局 API + 文风收藏（存 localStorage）
           luckinLocal: exportLuckinLocal(),       // 瑞幸 token + 启用状态（存 localStorage）
           mcdLocal: exportMcdLocal(),             // 麦当劳 token + 启用状态（存 localStorage）
@@ -3584,6 +3625,7 @@ export const DB = {
           STORE_AIRP_WORLD, // v76 AIRP 世界事实/知识（物化缓存）—— importFullData 侧白名单
           STORE_AUTONOMOUS_OUTBOX, // v77 AIRP 自主生活转述账本 —— importFullData 侧白名单
           STORE_AUTONOMOUS_HEARTBEATS, // v77 AIRP 自主生活心跳 —— importFullData 侧白名单
+          STORE_AUTONOMY_WORKFLOW_PLANS, // v79 自主生活工作流记录 —— importFullData 侧白名单
       ].filter(name => db.objectStoreNames.contains(name));
 
       const hasStore = (storeName: string) => availableStores.includes(storeName);
@@ -3686,6 +3728,7 @@ export const DB = {
           data.airpWorlds !== undefined,
           data.autonomousOutbox !== undefined,
           data.autonomousHeartbeats !== undefined,
+          data.autonomyWorkflowPlans !== undefined,
           (data as any).worldHomeLocal !== undefined,
           (data as any).luckinLocal !== undefined,
           (data as any).mcdLocal !== undefined,
@@ -4013,6 +4056,10 @@ export const DB = {
           await clearAndAdd(STORE_AUTONOMOUS_HEARTBEATS, data.autonomousHeartbeats, 'AIRP 自主心跳', false);
           data.autonomousHeartbeats = undefined as any;
       }, data.autonomousHeartbeats?.length || 0);
+      await runSection('AIRP 自主工作流记录', data.autonomyWorkflowPlans !== undefined, async () => {
+          await clearAndAdd(STORE_AUTONOMY_WORKFLOW_PLANS, data.autonomyWorkflowPlans, 'AIRP 自主工作流记录', false);
+          data.autonomyWorkflowPlans = undefined as any;
+      }, data.autonomyWorkflowPlans?.length || 0);
       await runSection('家园本机配置', (data as any).worldHomeLocal !== undefined, async () => {
           importWorldHomeLocal((data as any).worldHomeLocal); // 全局 API + 文风收藏
           (data as any).worldHomeLocal = undefined;
@@ -4269,6 +4316,18 @@ export const DB = {
           data.bankState = undefined as any;
           data.bankDollhouse = undefined as any;
       }, (data.bankState ? 1 : 0) + (data.bankDollhouse ? 1 : 0));
+
+      // 记忆协商账本在 localStorage（`mp_negotiation_v1_<charId>`），**不进备份**，
+      // 所以这条独立导入路径（不经 OSContext 的那份收尾）也必须清一次：
+      // 导入换掉了消息表，旧候选携带的旧消息 id 会撞到新数据的消息上。
+      // 幂等、best-effort：账本本来就空就是 0 条；清不掉不许让已经写好的导入回滚
+      // （下一跳装配/解析会按角色重读账本，不会被这份残留改写事实）。
+      try {
+          const { clearAllNegotiationLedgers } = await import('./memoryPalace/negotiationLedger');
+          clearAllNegotiationLedgers();
+      } catch (e) {
+          console.warn('[Backup] 导入后清理旧记忆协商账本失败（旧候选可能误绑到新消息）', e);
+      }
   },
 
   // ─── 提示词段落预设（Preset App / v72）───

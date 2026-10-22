@@ -2634,7 +2634,7 @@ describe('fire 侧取消 / 改期任务', () => {
     expect(goneOut.reason).toBe('task_gone');
   });
 
-  it('usage 随末条 push 的 amsgUsage 回客户端（只挑两个数，不透传供应商私有字段）', async () => {
+  it('usage 随末条 push 的 amsgUsage 回客户端（allowlist 字段保真，缓存缺失可辨，不透传供应商私有对象）', async () => {
     const stash = makeStash({ instant: true });
     const decision = await amsgHooks.onLLMOutput({
       sessionId: 'sess_task_42', taskId: FIRE_TASK_ID, taskUuid: TASK_UUID,
@@ -2645,7 +2645,17 @@ describe('fire 侧取消 / 改期任务', () => {
       writeState: vi.fn(async () => ({ upserted: 1, skipped: 0, deleted: 0 })),
     } as any) as any;
     const last = decision.pushPayloads[decision.pushPayloads.length - 1];
-    expect(last.metadata.amsgUsage).toEqual({ promptTokens: 1234, completionTokens: 56 });
+    // C1/C2 契约：普通字段照旧；缓存读数供应商没给 → 明确记在 usageMissing 里
+    // （缺失 ≠ 0，UI 才能显示「未提供」而不是 0%）；provider_secret_detail 不进包。
+    expect(last.metadata.amsgUsage).toEqual({
+      promptTokens: 1234,
+      completionTokens: 56,
+      totalTokens: 1290,
+      usageStatus: 'reported',
+      usageCacheReadSemantics: 'unknown',
+      usageMissing: ['cachedTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens'],
+    });
+    expect(JSON.stringify(last.metadata.amsgUsage)).not.toContain('provider_secret_detail');
   });
 
   it('取消 / 改期的账随末条 push 的 amsgTaskMutations 回客户端（首条不带）', async () => {

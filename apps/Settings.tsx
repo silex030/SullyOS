@@ -22,10 +22,12 @@ import {
     getElevenLabsVoiceActingGuide,
 } from '../utils/elevenLabsTts';
 import { DATE_VOICE_GUIDE } from '../utils/datePrompts';
-import { Sun, Newspaper, NotePencil, Notebook, Book, Calendar, ForkKnife, Coffee, PlugsConnected, Bluetooth, MapPin } from '@phosphor-icons/react';
+import { Sun, Newspaper, NotePencil, Notebook, Book, Calendar, ForkKnife, Coffee, PlugsConnected, Bluetooth, MapPin, ShieldCheck, Brain } from '@phosphor-icons/react';
 import { loadMcpServers, saveMcpServers, createMcpServer, effectiveMcpRouting, migrateMcpRoutingDefault, testMcpConnection, resetMcpSession, getMcpUseNativeTools, setMcpUseNativeTools, loadMcpSettings, saveMcpSettings, type McpServerConfig, type McpSettings } from '../utils/mcpClient';
 import { getMcpResultList, clearMcpResults } from '../utils/mcpResultMemory';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
+import AutonomyGuardrailsSettings from '../components/settings/AutonomyGuardrailsSettings';
+import MemoryNegotiationSettings from '../components/settings/MemoryNegotiationSettings';
 import BluetoothPanel from '../components/settings/BluetoothPanel';
 import { bleEngine } from '../utils/bleEngine';
 import { loadBleDevices } from '../utils/bleRegistry';
@@ -3863,6 +3865,36 @@ const Settings: React.FC = () => {
             <p className="text-xs text-slate-500 leading-relaxed">
                 角色到点自动给你发消息，App 关着也能收。后端由官方 VPS 统一承载，无需自行部署，在配置里确认连接即可。聊天上云（即时对话）与定时主动消息都由它承担。
             </p>
+        </SettingsSection>
+
+        {/* ───────── 自主生活护栏（全局预算；权威副本在鉴权后台，本机只是草稿） ───────── */}
+        <SettingsSection
+            title="自主生活护栏"
+            icon={
+                <div className="p-2 bg-violet-100/60 rounded-xl text-violet-600">
+                    <ShieldCheck size={16} weight="bold" />
+                </div>
+            }
+        >
+            <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+                角色自己安排生活时的总闸与预算：全局每天最多几次、每角色默认几次、同类动作最少隔多久、每天 token 预算。各角色面板里还能单独收紧；0 = 暂停。
+            </p>
+            <AutonomyGuardrailsSettings />
+        </SettingsSection>
+
+        {/* ───────── 记忆协商（全局实验开关；落记忆宫殿 config，默认关） ───────── */}
+        <SettingsSection
+            title="记忆协商"
+            icon={
+                <div className="p-2 bg-violet-100/60 rounded-xl text-violet-600">
+                    <Brain size={16} weight="bold" />
+                </div>
+            }
+        >
+            <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+                角色对没把握的事会顺口问一句，而不是直接当成事实记住：自然确认、不强迫回答、短期状态不升级成长期结论。
+            </p>
+            <MemoryNegotiationSettings />
         </SettingsSection>
         {/* 自定义网络代理 — 刻意低调的高级入口。默认折叠，不主动指引基本发现不了。
             普通用户无需配置：默认走作者部署的公共 Worker，所有功能开箱即用。 */}

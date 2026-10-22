@@ -4038,6 +4038,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               'airp_events', 'airp_world',
               // v77 AIRP 自主生活：转述账本 + 心跳（导入端 importFullData 已支持恢复）
               'autonomous_outbox', 'autonomous_heartbeats',
+              // v79 自主生活工作流记录：角色想过/做过的低风险小事（导入端 importFullData 已支持恢复）
+              'airp_workflow_plans',
               // 角色小红书主页（导入端 runSection 早已支持，此前一直漏在本清单外——
               // 现在即使再漏，下面 ensureBackupStoresCovered 也会按 objectStoreNames 兜底）。
               'xhs_owned_posts'
@@ -4701,6 +4703,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   // 自主生活（v77）—— 键名须与 importFullData 读取的字段（data.autonomousOutbox / data.autonomousHeartbeats）对齐
                   case 'autonomous_outbox': backupData.autonomousOutbox = processedData; break;
                   case 'autonomous_heartbeats': backupData.autonomousHeartbeats = processedData; break;
+                  // 自主生活工作流记录（v79）—— 键名须与 importFullData 读取的字段（data.autonomyWorkflowPlans）对齐
+                  case 'airp_workflow_plans': backupData.autonomyWorkflowPlans = processedData; break;
                   // 漂移防护：未来新登记的 store 忘写 case 时，按 backupCoverage 的 KNOWN
                   // 映射自动落包（单例 store 取首条），并提醒把显式 case 补回这里。
                   default: {
@@ -5391,6 +5395,23 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
           setSysOperation({ status: 'idle', message: '', progress: 100 });
           clearImportInProgress();
+          // 记忆协商账本不进备份（localStorage `mp_negotiation_v1_<charId>`），导入也不会清它。
+          // 换了一份数据之后，旧候选还带着**旧数据里的消息 id**，会绑到新数据的消息上（id 撞车）。
+          // 所以导入成功就清掉全部旧账本；清不掉不许当清掉了（单独提示，仍继续恢复流程）。
+          let ledgerCleared = true;
+          try {
+              const { clearAllNegotiationLedgers } = await import('../utils/memoryPalace/negotiationLedger');
+              clearAllNegotiationLedgers();
+          } catch (e) {
+              ledgerCleared = false;
+              console.warn('[memory-negotiation] 导入后清理旧协商账本失败（旧候选可能误绑到新消息）', e);
+          }
+          if (!ledgerCleared) {
+              addToast(
+                  '恢复成功，但旧的记忆候选没能清干净（可能和新消息对不上）。重启后可在记忆宫殿里手动清空一次待确认项。',
+                  'info',
+              );
+          }
           // 脱敏包：密钥没进包，重启后第一次生成会提示配 Key，这里先打招呼。
           addToast(
               data.secretsRedacted

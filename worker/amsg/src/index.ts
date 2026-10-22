@@ -1,3 +1,5 @@
+import { cloudUsageMetadata } from '../../../utils/cloudUsageMetadata';
+
 /**
  * SullyOS 主动消息 2.0（amsg2）— 单用户 Cloudflare Worker 入口。
  *
@@ -29,6 +31,7 @@ import {
   createSingleUserCloudflareWorker,
   createWebCryptoWebPush,
   decryptFromStorage,
+  decryptPayload,
   deriveUserEncryptionKey,
   measurePushPayload,
 } from '@rei-standard/amsg-server/cloudflare';
@@ -174,11 +177,28 @@ import { installOpencodeIdentityFetch } from '../../../utils/llmIdentity';
 import {
   AUTONOMY_SKIP_REASONS,
   createAutonomyPostTask,
+  readAutonomyGuardrailsForUser,
   runAutonomyTick,
   scanAutonomyPacks,
 } from './autonomyScheduler';
-import { claimAutonomyTick, ensureAutonomySchema, type AutonomyDb } from './autonomyStore';
-import { configureAutonomyFireDb, configureAutonomyHomeEnv } from './autonomyFire';
+import {
+  normalizeGuardrailExpected,
+  patchGlobalGuardrails,
+  screenClientStateWrite,
+  type ClientStateWriteEntry,
+} from './guardrailPatch';
+import {
+  cancelAutonomyPlanById,
+  cancelSupersededAutonomyPlan,
+  claimAutonomyTick,
+  ensureAutonomySchema,
+  getAutonomyPlan,
+  insertAutonomyPlan,
+  type AutonomyDb,
+} from './autonomyStore';
+import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
+import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
+import { configureAutonomyFireDb, configureAutonomyFireMasterKey, configureAutonomyHomeEnv } from './autonomyFire';
 import { configurePlateHomeEnv } from './plateFire';
 
 // opencode.ai 上游自标识：凭据表里存的是原始供应商地址，worker 直连时必须带
@@ -2413,23 +2433,8 @@ export const amsgHooks = {
         const lastMeta: Record<string, unknown> = {};
         const toolTrace = condenseToolTrace(session.toolCalls);
         if (toolTrace.length > 0) lastMeta.amsgToolTrace = toolTrace;
-        // 最后一轮的 token 用量（amsg-server 2.6.0-next.15 起 sessionCtx 带 usage，
-        // 来源是供应商响应体的 usage 字段）。只挑三个数、不透传原对象——各家供应商
-        // 往 usage 里塞的私有字段（缓存命中、思考 token 明细…）没必要跟着每条 push 走。
-        // 客户端暂时只存不显示，将来做用量角标不用再动 worker。
-        const usage = (ctx as { usage?: Record<string, unknown> | null }).usage;
-        if (usage && typeof usage === 'object') {
-          const pick = (key: string): number | undefined =>
-            typeof usage[key] === 'number' ? usage[key] as number : undefined;
-          const promptTokens = pick('prompt_tokens');
-          const completionTokens = pick('completion_tokens');
-          if (promptTokens !== undefined || completionTokens !== undefined) {
-            lastMeta.amsgUsage = {
-              ...(promptTokens !== undefined ? { promptTokens } : {}),
-              ...(completionTokens !== undefined ? { completionTokens } : {}),
-            };
-          }
-        }
+        // 末轮用量以允许列表保留；缓存缺失不是零，工具链仍由客户端标明partial。
+        lastMeta.amsgUsage = cloudUsageMetadata((ctx as { usage?: unknown }).usage);
         if (stash.emotionEvalPromise) {
           const outcome = await raceEmotionEval(stash.emotionEvalPromise);
           if (outcome === null) {
@@ -2624,6 +2629,9 @@ export const buildWorkerConfig = (env: Env) => {
     : null);
   // 自主回合 handler 的 D1：kind 分派点够不到 env，同 configureInstantErrorPush 走模块级注入。
   configureAutonomyFireDb(env.DB as AutonomyDb | null);
+  // 到点复核用户级总暂停要读加密的共享护栏行：同一把钥也走模块级注入。
+  // 没配钥时复核必定失败 → 整轮暂停（fail-closed），不会是「默认未暂停」。
+  configureAutonomyFireMasterKey(env.AMSG_MASTER_KEY);
   // P2 自主回合的 home 事件落盘地址：同 sullyos-home（8837），没配就用本地默认。
   const homeEndpoint = env as Env & { HOME_URL?: string; AMSG_CLIENT_TOKEN?: string };
   configureAutonomyHomeEnv({
@@ -3342,6 +3350,88 @@ export default {
       return handleInstantChat({ request, env, upstream, json: jsonWithCors });
     }
 
+    // 普通聊天里提的生活工作流（P5）：登记一条 proposed 计划，到点由既有调度器跑。
+    //
+    // 与 /instant-chat 一样排在配置门之后（走到这里 D1 与密钥必然都在）。鉴权口径与
+    // /push-subscription/remove 一致：配了 AMSG_SERVER_TOKEN 就强制校验 X-Client-Token；
+    // **用户身份只认 X-User-Id 头**，body 里的 userId 一律不看（防跨用户伪造）。
+    if (pathname.endsWith('/chat-life-workflow')) {
+      if (method !== 'POST') {
+        return jsonWithCors(405, {
+          success: false,
+          error: { code: 'METHOD_NOT_ALLOWED', message: '/chat-life-workflow 只接受 POST' },
+        });
+      }
+      const workflowServerToken = (env.AMSG_SERVER_TOKEN ?? '').trim();
+      const workflowClientToken = request.headers.get('X-Client-Token') ?? '';
+      if (workflowServerToken
+        && (!workflowClientToken || !(await constantTimeEqual(workflowClientToken, workflowServerToken)))) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: 'INVALID_CLIENT_TOKEN', message: '共享密钥无效或缺失' },
+        });
+      }
+      const workflowUserId = (request.headers.get('X-User-Id') ?? '').trim();
+      if (!workflowUserId) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: 'UNAUTHORIZED', message: '缺少用户身份' },
+        });
+      }
+      let workflowBody: unknown = null;
+      try { workflowBody = await request.json(); } catch { workflowBody = null; }
+      try {
+        await ensureAutonomySchema(env.DB as unknown as AutonomyDb);
+      } catch (error) {
+        console.error('[amsg] 工作流登记：建表失败', error instanceof Error ? error.message : error);
+        return jsonWithCors(500, {
+          success: false,
+          error: { code: 'SCHEMA_FAILED', message: '云端存储没准备好，稍后再试' },
+        });
+      }
+      const result = await handleChatLifeWorkflow({
+        userId: workflowUserId,
+        nowMs: Date.now(),
+        rawBody: workflowBody,
+        loadPack: async ({ userId, charId }) => {
+          // 按「用户 + 角色」精确查：查不到就是没有（或不是这个用户的），不区分原因。
+          const db = env.DB as unknown as AutonomyDb;
+          const row = await db
+            .prepare('SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?')
+            .bind(userId, `${AMSG_STATE_NAMESPACE_PREFIX}${charId}`, AMSG_FIRE_PACK_KEY)
+            .first();
+          const value = (row as { value?: unknown } | null)?.value;
+          if (typeof value !== 'string' || !value) return null;
+          try {
+            const userKey = await deriveUserEncryptionKey(userId, env.AMSG_MASTER_KEY);
+            return parseFirePack(await unpackStateValue(await decryptFromStorage(value, userKey)));
+          } catch {
+            return null;
+          }
+        },
+        isUserPaused: async (userId) => {
+          const guardrails = await readAutonomyGuardrailsForUser(
+            env.DB as unknown as AutonomyDb,
+            env.AMSG_MASTER_KEY,
+            userId,
+          );
+          return guardrails.paused === true;
+        },
+        insertPlan: (plan) => insertAutonomyPlan(env.DB as unknown as AutonomyDb, plan),
+        loadPlan: (planId) => getAutonomyPlan(env.DB as unknown as AutonomyDb, planId),
+        cancelPlan: ({ planId, charId, reason }) => cancelAutonomyPlanById(
+          env.DB as unknown as AutonomyDb,
+          { planId, charId, reason, nowMs: Date.now() },
+        ),
+        cancelPredecessor: ({ charId, predecessorId }) => cancelSupersededAutonomyPlan(
+          env.DB as unknown as AutonomyDb,
+          { charId, predecessorId, nowMs: Date.now() },
+        ),
+        newPlanId: () => crypto.randomUUID(),
+      });
+      return jsonWithCors(result.status, result.body);
+    }
+
     // 多设备推送：订阅注册镜像（转发成功后 best-effort 落进多设备表）。
     if (method === 'PUT' && pathname.endsWith('/push-subscription')) {
       const mirrored = request.clone();
@@ -3412,6 +3502,121 @@ export default {
       });
     }
 
+    // 全局自主生活护栏的**专用写入**（发布阻断项 6）。
+    //
+    // 为什么不能走普通 `PUT /client-state`：那条是按 updatedAt last-write-wins 的整对象
+    // 覆盖，两台设备同时保存时后写的会把远端刚按下的暂停改回未暂停。这里用条件 UPDATE
+    // （CAS）落库：期望基线与云端不一致就是 409，本轮一个字都不写；当前是暂停时，
+    // 没有 `allowUnpause: true`（用户明确点了总开关）就保不住 `paused: false`。
+    if (method === 'POST' && pathname.endsWith('/autonomy-guardrails/patch')) {
+      const token = (env.AMSG_SERVER_TOKEN ?? '').trim();
+      const clientToken = request.headers.get('X-Client-Token') ?? '';
+      if (token && (!clientToken || !(await constantTimeEqual(clientToken, token)))) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: 'INVALID_CLIENT_TOKEN', message: '共享密钥无效或缺失' },
+        });
+      }
+      const guardrailUserId = (request.headers.get('X-User-Id') ?? '').trim();
+      if (!guardrailUserId) {
+        return jsonWithCors(401, {
+          success: false,
+          error: { code: 'UNAUTHORIZED', message: '缺少用户身份' },
+        });
+      }
+      let guardrailBody: unknown = null;
+      try { guardrailBody = await request.json(); } catch { guardrailBody = null; }
+      if (!guardrailBody || typeof guardrailBody !== 'object' || Array.isArray(guardrailBody)) {
+        return jsonWithCors(400, {
+          success: false,
+          error: { code: 'INVALID_REQUEST', message: '请求体不合法' },
+        });
+      }
+      const body = guardrailBody as Record<string, unknown>;
+      const expected = normalizeGuardrailExpected(body.expected);
+      if (expected === 'invalid') {
+        return jsonWithCors(400, {
+          success: false,
+          error: { code: 'INVALID_EXPECTED', message: '期望基线形状不对（拒绝盲写）' },
+        });
+      }
+      const result = await patchGlobalGuardrails({
+        db: env.DB as unknown as AutonomyDb,
+        masterKey: env.AMSG_MASTER_KEY ?? '',
+        userId: guardrailUserId,
+        patch: body.patch,
+        expected,
+        allowUnpause: body.allowUnpause === true,
+        nowMs: Date.now(),
+      });
+      if (result.ok) {
+        return jsonWithCors(200, {
+          success: true,
+          data: {
+            value: result.value,
+            ...(result.unpauseIgnored ? { unpauseIgnored: true } : {}),
+          },
+        });
+      }
+      if (result.status === 'conflict') {
+        return jsonWithCors(409, {
+          success: false,
+          error: { code: 'GUARDRAIL_CONFLICT', message: '云端护栏已被另一台设备修改，本次没有写入' },
+          data: { value: result.value },
+        });
+      }
+      if (result.status === 'unreadable') {
+        return jsonWithCors(503, {
+          success: false,
+          error: { code: 'GUARDRAIL_UNREADABLE', message: '云端护栏现在读不出来，本次没有写入' },
+        });
+      }
+      return jsonWithCors(400, {
+        success: false,
+        error: { code: 'INVALID_REQUEST', message: '没有可写入的护栏字段' },
+      });
+    }
+
+    // 泛写入口的最后一道闸：普通 `PUT /client-state` 不许把远端暂停改回未暂停。
+    //
+    // 老客户端（或任何绕过专用路由的写入）仍然会用整对象覆盖；这里在转发上游之前
+    // 解出 entries，只针对 `amsg:global/autonomy_guardrails` 这一行做判定：
+    //   - 云端当前是暂停 + 这次写的是未暂停 + 没有明确解暂停意图 → 409，不转发（行不动）；
+    //   - 云端读不出来（缺钥/密文坏）→ 同样拒写（证明不了「没暂停」）。
+    // 其它条目原样放行，这条闸不影响 fire_pack / 工具配置 / 角色状态同步。
+    if (method === 'PUT' && pathname.endsWith('/client-state')) {
+      try {
+        const clone = request.clone();
+        const encryptedBody = (request.headers.get('X-Payload-Encrypted') ?? '').toLowerCase() === 'true';
+        const stateUserId = (request.headers.get('X-User-Id') ?? '').trim();
+        if (encryptedBody && stateUserId && env.AMSG_MASTER_KEY) {
+          const envelope = await clone.json();
+          const stateUserKey = await deriveUserEncryptionKey(stateUserId, env.AMSG_MASTER_KEY);
+          const payload = await decryptPayload(envelope, stateUserKey) as { entries?: unknown };
+          const entries: ClientStateWriteEntry[] = Array.isArray(payload?.entries)
+            ? payload.entries as ClientStateWriteEntry[]
+            : [];
+          const screen = await screenClientStateWrite({
+            db: env.DB as unknown as AutonomyDb,
+            masterKey: env.AMSG_MASTER_KEY,
+            userId: stateUserId,
+            entries,
+            allowUnpause: (request.headers.get('X-Guardrail-Unpause') ?? '') === '1',
+          });
+          if (screen.blocked) {
+            console.warn('[amsg] 普通状态写入被拦：会把云端自主生活暂停改回未暂停', screen.reason, stateUserId);
+            return jsonWithCors(409, {
+              success: false,
+              error: { code: 'GUARDRAIL_PAUSE_PROTECTED', message: screen.message },
+            });
+          }
+        }
+      } catch (error) {
+        // 解不开就交给上游（它会按自己的格式校验回错）。这条闸只挡它看得懂的内容。
+        console.warn('[amsg] 状态写入预检解不开，交给上游处理', error instanceof Error ? error.message : error);
+      }
+    }
+
     return upstream.fetch(request, env);
   },
 
@@ -3447,6 +3652,9 @@ export default {
         nowMs,
         db,
         packs: scanned.packs,
+        // 扫描与 tick 内的兜底读取必须同一把钥：缺了它护栏只能按「读不出来」暂停，
+        // 而以前是把用户的总暂停静默降级成「未暂停 + 默认 6 次/天」。
+        masterKey: env.AMSG_MASTER_KEY,
         postTask: createAutonomyPostTask({
           forward: (request) => upstream.fetch(request, env),
           masterKey: env.AMSG_MASTER_KEY,

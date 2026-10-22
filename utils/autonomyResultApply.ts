@@ -26,7 +26,7 @@ import { mergeAutonomySettings } from './airp/autonomySettings';
 import { saveAirpEvents } from './airp/eventStore';
 import { materializeCommittedEvents } from './airp/worldStore';
 import type { AirpCommittedEvent } from './airp/commit';
-import type { AutonomousOutboxEntry, AutonomyHeartbeat } from '../types';
+import type { AutonomousOutboxEntry, AutonomyHeartbeat, AutonomyWorkflowPlanRecord } from '../types';
 
 const HEADER = '[airp:autonomy]';
 
@@ -71,16 +71,106 @@ const toDid = (value: unknown): AutonomyDid =>
 /** 日记日用 UTC YYYY-MM-DD（确定性选择：payload 不带角色时区日期）。 */
 const utcDateKey = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
-const readUsage = (raw: unknown): { prompt: number; completion: number; total: number } => {
+const readUsage = (raw: unknown): AutonomyHeartbeat['usage'] => {
   const rec = isRecord(raw) ? raw : {};
-  const pick = (key: string): number => {
+  const pick = (key: string): number | undefined => {
     const value = rec[key];
-    return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
   };
   const prompt = pick('prompt');
   const completion = pick('completion');
-  const total = pick('total') || prompt + completion;
-  return { prompt, completion, total };
+  const total = pick('total') ?? (prompt ?? 0) + (completion ?? 0);
+  // P1/C2：缓存的读/写计数原样带过去；供应商没报就**不写这个字段**（缺失 ≠ 0）。
+  const cachedTokens = pick('cachedTokens');
+  const cacheReadTokens = pick('cacheReadTokens');
+  const cacheWriteTokens = pick('cacheWriteTokens');
+  return {
+    ...(prompt !== undefined ? { prompt } : {}),
+    ...(completion !== undefined ? { completion } : {}),
+    total,
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+  };
+};
+
+const WORKFLOW_KINDS = ['diary', 'plan', 'interest_note'] as const;
+type WorkflowKind = (typeof WORKFLOW_KINDS)[number];
+
+const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
+  'completed', 'cancelled', 'failed', 'unknown',
+]);
+
+const toWorkflowKind = (value: unknown): WorkflowKind =>
+  typeof value === 'string' && (WORKFLOW_KINDS as readonly string[]).includes(value)
+    ? (value as WorkflowKind)
+    : 'diary';
+
+const toBasis = (value: unknown): 'inference' | 'virtual' =>
+  value === 'inference' ? 'inference' : 'virtual';
+
+const finite = (value: unknown, fallback: number): number =>
+  (typeof value === 'number' && Number.isFinite(value) ? value : fallback);
+
+/** 结果正文与「后续打算」都只是角色自己的话：限长入库，别让一条结果撑爆一条记录。 */
+const RESULT_TEXT_MAX_CHARS = 2000;
+const RESULT_PLANS_MAX = 8;
+const RESULT_PLAN_MAX_CHARS = 200;
+
+interface NormalizedWorkflowProposal {
+  id: string;
+  kind: WorkflowKind;
+  title: string;
+  purpose: string;
+  scheduledAt: number;
+  expiresAt: number;
+  basis: 'inference' | 'virtual';
+}
+
+interface NormalizedWorkflowResult {
+  planId: string;
+  kind: WorkflowKind;
+  title: string;
+  text: string;
+  plans: string[];
+  basis: 'inference' | 'virtual';
+}
+
+/** 这一轮提出来、已落库的计划（给「角色想做什么」用）；坏条目只丢自己。 */
+const normalizeWorkflowProposal = (raw: unknown, atMs: number): NormalizedWorkflowProposal | null => {
+  if (!isRecord(raw) || !isNonEmptyString(raw.id)) return null;
+  const scheduledAt = finite(raw.scheduledAt, atMs);
+  return {
+    id: raw.id,
+    kind: toWorkflowKind(raw.kind),
+    title: typeof raw.title === 'string' ? raw.title.slice(0, 120) : '',
+    purpose: typeof raw.purpose === 'string' ? raw.purpose.slice(0, 240) : '',
+    scheduledAt,
+    expiresAt: finite(raw.expiresAt, scheduledAt),
+    basis: toBasis(raw.basis),
+  };
+};
+
+/** 一次已经跑完的工作流结果；没有 planId 就没法对上计划，丢掉。 */
+const normalizeWorkflowResult = (raw: unknown): NormalizedWorkflowResult | null => {
+  if (!isRecord(raw) || !isNonEmptyString(raw.planId)) return null;
+  const text = typeof raw.text === 'string' ? raw.text.trim().slice(0, RESULT_TEXT_MAX_CHARS) : '';
+  const plans = Array.isArray(raw.plans)
+    ? raw.plans
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim().slice(0, RESULT_PLAN_MAX_CHARS))
+      .filter(Boolean)
+      .slice(0, RESULT_PLANS_MAX)
+    : [];
+  if (!text && plans.length === 0) return null;
+  return {
+    planId: raw.planId,
+    kind: toWorkflowKind(raw.kind),
+    title: typeof raw.title === 'string' ? raw.title.slice(0, 120) : '',
+    text,
+    plans,
+    basis: toBasis(raw.basis),
+  };
 };
 
 interface NormalizedExperience {
@@ -155,11 +245,22 @@ export async function applyAutonomyResult(payload: unknown): Promise<boolean> {
     return true;
   }
 
+  const workflowsRaw = payload.workflows;
+  if (workflowsRaw !== undefined && !Array.isArray(workflowsRaw)) {
+    // 形状坏了只丢这一段，不影响经历/事件的落点（与 worker 侧「坏条目只丢自己」一致）。
+    console.warn(`${HEADER} workflows 不是数组，这一段丢掉`, charId);
+  }
+
   try {
     await landAutonomyResult({
       charId,
       experiences: experiencesRaw.map(normalizeExperience).filter((item): item is NormalizedExperience => item !== null),
       proposedEvents: proposedRaw.map(normalizeProposedEvent).filter((item): item is NormalizedProposedEvent => item !== null),
+      workflows: Array.isArray(workflowsRaw)
+        ? workflowsRaw.map((item) => normalizeWorkflowProposal(item, Date.now()))
+          .filter((item): item is NormalizedWorkflowProposal => item !== null)
+        : [],
+      workflow: normalizeWorkflowResult(payload.workflow),
       usage: readUsage(payload.usage),
       toolsUsed: Array.isArray(payload.toolsUsed)
         ? payload.toolsUsed.filter((item): item is string => typeof item === 'string')
@@ -180,7 +281,11 @@ interface LandInput {
   charId: string;
   experiences: NormalizedExperience[];
   proposedEvents: NormalizedProposedEvent[];
-  usage: { prompt: number; completion: number; total: number };
+  /** P5：这一轮顺带提的计划（可查看记录）。 */
+  workflows: NormalizedWorkflowProposal[];
+  /** P5：一次跑完的工作流结果（虚拟经历）。 */
+  workflow: NormalizedWorkflowResult | null;
+  usage: AutonomyHeartbeat['usage'];
   toolsUsed: string[];
   did: AutonomyDid;
   anchorFromFirstExperience?: string;
@@ -290,6 +395,94 @@ async function landAutonomyResult(input: LandInput): Promise<void> {
     outboxed: outboxEntries.length,
   };
   await DB.saveHeartbeat(heartbeat);
+
+  // 5. 生活工作流的可查看记录（P5）：角色「想做 / 做过什么」。
+  //    只写这一份客户端投影 + 结果走上面已有的日记页；**不写 airp_events**（那是现实世界事实），
+  //    也不进 outbox（inbox 是「要不要跟对方提」的账，这里不催角色报告）。
+  await landWorkflowRecords({
+    charId,
+    atMs,
+    workflows: input.workflows,
+    workflow: input.workflow,
+  });
+}
+
+interface LandWorkflowInput {
+  charId: string;
+  atMs: number;
+  workflows: NormalizedWorkflowProposal[];
+  workflow: NormalizedWorkflowResult | null;
+}
+
+/**
+ * 把「这一轮提的计划」与「跑完的结果」折进同一个 store。
+ *
+ * 三条纪律：
+ *   - 终态不倒退：重投同一份信封时，已经 completed/failed 的记录不会被重新写成 proposed；
+ *   - 结果只落在对应计划上：找不到提议记录（别的设备提的 / 本地清过）就补一条最小记录，
+ *     免得结果凭空消失，但绝不因此伪造「计划是这台设备提的」以外的字段；
+ *   - 失败不写结果：failed/unknown 不带 resultText。
+ */
+async function landWorkflowRecords(input: LandWorkflowInput): Promise<void> {
+  if (input.workflows.length === 0 && !input.workflow) return;
+
+  let existing: AutonomyWorkflowPlanRecord[] = [];
+  try {
+    existing = await DB.getWorkflowPlansByChar(input.charId, 200);
+  } catch (error) {
+    // 读不出来不该挡住写：下面按「全新建记录」继续，put 是覆盖语义，不会写坏已有行。
+    console.warn(`${HEADER} 读工作流记录失败，按新建继续`, input.charId, error);
+  }
+  const byId = new Map(existing.map((record) => [record.id, record]));
+  const next: AutonomyWorkflowPlanRecord[] = [];
+
+  for (const proposal of input.workflows) {
+    const prev = byId.get(proposal.id);
+    if (prev && TERMINAL_PLAN_STATUSES.has(prev.status)) continue; // 终态不倒退
+    next.push({
+      id: proposal.id,
+      charId: input.charId,
+      kind: proposal.kind,
+      status: prev?.status ?? 'proposed',
+      title: proposal.title || prev?.title || '',
+      purpose: proposal.purpose || prev?.purpose || '',
+      basis: proposal.basis,
+      source: prev?.source ?? 'autonomy_round',
+      sourceRef: prev?.sourceRef ?? '',
+      scheduledAt: proposal.scheduledAt,
+      expiresAt: proposal.expiresAt,
+      createdAt: prev?.createdAt ?? input.atMs,
+      updatedAt: input.atMs,
+      ...(prev?.resultText !== undefined ? { resultText: prev.resultText } : {}),
+      ...(prev?.resultPlans !== undefined ? { resultPlans: prev.resultPlans } : {}),
+      ...(prev?.lastError !== undefined ? { lastError: prev.lastError } : {}),
+    });
+  }
+
+  const result = input.workflow;
+  if (result) {
+    const prev = byId.get(result.planId);
+    next.push({
+      id: result.planId,
+      charId: input.charId,
+      kind: result.kind,
+      // 结果只可能是「跑完了」：失败的轮次 worker 不会发 workflow 段。
+      status: 'completed',
+      title: result.title || prev?.title || '',
+      purpose: prev?.purpose ?? '',
+      basis: 'virtual',
+      source: prev?.source ?? 'autonomy_round',
+      sourceRef: prev?.sourceRef ?? '',
+      scheduledAt: prev?.scheduledAt ?? input.atMs,
+      expiresAt: prev?.expiresAt ?? input.atMs,
+      createdAt: prev?.createdAt ?? input.atMs,
+      updatedAt: input.atMs,
+      ...(result.text ? { resultText: result.text } : {}),
+      ...(result.plans.length > 0 ? { resultPlans: result.plans } : {}),
+    });
+  }
+
+  if (next.length > 0) await DB.saveWorkflowPlans(next);
 }
 
 /** 读角色的自主档位；角色不在库里按 0（改道，不物化）。存取器缺表时 getAllCharacters 仍可用。 */

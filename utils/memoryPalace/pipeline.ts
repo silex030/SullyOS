@@ -65,6 +65,9 @@ function getRerankConfig(): { baseUrl: string; apiKey: string; model: string; to
 }
 import { extractMemoriesFromBuffer } from './extraction';
 import type { RelatedMemoryRef, PinnedMemoryRef } from './extraction';
+import type { NegotiationPlan } from './negotiationPlan';
+import { commitPromotedMemories } from './negotiationPlan';
+import { recordExtractionCorrection } from './negotiation';
 import { fetchRelatedMemoriesForExtraction, sampleSnippetsFromMessages, splitMessagesToSpikes } from './relatedMemories';
 import { getReceiptIdsInRange } from './recallReceipts';
 import { vectorizeAndStore, checkModelConsistency, rebuildAllVectors } from './vectorStore';
@@ -1691,6 +1694,11 @@ export interface PipelineResult {
      * caller 看到这个字段就应当提示"聊天还不够，继续聊"，而不是报"LLM 提取失败"。
      */
     skipReason?: 'lock' | 'hot_zone' | 'threshold';
+    /**
+     * 记忆协商留下的未决条数：这批内容已经被读过了，只是不确定的部分没落库。
+     * caller 据 stored=0 + deferred>0 即可判断「不是失败，是等用户澄清」。
+     */
+    deferred?: number;
 }
 
 /** 构造一个"软跳过"结果，统一 caller 的分支处理 */
@@ -1709,7 +1717,11 @@ interface ExtractCoreResult {
     batches: PipelineResult['batches'];
     crossTimeLinks: { newMemoryId: string; existingMemoryId: string }[];
     eventBoxHints: import('./extraction').EventBoxHint[];
-    corrections: { targetId: string; note: string }[];
+    corrections: { targetId: string; note: string; sourceMessageIds?: number[] }[];
+    /** 记忆协商计划（开关关闭时为空数组）：已落库的节点里剔掉了「不确定」的说法 */
+    negotiationPlans: NegotiationPlan[];
+    /** 本轮提取出的条目全部被协商判为不确定（没有可落库条目）——水位线仍然可以前进 */
+    deferredOnly: boolean;
 }
 
 /**
@@ -1836,8 +1848,9 @@ async function extractAndStoreMemories(
         const allMemories: import('./types').MemoryNode[] = [];
         const allCrossTimeLinks: { newMemoryId: string; existingMemoryId: string }[] = [];
         const allEventBoxHints: import('./extraction').EventBoxHint[] = [];
-        const allCorrections: { targetId: string; note: string }[] = [];
+        const allCorrections: { targetId: string; note: string; sourceMessageIds?: number[] }[] = [];
         const allUnpinIds = new Set<string>();
+        const allNegotiationPlans: NegotiationPlan[] = [];
         const batchResults: PipelineResult['batches'] = [];
 
         for (let ci = 0; ci < chunks.length; ci++) {
@@ -1853,6 +1866,7 @@ async function extractAndStoreMemories(
                 allCrossTimeLinks.push(...extractionResult.crossTimeLinks);
                 allEventBoxHints.push(...extractionResult.eventBoxHints);
                 allCorrections.push(...extractionResult.corrections);
+                if (extractionResult.negotiation) allNegotiationPlans.push(extractionResult.negotiation);
                 extractionResult.unpinIds.forEach(id => allUnpinIds.add(id));
                 batchResults.push({ index: ci + 1, total: chunks.length, extracted: extractionResult.memories.length, ok: true });
             } catch (e: any) {
@@ -1871,6 +1885,8 @@ async function extractAndStoreMemories(
                 crossTimeLinks: [],
                 eventBoxHints: [],
                 corrections: [],
+                negotiationPlans: [],
+                deferredOnly: false,
             };
         }
 
@@ -1887,13 +1903,70 @@ async function extractAndStoreMemories(
         }
 
         const memories = allMemories;
+        // 本轮没有新提取条目，但可能有「上一轮未决、这一轮被澄清」的候选要补写，
+        // 这种批次不能当成空跑（否则每次都要重新问用户一次）。
+        const hasPromotions = allNegotiationPlans.some(plan => plan.promotions.length > 0);
 
-        if (memories.length === 0) {
+        if (memories.length === 0 && !hasPromotions) {
             console.warn(`🏰 [Pipeline] 所有批次共提取 0 条记忆（${toProcess.length} 条消息），不更新高水位，下次重试`);
-            return { stored: 0, skipped: 0, memories: [], batches: batchResults, crossTimeLinks: allCrossTimeLinks, eventBoxHints: allEventBoxHints, corrections: allCorrections };
+            return {
+                stored: 0,
+                skipped: 0,
+                memories: [],
+                batches: batchResults,
+                crossTimeLinks: allCrossTimeLinks,
+                eventBoxHints: allEventBoxHints,
+                corrections: allCorrections,
+                negotiationPlans: allNegotiationPlans,
+                deferredOnly: false,
+            };
         }
 
         console.log(`🏰 [Pipeline] 提取完成：${chunks.length} 批共 ${memories.length} 条记忆`);
+
+        // 7c. 记忆协商闸门：被判定为「否定 / 引用 / 角色猜测 / 主体不明 / 来源不可核对」的条目
+        //     不落库，只留在未决账本里；同时把指向它们的关联 / 纠正 / 事件盒提示一起剔掉，
+        //     避免 EventBox 绑定到根本不存在的节点。
+        const keptMemoryIds = new Set<string>();
+        for (const plan of allNegotiationPlans) {
+            for (const id of plan.keptMemoryIds) keptMemoryIds.add(id);
+        }
+        const negotiationOn = allNegotiationPlans.length > 0;
+        const storableMemories = negotiationOn
+            ? memories.filter(memory => keptMemoryIds.has(memory.id))
+            : memories;
+        const deferredCount = memories.length - storableMemories.length;
+        const crossTimeLinks = negotiationOn
+            ? allCrossTimeLinks.filter(link => keptMemoryIds.has(link.newMemoryId))
+            : allCrossTimeLinks;
+        const eventBoxHints = negotiationOn
+            ? allEventBoxHints.filter(hint => keptMemoryIds.has(hint.newMemoryId))
+            : allEventBoxHints;
+        const corrections = allCorrections;
+        const promotedNodes = allNegotiationPlans.flatMap(plan => plan.promotions.map(promotion => promotion.node));
+
+        if (negotiationOn) {
+            console.log(
+                `🗣️ [Pipeline] 记忆协商：${storableMemories.length} 条落库，${deferredCount} 条留作未决候选，`
+                + `${promotedNodes.length} 条候选已澄清待补写`,
+            );
+        }
+
+        if (storableMemories.length === 0 && promotedNodes.length === 0) {
+            // 全部条目都被协商判为不确定：已经有账本记录，重跑同一批只会重复问一次，
+            // 所以允许调用方推进水位线（见 deferredOnly）。
+            return {
+                stored: 0,
+                skipped: 0,
+                memories: [],
+                batches: batchResults,
+                crossTimeLinks: [],
+                eventBoxHints: [],
+                corrections,
+                negotiationPlans: allNegotiationPlans,
+                deferredOnly: deferredCount > 0,
+            };
+        }
 
         // 7b. 检测 embedding 模型是否变更，如果变了则重建所有已有向量
         try {
@@ -1908,19 +1981,42 @@ async function extractAndStoreMemories(
         }
 
         // 8. 向量化（Embedding API，按批次）。向量化失败 → stored=0，caller 据此决定不更新水位。
-        console.log(`🏰 [Pipeline] 开始向量化 ${memories.length} 条记忆...`);
-        onProgress?.(`正在向量化 ${memories.length} 条记忆...`);
-        const vectorResult = await vectorizeAndStore(memories, embeddingConfig, getRemoteVectorConfig(), { skipDedup });
+        console.log(`🏰 [Pipeline] 开始向量化 ${storableMemories.length} 条记忆...`);
+        onProgress?.(`正在向量化 ${storableMemories.length} 条记忆...`);
+        const vectorResult = await vectorizeAndStore(storableMemories, embeddingConfig, getRemoteVectorConfig(), { skipDedup });
         console.log(`🏰 [Pipeline] 向量化完成：${vectorResult.stored} 条存储, ${vectorResult.skipped} 条去重跳过`);
+
+        // 8b. 已被用户明确澄清的候选：用确定性 ID 补写，成功后回填 appliedMemoryId（重放不重复）。
+        if (promotedNodes.length > 0) {
+            try {
+                await vectorizeAndStore(promotedNodes, embeddingConfig, getRemoteVectorConfig(), { skipDedup: true });
+                for (const plan of allNegotiationPlans) {
+                    if (plan.promotions.length === 0) continue;
+                    commitPromotedMemories(
+                        plan,
+                        plan.promotions.map(promotion => ({
+                            candidateId: promotion.candidateId,
+                            memoryId: promotion.node.id,
+                        })),
+                    );
+                }
+                console.log(`🗣️ [Pipeline] ${promotedNodes.length} 条协商确认的记忆已补写`);
+            } catch (e: any) {
+                console.warn(`🗣️ [Pipeline] 协商确认记忆补写失败（下一轮会重试，不会重复）: ${e?.message || e}`);
+            }
+        }
 
         return {
             stored: vectorResult.stored,
             skipped: vectorResult.skipped,
-            memories,
+            memories: storableMemories,
             batches: batchResults,
-            crossTimeLinks: allCrossTimeLinks,
-            eventBoxHints: allEventBoxHints,
-            corrections: allCorrections,
+            crossTimeLinks,
+            eventBoxHints,
+            corrections,
+            negotiationPlans: allNegotiationPlans,
+            deferredOnly: storableMemories.length === 0
+                && (deferredCount > 0 || promotedNodes.length > 0),
         };
 }
 
@@ -1936,7 +2032,7 @@ async function applyMemorySideEffects(
     memories: import('./types').MemoryNode[],
     crossTimeLinks: { newMemoryId: string; existingMemoryId: string }[],
     eventBoxHints: import('./extraction').EventBoxHint[],
-    corrections: { targetId: string; note: string }[],
+    corrections: { targetId: string; note: string; sourceMessageIds?: number[] }[],
     embeddingConfig: EmbeddingConfig,
     llmConfig: LightLLMConfig,
     userName: string,
@@ -1984,16 +2080,19 @@ async function applyMemorySideEffects(
         if (corrections.length > 0) {
             try {
                 // 同一目标多次纠正：合并成一条多分号 note，避免追加多次
-                const merged = new Map<string, string[]>();
+                const merged = new Map<string, { notes: string[]; messageIds: number[] }>();
                 for (const c of corrections) {
-                    const arr = merged.get(c.targetId) || [];
-                    arr.push(c.note);
-                    merged.set(c.targetId, arr);
+                    const entry = merged.get(c.targetId) || { notes: [], messageIds: [] };
+                    entry.notes.push(c.note);
+                    for (const id of c.sourceMessageIds || []) {
+                        if (!entry.messageIds.includes(id)) entry.messageIds.push(id);
+                    }
+                    merged.set(c.targetId, entry);
                 }
 
                 const dateStr = getLocalDateKey();
                 const toRevectorize: import('./types').MemoryNode[] = [];
-                for (const [targetId, notes] of merged) {
+                for (const [targetId, entry] of merged) {
                     const node = await MemoryNodeDB.getById(targetId);
                     if (!node) {
                         console.warn(`✏️ [Pipeline] 纠正目标 ${targetId} 已不存在，跳过`);
@@ -2004,9 +2103,15 @@ async function applyMemorySideEffects(
                         console.warn(`✏️ [Pipeline] 纠正目标 ${targetId} 已归档，跳过`);
                         continue;
                     }
-                    const noteText = notes.map(n => n.trim()).filter(Boolean).join('；');
+                    const noteText = entry.notes.map(n => n.trim()).filter(Boolean).join('；');
                     if (!noteText) continue;
                     node.content = `${node.content}\n（${dateStr} 纠正：${noteText}）`;
+                    // 保留失效关系与来源：原 content 不删，追加一条带消息 ID 的 supersession。
+                    recordExtractionCorrection(node, {
+                        note: noteText,
+                        sourceMessageIds: entry.messageIds,
+                        at: Date.now(),
+                    });
                     node.embedded = false; // 触发重新向量化
                     node.lastAccessedAt = Date.now();
                     await MemoryNodeDB.save(node);
@@ -2176,6 +2281,23 @@ export async function processNewMessages(
 
         if (core.memories.length === 0) {
             const allBatchesSucceeded = core.batches.length > 0 && core.batches.every(batch => batch.ok);
+            // 协商把整批都判成了不确定：账本已记下这些未决说法，重跑同一批只会再问一次，
+            // 所以照常推进水位线（deferred>0 表示「读过，但不落事实」）。
+            if (core.deferredOnly) {
+                if (drainBuffer) await setReliableMemoryPalaceHighWaterMark(charId, targetHighWaterMark);
+                else await setReliableMemoryPalaceHighWaterMark(charId, toProcess[toProcess.length - 1].id);
+                onProgress?.('这轮说法还不确定，先记成待澄清');
+                return {
+                    stored: 0,
+                    skipped: 0,
+                    processedMessages: toProcess.length,
+                    memories: [],
+                    batches: core.batches,
+                    autoArchive: null,
+                    deferred: core.negotiationPlans
+                        .reduce((sum, plan) => sum + plan.summary.deferred, 0),
+                };
+            }
             if (drainBuffer && options.requireAllBatches && allBatchesSucceeded) {
                 // LLM 成功读完但判断没有值得长期保存的记忆，仍可视为完成了本次记忆处理。
                 await setReliableMemoryPalaceHighWaterMark(charId, targetHighWaterMark);
@@ -2212,6 +2334,7 @@ export async function processNewMessages(
         const autoArchive = buildAutoArchiveFragments(core.memories, newHighWaterMark);
 
         // 构建返回结果
+        const deferredCount = core.negotiationPlans.reduce((sum, plan) => sum + plan.summary.deferred, 0);
         const pipelineResult: PipelineResult = {
             stored: core.stored,
             skipped: core.skipped,
@@ -2219,6 +2342,7 @@ export async function processNewMessages(
             memories: core.memories.map(m => ({ content: m.content, room: m.room, importance: m.importance, mood: m.mood, tags: m.tags })),
             batches: core.batches,
             autoArchive,
+            ...(deferredCount > 0 ? { deferred: deferredCount } : {}),
         };
 
         // 10–11. 建链 / EventBox / 纠正 / 巩固（共用 applyMemorySideEffects）
@@ -2253,6 +2377,8 @@ export interface RangeProcessResult {
      * - 其它字符串    异常信息
      */
     error?: 'lock' | 'empty' | 'no_memories' | string;
+    /** 记忆协商留下的未决条数（这批读过、但不确定的说法没落库） */
+    deferred?: number;
 }
 
 /** 外部文本搬家到记忆宫殿的结果。 */
@@ -2448,7 +2574,26 @@ export async function processMessageRange(
         );
 
         if (core.memories.length === 0) {
-            return { stored: 0, skipped: 0, processedMessages: toProcess.length, memories: [], batches: core.batches, error: 'no_memories' };
+            const deferred = core.negotiationPlans.reduce((sum, plan) => sum + plan.summary.deferred, 0);
+            if (core.deferredOnly) {
+                return {
+                    stored: 0,
+                    skipped: 0,
+                    processedMessages: toProcess.length,
+                    memories: [],
+                    batches: core.batches,
+                    deferred,
+                };
+            }
+            return {
+                stored: 0,
+                skipped: 0,
+                processedMessages: toProcess.length,
+                memories: [],
+                batches: core.batches,
+                error: 'no_memories',
+                ...(deferred > 0 ? { deferred } : {}),
+            };
         }
 
         // 关键：不更新水位线、不做自动归档。只跑入库后的副作用。
@@ -2460,12 +2605,14 @@ export async function processMessageRange(
         console.log(`✅ [Pipeline] 手动区间总结完成：新增 ${core.stored} 条，去重跳过 ${core.skipped} 条（水位线未改动）`);
         onProgress?.(`完成！新增 ${core.stored} 条记忆${core.skipped > 0 ? `，${core.skipped} 条因重复跳过` : ''}`);
 
+        const rangeDeferred = core.negotiationPlans.reduce((sum, plan) => sum + plan.summary.deferred, 0);
         return {
             stored: core.stored,
             skipped: core.skipped,
             processedMessages: toProcess.length,
             memories: core.memories.map(m => ({ content: m.content, room: m.room, importance: m.importance, mood: m.mood, tags: m.tags })),
             batches: core.batches,
+            ...(rangeDeferred > 0 ? { deferred: rangeDeferred } : {}),
         };
     } catch (err: any) {
         console.error(`❌ [Pipeline] processMessageRange 失败 (charId=${charId}):`, err.message, err.stack?.split('\n')[1] || '');

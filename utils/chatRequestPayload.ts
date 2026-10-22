@@ -30,7 +30,13 @@ import { buildLuckinMiniAppContextBlock, buildLuckinChatSystemBlock } from './lu
 import type { LuckinMiniAppSnapshot, LuckinChatState } from './luckinToolBridge';
 import { isMcpChatAvailable, loadMcpSettings } from './mcpClient';
 import { buildMcpSystemBlock, MCP_TAIL_REMINDER } from './mcpToolBridge';
-import { getMcpResultMemoryBlock } from './mcpResultMemory';
+import { getMcpResultMemoryParts } from './mcpResultMemory';
+import { buildMemoryNegotiationBlock, resolveMemoryNegotiationEnabled } from './memoryNegotiation';
+import {
+    inspectStableShape,
+    type StableShapeReport,
+    type WorldbookStabilityInput,
+} from './promptCacheDiagnostics';
 import type { MusicCfg, Song, LyricLine, MusicPlaybackSnapshot, RecentTrackChange } from '../context/MusicContext';
 import { isPromptBuildSkipped, isSystemMessageMergeEnabled } from './devDebug';
 import { mergeSystemMessages } from './systemMessageMerge';
@@ -118,6 +124,11 @@ export interface BuildChatPayloadInput {
      * 空串 / 缺省 = 与历史输出逐字一致（AIRP 关闭角色的零影响保证）。
      */
     airpInstruction?: string;
+    /**
+     * P3 记忆协商前台策略的开关：显式值优先，缺省读本地存储（默认关闭，见总体计划 P6）。
+     * 打开只是多一段固定的协商纪律（进稳定前缀），不新增任何记忆写入指令或额外 LLM 调用。
+     */
+    memoryNegotiationEnabled?: boolean;
 }
 
 export interface BuildChatPayloadResult {
@@ -144,6 +155,12 @@ export interface BuildChatPayloadResult {
     autonomyToldIds: string[];
     /** 本轮记忆召回的脱敏 Trace；Prompt Build 被整体跳过时不存在。 */
     recallTrace?: RecallTrace;
+    /**
+     * 稳定前缀的结构诊断（C4/C6/C9）：指纹、段落、动态内容告警。
+     * 只含结构数字与段落 id，**不含 prompt 原文片段**，可安全写进本地诊断日志。
+     * 告警是启发式的（固定规则里的「今天/9:30」举例也会命中），不是「这段一定每轮变」的确认。
+     */
+    cacheShape?: StableShapeReport & { stableHash: string };
     /** 调试用：bilingual / mcd 是否实际注入 */
     flags: {
         bilingualActive: boolean;
@@ -498,17 +515,29 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         }
     }
     // ── 9e. MCP 调用结果记忆块（本地 + worker 两条链路都注入，防重复调用） ──
-    // 读 localStorage 记录（按 charId 隔离）：最近 N 轮摘要 + 手册类长期原文。
+    // 读 localStorage 记录（按 charId 隔离），拆两段（C7）：
+    //   stable  = 手册类长期原文（用户手动清空前一直有效，变化极慢）→ 稳定前缀；
+    //   dynamic = 最近 N 轮摘要（轮次窗口滚动、每次新调用都会变）→ 易变尾段、钢印之前。
+    // 为什么必须拆：近期结果原先追加在 stable 末尾，等于每来一条工具结果就把整段历史的前缀
+    // 复用挡掉一次；而它贴尾反而能拿到 recency。
     // worker 链路也注入：记录在前端产生（fire 回调/本地执行后落 localStorage），
     // prompt 组装时一并带给云端，云端工具结果的上云不在本期范围。
+    let mcpResultDynamic = '';
     if (mcpChatActive) {
         try {
             const mcpSettings = loadMcpSettings();
-            const memoryBlock = getMcpResultMemoryBlock(char.id, mcpSettings.resultKeepTurns);
-            if (memoryBlock) {
-                systemPrompt += memoryBlock;
-            }
+            const memoryParts = getMcpResultMemoryParts(char.id, mcpSettings.resultKeepTurns);
+            if (memoryParts.stable) systemPrompt += memoryParts.stable;
+            mcpResultDynamic = memoryParts.dynamic;
         } catch { /* 记忆读取失败不影响主链路 */ }
+    }
+    if (mcpResultDynamic) volatileTail += mcpResultDynamic;
+
+    // ── 9f. P3 记忆协商纪律（固定文案 → 稳定前缀）──
+    // 只讲「怎么判断、怎么问」，不新增记忆写入指令、不加前置分析请求、不改变回复格式。
+    // 默认关闭（总体计划 P6：记忆协商独立开关、默认关），父层可显式传值或在本地存储打开。
+    if (resolveMemoryNegotiationEnabled(input.memoryNegotiationEnabled)) {
+        systemPrompt += `\n\n${buildMemoryNegotiationBlock()}`;
     }
 
     // ── 10. recency 钢印归位 + 组装 fullMessages ─────────
@@ -600,6 +629,13 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         console.warn(`[DevDebug] Merge system messages: ${fullMessages.length} → ${finalMessages.length} messages (system ${fullMessages.length - finalMessages.length + 1} → 1).`);
     }
 
+    // 稳定前缀结构诊断：只算指纹 / 段落 / 启发式告警，不改文本、不读网络、不落原文。
+    // 调用方（最终发送边界）可以拿 stableHash 判断「这一轮固定前缀有没有被动过」。
+    const stableShape = inspectStableShape({
+        segments: [{ id: 'system-stable', text: systemPrompt }],
+        worldbooks: (char.mountedWorldbooks || []) as unknown as WorldbookStabilityInput[],
+    });
+
     return {
         // 返回给情绪评估 / 调试查看器的仍是"完整拼接"——信息与主 API 完全一致，
         // 只是主 API 的实际消息结构把易变尾段放在历史之后（见上）。
@@ -610,6 +646,7 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         volatileTailIndex: finalMessages === fullMessages ? 1 + messagesWithPresetDepth.length : -1,
         autonomyToldIds,
         recallTrace,
+        cacheShape: { ...stableShape, stableHash: stableShape.segments[0]?.fingerprint || '' },
         flags: { bilingualActive, mcdActive, luckinActive, luckinChatActive, mcpChatActive, htmlActive, thinkingActive, promptBuildSkipped: false },
     };
 }

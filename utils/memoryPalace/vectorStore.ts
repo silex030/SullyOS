@@ -7,7 +7,7 @@
  */
 
 import type { EmbeddingConfig, MemoryNode, MemoryVector, RemoteVectorConfig } from './types';
-import { MemoryNodeDB, MemoryVectorDB, ensureFloat32 } from './db';
+import { MemoryNodeDB, MemoryVectorDB, ensureFloat32, saveNodeWithVector } from './db';
 import { getEmbeddings, cosineSimilarity } from './embedding';
 import { upsertVector as remoteUpsert } from './supabaseVector';
 
@@ -62,10 +62,10 @@ export async function vectorizeAndStore(
             continue;
         }
 
-        // 3. 保存
-        node.embedded = true;
-        await MemoryNodeDB.save(node);
-
+        // 3. 保存：正文（embedded=true）与向量必须在同一个事务里落地。
+        //    分两次写的旧实现一旦第二次失败，就会留下「新正文 + 旧向量」且标着
+        //    embedded=true 的假完成态（P0·B3）。
+        const storedNode: MemoryNode = { ...node, embedded: true };
         const memoryVector: MemoryVector = {
             memoryId: node.id,
             charId: node.charId,
@@ -73,7 +73,8 @@ export async function vectorizeAndStore(
             dimensions: embeddingConfig.dimensions,
             model: embeddingConfig.model,
         };
-        await MemoryVectorDB.save(memoryVector);
+        await saveNodeWithVector(storedNode, memoryVector);
+        node.embedded = true;
 
         // 同步写入远程（fire-and-forget，不阻塞本地流程）
         if (remoteVectorConfig?.enabled && remoteVectorConfig.initialized) {
@@ -125,6 +126,8 @@ export async function updateStoredMemoryNode(
     }
 
     updated.embedded = false;
+    // vectorizeAndStore 内部用单事务同时写正文 + 向量：失败时库里仍是「旧正文 + 旧向量」，
+    // 不会留下 updated.embedded=false 的半截记录，也不会假装已完成。
     await vectorizeAndStore(
         [updated],
         embeddingConfig,

@@ -58,6 +58,24 @@ export interface AirpAutonomyConfig {
 }
 
 /**
+ * 能力授权模式（P0·B4）。
+ *
+ * 历史契约只有一个 `capabilities: string[]`，且「空数组 = 全部可用」——用户想把
+ * 能力全关掉时，取消到最后一项就变回「全开」，语义上根本表达不出 none。
+ * 新增显式 mode 后三态各自独立：
+ *  - `all`：目录内全部能力可用（仍受 autonomyLevel / writable 闸门约束）
+ *  - `allowlist`：只放行 `capabilities` 里列出的 id
+ *  - `none`：一个都不给（空数组也不会被读回 all）
+ */
+export type AirpCapabilityMode = 'all' | 'allowlist' | 'none';
+
+export interface AirpCapabilityPolicy {
+    mode: AirpCapabilityMode;
+    /** allowlist 模式下的显式授权 id；all / none 恒为空数组。 */
+    allow: string[];
+}
+
+/**
  * 单个角色的 AIRP 运行时设置。整体挂在 CharacterProfile.airp 上，
  * 随角色持久化；缺省（undefined）代表该角色没开 AIRP，一切维持历史行为。
  */
@@ -68,8 +86,16 @@ export interface AirpSettings {
   autonomyLevel: AirpAutonomyLevel;
   /** 导演模型覆盖；缺省代表沿用角色主模型。 */
   directorModel?: string;
-  /** 允许的能力 id 白名单；默认空数组。 */
+  /**
+   * 允许的能力 id 白名单。**单独看它有历史歧义**（空数组 = 全开），
+   * 判权限请一律走 resolveAirpCapabilityPolicy()，不要直接读这个数组。
+   */
   capabilities: string[];
+  /**
+   * 能力授权模式。缺省 = 旧数据：`capabilities` 空数组按 all 解释、非空按 allowlist。
+   * 显式写 `none` 之后，即便 `capabilities` 是空数组也保持「全禁」，永远不会读回 all。
+   */
+  capabilityMode?: AirpCapabilityMode;
   /** 允许的 MCP server 白名单；默认空数组。 */
   mcpAllow: string[];
   /** 是否允许写入类能力；默认 false。 */
@@ -114,21 +140,87 @@ function toStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string');
 }
 
+/** 去重并保持首次出现顺序（能力 id 是字符串，重复没有意义）。 */
+function dedupeStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+/** 只认三个字面量；其它（含旧数据缺省、拼错、大小写不对）一律当作「没有 mode」。 */
+function toCapabilityMode(value: unknown): AirpCapabilityMode | undefined {
+  return value === 'all' || value === 'allowlist' || value === 'none' ? value : undefined;
+}
+
+/**
+ * 能力授权的唯一判定入口（前端面板 / 运行时快照 / 任何未来的 worker 闸门都走它）。
+ *
+ * 迁移规则（P0·B4，改动前先读）：
+ *  - 没有合法 `capabilityMode` = 旧数据：`capabilities` 空数组 → all，非空 → allowlist。
+ *    「不勾选即全开」的历史含义必须原样保留，否则升级后老角色会突然失去全部能力。
+ *  - 显式 `none` 永远赢：哪怕 `capabilities` 里还残留 id，也不许复活成 any。
+ *  - 显式 `allowlist` + 空数组 = none（空白名单不等于全开）。
+ *  - 显式 `all` 会丢掉残留数组，避免"all 但只给几个"的自相矛盾状态。
+ */
+export function resolveAirpCapabilityPolicy(raw: unknown = undefined): AirpCapabilityPolicy {
+  const source = isSettingsRecord(raw) ? raw : {};
+  const allow = dedupeStrings(toStringArray(source.capabilities));
+  const mode = toCapabilityMode(source.capabilityMode);
+
+  if (mode === 'none') return { mode: 'none', allow: [] };
+  if (mode === 'all') return { mode: 'all', allow: [] };
+  if (mode === 'allowlist') {
+    return allow.length > 0 ? { mode: 'allowlist', allow } : { mode: 'none', allow: [] };
+  }
+
+  return allow.length > 0 ? { mode: 'allowlist', allow } : { mode: 'all', allow: [] };
+}
+
+/**
+ * 把策略压回可持久化的两个字段（mode + 数组永远同源写）。
+ * 空 allowlist 收敛成 none，避免"写了白名单却是空的"被读成 all。
+ */
+export function capabilityPolicyPatch(policy: AirpCapabilityPolicy): {
+  capabilityMode: AirpCapabilityMode;
+  capabilities: string[];
+} {
+  if (policy.mode === 'allowlist') {
+    const allow = dedupeStrings(toStringArray(policy.allow));
+    return allow.length > 0
+      ? { capabilityMode: 'allowlist', capabilities: allow }
+      : { capabilityMode: 'none', capabilities: [] };
+  }
+  return { capabilityMode: policy.mode, capabilities: [] };
+}
+
 /**
  * 把任意来源的原始值（IndexedDB 里读出来的、导入卡里的、调用方手搓的）
  * 合并成一份完整、合法的 AirpSettings。任何输入都不会抛错：
  * 非对象 → 全默认；对象 → 逐字段校验，非法字段各自回落默认值。
+ *
+ * `capabilityMode` 只在原始数据**显式**带了合法 mode 时才回写：旧数据保持旧形状
+ * （不凭空多出一个字段），显式 none 也不会在往返中丢失。
  */
 export function mergeAirpSettings(raw: unknown = undefined): AirpSettings {
   const source = isSettingsRecord(raw) ? raw : {};
+  const policy = resolveAirpCapabilityPolicy(source);
+  const explicitMode = toCapabilityMode(source.capabilityMode);
 
-  return {
+  const merged: AirpSettings = {
     enabled: toBoolean(source.enabled),
     autonomyLevel: toAutonomyLevel(source.autonomyLevel),
     directorModel: toDirectorModel(source.directorModel),
-    capabilities: toStringArray(source.capabilities),
+    capabilities: policy.allow,
     mcpAllow: toStringArray(source.mcpAllow),
     writable: toBoolean(source.writable),
     version: 1,
   };
+
+  if (explicitMode) merged.capabilityMode = policy.mode;
+  return merged;
 }

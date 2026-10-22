@@ -41,7 +41,7 @@ const relayRequest = (
             headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
             body: method === 'GET' || method === 'HEAD' ? undefined : '{}',
         }),
-        opts.env || {},
+        { MAIN_AGENT_ALLOW_ANONYMOUS: 'true', ...(opts.env || {}) },
         { waitUntil: () => {} },
     );
 };
@@ -195,7 +195,7 @@ describe('POST /v1/chat/completions 上游 LLM 自标识', () => {
     const chatBody = () => JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: false });
     const sseOk = 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
     const llmEnv = (baseUrl: string) => ({
-        LLM_BASE_URL: baseUrl, LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '5000',
+        MAIN_AGENT_ALLOW_ANONYMOUS: 'true', LLM_BASE_URL: baseUrl, LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '5000',
     });
     const callChat = async (env: Record<string, string>) => {
         const calls: Array<{ url: string; init: { headers?: HeadersInit } }> = [];
@@ -251,7 +251,7 @@ describe('聊天 SSE 心跳（静默期保活）', () => {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
                 }),
-                { LLM_BASE_URL: 'https://opencode.ai/zen/go/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '120000' },
+                { MAIN_AGENT_ALLOW_ANONYMOUS: 'true', LLM_BASE_URL: 'https://opencode.ai/zen/go/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '120000' },
                 { waitUntil: () => {} },
             );
             expect(res.status).toBe(200);
@@ -300,7 +300,7 @@ describe('上游发完终止事件但不关连接', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
             }),
-            { LLM_BASE_URL: 'https://api.example.com/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '120000' },
+            { MAIN_AGENT_ALLOW_ANONYMOUS: 'true', LLM_BASE_URL: 'https://api.example.com/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm', LLM_TIMEOUT_MS: '120000' },
             { waitUntil: () => {} },
         );
         expect(res.status).toBe(200);

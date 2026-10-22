@@ -94,6 +94,7 @@ const KNOWN: Readonly<Record<string, string>> = {
     airp_world: 'airpWorlds',
     autonomous_outbox: 'autonomousOutbox',
     autonomous_heartbeats: 'autonomousHeartbeats',
+    airp_workflow_plans: 'autonomyWorkflowPlans',
     life_records: 'lifeRecords',
     med_plans: 'medPlans',
     life_record_settings: 'lifeRecordSettings',

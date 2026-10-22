@@ -313,6 +313,68 @@ function isLegacyVec(vec: unknown): boolean {
     return Array.isArray(vec);
 }
 
+/**
+ * 记忆正文与向量**同一个事务**提交（P0·B3）。
+ *
+ * 为什么不能用「先 MemoryNodeDB.save(node) 再 MemoryVectorDB.save(vec)」：
+ * 两条独立事务之间失败（配额不足、页面被杀）会留下「正文是新的、向量还是旧的」，
+ * 而节点上的 `embedded=true` 又让后台以为这条记忆已经向量化 → 检索永远拿旧向量，
+ * 且没有任何重试入口。事务级原子性保证：要么两份都是旧的，要么两份都是新的。
+ *
+ * `node.embedded` 由调用方在成功前设好（这里不替你改写语义），失败时调用方持有的
+ * 对象也不会被标记成已完成。
+ */
+export async function saveNodeWithVector(node: MemoryNode, vector: MemoryVector): Promise<void> {
+    const db = await openDB();
+    const storedVector: MemoryVector = { ...vector, vector: vecForStorage(vector.vector) };
+
+    let tx: IDBTransaction;
+    try {
+        tx = db.transaction([STORE_MEMORY_NODES, STORE_MEMORY_VECTORS], 'readwrite');
+    } catch (e) {
+        throw e instanceof Error ? e : new Error(String(e));
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const fail = (err: unknown) => {
+            if (settled) return;
+            settled = true;
+            // put 同步抛错不会自动回滚事务，必须显式 abort 才能把已排队的正文一起撤掉。
+            try { tx.abort(); } catch { /* 事务已结束，忽略 */ }
+            reject(err instanceof Error ? err : new Error(String(err)));
+        };
+
+        tx.oncomplete = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        tx.onerror = () => {
+            if (settled) return;
+            settled = true;
+            reject(tx.error ?? new Error('memory node/vector transaction failed'));
+        };
+        tx.onabort = () => {
+            if (settled) return;
+            settled = true;
+            reject(tx.error ?? new Error('memory node/vector transaction aborted'));
+        };
+
+        try {
+            tx.objectStore(STORE_MEMORY_NODES).put(node);
+            tx.objectStore(STORE_MEMORY_VECTORS).put(storedVector);
+        } catch (err) {
+            fail(err);
+        }
+    });
+
+    // 事务已提交，才更新内存里的 BM25 索引 / 远端 metadata；
+    // 失败路径一行都不执行，不会出现「索引里有、库里没有」。
+    bm25Index.onNodeSaved(node);
+    syncNodeMetadataToRemote(node);
+}
+
 // ─── MemoryVector CRUD ────────────────────────────────
 
 export const MemoryVectorDB = {

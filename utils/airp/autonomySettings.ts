@@ -10,6 +10,11 @@
  */
 
 import type { AirpAutonomyLevel } from './types';
+import { resolveAirpCapabilityPolicy, type AirpCapabilityMode } from './settings';
+import {
+  readCharAutonomyGuardrails,
+  type AirpAutonomyGuardrails,
+} from './autonomyGuardrails';
 import type {
   AirpAutonomyConfig,
   AirpAutonomyOverrides,
@@ -26,6 +31,9 @@ export type {
   AirpAutonomyTemplateId,
   RetellStyle,
 } from './settings';
+
+// 护栏归并在独立叶子里（P5）；这里只把它挂进自主设置终值，转出类型方便前端直接用。
+export type { AirpAutonomyGuardrails } from './autonomyGuardrails';
 
 /** token 预算的常量兜底：模板与覆盖都没给时用它。 */
 export const AUTONOMY_DAILY_TOKEN_BUDGET = 100_000;
@@ -99,6 +107,14 @@ export interface ResolvedAirpAutonomy {
   mcpAllow: string[];
   /** 反归一化的写入总闸。 */
   writable: boolean;
+  capabilityMode?: AirpCapabilityMode;
+  capabilities?: string[];
+  /**
+   * 自主生活护栏（P5）：每角色每日次数 / 同类最小间隔 / 单次 token 预留。
+   * 全局额度与总暂停**不在这里说了算**——它们只认云端共享配置，调度器读到时覆盖
+   * （见 utils/airp/autonomyGuardrails.ts 的 effectiveAutonomyGuardrails）。
+   */
+  guardrails: AirpAutonomyGuardrails;
 }
 
 /** 只接受普通对象；数组、null 与原始值一律视为无设置。 */
@@ -250,6 +266,9 @@ export function mergeAutonomySettings(
     autonomyLevel: level,
     mcpAllow: toStringArrayOrUndefined(airp.mcpAllow) ?? [],
     writable: airp.writable === true,
+    capabilityMode: resolveAirpCapabilityPolicy(airp).mode,
+    capabilities: resolveAirpCapabilityPolicy(airp).allow,
+    guardrails: readCharAutonomyGuardrails(autonomy),
   };
 }
 

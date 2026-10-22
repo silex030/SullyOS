@@ -128,3 +128,25 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - ✅ **正式入口：`https://link.ethernet.bot.cd`**（Let's Encrypt 证书自动签发，2026-10-21 五项实测通过）。过渡地址 `https://ethernet.ethernet.bot.cd` 也保留在 Caddyfile 里，未删。
   - ⚠️ DNSHE 面板坑：记录名填的是**相对本子域的名字**。在 `ethernet.bot.cd` 这个子域下，记录名 `link` → `link.ethernet.bot.cd`；填 `@` 才是本子域自身；填 `ethernet` 会变成 `ethernet.ethernet.bot.cd`（用户第一次就踩了这个）。DNSHE 免费版 API（`api005.dnshe.com`，X-API-Key/X-API-Secret）虽然可用，但用户那把 Secret 少一位（63 位）认证失败，最后是手工在面板改的。
   - 验证口径：`curl` 首页 200 + 抓 `/assets/index-*.js` → 取 `Settings-*.js` chunk → `grep` 当天新文案。这个手法能区分「真上线」和「以为上线」。
+
+- 🧰 **2026-10-22 大轮（可靠记忆 / 缓存可观测 / 记忆协商 / 自主生活工作流）**：
+  - 范围：总计划 `plans/2026-10-22-interaction-cache-master-plan.md` 的 P0–P5。**未提交、未部署**（等父审查）。
+  - 新增 DB v79 表 `airp_workflow_plans`（角色自主生活工作流的可查看记录）。新 store 必须四处登记才进备份：`utils/db.ts` 导出/导入两侧、`utils/backupCoverage.ts` 的 `KNOWN`、`context/OSContext.tsx` 的导出 store 清单与导入 case，以及 `types.ts` 的 `FullBackupData` 字段。少一处就是「备份静默漏数据」。`check:workers` 按 `git status worker public` 判定，**未提交时必然非零**——用「重建前后 bundle sha256 相同」作为等价证据。
+  - **前沿教训（本轮真实踩到）**：兄弟代理写的测试在、模块不在（`chatLifeWorkflowClient.ts` / `chatLifeWorkflowHandler.ts` 只有 `.test.ts`），`grep` 一遍就能看出来。子代理自报「已接线」不可信，必须追到调用点。另外 `AutonomyPlanTickArgs.autonomous` 原是一个**窄接口**（只有 `dailyTokenBudget` + `guardrails`），窄到读不到 `capabilityMode`——这就是「能力闸只到点才生效」的根因；类型收窄会静默废掉权限判定，改权限相关代码时先看类型里到底有没有那个字段。
+  - 权限语义固定为三处同源：聊天工具注入（`chatLifeWorkflowAvailability`）、排队前（`runAutonomyPlanQueue`）、执行前（`autonomyFire`）。显式 `none` 连排队都不进；私人虚拟生活不看 `writable`（那是真实写入总闸），但对外真实写入照旧必须 `writable`。
+  - 感知段落默认**是空的**：本地这条路里天气/热搜/日程/当前槽位都已经由既有段落说过，`perceptionPrompt` 只补「没被渲染过」的来源（例如现拉失败但缓存还在）。想加感知来源时先问「这件事这段提示词里是不是已经说过」，重复注入比不注入更糟。
+  - 备份/恢复脚本本轮只做静态审查 + 沙箱测试，**没有直接执行**任何生产脚本；事故记录见 `/srv/model-tests/implementation/backup-test-incident.md`。
+  - 门禁与逐项验收数字见 `/srv/model-tests/implementation/FINAL-INTEGRATION.md`。
+
+- 🧰 **2026-10-22 发布候选收尾（三路阻断之后的最后一公里）**：
+  - **护栏暂停这件事必须由服务端保证**：客户端「读基线 → 写 → 读回」不是原子，`PUT /client-state` 是 updatedAt last-write-wins，多设备同时保存时会覆盖别人的暂停。现在有专用路由 `POST /autonomy-guardrails/patch`（D1 条件 UPDATE，0 行即 409），泛写入口另有闸：云端是暂停 + 这次写未暂停 + 没有明确解暂停意图 → 拒写。**别把「读一遍再写」说成原子**，这是本轮评审的原话。
+  - **真 SQL 回归用 node:sqlite**：`worker/amsg/src/test/d1-sqlite.ts` 是最小 D1 适配器（`beforeStatement` 钩子可在 UPDATE 前插入「另一台设备」的写入）。vitest 会把静态 `node:sqlite` 解析成裸 `sqlite` 而失败，必须 `createRequire(import.meta.url)('node:sqlite')`；不要为此改全局 vitest 配置。
+  - **`released` 认领行不能删**：删了就看不出「认领过又退回」。改名让出唯一键（`:released:<rowId>`）即可，行留着就是审计。
+  - **取消待办要看消息身份，不只比时间戳**：消息时间戳来自客户端、计划 `createdAt` 来自服务端，时钟差几秒就会把「刚提的计划」下一跳撤掉。fire_pack 新增可选 `lastUserMessageId`，`isCancelableByUserSpeech` 用 `chat:<charId>:m<id>` 认「就是这一句提的」。
+  - **角色看不见 planId 的根因不在工具，在上下文**：id 只在 propose 回执出现一次。解法是把本地 `airp_workflow_plans`（结果回程与聊天回执都会写）压成一小段动态尾段（`utils/airp/pendingPlansPrompt.ts`），零请求、零额外 LLM 调用。
+  - 门禁实测：全量 `561 文件 / 6854 用例`；`tsc` 55 条存量且 (文件, 错误码, 语义) 集合与基线逐条相同；`build:workers` 两次产物同哈希（`c6c4ce60…`）；`mojibakeGuard` 1/1；`vite build` 通过。`check:workers` 在未提交状态下必红（脚本按 `git status worker public` 判定），提交后再跑。
+- 🧰 **2026-10-22 发布前最后两个硬阻断（retry / owner / 恢复落点）**：
+  - **人工重试必须换去重键**：`autonomy_plans` 有 `UNIQUE (char_id, dedupe_key)`，旧实现 `{...previous, id:newPlanId}` 沿用旧键 + `INSERT OR IGNORE` → 0 行 → 对 failed/unknown 永久死锁。新代键 = `` `${previous.dedupeKey}:gen:${newPlanId}` ``，确定性（同一 newPlanId 再点仍被唯一索引拒）且不越额度（额度按行数算，旧行都在）。真表回归 `autonomyRetry.sqlite.test.ts`（2 例，先红后绿）；该函数无生产调用方，bundle 里会被 tree-shake 掉，只有人工触发路径。
+  - **认不出 owner 一律暂停（fail-closed）**：`readAutonomyOwnerUserId` 回空串时旧逻辑被当成「没设过护栏的新用户」→ `paused:false` 放行。现在空 owner 直接 `skip`（`autonomy-owner-unresolved`），位置在计划分支之前，普通回合与计划到点都停；owner 只取服务端 `client_state` 行，绝不从 request/metadata 取 userId。
+  - **恢复按每库真实落点安装**：`db-manifest.mjs` 的 registry 给每个库 `targets{name→path,dir,enabled,ambiguous}`；`restore.sh` 逐库在各自目录暂存/原子换入，跨目录中途失败按 `installed.txt` 全部回滚；`verify --registry` 用当前启用必填库全集比对，缺库默认拒（`--allow-partial` 才降级为「部分恢复」）；同名歧义、包内路径字段、`SULLYOS_SERVICES_CONFIG` 任意指向都被拒。回归 56 例全绿，全部在测试沙箱的 `unshare -m -n` 内执行，生产库只读快照无变化。
+  - 发布轮门禁：全量 `562 文件 / 6869 用例`（首跑 apprules 1 例 60s 超时，单跑 5/5 808ms，复跑全绿）；`tsc` 55 条 0 新增；`build:workers` 两次同哈希 `bbdc966e…`；`mojibakeGuard` 1/1；`vite build` 通过；`check:workers` 提交后转绿。提交 SHA / 线上读回见 `/srv/model-tests/implementation/RELEASE-RESULT.md`。

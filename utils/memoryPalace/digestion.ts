@@ -30,6 +30,7 @@ import { MemoryNodeDB, AnticipationDB, DigestReportDB } from './db';
 import { PLATE_ROOMS } from './types';
 import { fulfillAnticipation, disappointAnticipation, createAnticipation } from './anticipation';
 import { vectorizeAndStore } from './vectorStore';
+import { isNodeLongTermEligible } from './negotiationEvidence';
 import { safeFetchJson } from '../safeApi';
 import { safeParseJsonArray } from './jsonUtils';
 import { getBuiltinContent, fillIdentity } from '../promptPresetCatalog';
@@ -192,8 +193,14 @@ async function gatherDigestMaterial(charId: string): Promise<{
     }
     // digestion 衍生节点自身也不参与下一轮处理：它们是产物，不是原料；
     // 反刍它们会让 LLM 产出"insight 的 insight"，正是用户截图里那种近似重复条目的来源。
+    // 记忆协商：只有「用户明确 + 长期」的事实才配进长期消化材料——
+    // 一时情绪（今天累了）、角色推测、主体不明的说法都不在这里被蒸成性格/偏好。
+    // 旧数据没有协商元数据 → isNodeLongTermEligible 返回 true，行为与升级前一致。
     const isFreshCandidate = (n: MemoryNode) =>
-        n.origin !== 'digestion' && !n.digestedAt && !digestedSourceIds.has(n.id);
+        n.origin !== 'digestion'
+        && !n.digestedAt
+        && !digestedSourceIds.has(n.id)
+        && isNodeLongTermEligible(n);
 
     // 按时近取前 N 条（cap 内的下轮继续，cap 外的老积压留在房间里走召回）
     const capByRecency = (nodes: MemoryNode[], cap: number) =>

@@ -219,32 +219,66 @@ export const getMcpResultList = (charId: string): McpResultEntry[] =>
         .sort((a, b) => b.createdAt - a.createdAt);
 
 /**
- * 生成注入 system prompt 的「工具调用记忆块」。空记录返回空串。
- * 结构分两段：近期窗口（摘要）+ 长期手册（原文），并附防重复调用纪律。
+ * 取当前窗口内的条目：近期（非手册类，按轮次窗口）+ 长期手册（persistent）。
  */
-export const getMcpResultMemoryBlock = (charId: string, keepTurns: number): string => {
+const selectEntries = (charId: string, keepTurns: number) => {
     const currentTurn = getMcpTurn(charId);
     const entries = getMcpResultList(charId);
-    if (!entries.length) return '';
-
     const floor = currentTurn - Math.max(0, keepTurns) + 1;
     const recent = entries.filter(e => !e.persistent && e.turnId >= floor);
     const manual = entries.filter(e => e.persistent);
+    return { recent, manual };
+};
 
-    if (!recent.length && !manual.length) return '';
+const RECENT_HEADER = '[工具调用记忆 —— 最近几轮你调用过这些工具并已拿到结果。参数相同或相近的需求直接复用已有结果，不要重复调用]';
+const MANUAL_HEADER = '[长期工具手册 —— 以下结果长期保留（用户手动清空前一直有效）。需要时直接引用，不要重复调用]';
 
+const recentLines = (recent: McpResultEntry[]): string[] => recent.length
+    ? [RECENT_HEADER, ...recent.map(e => `- (第${e.turnId}轮) ${e.serverName}·${e.toolName} · 参数: ${e.argsSummary} → 结果: ${e.resultSummary}`)]
+    : [];
+
+const manualLines = (manual: McpResultEntry[]): string[] => manual.length
+    ? [MANUAL_HEADER, ...manual.map(e => `- ${e.serverName}·${e.toolName} · 参数: ${e.argsSummary} → 结果: ${e.resultRaw || e.resultSummary}`)]
+    : [];
+
+const wrapBlock = (lines: string[]): string => (lines.length ? `\n---\n${lines.join('\n')}\n---\n` : '');
+
+export interface McpResultMemoryParts {
+    /**
+     * 长期手册类结果：变化极慢（用户手动清空前一直有效），进稳定前缀，可长期复用。
+     */
+    stable: string;
+    /**
+     * 最近几轮的调用结果：轮次窗口滚动、新结果进来就变，必须进易变尾段（钢印之前），
+     * 否则会把整段历史的前缀复用挡掉。
+     */
+    dynamic: string;
+}
+
+/**
+ * 拆分版：给统一载荷构造用（C7）。stable 进第一条 system，dynamic 进易变尾段。
+ * 两段各自带完整的 `---` 边框，分开注入也不会跟相邻段粘在一起。
+ */
+export const getMcpResultMemoryParts = (charId: string, keepTurns: number): McpResultMemoryParts => {
+    const { recent, manual } = selectEntries(charId, keepTurns);
+    return {
+        stable: wrapBlock(manualLines(manual)),
+        dynamic: wrapBlock(recentLines(recent)),
+    };
+};
+
+/**
+ * 旧接口（保留给既有调用方 / 测试）：近期 + 手册拼成一块，顺序与历史一致。
+ * 新代码请用 getMcpResultMemoryParts —— 整块塞进稳定前缀会让近期结果每轮打断前缀缓存。
+ */
+export const getMcpResultMemoryBlock = (charId: string, keepTurns: number): string => {
+    const { recent, manual } = selectEntries(charId, keepTurns);
     const lines: string[] = [];
     if (recent.length) {
-        lines.push('[工具调用记忆 —— 最近几轮你调用过这些工具并已拿到结果。参数相同或相近的需求直接复用已有结果，不要重复调用]');
-        for (const e of recent) {
-            lines.push(`- (第${e.turnId}轮) ${e.serverName}·${e.toolName} · 参数: ${e.argsSummary} → 结果: ${e.resultSummary}`);
-        }
+        lines.push(...recentLines(recent));
     }
     if (manual.length) {
-        lines.push('[长期工具手册 —— 以下结果长期保留（用户手动清空前一直有效）。需要时直接引用，不要重复调用]');
-        for (const e of manual) {
-            lines.push(`- ${e.serverName}·${e.toolName} · 参数: ${e.argsSummary} → 结果: ${e.resultRaw || e.resultSummary}`);
-        }
+        lines.push(...manualLines(manual));
     }
     return `\n---\n${lines.join('\n')}\n---\n`;
 };

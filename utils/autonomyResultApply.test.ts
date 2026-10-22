@@ -16,6 +16,7 @@ import type { AirpCommittedEvent } from './airp/commit';
 const STORES = [
   'autonomous_outbox',
   'autonomous_heartbeats',
+  'airp_workflow_plans',
   'airp_events',
   'airp_world',
   'diaries',
@@ -382,3 +383,137 @@ describe('备份登记与往返', () => {
     expect((await DB.getHeartbeatsByChar('c1')).map((h) => h.id)).toEqual(['airp-hb-c1-exp-1']);
   });
 });
+
+// ─── P5：生活工作流的可查看记录（v79）─────────────────────────────────────
+
+const planPayload = (overrides: Record<string, unknown> = {}) => roundPayload({
+  // 这一测只关心工作流这一段：经历与事件清空，免得把「提议不是现实事件」的断言搅浑。
+  experiences: [],
+  proposedEvents: [],
+  workflows: [
+    {
+      id: 'plan-1', kind: 'diary', title: '今天的一点小事', purpose: '把那句话记下来',
+      scheduledAt: 1_700_000_000_000, expiresAt: 1_700_100_000_000, basis: 'virtual',
+    },
+  ],
+  ...overrides,
+});
+
+describe('工作流记录 — 提议入册', () => {
+  it('计划提案 → 一条 proposed 记录，来源与用途都在，basis 保持虚拟', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await expect(applyAutonomyResult(planPayload())).resolves.toBe(true);
+
+    const plans = await DB.getWorkflowPlansByChar('c1');
+    expect(plans).toHaveLength(1);
+    expect(plans[0]).toMatchObject({
+      id: 'plan-1', charId: 'c1', kind: 'diary', status: 'proposed',
+      title: '今天的一点小事', purpose: '把那句话记下来', basis: 'virtual',
+      scheduledAt: 1_700_000_000_000, expiresAt: 1_700_100_000_000,
+    });
+    // 提议不是现实事件：世界事件流里一条都不许多
+    expect(await listAirpEventsByChar('c1')).toHaveLength(0);
+  });
+
+  it('同一条结果重投两次：记录不翻倍，完成态不被降级回 proposed', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await applyAutonomyResult(planPayload());
+    await applyAutonomyResult(planPayload({
+      workflow: { planId: 'plan-1', kind: 'diary', title: '今天的一点小事', text: '写了几句。', plans: [], basis: 'virtual' },
+    }));
+    await applyAutonomyResult(planPayload({
+      workflow: { planId: 'plan-1', kind: 'diary', title: '今天的一点小事', text: '写了几句。', plans: [], basis: 'virtual' },
+    }));
+
+    const plans = await DB.getWorkflowPlansByChar('c1');
+    expect(plans).toHaveLength(1);
+    expect(plans[0].status).toBe('completed');
+    expect(plans[0].resultText).toBe('写了几句。');
+  });
+});
+
+describe('工作流记录 — 结果落点', () => {
+  it('跑完的结果折到对应计划上，正文是虚拟经历；日记另有 charPage', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await applyAutonomyResult(planPayload());
+    await applyAutonomyResult(roundPayload({
+      experiences: [
+        { id: 'exp-wf', q: '今天的一点小事', note: '写了一小段，心里安静下来。', kind: 'diary', importance: 'small', pushed: false },
+      ],
+      workflows: [],
+      workflow: {
+        planId: 'plan-1', kind: 'diary', title: '今天的一点小事',
+        text: '写了一小段，心里安静下来。', plans: ['明天想早点睡'], basis: 'virtual',
+      },
+    }));
+
+    const plans = await DB.getWorkflowPlansByChar('c1');
+    expect(plans[0]).toMatchObject({
+      status: 'completed', resultText: '写了一小段，心里安静下来。', resultPlans: ['明天想早点睡'], basis: 'virtual',
+    });
+    const diaries = await DB.getDiariesByCharId('c1');
+    expect(diaries.some((d) => d.id === 'airp-diary-exp-wf')).toBe(true);
+  });
+
+  it('找不到提议记录时补一条最小完成记录（别的设备提的也不丢结果）', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await applyAutonomyResult(roundPayload({
+      experiences: [],
+      workflows: [],
+      workflow: { planId: 'plan-x', kind: 'interest_note', title: '想读那本书', text: '读了两页。', plans: [], basis: 'virtual' },
+    }));
+
+    const plans = await DB.getWorkflowPlansByChar('c1');
+    expect(plans).toHaveLength(1);
+    expect(plans[0]).toMatchObject({ id: 'plan-x', status: 'completed', resultText: '读了两页。', purpose: '' });
+  });
+
+  it('坏 workflows 段（不是数组）只丢这一段，经历照常落地', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await expect(applyAutonomyResult(planPayload({
+      workflows: 'nope',
+      experiences: [{ id: 'exp-bad', q: 'q', note: 'n', kind: 'surf', importance: 'small', pushed: false }],
+    }))).resolves.toBe(true);
+    expect(await DB.getWorkflowPlansByChar('c1')).toHaveLength(0);
+    expect((await DB.getOutboxByChar('c1')).length).toBeGreaterThan(0);
+  });
+});
+
+describe('用量字段保真（C2）', () => {
+  it('缓存读数随心跳保真：供应商报了就有，没报就不写成 0', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await applyAutonomyResult(roundPayload({
+      usage: { prompt: 100, completion: 20, total: 120, cachedTokens: 64, cacheReadTokens: 8 },
+    }));
+    const withCache = (await DB.getHeartbeatsByChar('c1'))[0];
+    expect(withCache.usage).toMatchObject({ prompt: 100, completion: 20, total: 120, cachedTokens: 64, cacheReadTokens: 8 });
+    expect('cacheWriteTokens' in withCache.usage).toBe(false);
+
+    await clearStores(['autonomous_heartbeats']);
+    await applyAutonomyResult(roundPayload({ usage: { prompt: 10, completion: 5 } }));
+    const plain = (await DB.getHeartbeatsByChar('c1'))[0];
+    expect(plain.usage.total).toBe(15);
+    expect('cachedTokens' in plain.usage).toBe(false);
+  });
+});
+
+describe('备份登记与往返（v79）', () => {
+  it('KNOWN 映射登记工作流记录 store', () => {
+    expect(knownBackupStoreFieldMap()['airp_workflow_plans']).toBe('autonomyWorkflowPlans');
+  });
+
+  it('exportFullData → importFullData 往返：工作流记录整组清-加恢复', async () => {
+    await seedChar({ enabled: true, writable: true, autonomyLevel: 2 });
+    await applyAutonomyResult(planPayload());
+
+    const exported = await DB.exportFullData();
+    expect((exported.autonomyWorkflowPlans ?? []).map((p) => p.id)).toEqual(['plan-1']);
+
+    await clearStores(['airp_workflow_plans']);
+    expect(await DB.getWorkflowPlansByChar('c1')).toHaveLength(0);
+
+    await DB.importFullData({ ...exported } as any);
+    expect((await DB.getWorkflowPlansByChar('c1')).map((p) => p.id)).toEqual(['plan-1']);
+  });
+});
+

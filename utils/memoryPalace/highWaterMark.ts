@@ -1,7 +1,17 @@
-import { DB } from '../db';
+import { DB, openDB } from '../db';
 
 const LOCAL_KEY = (charId: string) => `mp_lastMsgId_${charId}`;
 const MIRROR_KEY = (charId: string) => `mp_hwm_v1_${charId}`;
+
+/**
+ * 两份水位的键前缀。
+ *
+ * 清空逻辑必须同时认这两个前缀：只清 localStorage 的话，`getReliable…` 会从
+ * IndexedDB 镜像把旧水位读回来，历史聊天永远进不了下一轮处理。
+ */
+const LOCAL_KEY_PREFIX = 'mp_lastMsgId_';
+const MIRROR_KEY_PREFIX = 'mp_hwm_v1_';
+const ASSET_STORE = 'assets';
 
 interface HighWaterMarkMirror {
     version: 1;
@@ -88,4 +98,59 @@ export async function setReliableMemoryPalaceHighWaterMark(charId: string, msgId
     } catch {
         // 与旧行为一致：持久化故障不抹掉已经成功写入的记忆。
     }
+}
+
+/**
+ * 清掉 assets 表里所有以 `prefix` 开头的键（只动这个前缀，别的资产一条不碰）。
+ *
+ * 清空操作必须「说到做到」：删除失败要抛出去，不能静默跳过——静默跳过会让
+ * 界面显示「高水位已清」而镜像里还躺着旧值，用户以为旧聊天能重新处理，其实不能。
+ */
+async function deleteAssetsByPrefix(prefix: string): Promise<number> {
+    const db = await openDB();
+    if (!db.objectStoreNames.contains(ASSET_STORE)) return 0;
+
+    return await new Promise<number>((resolve, reject) => {
+        const tx = db.transaction(ASSET_STORE, 'readwrite');
+        const store = tx.objectStore(ASSET_STORE);
+        let removed = 0;
+        const req = store.getAllKeys();
+        req.onsuccess = () => {
+            const keys = (req.result || []).filter(
+                (key): key is string => typeof key === 'string' && key.startsWith(prefix),
+            );
+            for (const key of keys) store.delete(key);
+            removed = keys.length;
+        };
+        req.onerror = () => reject(req.error);
+        tx.oncomplete = () => resolve(removed);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error ?? new Error('clear memory palace high-water mirrors aborted'));
+    });
+}
+
+/**
+ * 清空所有角色 / 所有前缀的两份水位（localStorage + IndexedDB 资产镜像）。
+ *
+ * @returns 实际清掉的条目数（localStorage 键 + assets 镜像行）
+ */
+export async function clearAllMemoryPalaceHighWaterMarks(): Promise<number> {
+    let localRemoved = 0;
+    try {
+        const toRemove: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith(LOCAL_KEY_PREFIX)) toRemove.push(key);
+        }
+        for (const key of toRemove) {
+            localStorage.removeItem(key);
+            localRemoved++;
+        }
+    } catch {
+        // localStorage 被禁用时镜像仍要清；计数只统计真正清掉的。
+        localRemoved = 0;
+    }
+
+    const mirrorRemoved = await deleteAssetsByPrefix(MIRROR_KEY_PREFIX);
+    return localRemoved + mirrorRemoved;
 }

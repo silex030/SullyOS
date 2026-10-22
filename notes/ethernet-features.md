@@ -165,6 +165,42 @@
 - 前端站点由 Vercel 换到 **Cloudflare Pages**（项目 `sullyos`，只从 ethernet 分支自动构建，构建命令 `pnpm exec vite build`，`functions/` + `public/_redirects` 承接同源中转与 SPA 回退）；Vercel 保留为备用入口。
 - VPS 域名拆分为后端 / MCP / opencode / worker 中转四个独立主机名；同源后端中转地址走部署面板环境变量 `BACKEND_HOST`，仓库无写死域名。工程细节与踩坑见 `notes/ethernet-branch-context.md` 域名迁移条目。
 
+## 十七、可靠记忆 · 缓存可观测 · 角色连续生活（2026-10-22 批次）
+
+一批把四件事同时收口，互相依赖：**记忆不出错、缓存看得见、协商不臆造、生活能自己过**。
+
+### 1. 记忆可靠性（P0）
+
+- **清空清两份水位**：IndexedDB 里 assets 的 `mp_hwm_v1_*` 镜像与 localStorage 的 `mp_lastMsgId_*` 一起清；只按前缀删镜像，别的 assets 不动。只清一处会让「清空后旧聊天不再处理」失效。
+- **云端清空结果三态**：`success / failed / skipped`，行数未知显示「行数未提供」而不是 0；云端失败可以只重试云端，不重复清本地。
+- **正文与向量同一事务**：`saveNodeWithVector` 在一个 readwrite 事务里提交，put 抛错就 `tx.abort()`；失败不会留下 `embedded=true` 的假完成。
+- **能力权限三态**：`all / allowlist / none`，旧空数组仍是 all，显式 none 不会被迁移成 all；面板显示「全部允许 / 白名单 N 项 / 全部禁止」。
+- **主代理鉴权 fail-closed**：没配 `AMSG_CLIENT_TOKEN` 的生产路径一律 403，只有显式 `MAIN_AGENT_ALLOW_ANONYMOUS=true` 才允许匿名（默认值没改，凭据没动）。
+- **备份/恢复**：备份源从 `config/services.js` 的真实库路径生成 manifest（`VACUUM INTO` + integrity_check + sha256），不完整不产包不轮转；恢复先校验再停服，暂存→替换→失败回滚，启动失败不谎报。测试只在临时目录 + fake `systemctl`/`cp` 上跑。
+
+### 2. 缓存可观测（P1/P2）
+
+- usage allowlist 契约（`utils/llmUsage.ts`）：普通 token、缓存读/写、缺失状态、缓存语义（子集/独占/未知）。**缺失不写 0**，UI 显示「未提供」而不是 0%。
+- 前台 API 调用记录、main-agent、amsg 即时/自主回程都保留这些字段；流式正文先出，尾部有界收集 usage（超时/EOF/DONE 都退出，不留悬挂连接）。
+- 提示词结构：时光契约、生活记录实时摘要、MCP 近期结果、生活否决反馈移到动态尾段；固定说明与长期手册仍留稳定段；工具名映射与 schema 序列化稳定化（不重排 enum/required 语义数组）；用户世界书位置一律不动。
+- 诊断叶子 `utils/promptCacheDiagnostics.ts` + `utils/requestPrefixObserver.ts`：段指纹、首个差异段、TTFT；只报结构指标，不宣称命中率。
+
+### 3. 自然记忆协商（P3）
+
+- 同一次提取调用内产出证据等级/主体/时间范围/来源消息；**零额外请求**，没有固定问卷、没有关键词判断。
+- 否定、引用、假设、角色猜测、主体不明、来源不可核对 → 不落库，进按角色隔离的未决候选账本；只有模型显式 `resolve` + 新消息证据 + 议题一致才物化。
+- 用户纠正保留原正文 + 追加失效关系；短期状态不升级成长偏好。
+- 开关：`featureFlags.epistemicState`（默认关），本机调试 key 仅作覆盖；设置页如实显示开关来源。
+
+### 4. 感知与自主生活（P4/P5）
+
+- 感知归一（`utils/airp/perception.ts`）：source / subject / observedAt / expiresAt / permissions / version / dedupeKey；本地过滤过期、重复、无权限、无关联；只把相关小快照放动态尾段，缺席就省略（`utils/airp/perceptionPrompt.ts` 支持「已渲染来源」去重，绝不重复注入、不发请求）。
+- 自主工作流：角色在**已有的一轮生成**里顺带提一条低风险小事（私人日记 / 个人计划 / 兴趣笔记），规则校验器降成白名单动作（禁 URL/代码/工具/权限/预算键、禁替对方断言感受、禁把想法说成已发生），云端落 `proposed` 计划，到点用既有调度器另起一次后台请求执行。
+- 能力闸三处一致：聊天工具注入、排队前、执行前都读同一份权限终值；显式 `none` 连排队都不进（不白占当日次数）。
+- 预算双门禁：每角色 2 次/天、同类动作间隔 2 小时、全局 6 次/天（云端共享行权威），外加既有 token 预算；`unknown` 是终态，绝不自动重试计费请求。
+- 客户端可查看：新表 `airp_workflow_plans`（DB v79，随备份动态覆盖）在角色自主生活面板显示「TA 自己的小事」——标题、为什么想做、做完了的正文（明确标「TA 的私事（虚拟）」），失败/未知不展示成完成。
+- 普通聊天里也能提：native tool `propose_life_workflow`（工具参数无正文、无网址、无权限字段），前台只发一次鉴权登记请求，回话只说「后台已排队，不要向对方提起」，不在回复里宣布。
+
 ## 十六、减法项（退役与移除）
 
 - Instant Push UI 整体退役，主动消息收拢为 amsg2 唯一模块；VAPID 凭据面板退役。
@@ -193,3 +229,7 @@
 - 2026-09-23：**XHS VPS 会话桥代码入库**——批次一（会话模型/超时单飞/三态/token 字段）+ 批次二代码（sessionStore/sessionBridge/collector/run + deploy 件 + Caddy 模板）+ 批次三接线（vps 传输测试/Settings 会话卡/amsg 不上 cookie + bundle 2026-09-15）+ 任务 16 文档（README/排障重写/部署手册）。本地代码完、门禁绿；VPS 部署（camofox/扫码/24h 试验）、安全审计、六场景验收待做，见交接清单。
 - 2026-09-23：**提示词统合收尾（Unified Prompt，`v3.18`）**——预设 App 收成三页：提示词（内置常驻段可接管落位 + 生效徽标 + 真实发送抓取视图）/ 世界书（原样嵌入）/ 调用地图（注册表按分类渲染调用卡：门三态按当前角色实时算、sourceKey 点跳页1对应卡、本地站点显示最近一次抓取时间并点开同渲染器、云端卡列补段清单、未接入抓取站点打标）；世界书独立 App 退役（入口/图标/预载/渲染全撤）；删离线预览镜像（`promptPreviewComposer` 及测试，抓取视图为唯一完整 prompt 来源）；`chat.appRules` 补进行为规范条目。各任务门禁全量绿，见 `notes/ethernet-branch-context.md` 同日条目。
 - 2026-09-24：**VPS 语音换 Genie-TTS（替换 GPT-SoVITS-CPUFast）**——`/home/speak` 从 9880 切 9882，角色名 `ether`，补 44 字节 WAV 头。顺带修好一个从未生效的功能：原实现只发 `{text}`，而 GPT-SoVITS 要 `ref_audio_path`，所以该端点自上线起每次 400、一直静默降级成纯文本。VPS 侧 `gptsovits-api.service` 与 `/opt/gpt-sovits`（含 conda env）已删除。**收益**：盘空 22G→27G、合成 4-22 秒→3-4 秒；**代价**：常驻内存 4.6G，比原 GPT-SoVITS 多约 1.9G。工程细节、三个上游坑、换机可行性见 `docs/superpowers/plans/2026-09-24-genie-tts-swap-plan.md` 与 `notes/ethernet-branch-context.md` 同日条目。
+- 2026-10-22：**可靠记忆 / 缓存可观测 / 记忆协商 / 角色连续生活（P0–P5 批）**——记忆清空两份水位 + 云端三态 + 正文向量原子事务 + 能力 all/allowlist/none；usage 缓存字段保真（缺失≠0）+ 提示词稳定结构（易变段落后移、工具 schema 稳定化）+ 缓存诊断叶子；记忆协商走同一次提取调用（证据等级、未决候选账本、纠正追加失效、默认关）；感知归一与自主生活工作流（聊天工具 + 后台计划 + 预算双门禁 + 客户端可查看记录 DB v79）。未部署；门禁数字见 `/srv/model-tests/implementation/FINAL-INTEGRATION.md`。
+- 2026-10-22：**P3 记忆协商数据闭环（离线实现，未部署）**——记忆提取同一次调用内新增证据字段（evidence / subject / scope / timeRange / topic / sourceMsgIds），零额外 LLM 请求；否定、引用、假设、角色猜测、主体不明、来源不可核对一律不落库，改存未决候选账本（按角色隔离、localStorage、有上限），候选只在模型显式 `resolve` + 新消息 + 议题/主体一致时才物化成确定性 ID 的事实节点，重放幂等；用户纠正记录带来源消息的失效关系、原正文不删；短期状态不进消化材料与门牌。开关沿用 `featureFlags.epistemicState`，默认关闭。文件：`utils/memoryPalace/negotiation*.ts`（新）、`extraction.ts` / `pipeline.ts` / `digestion.ts`（最小接入）。清空记忆时需由 wipe 调用 `clearNegotiationLedger(charId)`（未接，属另一位代理文件）。
+- 2026-10-22：**发布前最后两个硬阻断修复**——人工重试换新代去重键（`旧键:gen:新id`，真 SQLite UNIQUE 回归）；owner 未解析一律 fail-closed 跳过（普通回合与计划到点都停）；备份恢复按每库真实落点安装、必填库全集校验（缺库默认拒，`--allow-partial` 才「部分恢复」）。发布门禁：全量 562 文件 / 6869 用例、tsc 55 条 0 新增、worker bundle 两次同哈希、vite build 通过；上线读回见 `/srv/model-tests/implementation/RELEASE-RESULT.md`。
+- 2026-10-22：**发布候选收尾（三路阻断修复后的最终打通）**——①记忆协商开关前后台统一走 `getMemoryNegotiationGate()`（正式 config 的 false 压过旧 localkey，config 读坏按关且不回落）；②导入备份后清空旧协商账本（OSContext 收尾 + `db.importFullData` 两条入口，幂等，清不掉如实提示）；③角色面板改用权威快照显示全局护栏（读不到云端显示「后台未确认」，不再拿默认 6 次的兜底值冒充）；④补上「角色自己排着的事」提示段（服务端 id + 标题 + 能不能撤），聊天工具登记/撤销后同步本地 `airp_workflow_plans`，取消不再被同一条用户消息误判；⑤人工重试保留旧 run 审计（released 行改名让位而非删除），旧 task payload 只认自己那一代计划；⑥全局护栏新增受鉴权专用 CAS 写路由（`POST /autonomy-guardrails/patch`），并在泛写入口拦「把远端暂停改回未暂停」的普通保存，带真 SQL 并发回归。未提交/未部署；门禁与产物哈希见 `/srv/model-tests/implementation/RELEASE-CANDIDATE.md`。

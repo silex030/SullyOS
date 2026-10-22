@@ -528,6 +528,12 @@ export const settleInstantChatApiLog = (uuid: string, metadata?: Record<string, 
     ok: true,
     promptTokens: num(usage?.promptTokens),
     completionTokens: num(usage?.completionTokens),
+    totalTokens: num(usage?.totalTokens),
+    cachedTokens: num(usage?.cachedTokens),
+    cacheReadTokens: num(usage?.cacheReadTokens),
+    cacheWriteTokens: num(usage?.cacheWriteTokens),
+    usageStatus: usage?.usageStatus,
+    usageMissing: Array.isArray(usage?.usageMissing) ? usage.usageMissing : undefined,
     tokensPartial: Array.isArray(toolTrace) && toolTrace.length > 0,
   });
 };

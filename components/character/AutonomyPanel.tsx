@@ -2,6 +2,23 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { MoonStars, Plus, WarningCircle, Wrench, X } from '@phosphor-icons/react';
 import type { CharacterProfile } from '../../types';
 import { AUTONOMY_DAILY_TOKEN_BUDGET, mergeAutonomySettings } from '../../utils/airp/autonomySettings';
+import { AUTONOMY_GUARDRAIL_DEFAULTS, type AirpAutonomyGuardrails } from '../../utils/airp/autonomyGuardrails';
+import {
+  clearCharGuardrails,
+  getGlobalGuardrailsSnapshot,
+  hoursToMinutes,
+  minutesToHours,
+  readCharGuardrailsUi,
+  subscribeGlobalGuardrails,
+  withCharGuardrails,
+  type GlobalGuardrailsSnapshot,
+} from '../../utils/airp/autonomyGuardrailsClient';
+import {
+  AutonomyGuardrailsFields,
+  GuardrailPauseNote,
+  type CharGuardrailFormKey,
+  type CharGuardrailFormValue,
+} from './AutonomyGuardrailsFields';
 import type {
   AirpAutonomyConfig,
   AirpAutonomyOverrides,
@@ -9,7 +26,8 @@ import type {
   AirpSettings,
   RetellStyle,
 } from '../../utils/airp/settings';
-import { openDB } from '../../utils/db';
+import { DB, openDB } from '../../utils/db';
+import type { AutonomyWorkflowPlanRecord } from '../../types';
 import { getEnabledMcpServers } from '../../utils/mcpClient';
 
 /**
@@ -217,6 +235,36 @@ const loadLatestHeartbeat = async (charId: string): Promise<AutonomyHeartbeatRow
     return mine[0] ?? null;
   } catch {
     return null;
+  }
+};
+
+// ── 生活工作流记录（airp_workflow_plans，v79）────────────────────────────
+// 只读：角色想过/做过什么。结果正文是 TA 自己的虚拟经历，面板上明确标出来，
+// 不往「现实里发生过」的方向说；失败/未知不展示成完成。
+
+const WORKFLOW_KIND_LABELS: Record<string, string> = {
+  diary: '写点东西',
+  plan: '调自己的计划',
+  interest_note: '记点兴趣',
+};
+
+const WORKFLOW_STATUS_LABELS: Record<string, string> = {
+  proposed: '想做',
+  scheduled: '等着做',
+  running: '在做',
+  completed: '做完了',
+  cancelled: '不做了',
+  failed: '没做成',
+  unknown: '不确定做完没有',
+};
+
+const WORKFLOW_VISIBLE_MAX = 4;
+
+const loadWorkflowPlans = async (charId: string): Promise<AutonomyWorkflowPlanRecord[]> => {
+  try {
+    return await DB.getWorkflowPlansByChar(charId, WORKFLOW_VISIBLE_MAX);
+  } catch {
+    return [];
   }
 };
 
@@ -483,6 +531,38 @@ const AutonomyPanel: React.FC<AutonomyPanelProps> = ({ char, onChange }) => {
       push: { mode: push.mode, maxPerDay: push.maxPerDay, cooldownMinutes: push.cooldownMinutes, ...patch },
     });
 
+  // 生活护栏：每角色值写 char.airp.autonomy.guardrails（契约见 utils/airp/autonomyGuardrails.ts），
+  // 全局共享行是权威后台值的本地草稿（可能待同步），这里只读来显示合计上限 / 暂停状态。
+  //
+  // **必须用权威快照**，不能用 `readGlobalGuardrails()` 那个展示兜底：它读不到云端真实值时
+  // 会返回契约默认（6 次/天、未暂停），面板照着显示就等于告诉用户「暂停没关」。
+  // 快照的 `value === null` 只表示「后台未确认」，界面就该说「未确认」而不是编一个数字。
+  const [globalSnapshot, setGlobalSnapshot] = useState<GlobalGuardrailsSnapshot>(() => getGlobalGuardrailsSnapshot());
+  useEffect(() => {
+    const sync = () => setGlobalSnapshot(getGlobalGuardrailsSnapshot());
+    sync();
+    // 订阅回调给的是展示值（可能为空/默认），这里忽略它，统一回快照读——只有快照分得清
+    // 「云端确认是 0/暂停」和「根本不知道云端是什么」。
+    return subscribeGlobalGuardrails(sync);
+  }, []);
+  const globalGuardrails: AirpAutonomyGuardrails | null = globalSnapshot.value;
+  const charGuardrails = readCharGuardrailsUi(char);
+  const guardrailsValue: CharGuardrailFormValue = {
+    maxRunsPerDay: charGuardrails.perCharPerDay,
+    sameKindMinGapHours: charGuardrails.sameKindMinGapHours,
+    reserveTokensPerRun: charGuardrails.reserveTokensPerRun,
+  };
+  const commitGuardrail = (key: CharGuardrailFormKey, next: number) => {
+    const patch = key === 'maxRunsPerDay'
+      ? { perCharPerDay: next }
+      : key === 'sameKindMinGapHours'
+        ? { sameKindMinGapMinutes: hoursToMinutes(next) }
+        : { reserveTokensPerRun: next };
+    onChange(withCharGuardrails(airp, patch));
+  };
+  // 契约不接受 0 次/天：面板的 0 落成「这个角色暂停」（autonomy.enabled = false）。
+  const pausedByGuardrails = charGuardrails.hasOwn && charGuardrails.perCharPerDay === 0;
+
   // 工具：只列「已启用、已取到工具、对该角色可见」的 server
   const enabledServers = useMemo(() => getEnabledMcpServers(char.id), [char.id]);
   const mcpAllow = airp?.mcpAllow ?? [];
@@ -502,6 +582,22 @@ const AutonomyPanel: React.FC<AutonomyPanelProps> = ({ char, onChange }) => {
       if (!alive) return;
       setHeartbeat(row);
       setHeartbeatChecked(true);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [char.id]);
+
+  // 工作流记录（只读）：谈了来源与结果，但只是 TA 自己的私事
+  const [workflowPlans, setWorkflowPlans] = useState<AutonomyWorkflowPlanRecord[]>([]);
+  const [workflowChecked, setWorkflowChecked] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    setWorkflowChecked(false);
+    void loadWorkflowPlans(char.id).then((rows) => {
+      if (!alive) return;
+      setWorkflowPlans(rows);
+      setWorkflowChecked(true);
     });
     return () => {
       alive = false;
@@ -723,6 +819,44 @@ const AutonomyPanel: React.FC<AutonomyPanelProps> = ({ char, onChange }) => {
           </Row>
         </Group>
 
+        <Group
+          label="生活护栏"
+          hint={`默认每角色 ${AUTONOMY_GUARDRAIL_DEFAULTS.perCharPerDay} 次、同类间隔 ${minutesToHours(AUTONOMY_GUARDRAIL_DEFAULTS.sameKindMinGapMinutes)}h、每次预留 ${AUTONOMY_GUARDRAIL_DEFAULTS.reserveTokensPerRun} token；全部角色合计${globalGuardrails ? `每天最多 ${globalGuardrails.globalPerDay} 次` : '（后台未确认）'}。全局总开关与合计在 设置 → 自主生活护栏。`}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-xs font-bold text-slate-700">这个角色的上限</div>
+              <p className="text-[10px] text-slate-400 mt-0.5 leading-relaxed">
+                {charGuardrails.hasOwn ? '已单独设置，改一项存一项。' : '跟随契约默认；改一项就为这个角色单独存一份。'}
+              </p>
+            </div>
+            {charGuardrails.hasOwn && (
+              <button
+                type="button"
+                onClick={() => onChange(clearCharGuardrails(airp))}
+                className="shrink-0 text-[10px] px-2 py-1 rounded-xl bg-white border border-slate-200 text-slate-500 font-bold active:scale-95 transition-transform"
+              >
+                恢复全局默认
+              </button>
+            )}
+          </div>
+          <AutonomyGuardrailsFields value={guardrailsValue} onCommit={commitGuardrail} />
+          {pausedByGuardrails && (
+            <GuardrailPauseNote>
+              次数或预算是 0：这个角色的自主生活已暂停（上面「开启自主背景生活」也一起关掉了）。改回大于 0 后，再把那个开关打开。
+            </GuardrailPauseNote>
+          )}
+          {globalGuardrails === null ? (
+            <GuardrailPauseNote>
+              后台的全局护栏现在读不出来（未确认）：不知道是否暂停，这里调多大都不代表能生成，先去 设置 → 自主生活护栏 重新同步。
+            </GuardrailPauseNote>
+          ) : globalGuardrails.paused && (
+            <GuardrailPauseNote>
+              全局护栏当前是暂停状态（设置 → 自主生活护栏），这里调多大都不会生成。
+            </GuardrailPauseNote>
+          )}
+        </Group>
+
         <Group label="预算与文风" hint="超出当日 token 预算就当天不再醒。留空 = 用默认值。">
           <Row label="每天 token 预算" hint={`默认 ${AUTONOMY_DAILY_TOKEN_BUDGET.toLocaleString()}`}>
             <NumberField
@@ -820,6 +954,50 @@ const AutonomyPanel: React.FC<AutonomyPanelProps> = ({ char, onChange }) => {
           </div>
         ) : (
           <p className="text-[11px] text-slate-400">暂无记录——开着的角色在云端醒过后会写在这里。</p>
+        )}
+      </div>
+
+      {/* 生活工作流（只读）：TA 自己想做/做过的小事 */}
+      <div className="border-t border-slate-100 pt-3">
+        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5">TA 自己的小事</p>
+        {!workflowChecked ? (
+          <p className="text-[11px] text-slate-400">读取中…</p>
+        ) : workflowPlans.length === 0 ? (
+          <p className="text-[11px] text-slate-400">还没有——TA 想到什么、或真做完了，才会记在这里。</p>
+        ) : (
+          <ul className="space-y-2">
+            {workflowPlans.map((plan) => (
+              <li key={plan.id} className="rounded-2xl bg-slate-50 border border-slate-100 px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-bold text-slate-700 truncate">
+                    {plan.title || WORKFLOW_KIND_LABELS[plan.kind] || plan.kind}
+                  </span>
+                  <span className="text-[10px] text-violet-500 shrink-0">
+                    {WORKFLOW_STATUS_LABELS[plan.status] ?? plan.status}
+                  </span>
+                </div>
+                {plan.purpose ? (
+                  <p className="text-[10px] text-slate-500 mt-0.5 leading-relaxed line-clamp-2">{plan.purpose}</p>
+                ) : null}
+                {plan.lastError === 'cannot-cancel' ? (
+                  <p className="text-[10px] text-amber-600 mt-0.5 leading-relaxed">
+                    撤不了：这条已经在做或者已经结束了（这里不会改写成「不做了」）。
+                  </p>
+                ) : null}
+                {plan.resultText ? (
+                  <p className="text-[10px] text-slate-600 mt-1 leading-relaxed line-clamp-3 whitespace-pre-wrap">{plan.resultText}</p>
+                ) : null}
+                <div className="flex items-center gap-2 mt-1 text-[9px] text-slate-400">
+                  <span>{formatStamp(plan.createdAt)}</span>
+                  <span>·</span>
+                  <span>{WORKFLOW_KIND_LABELS[plan.kind] ?? plan.kind}</span>
+                  <span>·</span>
+                  {/* 认知档必须看得见：这些是 TA 自己的虚拟生活，不是现实观测 */}
+                  <span>{plan.basis === 'virtual' ? 'TA 的私事（虚拟）' : 'TA 的推断'}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>

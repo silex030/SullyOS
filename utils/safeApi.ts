@@ -119,6 +119,9 @@ class SseAssembler {
     private finishReason: string | null = null;
     private firstChunk: any = null;
     private usage: any = undefined;
+    // 后端自报的模型名（最后一个非空）。流式里 model 常只在首块/末块出现，
+    // 只认 firstChunk 会把「末块才是真实自报身份」的渠道记成空。
+    private model = '';
     private gotAnyChunk = false;
     // tool_calls 流式分片: OpenAI 约定按 index 分组, id/name 在首片, arguments 逐片拼接。
     // 不拼的话开了 stream 的工具模式(瑞幸/MCP)会静默丢掉全部工具调用。
@@ -150,6 +153,7 @@ class SseAssembler {
         // OpenAI 流式 usage 在最后一个 chunk（include_usage=true 时），也可能出现在中途；
         // 始终取最后一个非空的 usage，兼容各家代理。
         if (chunk.usage) this.usage = chunk.usage;
+        if (typeof chunk.model === 'string' && chunk.model) this.model = chunk.model;
         const choice = chunk.choices?.[0];
         if (!choice) return { content: '', reasoning: '', done: false };
         let delta = '';
@@ -212,6 +216,16 @@ class SseAssembler {
         return this.reasoning;
     }
 
+    /** 是否已收到 usage（尾捕窗口据此决定还要不要等）。 */
+    get hasUsage(): boolean {
+        return this.usage !== undefined;
+    }
+
+    /** 已收到的原始 usage 对象（只读引用，调用方自己归一化）。 */
+    get capturedUsage(): any {
+        return this.usage;
+    }
+
     finish(): any | null {
         if (!this.gotAnyChunk) return null;
         // 取证探针: 思考没抓到时把渠道实际用的 delta 字段名单打出来, 下一轮排查直接看名单。
@@ -224,7 +238,7 @@ class SseAssembler {
             id: this.firstChunk?.id || 'sse-assembled',
             object: 'chat.completion',
             created: this.firstChunk?.created || Math.floor(Date.now() / 1000),
-            model: this.firstChunk?.model || '',
+            model: this.model || this.firstChunk?.model || '',
             choices: [{
                 index: 0,
                 message: {
@@ -254,7 +268,20 @@ export interface StreamHooks {
     onReasoningDelta?: (delta: string, fullReasoning: string) => void;
     /** 收到第一个正文增量时回调一次（TTFT 参考点） */
     onFirstDelta?: () => void;
+    /**
+     * 终止事件（finish_reason / [DONE]）之后，最多再等多久的尾随 usage。
+     * 默认 `TERMINAL_USAGE_GRACE_MS`；0 = 一到终止事件立即收口（不给尾捕机会）。
+     * 只在**还没收到 usage** 时才等 —— 正文增量早已通过 onDelta 交付，不等它。
+     */
+    usageGraceMs?: number;
 }
+
+/**
+ * 终止事件之后留给尾随 usage 的宽限（毫秒）。
+ * OpenAI 的 include_usage 末块常紧跟 finish_reason / [DONE]，但部分代理会晚一个网络块；
+ * 正文此时已经交付完，等它的唯一代价是这次调用的 promise 晚一点 resolve，所以给一个有界窗。
+ */
+export const TERMINAL_USAGE_GRACE_MS = 600;
 
 /**
  * 真·流式读取响应体：边到边解析 SSE 行并回调 onDelta。
@@ -276,6 +303,9 @@ async function readBodyWithStreaming(
     let mode: 'undecided' | 'sse' | 'raw' = 'undecided';
     let sawFirstDelta = false;
     let sawTerminalEvent = false;
+    // 终止事件之后的尾捕预算：只在**还没拿到 usage** 时才开窗，有界，不无限等。
+    const usageGraceMs = Math.max(0, hooks.usageGraceMs ?? TERMINAL_USAGE_GRACE_MS);
+    let tailDeadline = 0;
     const contentType = response.headers.get('content-type');
 
     const emit = (delta: SseFeedDelta) => {
@@ -302,7 +332,27 @@ async function readBodyWithStreaming(
     };
 
     while (true) {
-        const { done, value } = await reader.read();
+        let step: any;
+        if (tailDeadline) {
+            const remaining = tailDeadline - Date.now();
+            if (remaining <= 0) {
+                try { await reader.cancel(); } catch { /* 尾捕到期，连接必须收掉 */ }
+                break;
+            }
+            let tailTimer: ReturnType<typeof setTimeout> | null = null;
+            step = await Promise.race([
+                reader.read(),
+                new Promise(resolve => { tailTimer = setTimeout(() => resolve({ __tailTimeout: true }), remaining); }),
+            ]);
+            if (tailTimer) clearTimeout(tailTimer);
+            if (step && step.__tailTimeout) {
+                try { await reader.cancel(); } catch { /* 尾捕到期，连接必须收掉 */ }
+                break;
+            }
+        } else {
+            step = await reader.read();
+        }
+        const { done, value } = step;
         if (done) break;
         const textChunk = decoder.decode(value, { stream: true });
         raw += textChunk;
@@ -327,8 +377,13 @@ async function readBodyWithStreaming(
             // A few OpenAI-compatible Claude proxies send [DONE]/finish_reason but
             // keep the HTTP socket alive. The completion is already whole; waiting
             // for reader.done would leave the Qixi loader spinning forever.
-            try { await reader.cancel(); } catch { /* completion is already assembled */ }
-            break;
+            // 但 usage 可能排在终止事件之后一个网络块（choices: []）——正文已经交付，
+            // 这里只给一个有界尾捕窗；拿到了或到期都必须走人。
+            if (asm.hasUsage || usageGraceMs <= 0) {
+                try { await reader.cancel(); } catch { /* completion is already assembled */ }
+                break;
+            }
+            if (!tailDeadline) tailDeadline = Date.now() + usageGraceMs;
         }
     }
     const tail = decoder.decode();
@@ -376,10 +431,13 @@ export async function readBodyTextUntilTerminal(
     const clearGrace = () => {
         if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
     };
-    const armGrace = () => {
+    const armGrace = (ms: number = graceMs) => {
         clearGrace();
-        graceTimer = setTimeout(() => { graceTimer = null; cancelNow(); }, graceMs);
+        graceTimer = setTimeout(() => { graceTimer = null; cancelNow(); }, ms);
     };
+    // [DONE] 之后还可能有 usage 尾块（有代理这么发）；只给一个短窗，拿到了立刻收口。
+    const usageTailMs = Math.min(graceMs, TERMINAL_USAGE_GRACE_MS);
+    let sawTerminalEvent = false;
 
     try {
         while (true) {
@@ -396,6 +454,7 @@ export async function readBodyTextUntilTerminal(
             for (const line of complete.split(/\r?\n/)) {
                 const delta = asm.feedLine(line);
                 if (!delta.done) continue;
+                sawTerminalEvent = true;
                 if (line.startsWith('data:') && line.slice(5).trim() === '[DONE]') {
                     explicitDone = true;
                     break;
@@ -403,6 +462,16 @@ export async function readBodyTextUntilTerminal(
                 armGrace();
             }
             if (explicitDone) {
+                if (asm.hasUsage) {
+                    clearGrace();
+                    cancelNow();
+                    break;
+                }
+                // 还没拿到 usage：给有界短窗，等尾块到了就收（到期由 graceTimer 收口）
+                armGrace(usageTailMs);
+                continue;
+            }
+            if (sawTerminalEvent && asm.hasUsage) {
                 clearGrace();
                 cancelNow();
                 break;
@@ -536,6 +605,9 @@ export async function safeFetchJson(
                     response: data,
                     meta: logMeta,
                     durationMs: totalMs,
+                    // 计时拆分一起入库：headers ≈ 排队/prefill，firstDelta ≈ 真 TTFT。
+                    headersMs,
+                    firstDeltaMs: timing.firstDeltaMs,
                 });
             }
             return data;

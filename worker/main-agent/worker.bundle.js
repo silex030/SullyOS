@@ -60,9 +60,17 @@ function corsPreflight(request) {
 
 function checkAuth(req, env) {
   const expected = (env.AMSG_CLIENT_TOKEN || '').trim();
-  if (!expected) return null; // 未配置令牌 = 开发模式放行
   const header = req.headers.get('x-client-token') || '';
   const bearer = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!expected) {
+    // 未配置令牌 = fail-closed（生产默认拒绝）：漏配 env 时不能变成公开代理。
+    // 只有显式开发开关才允许匿名——本地调试设 MAIN_AGENT_ALLOW_ANONYMOUS=true。
+    if (String(env.MAIN_AGENT_ALLOW_ANONYMOUS || '').trim().toLowerCase() === 'true') return null;
+    return json({
+      error: 'unauthorized',
+      hint: 'AMSG_CLIENT_TOKEN not configured (fail-closed); set MAIN_AGENT_ALLOW_ANONYMOUS=true only for local dev',
+    }, 403);
+  }
   if (header === expected || bearer === expected) return null;
   return json({ error: 'unauthorized', hint: 'X-Client-Token required' }, 403);
 }
@@ -113,6 +121,150 @@ function providersOf(env, llmOverride) {
     }
   }
   return out;
+}
+
+// ─────────────────────── usage 保真（allowlist）───────────────────────
+// 契约与 utils/llmUsage.ts 完全一致。main-agent 是 verbatim 单文件（宿主直接加载
+// worker.bundle.js，不能 import），所以这里是内联副本；两边一致性由
+// worker/main-agent/src/usage.test.ts 的契约测试守着（同一批 fixture 逐字段比对）。
+//
+// 三条硬规则：
+//   1. 只认语义明确的数值字段；未知供应商字段不进日志（不长期落库上游原对象）；
+//   2. 缺失不等于 0：没有到的字段键就不存在，绝不填 0 冒充"确实零消耗"；
+//   3. 缓存读的语义分开记：cached_tokens 是 prompt 子集（可算比例），
+//      cache_read_input_tokens 不含在 input_tokens 里（不能算比例）。
+const USAGE_FIELDS = [
+  'promptTokens', 'completionTokens', 'totalTokens',
+  'cachedTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens',
+];
+
+function usageNumber(value) {
+  return (typeof value === 'number' && Number.isFinite(value) && value >= 0) ? value : undefined;
+}
+
+function usageReadPath(source, path) {
+  let cur = source;
+  for (const key of path) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    cur = cur[key];
+  }
+  return cur;
+}
+
+function usagePick(source, paths) {
+  for (const p of paths) {
+    const value = usageNumber(usageReadPath(source, p));
+    if (value !== undefined) return { value, source: p.join('.') };
+  }
+  return {};
+}
+
+function normalizeUsageEnvelope(raw) {
+  const usagePresent = !!raw && typeof raw === 'object' && !Array.isArray(raw);
+  const values = {};
+  const fieldSources = {};
+  let cacheReadSource = '';
+  const take = (field, hit) => {
+    if (hit.value === undefined) return;
+    values[field] = hit.value;
+    fieldSources[field] = hit.source || '';
+  };
+  if (usagePresent) {
+    take('promptTokens', usagePick(raw, [['prompt_tokens'], ['input_tokens'], ['promptTokenCount']]));
+    take('completionTokens', usagePick(raw, [['completion_tokens'], ['output_tokens'], ['candidatesTokenCount']]));
+    take('totalTokens', usagePick(raw, [['total_tokens'], ['totalTokenCount']]));
+    take('cachedTokens', usagePick(raw, [
+      ['prompt_tokens_details', 'cached_tokens'],
+      ['input_tokens_details', 'cached_tokens'],
+      ['prompt_cache_hit_tokens'],
+      ['cachedContentTokenCount'],
+    ]));
+    const cacheRead = usagePick(raw, [['cache_read_input_tokens'], ['cache_read_tokens']]);
+    take('cacheReadTokens', cacheRead);
+    if (cacheRead.source) cacheReadSource = cacheRead.source;
+    take('cacheWriteTokens', usagePick(raw, [
+      ['cache_creation_input_tokens'], ['cache_creation_tokens'], ['cache_write_tokens'],
+    ]));
+    take('reasoningTokens', usagePick(raw, [
+      ['completion_tokens_details', 'reasoning_tokens'],
+      ['output_tokens_details', 'reasoning_tokens'],
+      ['reasoning_tokens'],
+    ]));
+  }
+  const reported = USAGE_FIELDS.filter((f) => values[f] !== undefined);
+  const missing = USAGE_FIELDS.filter((f) => values[f] === undefined);
+  const status = reported.length === 0
+    ? 'not-reported'
+    : (values.promptTokens !== undefined && values.completionTokens !== undefined ? 'reported' : 'partial');
+  let cacheReadSemantics = 'unknown';
+  if (values.cachedTokens !== undefined) cacheReadSemantics = 'subset-of-prompt';
+  else if (cacheReadSource === 'cache_read_input_tokens') cacheReadSemantics = 'exclusive-of-prompt';
+  const usage = { reported, partial: [], missing, status, usagePresent, cacheReadSemantics };
+  for (const field of USAGE_FIELDS) {
+    if (values[field] !== undefined) usage[field] = values[field];
+  }
+  if (Object.keys(fieldSources).length > 0) usage.fieldSources = fieldSources;
+  return usage;
+}
+
+function sumUsageEnvelopes(parts) {
+  const list = (Array.isArray(parts) ? parts : []).filter(Boolean);
+  const values = {};
+  const reported = [];
+  const partial = [];
+  const missing = [];
+  for (const field of USAGE_FIELDS) {
+    let sum = 0;
+    let provided = 0;
+    for (const part of list) {
+      const value = part[field];
+      if (typeof value === 'number' && Number.isFinite(value)) { sum += value; provided++; }
+    }
+    if (list.length > 0 && provided === list.length) { values[field] = sum; reported.push(field); }
+    else if (provided > 0) partial.push(field);
+    else missing.push(field);
+  }
+  const status = reported.length === 0
+    ? 'not-reported'
+    : (values.promptTokens !== undefined && values.completionTokens !== undefined ? 'reported' : 'partial');
+  const semantics = new Set();
+  for (const part of list) {
+    if (part.cachedTokens !== undefined || part.cacheReadTokens !== undefined) semantics.add(part.cacheReadSemantics);
+  }
+  const usage = {
+    reported, partial, missing, status,
+    usagePresent: list.some((part) => part.usagePresent),
+    cacheReadSemantics: semantics.size === 1 ? [...semantics][0] : 'unknown',
+  };
+  for (const field of USAGE_FIELDS) {
+    if (values[field] !== undefined) usage[field] = values[field];
+  }
+  return usage;
+}
+
+function usageToOpenAi(usage) {
+  if (!usage) return undefined;
+  const out = {};
+  if (usage.promptTokens !== undefined) out.prompt_tokens = usage.promptTokens;
+  if (usage.completionTokens !== undefined) out.completion_tokens = usage.completionTokens;
+  if (usage.totalTokens !== undefined) out.total_tokens = usage.totalTokens;
+  if (usage.cachedTokens !== undefined) out.prompt_tokens_details = { cached_tokens: usage.cachedTokens };
+  if (usage.cacheReadTokens !== undefined) out.cache_read_input_tokens = usage.cacheReadTokens;
+  if (usage.cacheWriteTokens !== undefined) out.cache_creation_input_tokens = usage.cacheWriteTokens;
+  if (usage.reasoningTokens !== undefined) out.completion_tokens_details = { reasoning_tokens: usage.reasoningTokens };
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** 脱敏身份：只留 hostname，不带路径、查询参数或凭据。 */
+function providerIdOf(baseUrl) {
+  try { return new URL(String(baseUrl)).hostname.toLowerCase(); } catch { return 'unknown'; }
+}
+
+/** 终止事件之后留给尾随 usage 的宽限（有界；0 = 不额外等）。 */
+function usageTailMsOf(env) {
+  const raw = parseInt((env && env.LLM_USAGE_TAIL_MS) || '', 10);
+  if (!Number.isFinite(raw)) return 600;
+  return Math.max(0, Math.min(raw, 5000));
 }
 
 // ─────────────────────── MCP 客户端（streamable HTTP）───────────────────────
@@ -244,63 +396,125 @@ function llmIdentityHeaders(baseUrl) {
     'x-opencode-session': llmSessionId,
   };
 }
-async function llmStream(provider, messages, tools, timeoutMs, emitText) {
+async function llmStream(provider, messages, tools, timeoutMs, emitText, env) {
   const url = `${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || 120000);
+  const startedAt = Date.now();
+  const headers = {
+    'content-type': 'application/json',
+    ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
+    accept: 'text/event-stream',
+    ...llmIdentityHeaders(provider.baseUrl),
+  };
+  const requestBody = (withUsage) => JSON.stringify({
+    model: provider.model,
+    messages,
+    tools: tools && tools.length ? tools : undefined,
+    stream: true,
+    ...(withUsage ? { stream_options: { include_usage: true } } : {}),
+  });
+  const post = (withUsage) => fetch(url, {
+    method: 'POST',
+    headers,
+    body: requestBody(withUsage),
+    signal: controller.signal,
+  });
+
+  // 能力声明：默认请求 include_usage（要给用户看真实缓存数）；LLM_INCLUDE_USAGE=0 才关。
+  let includeUsage = provider.includeUsage !== false && String((env && env.LLM_INCLUDE_USAGE) || '') !== '0';
   let res;
   try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
-        accept: 'text/event-stream',
-        ...llmIdentityHeaders(provider.baseUrl),
-      },
-      body: JSON.stringify({
-        model: provider.model,
-        messages,
-        tools: tools && tools.length ? tools : undefined,
-        stream: true,
-      }),
-      signal: controller.signal,
-    });
+    res = await post(includeUsage);
   } catch (err) {
     clearTimeout(timer);
     throw new Error(`LLM 连接失败 (${provider.baseUrl}): ${err.message}`);
   }
+  let errorText = '';
+  if (includeUsage && res.status === 400) {
+    // 只有上游**明确**拒收 stream_options（400 且正文点名它）才降级重发：那一次请求在上游
+    // 就被拒了，没有生成、没有计费，换掉参数再发不属于"重复计费的重试"。5xx / 超时 /
+    // 连接中断一律不在这里重发——那可能已经生成过，交给上层 fallback 策略决定。
+    errorText = await res.text().catch(() => '');
+    if (/stream_options|include_usage/i.test(errorText)) {
+      includeUsage = false;
+      provider.includeUsage = false; // 同一供应商后续 loop 不再试
+      errorText = '';
+      try {
+        res = await post(false);
+      } catch (err) {
+        clearTimeout(timer);
+        throw new Error(`LLM 连接失败 (${provider.baseUrl}): ${err.message}`);
+      }
+    }
+  }
   if (!res.ok || !res.body) {
     clearTimeout(timer);
-    const body = await res.text().catch(() => '');
+    const body = errorText || await res.text().catch(() => '');
     throw new Error(`LLM HTTP ${res.status} (${provider.baseUrl}): ${body.slice(0, 300)}`);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  const acc = { text: '', toolCalls: [], finishReason: null };
+  const acc = {
+    text: '', toolCalls: [], finishReason: null,
+    usageRaw: null, usageExit: 'none', model: '',
+    ttftMs: null, totalMs: 0, includeUsage,
+  };
   const tcMap = new Map();
+  const tailMs = usageTailMsOf(env);
+  let sawTerminal = false;
+  let tailDeadline = 0;
+  const armTail = () => { if (!tailDeadline && tailMs > 0) tailDeadline = Date.now() + tailMs; };
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      let step;
+      if (tailDeadline) {
+        // 尾捕阶段：每次读都带剩余预算，绝不为等 usage 把连接无限挂着。
+        const remaining = tailDeadline - Date.now();
+        if (remaining <= 0) { acc.usageExit = 'timeout'; break; }
+        let tailTimer = null;
+        step = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => { tailTimer = setTimeout(() => resolve({ __tailTimeout: true }), remaining); }),
+        ]);
+        if (tailTimer) clearTimeout(tailTimer);
+        if (step && step.__tailTimeout) { acc.usageExit = 'timeout'; break; }
+      } else {
+        step = await reader.read();
+      }
+      if (step.done) break;
+      buf += decoder.decode(step.value, { stream: true });
       let idx;
-      let sawTerminal = false;
+      let tailReady = false;
       while ((idx = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trim();
-        // 终止事件即收口：部分代理发完 [DONE]/finish_reason 后仍保持 socket，
-        // 等 EOF 会被 120s abort 成「假失败」并触发 fallback 重试（重复计费）。
-        if (data === DONE_MARKER) { acc.finishReason = acc.finishReason || 'stop'; sawTerminal = true; break; }
+        // 终止事件不再是"立刻收口"：正文已经流完了，这里只决定还要不要等尾随 usage。
+        if (data === DONE_MARKER) {
+          acc.finishReason = acc.finishReason || 'stop';
+          sawTerminal = true;
+          if (acc.usageRaw) { acc.usageExit = 'in-chunk'; tailReady = true; break; }
+          if (tailMs <= 0) { acc.usageExit = 'timeout'; tailReady = true; break; }
+          armTail();
+          continue; // 有代理把 usage 排在 [DONE] 之后
+        }
         let chunk;
         try { chunk = JSON.parse(data); } catch { continue; }
+        // usage / 自报 model 与 choices 无关：finish 之后那条 choices:[] 的尾块也走这里。
+        if (chunk && chunk.usage && typeof chunk.usage === 'object') {
+          acc.usageRaw = chunk.usage;
+          if (sawTerminal) { acc.usageExit = 'tail'; tailReady = true; break; }
+          acc.usageExit = 'in-chunk';
+        }
+        if (!acc.model && typeof chunk.model === 'string' && chunk.model) acc.model = chunk.model;
         const choice = chunk && chunk.choices && chunk.choices[0];
         if (!choice) continue;
         const delta = choice.delta || {};
         if (typeof delta.content === 'string' && delta.content) {
+          if (acc.ttftMs === null) acc.ttftMs = Date.now() - startedAt;
           acc.text += delta.content;
           if (emitText) emitText(delta.content);
         }
@@ -314,19 +528,33 @@ async function llmStream(provider, messages, tools, timeoutMs, emitText) {
             tcMap.set(i, slot);
           }
         }
-        if (choice.finish_reason) { acc.finishReason = choice.finish_reason; sawTerminal = true; break; }
+        if (choice.finish_reason) {
+          acc.finishReason = choice.finish_reason;
+          sawTerminal = true;
+          if (acc.usageRaw) { acc.usageExit = 'in-chunk'; tailReady = true; break; }
+          if (tailMs <= 0) { acc.usageExit = 'timeout'; tailReady = true; break; }
+          armTail();
+        }
       }
-      if (sawTerminal) break;
+      if (tailReady) break;
     }
   } finally {
+    acc.totalMs = Date.now() - startedAt;
     clearTimeout(timer);
     try { reader.cancel(); } catch { /* 忽略 */ }
   }
+  if (!acc.usageRaw && acc.usageExit !== 'timeout') acc.usageExit = sawTerminal ? 'eof' : 'none';
   acc.toolCalls = [...tcMap.values()].map((tc) => {
     let args = {};
     try { args = tc.arguments ? JSON.parse(tc.arguments) : {}; } catch { args = { _raw: tc.arguments }; }
     return { id: tc.id || `call_${Math.random().toString(36).slice(2)}`, name: tc.name, arguments: args };
   });
+  acc.usage = normalizeUsageEnvelope(acc.usageRaw);
+  acc.usageStatus = acc.usage.status;
+  acc.providerId = providerIdOf(provider.baseUrl);
+  acc.requestModel = provider.model;
+  acc.responseModel = acc.model || '';
+  acc.includeUsage = includeUsage;
   return acc;
 }
 
@@ -403,29 +631,107 @@ async function runAgentLoop(env, messages, emit, llmOverride) {
   const byName = new Map(collected.map((c) => [c.name, c]));
   // 钉住工具（参考类）：第 2 轮起仍携带；其余工具仅首轮
   const pinnedNames = new Set(pinnedRaw);
-  const stats = { loops: 0, toolCalls: 0, maxLoops, toolErrors, servers: servers.map((s) => s.name), llmSource: llmOverride ? 'request' : 'env' };
+  const stats = {
+    loops: 0, toolCalls: 0, maxLoops, toolErrors,
+    servers: servers.map((s) => s.name),
+    llmSource: llmOverride ? 'request' : 'env',
+    path: 'main-agent',
+  };
   const timeoutMs = parseInt(env.LLM_TIMEOUT_MS || '120000', 10) || 120000;
   let providerIdx = 0;
+  // 逐 attempt（含失败）与逐 loop（只记成功那一发）分开存，末轮与总和永不混用。
+  const attempts = [];
+  const loopRecords = [];
+  let identity = null;
+
+  const finalizeStats = () => {
+    const totals = sumUsageEnvelopes(loopRecords.map((item) => item.usage));
+    const last = loopRecords.length
+      ? loopRecords[loopRecords.length - 1].usage
+      : normalizeUsageEnvelope(undefined);
+    stats.usage = {
+      status: totals.status,
+      totals,
+      last,
+      loops: loopRecords,
+      // 只有每一轮都报全，总量才算"完整"；否则界面按 partial 显示，不去对账。
+      complete: loopRecords.length > 0 && loopRecords.every((item) => item.usage.status === 'reported'),
+    };
+    stats.attempts = attempts;
+    if (identity) stats.identity = identity;
+    return stats;
+  };
 
   for (let loop = 0; loop < maxLoops; loop++) {
     stats.loops = loop + 1;
     const toolsThisTurn = loop === 0 ? openaiTools : openaiTools.filter((t) => pinnedNames.has(t.function.name));
 
-    // 供应商 fallback 重试
+    // 供应商 fallback 重试（失败 attempt 也记账，计费可能已发生）
     let outcome = null;
-    let attempts = 0;
-    while (attempts < providers.length) {
+    let served = null;
+    let attemptNo = 0;
+    while (attemptNo < providers.length) {
       const provider = providers[providerIdx % providers.length];
+      attemptNo++;
+      const attemptStartedAt = Date.now();
       try {
-        outcome = await llmStream(provider, messages, toolsThisTurn, timeoutMs, (txt) => emit({ type: 'delta', content: txt }));
+        outcome = await llmStream(
+          provider, messages, toolsThisTurn, timeoutMs,
+          (txt) => emit({ type: 'delta', content: txt }), env,
+        );
+        if (!outcome) continue;
+        served = provider;
+        attempts.push({
+          loop: loop + 1,
+          attempt: attemptNo,
+          path: 'main-agent',
+          ok: true,
+          providerId: outcome.providerId,
+          requestModel: outcome.requestModel,
+          responseModel: outcome.responseModel || undefined,
+          usage: outcome.usage,
+          usageExit: outcome.usageExit,
+          ttftMs: outcome.ttftMs,
+          durationMs: outcome.totalMs,
+          streamOptions: outcome.includeUsage,
+        });
         break;
       } catch (err) {
-        attempts++;
+        attempts.push({
+          loop: loop + 1,
+          attempt: attemptNo,
+          path: 'main-agent',
+          ok: false,
+          providerId: providerIdOf(provider.baseUrl),
+          requestModel: provider.model,
+          usage: normalizeUsageEnvelope(undefined),
+          durationMs: Date.now() - attemptStartedAt,
+          error: String(err.message || err).slice(0, 200),
+        });
         providerIdx = (providerIdx + 1) % providers.length;
         emit({ type: 'system', content: `LLM 供应商切换：${String(err.message).slice(0, 160)}` });
       }
     }
     if (!outcome) throw new Error('全部 LLM 供应商不可用');
+    identity = {
+      providerId: outcome.providerId,
+      requestModel: outcome.requestModel,
+      responseModel: outcome.responseModel || undefined,
+      // 请求级 llm 预设才算 request；env 兜底要写清楚，别把自报模型当身份认证
+      modelSource: llmOverride ? 'request' : 'env',
+      streamOptions: outcome.includeUsage,
+    };
+    loopRecords.push({
+      loop: loop + 1,
+      path: 'main-agent',
+      ...identity,
+      usage: outcome.usage,
+      usageExit: outcome.usageExit,
+      ttftMs: outcome.ttftMs,
+      durationMs: outcome.totalMs,
+      finishReason: outcome.finishReason || undefined,
+      toolCalls: outcome.toolCalls.length,
+    });
 
     const assistantMsg = { role: 'assistant', content: outcome.text || null };
     if (outcome.toolCalls.length) {
@@ -438,7 +744,7 @@ async function runAgentLoop(env, messages, emit, llmOverride) {
     messages.push(assistantMsg);
 
     if (!outcome.toolCalls.length) {
-      emit({ type: 'done', stats, finishReason: outcome.finishReason || 'stop' });
+      emit({ type: 'done', stats: finalizeStats(), finishReason: outcome.finishReason || 'stop' });
       return { messages, stats };
     }
 
@@ -459,7 +765,7 @@ async function runAgentLoop(env, messages, emit, llmOverride) {
       emit({ type: 'tool_result', name: tc.name, ok: !(result && result.error), preview: content.slice(0, 300) });
     }
   }
-  emit({ type: 'done', stats, finishReason: 'max_loops', note: `达到 MCP_MAX_LOOPS=${maxLoops} 上限` });
+  emit({ type: 'done', stats: finalizeStats(), finishReason: 'max_loops', note: `达到 MCP_MAX_LOOPS=${maxLoops} 上限` });
   return { messages, stats };
 }
 
@@ -594,20 +900,31 @@ async function handleChat(req, env) {
   const stream = body.stream !== false;
   // 前端「API 预设」随请求直传：{ baseUrl, apiKey, model, fallbacks? }
   const llmOverride = body.llm && typeof body.llm === 'object' ? body.llm : null;
+  // 排障用的关联 id：只留安全字符，客户端没传就自己生成（不进日志正文）。
+  const requestId = String(body.requestId || req.headers.get('x-request-id') || `agent-${Date.now().toString(36)}`)
+    .replace(/[^\w.:-]/g, '')
+    .slice(0, 64);
+  // 请求侧模型：只在还没有响应自报身份时兜底，绝不写一个假名字冒充真实后端。
+  const requestedModel = (llmOverride && llmOverride.model) || (env.LLM_MODEL || '');
+  const modelOf = (stats) => (stats && stats.identity && (stats.identity.responseModel || stats.identity.requestModel))
+    || requestedModel
+    || 'unknown';
 
   if (!stream) {
     const out = { text: '' };
     const res = await runAgentLoop(env, [...messages], (ev) => {
       if (ev.type === 'delta') out.text += ev.content;
     }, llmOverride);
+    // 没有真实 usage 就不给这个字段（以前硬编码 0，看起来像"确实零消耗"）。
+    const usage = usageToOpenAi(res.stats.usage && res.stats.usage.totals);
     return json({
       id: `chatcmpl-${Date.now().toString(36)}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model: (env.LLM_MODEL || 'sullyos-main-agent'),
+      model: modelOf(res.stats),
       choices: [{ index: 0, message: { role: 'assistant', content: out.text }, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-      _meta: { stats: res.stats },
+      ...(usage ? { usage } : {}),
+      _meta: { stats: res.stats, requestId },
     });
   }
 
@@ -618,7 +935,8 @@ async function handleChat(req, env) {
     if (ev.type === 'delta') {
       sse.send('message', JSON.stringify({
         id: chatId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-        model: env.LLM_MODEL || 'sullyos-main-agent',
+        // 流里先报请求侧模型（此时还不知道后端自报什么）；末块 usage 再报实际身份。
+        ...(requestedModel ? { model: requestedModel } : {}),
         choices: [{ index: 0, delta: { content: ev.content }, finish_reason: null }],
       }));
     } else if (ev.type === 'tool_call') {
@@ -628,12 +946,28 @@ async function handleChat(req, env) {
     } else if (ev.type === 'system') {
       sse.send('system', JSON.stringify({ content: ev.content }));
     } else if (ev.type === 'done') {
-      sse.send('done', JSON.stringify({ stats: ev.stats, finishReason: ev.finishReason, note: ev.note || null }));
+      // 先发一个 OpenAI 兼容的 usage 末块（choices: []）：客户端/日志的既有扫描
+      // 只认 data 行里的 chunk.usage，这样缓存字段不用另造通道就能落进「API 调用记录」。
+      const usage = usageToOpenAi(ev.stats && ev.stats.usage && ev.stats.usage.totals);
+      if (usage) {
+        sse.send('message', JSON.stringify({
+          id: chatId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model: modelOf(ev.stats),
+          choices: [],
+          usage,
+        }));
+      }
+      sse.send('done', JSON.stringify({
+        stats: ev.stats,
+        finishReason: ev.finishReason,
+        note: ev.note || null,
+        requestId,
+      }));
       sse.send('message', DONE_MARKER);
       sse.close();
     }
   }, llmOverride).catch((err) => {
-    try { sse.send('error', JSON.stringify({ error: String(err.message || err) })); } catch { /* 忽略 */ }
+    try { sse.send('error', JSON.stringify({ error: String(err.message || err), requestId })); } catch { /* 忽略 */ }
     try { sse.close(); } catch { /* 忽略 */ }
   });
   return new Response(sse.stream, {
@@ -864,3 +1198,6 @@ export default {
     return json({ error: 'not_found', path }, 404);
   },
 };
+
+// 测试与 utils/llmUsage.ts 的契约对齐用（运行时无人调用，只是把纯函数暴露出来）。
+export { normalizeUsageEnvelope, sumUsageEnvelopes, usageToOpenAi, providerIdOf };

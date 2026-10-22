@@ -17,6 +17,16 @@
  * 吞掉，绝不影响主请求链路。
  */
 
+import {
+    type LlmCacheReadSemantics,
+    type LlmUsage,
+    type LlmUsageFieldName,
+    type LlmUsageStatus,
+    cacheHitRate,
+    describeCacheReadSemantics,
+    normalizeLlmUsage,
+} from './llmUsage';
+
 /** 调用方可补充的语义信息（哪个 App / 角色 / 用途）。能填多少填多少。 */
 export interface ApiCallMeta {
     /** AppID 字符串，如 'chat' / 'lifesim'，可空 */
@@ -89,6 +99,34 @@ export interface ApiCallLogEntry extends ApiCallMeta {
     completionTokens?: number;
     /** 总 token（total_tokens） */
     totalTokens?: number;
+    /**
+     * 缓存命中 token（OpenAI `prompt_tokens_details.cached_tokens` / DeepSeek
+     * `prompt_cache_hit_tokens` / Gemini `cachedContentTokenCount`）。**prompt 的子集**。
+     */
+    cachedTokens?: number;
+    /**
+     * 缓存读取 token（Anthropic `cache_read_input_tokens`）。语义上**不在** promptTokens
+     * 里，不能拿它除以 promptTokens 算命中率 —— 两个字段分开记就是为了不混。
+     */
+    cacheReadTokens?: number;
+    /** 缓存写入/创建 token（`cache_creation_input_tokens` 等）。 */
+    cacheWriteTokens?: number;
+    /** 思考 token 明细（`completion_tokens_details.reasoning_tokens`）。 */
+    reasoningTokens?: number;
+    /**
+     * usage 保真状态：`reported` = 输入输出都到了；`partial` = 只到一部分；
+     * `not-reported` = 供应商没给或形状不认识。缺失的字段一律不写 0，
+     * 界面按这个显示「未提供」而不是 0% 命中。
+     */
+    usageStatus?: LlmUsageStatus;
+    /** 没提供的 allowlist 字段名单（只有字段名，不含值） */
+    usageMissing?: LlmUsageFieldName[];
+    /** 缓存读字段的语义（决定能不能算比例；unknown 时只展示原始计数） */
+    usageCacheReadSemantics?: LlmCacheReadSemantics;
+    /** 首包响应头耗时 ms（≈ 排队 + prefill 起点） */
+    headersMs?: number;
+    /** 首个正文增量耗时 ms（真 TTFT，仅流式路径有） */
+    firstDeltaMs?: number;
     /** 请求从发起到响应 / 报错的耗时 ms（NetworkError 类失败时 = 等了多久才断） */
     durationMs?: number;
     /**
@@ -155,7 +193,13 @@ export interface ApiRequestCapture {
     promptTokens?: number;
     completionTokens?: number;
     totalTokens?: number;
-    usageStatus?: 'pending' | 'reported' | 'not-reported' | 'failed';
+    /** 缓存命中（prompt 子集）/ 缓存读取（不含在输入 Token 内）/ 缓存写入；未提供时为空 */
+    cachedTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    /** 没提供的 usage 字段名（导出文案据此写「未提供」，不写 0） */
+    usageMissing?: LlmUsageFieldName[];
+    usageStatus?: 'pending' | 'reported' | 'partial' | 'not-reported' | 'failed';
     messageCount: number;
     binaryPlaceholders: number;
     sections: ApiRequestCaptureSection[];
@@ -301,20 +345,90 @@ function resolvePresetName(baseUrl: string, model: string): string {
 }
 
 /**
- * 记录一次 API 调用。fire-and-forget，绝不 throw / 阻塞主链路。
- * 在 safeFetchJson 里对 `/chat/completions` 的成功与失败都会调用。
+ * 从响应里取 usage 并归一成 allowlist 结构（P1-C1）。
+ * 兼容 usage / usage_metadata / usageMetadata 三种外壳；缺字段不补 0。
  */
-/** 从 OpenAI 兼容响应里抠 usage（各家代理大多遵循这个字段）。 */
-export function extractApiTokenUsage(response: unknown): { prompt?: number; completion?: number; total?: number } {
+export function extractLlmUsage(response: unknown): LlmUsage {
     const root = response as any;
-    const usage = root?.usage || root?.usage_metadata || root?.usageMetadata;
-    if (!usage || typeof usage !== 'object') return {};
-    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    return normalizeLlmUsage(root?.usage || root?.usage_metadata || root?.usageMetadata);
+}
+
+/**
+ * 从 OpenAI 兼容响应里抠 usage（各家代理大多遵循这个字段）。
+ * 普通三数向后兼容；缓存读写/思考明细是**可选**字段，缺失时键的值为 undefined
+ * （不写 0，列表不会把"没提供"显示成 0）。
+ */
+export function extractApiTokenUsage(response: unknown): {
+    prompt?: number;
+    completion?: number;
+    total?: number;
+    cached?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    reasoning?: number;
+} {
+    const usage = extractLlmUsage(response);
     return {
-        prompt: num(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokenCount),
-        completion: num(usage.completion_tokens ?? usage.output_tokens ?? usage.candidatesTokenCount),
-        total: num(usage.total_tokens ?? usage.totalTokenCount),
+        prompt: usage.promptTokens,
+        completion: usage.completionTokens,
+        total: usage.totalTokens,
+        cached: usage.cachedTokens,
+        cacheRead: usage.cacheReadTokens,
+        cacheWrite: usage.cacheWriteTokens,
+        reasoning: usage.reasoningTokens,
     };
+}
+
+/** usage → 记录里的可选字段（缺失即无键）。列表/导出共用同一套映射。 */
+export type ApiCallUsageFields = Pick<
+    ApiCallLogEntry,
+    | 'promptTokens'
+    | 'completionTokens'
+    | 'totalTokens'
+    | 'cachedTokens'
+    | 'cacheReadTokens'
+    | 'cacheWriteTokens'
+    | 'reasoningTokens'
+    | 'usageStatus'
+    | 'usageMissing'
+    | 'usageCacheReadSemantics'
+>;
+
+export function apiCallUsageFields(usage: LlmUsage | undefined): ApiCallUsageFields {
+    const empty: ApiCallUsageFields = { usageStatus: 'not-reported' };
+    if (!usage) return empty;
+    const fields: ApiCallUsageFields = {
+        usageStatus: usage.status,
+        usageMissing: usage.missing,
+        usageCacheReadSemantics: usage.cacheReadSemantics,
+    };
+    if (usage.promptTokens !== undefined) fields.promptTokens = usage.promptTokens;
+    if (usage.completionTokens !== undefined) fields.completionTokens = usage.completionTokens;
+    if (usage.totalTokens !== undefined) fields.totalTokens = usage.totalTokens;
+    if (usage.cachedTokens !== undefined) fields.cachedTokens = usage.cachedTokens;
+    if (usage.cacheReadTokens !== undefined) fields.cacheReadTokens = usage.cacheReadTokens;
+    if (usage.cacheWriteTokens !== undefined) fields.cacheWriteTokens = usage.cacheWriteTokens;
+    if (usage.reasoningTokens !== undefined) fields.reasoningTokens = usage.reasoningTokens;
+    return fields;
+}
+
+/**
+ * 记录条目的缓存命中比例。只认 `cachedTokens`（prompt 子集）语义：
+ * 缺字段 / 缺分母 / 只拿到 Anthropic 式缓存读数 → null，界面显示「未提供」而不是 0%。
+ */
+export function apiCallCacheHitRate(
+    entry: Pick<ApiCallLogEntry, 'promptTokens' | 'cachedTokens'>,
+): { rate: number; numerator: number; denominator: number } | null {
+    return cacheHitRate({
+        reported: [],
+        partial: [],
+        missing: [],
+        status: 'reported',
+        usagePresent: true,
+        cacheReadSemantics: entry.cachedTokens != null ? 'subset-of-prompt' : 'unknown',
+        ...(entry.promptTokens !== undefined ? { promptTokens: entry.promptTokens } : {}),
+        ...(entry.cachedTokens !== undefined ? { cachedTokens: entry.cachedTokens } : {}),
+    });
 }
 
 /**
@@ -856,6 +970,32 @@ export function summarizeApiRequestCaptureDuplicates(
     };
 }
 
+/**
+ * 抓包导出里的缓存读数：未提供就写「未提供」，命中率只在子集语义下计算。
+ * （绝不把"没给"显示成 0 / 0%。）
+ */
+function describeCaptureCache(capture: ApiRequestCapture): string[] {
+    const fmt = (value: number) => value.toLocaleString('en-US');
+    const usage: LlmUsage = {
+        reported: [],
+        partial: [],
+        missing: [],
+        status: 'reported',
+        usagePresent: true,
+        cacheReadSemantics: capture.cachedTokens != null ? 'subset-of-prompt' : 'unknown',
+        ...(capture.promptTokens !== undefined ? { promptTokens: capture.promptTokens } : {}),
+        ...(capture.cachedTokens !== undefined ? { cachedTokens: capture.cachedTokens } : {}),
+    };
+    const rate = cacheHitRate(usage);
+    return [
+        `缓存命中 Token（prompt 子集）：${capture.cachedTokens != null ? fmt(capture.cachedTokens) : '未提供'}`,
+        `缓存读取 Token（不含在输入内）：${capture.cacheReadTokens != null ? fmt(capture.cacheReadTokens) : '未提供'}`,
+        `缓存写入 Token：${capture.cacheWriteTokens != null ? fmt(capture.cacheWriteTokens) : '未提供'}`,
+        `缓存命中率：${rate ? `${(rate.rate * 100).toFixed(1)}%（${fmt(rate.numerator)} / ${fmt(rate.denominator)}）` : '未提供'}`,
+        `缓存语义：${describeCacheReadSemantics(usage)}`,
+    ];
+}
+
 /** 生成适合用户直接发给开发者排查的可读 TXT；不额外落库，只在复制/下载时即时拼装。 */
 export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
     const fmt = (value: number) => value.toLocaleString('en-US');
@@ -901,6 +1041,7 @@ export function formatApiRequestCaptureTxt(capture: ApiRequestCapture): string {
         `输入 Token（模型响应自报）：${capture.promptTokens != null ? fmt(capture.promptTokens) : capture.usageStatus === 'pending' ? '等待响应' : capture.usageStatus === 'failed' ? '请求失败，无法取得' : '接口未返回 usage'}`,
         `输出 Token：${capture.completionTokens != null ? fmt(capture.completionTokens) : '—'}`,
         `总 Token：${capture.totalTokens != null ? fmt(capture.totalTokens) : '—'}`,
+        ...describeCaptureCache(capture),
         `请求体总字符（不是 Token）：${fmt(capture.totalChars)}`,
         `消息数：${capture.messageCount}`,
         `分区数：${capture.sections.length}`,
@@ -960,12 +1101,17 @@ export function updateApiRequestCaptureUsage(input: {
             const scanned = scanSseForLog(input.responseText);
             if (scanned.usage) responseForUsage = { usage: scanned.usage };
         }
-        const usage = extractApiTokenUsage(responseForUsage);
+        const usage = extractLlmUsage(responseForUsage);
         const patch: Partial<ApiRequestCapture> = {
-            promptTokens: usage.prompt,
-            completionTokens: usage.completion,
-            totalTokens: usage.total,
-            usageStatus: !input.ok ? 'failed' : usage.prompt != null ? 'reported' : 'not-reported',
+            // 缺失字段整键不写（与记录一致：宁可「未提供」，不写 0）
+            ...(usage.promptTokens !== undefined ? { promptTokens: usage.promptTokens } : {}),
+            ...(usage.completionTokens !== undefined ? { completionTokens: usage.completionTokens } : {}),
+            ...(usage.totalTokens !== undefined ? { totalTokens: usage.totalTokens } : {}),
+            ...(usage.cachedTokens !== undefined ? { cachedTokens: usage.cachedTokens } : {}),
+            ...(usage.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+            ...(usage.cacheWriteTokens !== undefined ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
+            usageMissing: usage.missing,
+            usageStatus: !input.ok ? 'failed' : usage.status,
         };
         const pending = captureSaveInFlight?.id === input.captureId
             ? captureSaveInFlight.promise.catch(() => {})
@@ -980,7 +1126,7 @@ export function updateApiRequestCaptureUsage(input: {
     }
 }
 
-export function recordApiCall(input: {
+export interface ApiCallLogInput {
     /** 同一条 HTTP 请求在显式记录与全局 fetch 兜底间共享的 ID，用于原子去重。 */
     requestId?: string;
     url: string;
@@ -992,43 +1138,63 @@ export function recordApiCall(input: {
     responseText?: string;
     meta?: ApiCallMeta;
     durationMs?: number;
-}): void {
+    /** 首包响应头耗时 ms */
+    headersMs?: number;
+    /** 首个正文增量耗时 ms（真 TTFT） */
+    firstDeltaMs?: number;
+}
+
+/**
+ * 组装一条「API 调用记录」（纯函数，便于单测）。
+ *
+ * usage 走 allowlist 归一：普通三数 + 缓存读写 + 思考明细；缺失字段不写 0，
+ * 并用 usageStatus / usageMissing 把"没提供"说清楚。
+ */
+export function buildApiCallLogEntry(input: ApiCallLogInput): ApiCallLogEntry {
+    const baseUrl = deriveBaseUrl(input.url);
+    const model = extractModel(input.body);
+    // 显式 meta 优先（safeFetchJson 各调用点传的精确信息）；没有就用环境兜底（裸 fetch）。
+    const meta = hasMeta(input.meta) ? input.meta! : ambientMeta;
+    // 整包 JSON 直接读；流式响应（response 为空但有原始文本）走 SSE 兜底扫描
+    let responseForExtract: unknown = input.response;
+    let backendModel: string | undefined =
+        typeof (input.response as any)?.model === 'string' && (input.response as any).model
+            ? (input.response as any).model : undefined;
+    if (input.response === undefined && typeof input.responseText === 'string' && input.responseText.trimStart().startsWith('data:')) {
+        const scanned = scanSseForLog(input.responseText);
+        backendModel = scanned.model;
+        if (scanned.usage) responseForExtract = { usage: scanned.usage };
+    }
+    const usage = extractLlmUsage(responseForExtract);
+    return {
+        id: input.requestId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: Date.now(),
+        presetName: resolvePresetName(baseUrl, model),
+        baseUrl,
+        model,
+        ...(backendModel ? { backendModel } : {}),
+        status: input.status,
+        ok: input.ok,
+        ...apiCallUsageFields(usage),
+        durationMs: input.durationMs,
+        ...(input.headersMs !== undefined ? { headersMs: input.headersMs } : {}),
+        ...(input.firstDeltaMs !== undefined ? { firstDeltaMs: input.firstDeltaMs } : {}),
+        promptBreakdown: buildPromptBreakdown(input.body),
+        appId: meta.appId,
+        appName: meta.appName,
+        charId: meta.charId,
+        charName: meta.charName,
+        purpose: meta.purpose,
+    };
+}
+
+/**
+ * 记录一次 API 调用。fire-and-forget，绝不 throw / 阻塞主链路。
+ * 在 safeFetchJson / 全局 fetch 兜底里对 `/chat/completions` 的成功与失败都会调用。
+ */
+export function recordApiCall(input: ApiCallLogInput): void {
     try {
-        const baseUrl = deriveBaseUrl(input.url);
-        const model = extractModel(input.body);
-        // 显式 meta 优先（safeFetchJson 各调用点传的精确信息）；没有就用环境兜底（裸 fetch）。
-        const meta = hasMeta(input.meta) ? input.meta! : ambientMeta;
-        // 整包 JSON 直接读；流式响应（response 为空但有原始文本）走 SSE 兜底扫描
-        let responseForExtract: unknown = input.response;
-        let backendModel: string | undefined =
-            typeof (input.response as any)?.model === 'string' && (input.response as any).model
-                ? (input.response as any).model : undefined;
-        if (input.response === undefined && typeof input.responseText === 'string' && input.responseText.trimStart().startsWith('data:')) {
-            const scanned = scanSseForLog(input.responseText);
-            backendModel = scanned.model;
-            if (scanned.usage) responseForExtract = { usage: scanned.usage };
-        }
-        const usage = extractApiTokenUsage(responseForExtract);
-        const entry: ApiCallLogEntry = {
-            id: input.requestId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            timestamp: Date.now(),
-            presetName: resolvePresetName(baseUrl, model),
-            baseUrl,
-            model,
-            backendModel,
-            status: input.status,
-            ok: input.ok,
-            promptTokens: usage.prompt,
-            completionTokens: usage.completion,
-            totalTokens: usage.total,
-            durationMs: input.durationMs,
-            promptBreakdown: buildPromptBreakdown(input.body),
-            appId: meta.appId,
-            appName: meta.appName,
-            charId: meta.charId,
-            charName: meta.charName,
-            purpose: meta.purpose,
-        };
+        const entry = buildApiCallLogEntry(input);
         // 动态 import 避开 safeApi ↔ db 的潜在加载顺序问题；写库失败静默吞掉。
         import('./db')
             .then(({ DB }) => DB.appendApiCallLog(entry))
@@ -1110,10 +1276,22 @@ export function settleCloudApiCall(input: {
     ok: boolean;
     promptTokens?: number;
     completionTokens?: number;
+    /** 云端如果自己报了总数就用它；不传则按入 + 出算（既有行为）。 */
+    totalTokens?: number;
     /** 见 ApiCallLogEntry.tokensPartial。 */
     tokensPartial?: boolean;
     /** 见 ApiCallLogEntry.superseded。 */
     superseded?: boolean;
+    /** 云端回传的缓存命中数（prompt 子集，`cached_tokens` 语义） */
+    cachedTokens?: number;
+    /** 云端回传的缓存读取数（Anthropic 语义，不含在输入 Token 内） */
+    cacheReadTokens?: number;
+    /** 云端回传的缓存写入/创建数 */
+    cacheWriteTokens?: number;
+    /** 用量完整度；不传时按"入/出都有 = reported"推断。缺失一律不写 0。 */
+    usageStatus?: LlmUsageStatus;
+    /** 云端点名缺了哪些 usage 字段（只有字段名） */
+    usageMissing?: LlmUsageFieldName[];
 }): void {
     try {
         const { promptTokens, completionTokens } = input;
@@ -1125,10 +1303,17 @@ export function settleCloudApiCall(input: {
             promptTokens,
             completionTokens,
             // 云端只报入和出两个数，总数这边自己加——列表顶上的合计读的是这个字段。
-            totalTokens: promptTokens != null && completionTokens != null
-                ? promptTokens + completionTokens
-                : undefined,
+            totalTokens: input.totalTokens != null
+                ? input.totalTokens
+                : (promptTokens != null && completionTokens != null ? promptTokens + completionTokens : undefined),
             tokensPartial: input.tokensPartial || undefined,
+            // 缓存数只在云端真的带回来时才出现（键不存在 = 未提供；db 层会过滤 undefined）
+            ...(input.cachedTokens != null ? { cachedTokens: input.cachedTokens } : {}),
+            ...(input.cacheReadTokens != null ? { cacheReadTokens: input.cacheReadTokens } : {}),
+            ...(input.cacheWriteTokens != null ? { cacheWriteTokens: input.cacheWriteTokens } : {}),
+            usageStatus: input.usageStatus
+                || (promptTokens != null && completionTokens != null ? 'reported' : 'not-reported'),
+            ...(input.usageMissing ? { usageMissing: input.usageMissing } : {}),
         };
         import('./db')
             .then(({ DB }) => DB.appendApiCallLog(patch))

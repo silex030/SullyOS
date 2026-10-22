@@ -239,13 +239,14 @@ describe('反归一化运行时面：autonomyLevel / mcpAllow / writable', () =>
 });
 
 describe('纯叶子 / 不变式', () => {
-  it('module hygiene：只 import ./types 与 ./settings 的类型', () => {
+  it('module hygiene：只 import airp 内的纯叶子（无浏览器/网络依赖）', () => {
     const source = readFileSync(new URL('./autonomySettings.ts', import.meta.url), 'utf8');
     const specifiers = [
       ...source.matchAll(/from\s+['"]([^'"]+)['"]/g),
       ...source.matchAll(/import\s+['"]([^'"]+)['"]/g),
     ].map((m) => m[1]);
-    expect(specifiers.every((s) => s === './types' || s === './settings')).toBe(true);
+    // 护栏归并是同目录纯叶子（P5）；除此之外仍只允许 types/settings 的类型引用。
+    expect(specifiers.every((s) => s === './types' || s === './settings' || s === './autonomyGuardrails')).toBe(true);
   });
 
   it('不修改输入对象（模板对象也不被别名污染）', () => {
@@ -297,8 +298,62 @@ describe('never throws（敌意输入）', () => {
       expect([0, 1, 2, 3]).toContain(out.autonomyLevel);
       expect(Array.isArray(out.mcpAllow)).toBe(true);
       expect(typeof out.writable).toBe('boolean');
+      expect(Number.isInteger(out.guardrails.perCharPerDay)).toBe(true);
+      expect(out.guardrails.perCharPerDay).toBeGreaterThan(0);
+      expect(out.guardrails.globalPerDay).toBeGreaterThan(0);
+      expect(typeof out.guardrails.paused).toBe('boolean');
     });
   }
+});
+
+describe('护栏（P5）：挂进终值、非法回落、模板不影响', () => {
+  it('没配护栏 → 默认 2 次/天、同类 120 分钟、6 次/天', () => {
+    const out = withTemplate('custom');
+    expect(out.guardrails).toEqual({
+      version: 1, perCharPerDay: 2, sameKindMinGapMinutes: 120,
+      globalPerDay: 6, reserveTokensPerRun: 1600, paused: false,
+    });
+  });
+
+  it('autonomy.guardrails 覆盖生效；越界值夹到天花板', () => {
+    const out = merge(charOf({
+      autonomy: {
+        enabled: true, templateId: 'custom', version: 1,
+        overrides: {},
+        guardrails: { perCharPerDay: 3, sameKindMinGapMinutes: 90, globalPerDay: 99 },
+      },
+    }));
+    expect(out.guardrails.perCharPerDay).toBe(3);
+    expect(out.guardrails.sameKindMinGapMinutes).toBe(90);
+    expect(out.guardrails.globalPerDay).toBe(24);
+  });
+
+  it('兼容 overrides.guardrails 落点；两处都有时 direct 优先', () => {
+    const viaOverrides = merge(charOf({
+      autonomy: {
+        enabled: true, templateId: 'custom', version: 1,
+        overrides: { guardrails: { perCharPerDay: 1 } },
+      },
+    }));
+    expect(viaOverrides.guardrails.perCharPerDay).toBe(1);
+
+    const both = merge(charOf({
+      autonomy: {
+        enabled: true, templateId: 'custom', version: 1,
+        overrides: { guardrails: { perCharPerDay: 1 } },
+        guardrails: { perCharPerDay: 4 },
+      },
+    }));
+    expect(both.guardrails.perCharPerDay).toBe(4);
+  });
+
+  it('模板不会带护栏（护栏只由用户/共享配置决定）', () => {
+    for (const templateId of ['night_player', 'morning_brief', 'surf_share']) {
+      const out = withTemplate(templateId);
+      expect(out.guardrails.perCharPerDay).toBe(2);
+      expect(out.guardrails.globalPerDay).toBe(6);
+    }
+  });
 });
 
 function describeInput(input: unknown): string {

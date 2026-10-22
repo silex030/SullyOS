@@ -14,6 +14,11 @@ import { formatMessageForPrompt } from '../messageFormat';
 import { readRecallRuntimeSnapshot } from './trace';
 import { getBuiltinContent, fillIdentity } from '../promptPresetCatalog';
 import { resolveTechnicalPrompt } from '../promptPresetRuntime';
+import type { NegotiationPlan } from './negotiationPlan';
+import { planNegotiationBatch, persistNegotiationPlan } from './negotiationPlan';
+import { isMemoryNegotiationEnabled, pendingCandidatesForPrompt } from './negotiation';
+import { buildNegotiationPromptSuffix, NEGOTIATION_PROMPT_CANDIDATE_LIMIT } from './negotiationPrompt';
+import { validateSourceMessageIds } from './negotiationEvidence';
 // 内置默认（与提示词目录同源；测试经快照对拍防漂移）
 const MEMORY_EXTRACTION_RULES_BUILTIN = getBuiltinContent('memory.extractionRules');
 const MEMORY_EXTRACTION_ENTITY_RULE_BUILTIN = getBuiltinContent('memory.extractionEntityRule');
@@ -44,19 +49,24 @@ async function buildRulesBlock(charName: string, userLabel: string, includeEntit
     return fillIdentity(rules, charName, userLabel).replace(/__ENTITY_RULE__/g, () => entityRule);
 }
 
-function buildConversationText(messages: Message[], charName: string, userLabel: string): string {
+function buildConversationText(
+    messages: Message[], charName: string, userLabel: string, includeMessageIds = false,
+): string {
     // 每行带 [YYYY-MM-DD HH:MM] 时间戳前缀。
     // 没有这个 LLM 完全看不到日期，多日 batch 提取出来的记忆全部会被压到一个时间点
     // （见 parseMemoryNodesFromBuffer 的 midTime 兜底），跨日时间线就乱了。
+    // 协商开关打开时再补 [#消息ID]：模型输出的 sourceMsgIds 必须能校验回真实消息，
+    // 否则「证据来源」就是模型编的（见 negotiationEvidence.validateSourceMessageIds）。
     const pad2 = (n: number) => String(n).padStart(2, '0');
     return messages
         .map(m => {
             const body = formatMessageForPrompt(m, charName, userLabel).slice(0, 600);
+            const idTag = includeMessageIds && Number.isFinite(m.id) ? `[#${m.id}] ` : '';
             const ts = m.timestamp;
-            if (!ts || ts <= 0) return body;
+            if (!ts || ts <= 0) return `${idTag}${body}`;
             const d = new Date(ts);
             const stamp = `[${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}]`;
-            return `${stamp} ${body}`;
+            return `${idTag}${stamp} ${body}`;
         })
         .join('\n');
 }
@@ -339,7 +349,13 @@ export interface BufferExtractionResult {
     /** 应提前摘除的便利贴 ID */
     unpinIds: string[];
     /** 纠正：把对应已有记忆的 content 追加一行"YYYY-MM-DD 纠正：note"，并重新向量化 */
-    corrections: { targetId: string; note: string }[];
+    corrections: { targetId: string; note: string; sourceMessageIds?: number[] }[];
+    /**
+     * 记忆协商计划（开关打开时才有）。
+     * memories 仍是**完整**列表；调用方必须按 plan.keptMemoryIds 过滤后才落库，
+     * 否则「角色猜测 / 否定 / 引用」还是会被当成事实写进记忆宫殿。
+     */
+    negotiation?: NegotiationPlan;
 }
 
 // ─── 缓冲区提取：直接从消息提取记忆，不依赖 TopicBox ───
@@ -364,8 +380,10 @@ export async function extractMemoriesFromBuffer(
     if (messages.length === 0) return { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
 
     const includeEntities = readRecallRuntimeSnapshot().featureFlagsSnapshot.recallRouter;
+    // 协商开关：打开后这次**同一次**调用既产出记忆也产出证据字段与澄清指令（零额外请求）。
+    const negotiationEnabled = isMemoryNegotiationEnabled();
     const userLabel = userName || '用户';
-    const conversationText = buildConversationText(messages, charName, userLabel);
+    const conversationText = buildConversationText(messages, charName, userLabel, negotiationEnabled);
 
     const contextBlock = charContext
         ? `\n## 你的人设（供参考，帮助你理解对话中的关系和角色定位）\n${charContext}\n`
@@ -395,7 +413,7 @@ export async function extractMemoriesFromBuffer(
     // 动态数据段（上下文 / 已有记忆 / 便利贴 / 规则块 / 实体行）按 token 回填。
     const mainTpl = await resolveTechnicalPrompt('memory.extractionMain', MEMORY_EXTRACTION_MAIN_BUILTIN);
     const rulesBlock = await buildRulesBlock(charName, userLabel, includeEntities);
-    const systemPrompt = fillIdentity(mainTpl, charName, userLabel)
+    let systemPrompt = fillIdentity(mainTpl, charName, userLabel)
         .replace(/__CONTEXT_BLOCK__/g, () => contextBlock)
         .replace(/__RELATED_BLOCK__/g, () => relatedBlock)
         .replace(/__PINNED_BLOCK__/g, () => pinnedBlock)
@@ -404,6 +422,19 @@ export async function extractMemoriesFromBuffer(
         .replace(/__UNPIN_RULE__/g, () => unpinRule)
         .replace(/__RELATED_TO_FORMAT__/g, () => relatedToFormat)
         .replace(/__ENTITIES_LINE__/g, () => includeEntities ? '\n    "entities": [{"name": "明确出现的专名", "type": "person"}],' : '');
+
+    // 证据字段 + 未决候选 + 澄清写法：只在开关打开时追加，模板本体不动。
+    // pendingSnapshot 是「提示词实际展示的那几条」的快照：C0..Cn 的编号必须按它解析，
+    // 否则本批新增候选会把窗口顶走，澄清会绑到另一个议题上。
+    let pendingSnapshot: { id: string }[] = [];
+    if (negotiationEnabled) {
+        let pendingForPrompt: ReturnType<typeof pendingCandidatesForPrompt> = [];
+        try {
+            pendingForPrompt = pendingCandidatesForPrompt(charId);
+        } catch { /* 账本读失败就当没有未决事项 */ }
+        systemPrompt += buildNegotiationPromptSuffix(pendingForPrompt);
+        pendingSnapshot = pendingForPrompt.slice(-NEGOTIATION_PROMPT_CANDIDATE_LIMIT).map(candidate => ({ id: candidate.id }));
+    }
 
     try {
         try {
@@ -476,7 +507,8 @@ export async function extractMemoriesFromBuffer(
 
         // 解析纠正指令：{ "correct": "O0", "note": "实情是..." } → 真实 ID
         // 仅在有 relatedMemories 时才有意义（O 编号必须能解析回真节点 id）
-        const corrections: { targetId: string; note: string }[] = [];
+        const corrections: { targetId: string; note: string; sourceMessageIds?: number[] }[] = [];
+        const allowedMessageIds = new Set(messages.map(m => m.id).filter(id => Number.isFinite(id)));
         if (hasRelated) {
             for (const item of parsed) {
                 if (!item || typeof item.correct !== 'string') continue;
@@ -484,7 +516,19 @@ export async function extractMemoriesFromBuffer(
                 if (!note) continue;
                 const idx = parseInt(item.correct.replace(/^O/i, ''), 10);
                 if (idx >= 0 && idx < relatedMemories!.length) {
-                    corrections.push({ targetId: relatedMemories![idx].id, note });
+                    const correction: { targetId: string; note: string; sourceMessageIds?: number[] } = {
+                        targetId: relatedMemories![idx].id,
+                        note,
+                    };
+                    // 协商开启时给纠正也带上可核对的来源消息，落库时写进 supersession 记录。
+                    if (negotiationEnabled) {
+                        const { ids } = validateSourceMessageIds(
+                            item.sourceMsgIds ?? item.sourceMessageIds,
+                            allowedMessageIds,
+                        );
+                        if (ids.length > 0) correction.sourceMessageIds = ids;
+                    }
+                    corrections.push(correction);
                 }
             }
             if (corrections.length > 0) {
@@ -492,7 +536,36 @@ export async function extractMemoriesFromBuffer(
             }
         }
 
-        return { memories, crossTimeLinks, eventBoxHints, unpinIds, corrections };
+        // 证据分级 / 未决候选 / 澄清绑定：纯本地计算，复用这一次 LLM 的输出。
+        let negotiation: NegotiationPlan | undefined;
+        if (negotiationEnabled && parsed.length > 0) {
+            try {
+                const firstId = messages[0]?.id ?? 0;
+                const lastId = messages[messages.length - 1]?.id ?? 0;
+                negotiation = planNegotiationBatch({
+                    charId,
+                    charName,
+                    userName: userLabel,
+                    messages,
+                    parsed,
+                    memories,
+                    batchId: `mpx_${charId}_${firstId}_${lastId}_${messages.length}`,
+                    promptCandidates: pendingSnapshot,
+                });
+                // 账本先落盘：即使后续向量化失败，「这条只是猜测/未决」的状态也不会丢。
+                persistNegotiationPlan(negotiation);
+                console.log(
+                    `🗣️ [Extraction] 记忆协商：允许落库 ${negotiation.summary.applied} 条，`
+                    + `未决 ${negotiation.summary.deferred} 条，澄清指令 ${negotiation.summary.resolutionDirectives} 条，`
+                    + `待补写 ${negotiation.summary.promoted} 条`,
+                );
+            } catch (e: any) {
+                console.warn(`🗣️ [Extraction] 记忆协商计划失败（本次按原行为落库）: ${e?.message || e}`);
+                negotiation = undefined;
+            }
+        }
+
+        return { memories, crossTimeLinks, eventBoxHints, unpinIds, corrections, ...(negotiation ? { negotiation } : {}) };
 
     } catch (err: any) {
         console.error(`❌ [Extraction] 缓冲区提取失败 (${messages.length} 条消息):`, err.message);

@@ -27,6 +27,25 @@
 import { decryptFromStorage, deriveUserEncryptionKey } from '@rei-standard/amsg-server/cloudflare';
 import { AUTONOMOUS_ROUND_KIND } from '../../../utils/airp/autonomySettings';
 import {
+  AUTONOMY_GUARDRAIL_DEFAULTS,
+  AUTONOMY_GUARDRAIL_STATE_KEY,
+  AUTONOMY_GUARDRAIL_STATE_NAMESPACE,
+  effectiveAutonomyGuardrails,
+  normalizeAutonomyGuardrails,
+  parseAutonomyGuardrailStateValue,
+  type AirpAutonomyGuardrails,
+} from '../../../utils/airp/autonomyGuardrails';
+import type { ResolvedAirpAutonomy } from '../../../utils/airp/autonomySettings';
+import { canRunPrivateLifeAction } from '../../../utils/airp/lifeWorkflowPermissions';
+import {
+  computeScheduledAt,
+  evaluateWorkflowBudget,
+  chatUserMessageRef,
+  isCancelableByUserSpeech,
+  type AutonomyPlanRecord,
+  type WorkflowBudgetReason,
+} from '../../../utils/airp/lifeWorkflow';
+import {
   AMSG_FIRE_PACK_KEY,
   AMSG_STATE_NAMESPACE_PREFIX,
   parseFirePack,
@@ -42,10 +61,24 @@ import {
 } from '../../../utils/amsgTaskKinds';
 import {
   AUTONOMY_EXPERIENCE_TTL_MS,
+  cancelPendingAutonomyPlans,
+  claimAutonomyPlanForSchedule,
+  claimGlobalAutonomyBudget,
   cleanupAutonomyExperiences,
+  countAutonomyPlansSince,
   ensureAutonomySchema,
+  expireStaleAutonomyPlans,
   getAutonomyState,
+  getGlobalAutonomyUsage,
+  insertAutonomyPlanRun,
+  lastAutonomyPlanOfKindAt,
+  listAutonomyPlans,
+  listDueAutonomyPlans,
+  releaseGlobalAutonomyBudget,
   setAutonomyState,
+  settleAutonomyPlan,
+  sumReservedAutonomyTokensSince,
+  updateAutonomyPlanRun,
   type AutonomyDb,
 } from './autonomyStore';
 
@@ -55,6 +88,7 @@ export const AUTONOMY_FAIL_LIMIT = 3;
 /** 跳过原因只用这一组字面量：日志、测试和（之后的）面板都按它对齐。 */
 export const AUTONOMY_SKIP_REASONS = {
   disabled: 'autonomy-disabled',
+  paused: 'autonomy-paused',
   missingCredentials: 'missing-credentials',
   missingPushSubscription: 'missing-push-subscription',
   cadenceInvalid: 'cadence-invalid',
@@ -66,6 +100,16 @@ export const AUTONOMY_SKIP_REASONS = {
   tokenBudget: 'token-budget',
   failMuted: 'fail-muted',
   postFailed: 'post-failed',
+  // P5 生活工作流（计划）侧的跳过原因：与既有回合分开，面板/日志才对得上。
+  planDailyLimit: 'plan-char-daily-limit',
+  planKindGap: 'plan-kind-gap',
+  planGlobalLimit: 'plan-global-limit',
+  planTokenBudget: 'plan-token-budget',
+  planPostFailed: 'plan-post-failed',
+  planNotPending: 'plan-not-pending',
+  planCapability: 'plan-capability-denied',
+  /** 共享护栏读不出来（缺钥/密文坏/D1 错）：这一跳暂停，绝不当成「用户没暂停」。 */
+  guardrailsUnreadable: 'guardrails-unreadable',
 } as const;
 
 export type AutonomySkipReason = (typeof AUTONOMY_SKIP_REASONS)[keyof typeof AUTONOMY_SKIP_REASONS];
@@ -78,6 +122,17 @@ export interface AutonomyTickPack {
   /** 角色名（取自同命名空间的 tool_pack；缺了就是空串，转发时回落到 charId）。 */
   charName: string;
   pack: AmsgFirePack;
+  /**
+   * 用户级共享护栏（全局次数 / 总暂停）。由 scanAutonomyPacks 在同一次扫描里读出来
+   * 挂在包上——cron 调用处不需要额外传 masterKey，也不会退回「每个角色各带一份全局额度」。
+   * 缺省（手工喂包的单测）按默认 6 次/天、不暂停。
+   */
+  sharedGuardrails?: AirpAutonomyGuardrails;
+  /**
+   * true = 这个用户的共享护栏**读不出来**（缺 master key / 密文坏 / D1 错），
+   * 不是「没配」。读到这个标记时调度器必须整跳暂停，不能补读默认值。
+   */
+  sharedGuardrailsUnreadable?: boolean;
 }
 
 export interface AutonomyScanSkipped {
@@ -167,6 +222,49 @@ export async function scanAutonomyPacks(args: {
     packs.push({ userId: bucket.userId, charId, charName, pack });
   }
 
+  // 用户级共享护栏：和 fire_pack 同一次扫描、同一把 master key，读一次按 user 缓存。
+  // 读不出来的用户**必须**被记住：`runAutonomyTick` 不能再用「没挂上护栏 = 默认 6 次/天、
+  // 不暂停」去补一次读取，否则用户按下的总暂停会被无声取消（cloud 行坏了 / 换钥 / D1 抖动）。
+  // 只有「行确实不存在」才是新用户，可以走默认值。
+  const guardrailsByUser = new Map<string, AirpAutonomyGuardrails>();
+  const guardrailsUnreadableUsers = new Set<string>();
+  try {
+    const rowsGuard = await args.db
+      .prepare('SELECT user_id, value FROM client_state WHERE namespace = ? AND key = ?')
+      .bind(AUTONOMY_GUARDRAIL_STATE_NAMESPACE, AUTONOMY_GUARDRAIL_STATE_KEY)
+      .all();
+    for (const row of rowsGuard.results ?? []) {
+      const userId = row.user_id;
+      const value = row.value;
+      if (typeof userId !== 'string' || !userId) continue;
+      if (typeof value !== 'string' || !value) {
+        guardrailsUnreadableUsers.add(userId);
+        continue;
+      }
+      try {
+        const userKey = await deriveUserEncryptionKey(userId, args.masterKey);
+        const plain = await unpackStateValue(await decryptFromStorage(value, userKey));
+        const parsed = parseAutonomyGuardrailStateValue(plain);
+        if (parsed) guardrailsByUser.set(userId, parsed);
+        else guardrailsUnreadableUsers.add(userId);
+      } catch (error) {
+        // 单行坏掉只影响这个用户，但处理方式必须是「这一跳暂停」，不是「按默认预算跑」。
+        guardrailsUnreadableUsers.add(userId);
+        console.warn('[amsg:autonomy] 共享护栏解密/解析失败，本跳暂停这个用户', userId,
+          error instanceof Error ? error.message : error);
+      }
+    }
+  } catch (error) {
+    // 整表读不出来：所有这个用户的包都按「读不出来」处理（fail-closed）。
+    for (const bucket of byNamespace.values()) guardrailsUnreadableUsers.add(bucket.userId);
+    console.warn('[amsg:autonomy] 共享护栏没读出来（本跳按暂停处理）', error);
+  }
+  for (const entry of packs) {
+    const shared = guardrailsByUser.get(entry.userId);
+    if (shared) entry.sharedGuardrails = shared;
+    if (guardrailsUnreadableUsers.has(entry.userId)) entry.sharedGuardrailsUnreadable = true;
+  }
+
   return { packs, skipped };
 }
 
@@ -177,6 +275,8 @@ export interface AutonomyPostTaskArgs {
   charId: string;
   charName: string;
   pack: AmsgFirePack;
+  /** P5：这次建的是生活工作流任务（到点由 autonomyFire 走独立请求）。 */
+  plan?: AutonomyPlanRecord;
 }
 
 export interface AutonomyTickInput {
@@ -186,11 +286,19 @@ export interface AutonomyTickInput {
   db: AutonomyDb;
   packs: AutonomyTickPack[];
   postTask: (args: AutonomyPostTaskArgs) => Promise<unknown>;
+  /**
+   * 读共享护栏（`amsg:global/autonomy_guardrails`，加密行）用的 master key。
+   * 父集成在 cron 调用处传 `env.AMSG_MASTER_KEY`；缺省时全局配置回落到默认值
+   * （6 次/天、不暂停），不会让整跳失败。
+   */
+  masterKey?: string;
 }
 
 export interface AutonomyTickResult {
   /** 这一跳真的建出任务的角色。 */
   built: string[];
+  /** 这一跳排出去的生活工作流计划 id（P5；与回合分开记）。 */
+  plansScheduled: string[];
   skipped: Array<{ charId: string; reason: string }>;
 }
 
@@ -199,6 +307,115 @@ export function autonomyDateKey(nowMs: number, tzId: string): string {
   const p = wallClockPartsInZone(nowMs, { tzId });
   return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
 }
+
+/** 角色时区当地当日起点（绝对毫秒）。非法 tzId 抛错，与 autonomyDateKey 同语义。 */
+export function startOfAutonomyDayMs(nowMs: number, tzId: string): number {
+  const p = wallClockPartsInZone(nowMs, { tzId });
+  // 把「本地墙上时间当成 UTC」反推偏移，再折回绝对时刻；分钟级精度足够算日界。
+  const localAsUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute);
+  const offset = localAsUtc - Math.floor(nowMs / 60_000) * 60_000;
+  return Date.UTC(p.year, p.month - 1, p.day, 0, 0) - offset;
+}
+
+// ─── 全局护栏（用户级共享配置） ──────────────────────────────────────────
+//
+// 全局额度与总暂停存在 client_state 的 `amsg:global/autonomy_guardrails` 一行里：
+// 与工具配置同一个全局 namespace、同一套 X-User-Id + masterKey 加密边界，前端写它走
+// 既有 putClientStateOrThrow。**worker 只读这一行，绝不从某个角色的 fire_pack 里拿全局额度**——
+// 那等于让每个角色自带一份「全局额度」，多角色/多设备时既不同步也不可信。
+
+/**
+ * 读这个用户的共享护栏。三态是必须的：
+ *   - `absent`：这一行**确实不存在** = 新用户/没配过，可以走默认（6 次/天、不暂停）；
+ *   - `ok`：读到并归一；
+ *   - `unreadable`：缺 master key / 密文坏 / D1 错 / 形状坏——**不许**当成默认值。
+ *
+ * 以前这里把所有失败都折成默认值，等于用户按下的总暂停会被一次 D1 抖动静默取消。
+ */
+export type AutonomyGuardrailReadStatus = 'ok' | 'absent' | 'unreadable';
+
+export interface AutonomyGuardrailReadResult {
+  status: AutonomyGuardrailReadStatus;
+  /** 只有 `ok` 是用户真实配置；`absent` 是默认值；`unreadable` 是保守暂停值。 */
+  guardrails: AirpAutonomyGuardrails;
+  error?: string;
+}
+
+/** 读不出来时给调用方的保守值：暂停 + 0 额度（不会有任何计划被排出去）。 */
+export const AUTONOMY_GUARDRAIL_UNREADABLE: AirpAutonomyGuardrails = {
+  ...AUTONOMY_GUARDRAIL_DEFAULTS,
+  paused: true,
+  globalPerDay: 0,
+};
+
+export async function readAutonomyGuardrailsForUserDetailed(
+  db: AutonomyDb,
+  masterKey: string,
+  userId: string,
+): Promise<AutonomyGuardrailReadResult> {
+  if (!masterKey) {
+    // 没有 key 就无法证明用户没有暂停：按暂停处理，绝不「默认不暂停」。
+    return { status: 'unreadable', guardrails: { ...AUTONOMY_GUARDRAIL_UNREADABLE }, error: 'missing-master-key' };
+  }
+  try {
+    const row = await db
+      .prepare('SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?')
+      .bind(userId, AUTONOMY_GUARDRAIL_STATE_NAMESPACE, AUTONOMY_GUARDRAIL_STATE_KEY)
+      .first();
+    if (row == null) {
+      return { status: 'absent', guardrails: { ...AUTONOMY_GUARDRAIL_DEFAULTS } };
+    }
+    // 行的形状都不是「value 列」= 这条查询根本没命中护栏行（旧假库/异常驱动）；
+    // 真正的护栏行一定带 value 键（值可能是 null/空串 → 那是 unreadable）。
+    if (!('value' in (row as Record<string, unknown>))) {
+      return { status: 'absent', guardrails: { ...AUTONOMY_GUARDRAIL_DEFAULTS } };
+    }
+    const value = (row as { value?: unknown }).value;
+    if (typeof value !== 'string' || !value) {
+      return { status: 'unreadable', guardrails: { ...AUTONOMY_GUARDRAIL_UNREADABLE }, error: 'empty-value' };
+    }
+    const userKey = await deriveUserEncryptionKey(userId, masterKey);
+    const plain = await unpackStateValue(await decryptFromStorage(value, userKey));
+    const parsed = parseAutonomyGuardrailStateValue(plain);
+    if (!parsed) {
+      return { status: 'unreadable', guardrails: { ...AUTONOMY_GUARDRAIL_UNREADABLE }, error: 'bad-shape' };
+    }
+    return { status: 'ok', guardrails: parsed };
+  } catch (error) {
+    return {
+      status: 'unreadable',
+      guardrails: { ...AUTONOMY_GUARDRAIL_UNREADABLE },
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * 兼容入口：调用方只要护栏值。读不出来时返回**保守暂停值**（paused:true），
+ * 不是默认的「不暂停」。调用方要区分三态请用 `readAutonomyGuardrailsForUserDetailed`。
+ */
+export async function readAutonomyGuardrailsForUser(
+  db: AutonomyDb,
+  masterKey: string,
+  userId: string,
+): Promise<AirpAutonomyGuardrails> {
+  const result = await readAutonomyGuardrailsForUserDetailed(db, masterKey, userId);
+  if (result.status === 'unreadable') {
+    console.warn('[amsg:autonomy] 共享护栏读不出来，本轮按暂停处理', userId, result.error);
+  }
+  return result.guardrails;
+}
+
+const budgetSkipReason = (reason: WorkflowBudgetReason): string => {
+  switch (reason) {
+    case 'paused': return AUTONOMY_SKIP_REASONS.paused;
+    case 'char-daily-limit': return AUTONOMY_SKIP_REASONS.planDailyLimit;
+    case 'kind-gap': return AUTONOMY_SKIP_REASONS.planKindGap;
+    case 'global-daily-limit': return AUTONOMY_SKIP_REASONS.planGlobalLimit;
+    case 'token-budget': return AUTONOMY_SKIP_REASONS.planTokenBudget;
+    default: return AUTONOMY_SKIP_REASONS.planGlobalLimit;
+  }
+};
 
 // ─── 到点硬前置：上游 /schedule-message 在**建任务时**就会查这两样 ────────────
 //
@@ -289,6 +506,236 @@ export const autonomyConfigHash = (autonomy: unknown): string => stableStringify
 /** 每小时毫秒数。 */
 const HOUR_MS = 60 * 60 * 1000;
 
+/** 计划任务在 metadata 上的键：到点由 autonomyFire 认出「这次是工作流执行」。 */
+export const AUTONOMY_PLAN_META_KEY = 'amsgAutonomyPlan';
+
+export interface AutonomyPlanMeta {
+  planId: string;
+  kind: string;
+  title: string;
+  purpose: string;
+  noteHint?: string;
+  maxChars: number;
+}
+
+/** 调度器只依赖 autonomy 终值里的这一小撮字段（结构子集，避免循环类型）。 */
+/**
+ * 计划队列读的自主设置：直接用 fire_pack 里的 `ResolvedAirpAutonomy`（含 capabilityMode /
+ * capabilities），**不能**在这里另写一个窄接口——窄接口会让「排队前的能力闸」拿不到权限终值，
+ * 于是 none 只能等到点才被拦住（白排一次任务、白占一个当日名额）。
+ */
+type ResolvedAirpAutonomyLike = ResolvedAirpAutonomy;
+
+export interface AutonomyPlanTickArgs {
+  db: AutonomyDb;
+  userId: string;
+  charId: string;
+  charName: string;
+  pack: AmsgFirePack;
+  nowMs: number;
+  lastUserMessageAt: number | null;
+  autonomous: ResolvedAirpAutonomyLike;
+  sharedGuardrails: AirpAutonomyGuardrails;
+  postTask: (args: AutonomyPostTaskArgs) => Promise<unknown>;
+}
+
+export interface AutonomyPlanTickResult {
+  scheduled: string[];
+  skipped: Array<{ planId: string; reason: string }>;
+  cancelled: number;
+}
+
+/** 排期租约：建任务到到点之间最多 30 分钟；过点说明任务丢了，不重排、按过期失败收。 */
+const PLAN_SCHEDULE_LEASE_MS = 30 * 60 * 1000;
+
+const isUnknownFailure = (message: string): boolean =>
+  /timeout|timed\s*out|timedout|超时|unknown|未知|abort/i.test(message);
+
+/**
+ * 处理这个角色的生活工作流队列（P5 W3/W4）。
+ *
+ * 只在**既有 cron 跳**里跑，不新起定时器、不新增 LLM 判定调用：
+ *   - 用户重新开口 → 取消还没开始的（scheduled 但没被租约占住）；
+ *   - 到点的 proposed → 过次数/token 双门禁 → 认领全局额度 → 写执行预留 → 建一条
+ *     autonomous_round 任务（metadata 带计划 id，到点走独立后台请求）；
+ *   - 建任务失败：退全局名额、预留标 failed/unknown、计划标 failed/unknown（终态，
+ *     绝不自动重试）。
+ *
+ * 幂等：计划认领是条件 UPDATE，执行行有唯一幂等键；重启/多设备重报都不会重复生成。
+ */
+export async function runAutonomyPlanQueue(args: AutonomyPlanTickArgs): Promise<AutonomyPlanTickResult> {
+  const { db, charId, nowMs } = args;
+  const scheduled: string[] = [];
+  const skipped: AutonomyPlanTickResult['skipped'] = [];
+  let cancelled = 0;
+
+  try {
+    await expireStaleAutonomyPlans(db, { charId, nowMs });
+  } catch (error) {
+    console.warn('[amsg:autonomy] 过期计划没标掉（下一跳再试）', charId, error);
+  }
+
+  // W4：用户重新开口 → 取消尚未开始的收尾（running 里的只标结果不再适用，不假装能退款）。
+  // 「这一条用户消息」的引用带进判定：同一条消息催出来的计划不算「又开口了」。
+  const lastUserMessageRef = typeof args.pack.lastUserMessageId === 'number'
+    ? chatUserMessageRef(charId, args.pack.lastUserMessageId)
+    : null;
+  try {
+    const pending = await listAutonomyPlans(db, charId, ['proposed', 'scheduled'], 20);
+    if (pending.some((plan) => isCancelableByUserSpeech(plan, args.lastUserMessageAt, { lastUserMessageRef }))) {
+      cancelled = await cancelPendingAutonomyPlans(db, {
+        charId,
+        nowMs,
+        reason: 'user-spoke',
+        ...(typeof args.lastUserMessageAt === 'number' ? { createdBeforeMs: args.lastUserMessageAt } : {}),
+      });
+    }
+  } catch (error) {
+    console.warn('[amsg:autonomy] 取消待办计划失败（下一跳再试）', charId, error);
+  }
+
+  let due: AutonomyPlanRecord[] = [];
+  try {
+    due = await listDueAutonomyPlans(db, charId, nowMs);
+  } catch (error) {
+    console.warn('[amsg:autonomy] 读到点计划失败（下一跳再试）', charId, error);
+    return { scheduled, skipped, cancelled };
+  }
+
+  if (due.length === 0) return { scheduled, skipped, cancelled };
+
+  const dayStart = startOfAutonomyDayMs(nowMs, args.pack.tzId);
+  const dateKey = autonomyDateKey(nowMs, args.pack.tzId);
+  // 全局额度是**用户级**的：日界必须按用户那边的钟算，不能跟着每个角色的时区走。
+  // 否则上海角色和纽约角色会各自把共享行翻到不同日期，6 次/天被绕过。
+  const globalDateKey = autonomyDateKey(nowMs, args.pack.userTzId || args.pack.tzId);
+  const limits = effectiveAutonomyGuardrails(
+    normalizeAutonomyGuardrails(args.autonomous.guardrails),
+    args.sharedGuardrails,
+  );
+  // 既有回合已经烧掉的 token 记在 autonomy_state；计划侧再把未结算的预留加进去。
+  const state = await getAutonomyState(db, charId);
+  const tokensToday = state.tokensDate === dateKey ? state.tokensToday : 0;
+
+  for (const plan of due) {
+    // 能力闸必须**排队前**就过一遍，不能只等到点执行时再拦：
+    // 用户把某一类（或全部）能力关掉后，队列里旧计划不该继续占当天的次数/全局名额，
+    // 更不该建出一条到点必然失败的任务。到点那一侧（autonomyFire）仍会再查一次——
+    // 两次读的是同一份权限代理，中间的开关变化由后一次兜住。
+    if (!canRunPrivateLifeAction(args.autonomous, plan.kind)) {
+      try {
+        await settleAutonomyPlan(db, { planId: plan.id, status: 'failed', nowMs, error: 'capability-not-allowed' });
+      } catch { /* 下一跳再收 */ }
+      skipped.push({ planId: plan.id, reason: AUTONOMY_SKIP_REASONS.planCapability });
+      continue;
+    }
+
+    if (isCancelableByUserSpeech(plan, args.lastUserMessageAt, { lastUserMessageRef })) {
+      // 预扫已经把这些待办整体取消过；这里只兜「同一跳里读到的旧行」，不重复计数。
+      skipped.push({ planId: plan.id, reason: 'user-spoke' });
+      continue;
+    }
+
+    const [charUsedToday, lastSameKindAt, globalUsedToday, reservedTokens] = await Promise.all([
+      countAutonomyPlansSince(db, charId, dayStart),
+      lastAutonomyPlanOfKindAt(db, charId, plan.kind),
+      getGlobalAutonomyUsage(db, { userId: args.userId, dateKey: globalDateKey }),
+      sumReservedAutonomyTokensSince(db, charId, dayStart),
+    ]);
+
+    const budget = evaluateWorkflowBudget({
+      nowMs,
+      limits,
+      usage: {
+        charUsedToday,
+        lastSameKindAt,
+        globalUsedToday,
+        reservedTokensToday: reservedTokens,
+        // 计划侧的 token 门：既有回合已烧的账 + 本次及排队中未结算的预留。
+        tokensToday,
+        dailyTokenBudget: args.autonomous.dailyTokenBudget,
+      },
+    });
+    if (!budget.allowed) {
+      skipped.push({ planId: plan.id, reason: budgetSkipReason(budget.reason) });
+      continue;
+    }
+
+    // 全局额度是共享持久化的一行：条件 +1 只有一方能拿到，绝不信任任何角色 body。
+    const globalClaimed = await claimGlobalAutonomyBudget(db, {
+      userId: args.userId, dateKey: globalDateKey, limit: limits.globalPerDay, nowMs,
+    });
+    if (!globalClaimed) {
+      skipped.push({ planId: plan.id, reason: AUTONOMY_SKIP_REASONS.planGlobalLimit });
+      continue;
+    }
+
+    const idempotencyKey = `plan:${plan.id}`;
+    const runId = crypto.randomUUID();
+    const reserved = await insertAutonomyPlanRun(db, {
+      id: runId, planId: plan.id, charId,
+      idempotencyKey, reservedTokens: limits.reserveTokensPerRun, nowMs,
+    });
+    if (!reserved) {
+      await releaseGlobalAutonomyBudget(db, { userId: args.userId, dateKey: globalDateKey, nowMs });
+      skipped.push({ planId: plan.id, reason: AUTONOMY_SKIP_REASONS.planNotPending });
+      continue;
+    }
+
+    const claimed = await claimAutonomyPlanForSchedule(db, {
+      planId: plan.id, nowMs, leaseMs: PLAN_SCHEDULE_LEASE_MS,
+    });
+    if (!claimed) {
+      await releaseGlobalAutonomyBudget(db, { userId: args.userId, dateKey: globalDateKey, nowMs });
+      await updateAutonomyPlanRun(db, { idempotencyKey, status: 'released', nowMs });
+      skipped.push({ planId: plan.id, reason: AUTONOMY_SKIP_REASONS.planNotPending });
+      continue;
+    }
+
+    try {
+      await args.postTask({
+        userId: args.userId,
+        charId,
+        charName: args.charName,
+        pack: args.pack,
+        plan: { ...plan, status: 'scheduled', scheduledAt: computedAt(plan, nowMs, args.lastUserMessageAt, args.pack.tzId) },
+      });
+      scheduled.push(plan.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await releaseGlobalAutonomyBudget(db, { userId: args.userId, dateKey: globalDateKey, nowMs });
+      await updateAutonomyPlanRun(db, {
+        idempotencyKey, status: isUnknownFailure(message) ? 'unknown' : 'failed', error: message, nowMs,
+      });
+      // unknown 是终态：绝不自动重试（总计划 review focus 第 2 条）。
+      try {
+        await settleAutonomyPlan(db, {
+          planId: plan.id, status: isUnknownFailure(message) ? 'unknown' : 'failed', nowMs, error: message,
+        });
+      } catch (settleError) {
+        console.warn('[amsg:autonomy] 计划收尾没写进去（不再重排，等人工/下一份新提议）', plan.id, settleError);
+      }
+      skipped.push({ planId: plan.id, reason: AUTONOMY_SKIP_REASONS.planPostFailed });
+    }
+  }
+
+  return { scheduled, skipped, cancelled };
+}
+
+const computedAt = (
+  plan: AutonomyPlanRecord,
+  nowMs: number,
+  lastUserMessageAt: number | null,
+  tzId: string,
+): number => {
+  // 计划落库时已经算过 scheduledAt；这里只兜「老行没算过」的情况。
+  if (plan.scheduledAt > 0) return plan.scheduledAt;
+  return computeScheduledAt(
+    { trigger: plan.trigger, createdAt: plan.createdAt },
+    { nowMs, tzId, lastUserMessageAt },
+  );
+};
+
 /**
  * 跑一跳。返回这一跳建了哪些角色、各自因为什么被跳过。
  *
@@ -299,7 +746,10 @@ export async function runAutonomyTick(input: AutonomyTickInput): Promise<Autonom
   const { db, packs, postTask } = input;
   const rand = input.rand01 ?? Math.random;
   const built: string[] = [];
+  const plansScheduled: string[] = [];
   const skipped: Array<{ charId: string; reason: string }> = [];
+  // 同一跳里同一用户的共享护栏只读一次（D1 往返按 user 计，不按角色计）。
+  const sharedGuardrailsByUser = new Map<string, AirpAutonomyGuardrails>();
 
   await ensureAutonomySchema(db);
   // 每跳顺手清一次过期经历（7 天）。清不掉只记日志：它是收尾活儿，不该拖垮这一跳。
@@ -320,6 +770,30 @@ export async function runAutonomyTick(input: AutonomyTickInput): Promise<Autonom
       continue;
     }
 
+    // 闸 1.2：用户级总暂停（共享配置）。暂停是用户的主权闸，优先于凭据/推送等硬前置：
+    // 用户已经喊停，这一跳连扫描后的判定都不该继续。
+    // 扫描阶段已经确认「这个用户的护栏读不出来」：整跳暂停，不再补读默认值。
+    if (entry.sharedGuardrailsUnreadable) {
+      skip(AUTONOMY_SKIP_REASONS.guardrailsUnreadable);
+      continue;
+    }
+    let sharedGuardrails = entry.sharedGuardrails ?? sharedGuardrailsByUser.get(userId);
+    if (!sharedGuardrails) {
+      const read = await readAutonomyGuardrailsForUserDetailed(db, input.masterKey ?? '', userId);
+      if (read.status === 'unreadable') {
+        // 手工喂包 / 老调用方没带护栏：读不出来同样 fail-closed，不按默认预算跑。
+        console.warn('[amsg:autonomy] 这一跳读不出共享护栏，跳过这个用户', userId, read.error);
+        skip(AUTONOMY_SKIP_REASONS.guardrailsUnreadable);
+        continue;
+      }
+      sharedGuardrails = read.guardrails;
+      sharedGuardrailsByUser.set(userId, sharedGuardrails);
+    }
+    if (sharedGuardrails.paused) {
+      skip(AUTONOMY_SKIP_REASONS.paused);
+      continue;
+    }
+
     // 闸 1.5：到点硬前置（见上方核实段）。**必须在任何 state 写之前**：缺凭据行 /
     // 推送订阅时这条任务到点必被上游 409 拒掉，正确做法是这一跳整个跳过、一分账都不扣，
     // 而不是先清熔断 / 扣账再失败。查不到就是跳过，不写、不建、不烧预算。
@@ -330,6 +804,30 @@ export async function runAutonomyTick(input: AutonomyTickInput): Promise<Autonom
     if (!(await hasAutonomyPushSubscription(db, userId))) {
       skip(AUTONOMY_SKIP_REASONS.missingPushSubscription);
       continue;
+    }
+
+    // P5：生活工作流队列（W3/W4）。跑在既有回合的 cadence 闸之前——计划有它自己的
+    // 到点时间与预算，不该被「距上一轮多久」挡住；用户刚开口的情况会在队列内部取消。
+    try {
+      const planTick = await runAutonomyPlanQueue({
+        db,
+        userId,
+        charId,
+        charName,
+        pack,
+        nowMs: input.nowMs,
+        lastUserMessageAt: typeof pack.lastUserMessageAt === 'number' ? pack.lastUserMessageAt : null,
+        autonomous: autonomy,
+        sharedGuardrails,
+        postTask,
+      });
+      plansScheduled.push(...planTick.scheduled);
+      for (const entry of planTick.skipped) {
+        skipped.push({ charId, reason: entry.reason });
+      }
+    } catch (error) {
+      // 计划队列坏掉不该拖垮既有回合：记一行，继续走下面的回合闸。
+      console.warn('[amsg:autonomy] 生活工作流队列这一跳失败（回合照走）', charId, error);
     }
 
     const state = await getAutonomyState(db, charId);
@@ -438,7 +936,7 @@ export async function runAutonomyTick(input: AutonomyTickInput): Promise<Autonom
     }
   }
 
-  return { built, skipped };
+  return { built, plansScheduled, skipped };
 }
 
 // ─── 结果回账（Task 18 的 handler 调） ────────────────────────────────────
@@ -542,8 +1040,20 @@ export async function buildAutonomyScheduleRequest(args: {
   charName: string;
   masterKey: string;
   clientToken?: string;
+  /** P5：这是一次生活工作流执行（不是普通自主回合）。 */
+  plan?: AutonomyPlanRecord;
 }): Promise<Request> {
   const charName = args.charName || args.charId;
+  const planMeta: AutonomyPlanMeta | null = args.plan
+    ? {
+        planId: args.plan.id,
+        kind: args.plan.kind,
+        title: args.plan.title,
+        purpose: args.plan.purpose,
+        ...(args.plan.noteHint ? { noteHint: args.plan.noteHint } : {}),
+        maxChars: args.plan.maxChars,
+      }
+    : null;
   const payload = {
     contactName: charName,
     messageType: 'auto',
@@ -565,6 +1075,9 @@ export async function buildAutonomyScheduleRequest(args: {
       // Task 18 不需要 amsg:job 的一次性输入（只读 fire_pack + autonomy 表），
       // 这个键照客户端口径带上，handler 不读它。
       [AMSG_JOB_ID_KEY]: crypto.randomUUID(),
+      // P5：计划执行走同一种 kind（不新增 kind 就无需父集成改注册表），
+      // 到点由 autonomyFire 读这个键转成一次独立的后台工作流请求。
+      ...(planMeta ? { [AUTONOMY_PLAN_META_KEY]: planMeta } : {}),
     },
     credRefs: { chat: autonomyChatCredId(args.charId) },
     messages: [{ role: 'user', content: AUTONOMY_PLACEHOLDER_PROMPT }],
@@ -596,13 +1109,14 @@ export const createAutonomyPostTask = (deps: {
   masterKey: string;
   clientToken?: string;
 }): ((args: AutonomyPostTaskArgs) => Promise<{ status: number }>) =>
-  async ({ userId, charId, charName }) => {
+  async ({ userId, charId, charName, plan }) => {
     const request = await buildAutonomyScheduleRequest({
       userId,
       charId,
       charName,
       masterKey: deps.masterKey,
       clientToken: deps.clientToken,
+      ...(plan ? { plan } : {}),
     });
     const response = await deps.forward(request);
     if (!response.ok) throw new Error(`schedule-message 拒绝（HTTP ${response.status}）`);

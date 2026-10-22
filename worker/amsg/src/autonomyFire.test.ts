@@ -18,16 +18,21 @@ import {
   AUTONOMY_FIRE_SKIP,
   AUTONOMY_NOTE_MAX_CHARS,
   AUTONOMY_ROUND_OVERRIDE,
+  AUTONOMY_WORKFLOW_SKIP,
   autonomyRoundHandler,
+  buildAutonomyPerceptionBlock,
   buildAutonomyRoundPrompt,
+  buildWorkflowExecutionPrompt,
   collectBurntLines,
   configureAutonomyFireDb,
+  configureAutonomyFireMasterKey,
   dominantAutonomyKind,
   extractDialogueTail,
   fullStopNote,
   isWithinQuietHours,
   parseAutonomyRoundReply,
   postProcessNote,
+  readAutonomyPlanMeta,
   shouldPushAutonomy,
   stripThroatClearing,
   washMarkdownLinks,
@@ -43,6 +48,8 @@ const HOUR = 60 * 60 * 1000;
 afterEach(() => {
   // holder 是模块级单例：每个用例自己喂库，用完必须清回 null，否则下一条用例会串味。
   configureAutonomyFireDb(null);
+  // 到点复核护栏：假库没有这一行 → status='absent' → 默认未暂停（测试口径）。
+  configureAutonomyFireMasterKey('test-master-key');
 });
 
 // ─── 夹具 ────────────────────────────────────────────────────────────────
@@ -59,6 +66,10 @@ const baseAutonomy = (overrides: Partial<ResolvedAirpAutonomy> = {}): ResolvedAi
   autonomyLevel: 2,
   mcpAllow: [],
   writable: false,
+  guardrails: {
+    version: 1, perCharPerDay: 2, sameKindMinGapMinutes: 120,
+    globalPerDay: 6, reserveTokensPerRun: 1600, paused: false,
+  },
   ...overrides,
 });
 
@@ -118,6 +129,11 @@ const experienceRow = (overrides: Partial<FakeExperienceRow> = {}): FakeExperien
 const createFakeDb = (seed: {
   experiences?: FakeExperienceRow[];
   state?: Record<string, Record<string, unknown>>;
+  /**
+   * owner 反查的答案（`SELECT user_id FROM client_state WHERE namespace = ?`）。
+   * `userId: null` = 行在但 user_id 空 → 必须 fail-closed。
+   */
+  owner?: { userId?: string | null; rowMissing?: boolean };
 } = {}) => {
   const experiences = [...(seed.experiences ?? [])];
   const stateRows = new Map<string, Record<string, unknown>>(Object.entries(seed.state ?? {}));
@@ -167,6 +183,10 @@ const createFakeDb = (seed: {
         },
         async first() {
           sql.push(text);
+          if (text.includes('SELECT user_id FROM client_state')) {
+            if (seed.owner?.rowMissing) return null;
+            return { user_id: seed.owner?.userId === undefined ? 'u1' : seed.owner.userId };
+          }
           return stateRows.get(args[0] as string) ?? null;
         },
         async all() {
@@ -256,6 +276,7 @@ const runRound = async (args: {
 }) => {
   const fake = createFakeDb(args.seed);
   configureAutonomyFireDb(fake.db);
+  configureAutonomyFireMasterKey('test-master-key');
   const { ctx: fireCtx, scratch } = makeFireCtx(args.pack ?? buildPack());
   const plan = await amsgHooks.onBeforeFire(fireCtx);
   const { ctx, emitResult } = makeSessionCtx(scratch, args.reply, args.usage);
@@ -322,7 +343,7 @@ describe('autonomyFire 输出解析', () => {
 
   it('rest:true → 这一轮就是歇了', () => {
     const reply = parseAutonomyRoundReply('{"v":1,"rest":true}');
-    expect(reply).toEqual({ rested: true, experiences: [], proposedEvents: [] });
+    expect(reply).toEqual({ rested: true, experiences: [], proposedEvents: [], workflowCandidates: [] });
   });
 
   it('版本或形状非法 → 判失败（回 null）', () => {
@@ -601,6 +622,8 @@ describe('autonomyFire beforeFire 的跳过原因（直接喂 handler）', () =>
   it('fire_pack 不在 / 解不开 / 形状不认识 → 安静跳过', async () => {
     const fake = createFakeDb();
     configureAutonomyFireDb(fake.db);
+  configureAutonomyFireMasterKey('test-master-key');
+    configureAutonomyFireMasterKey('test-master-key');
     expect(await autonomyRoundHandler.beforeFire({ ctx: directCtx([]), charId: CHAR_ID, taskMeta: {} }))
       .toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.packMissing });
     expect(await autonomyRoundHandler.beforeFire({
@@ -618,6 +641,8 @@ describe('autonomyFire beforeFire 的跳过原因（直接喂 handler）', () =>
   it('自主关了 / 时区坏了 → 各自的原因', async () => {
     const fake = createFakeDb();
     configureAutonomyFireDb(fake.db);
+  configureAutonomyFireMasterKey('test-master-key');
+    configureAutonomyFireMasterKey('test-master-key');
     expect(await autonomyRoundHandler.beforeFire({
       ctx: directCtx([{ key: AMSG_FIRE_PACK_KEY, value: JSON.stringify(buildPack({ autonomy: baseAutonomy({ enabled: false }) })) }]),
       charId: CHAR_ID,
@@ -628,6 +653,34 @@ describe('autonomyFire beforeFire 的跳过原因（直接喂 handler）', () =>
       charId: CHAR_ID,
       taskMeta: {},
     })).toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.tzInvalid });
+  });
+
+  it('owner 认不出来（行缺失 / user_id 空串）→ 普通回合与计划都 fail-closed', async () => {
+    // 行缺失：查不到 owner。
+    const missing = createFakeDb({ owner: { rowMissing: true } });
+    configureAutonomyFireDb(missing.db);
+    configureAutonomyFireMasterKey('test-master-key');
+    const pack = buildPack();
+    const packRows = [{ key: AMSG_FIRE_PACK_KEY, value: JSON.stringify(pack) }];
+    const planMeta = { amsgAutonomyPlan: { planId: 'plan-1', kind: 'diary', title: '写夜记' } };
+    expect(await autonomyRoundHandler.beforeFire({ ctx: directCtx(packRows), charId: CHAR_ID, taskMeta: {} }))
+      .toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.ownerUnresolved });
+    // 计划到点：owner 读不到时连计划行都不碰（绝不执行），更不会去读护栏当新用户放行。
+    expect(await autonomyRoundHandler.beforeFire({ ctx: directCtx(packRows), charId: CHAR_ID, taskMeta: planMeta }))
+      .toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.ownerUnresolved });
+    expect(missing.sql.some((text) => text.includes('FROM autonomy_plans WHERE id'))).toBe(false);
+
+    // user_id 是空串：旧实现把它当「absent 新用户」→ paused:false 放行，这里必须同样拒绝。
+    const blank = createFakeDb({ owner: { userId: '   ' } });
+    configureAutonomyFireDb(blank.db);
+    expect(await autonomyRoundHandler.beforeFire({ ctx: directCtx(packRows), charId: CHAR_ID, taskMeta: {} }))
+      .toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.ownerUnresolved });
+
+    // 对照：owner 正常时这门放行（计划行缺失走 planMissing，而不是 ownerUnresolved）。
+    const ok = createFakeDb();
+    configureAutonomyFireDb(ok.db);
+    expect(await autonomyRoundHandler.beforeFire({ ctx: directCtx(packRows), charId: CHAR_ID, taskMeta: planMeta }))
+      .toEqual({ skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planMissing });
   });
 });
 
@@ -820,5 +873,267 @@ describe('autonomyFire 整轮（经 amsgHooks 的 kind 分派）', () => {
     const note = (emitResult.mock.calls[0]![0] as { experiences: Array<{ note: string }> }).experiences[0].note;
     expect(note.length).toBeLessThanOrEqual(AUTONOMY_NOTE_MAX_CHARS);
     expect(note.endsWith('。')).toBe(true);
+  });
+});
+
+// ─── P4/P5：感知 / 工作流提议 / 到点执行 ────────────────────────────────
+
+describe('P4 感知小快照', () => {
+  it('角色时区 + 当天日程 → 一小段带认知边界的感知；坏时区不炸', async () => {
+    const pack = buildPack({
+      scene: {
+        charId: CHAR_ID,
+        dateKey: '2026-09-16',
+        schedule: {
+          slots: [{ startTime: '19:00', activity: '写方案' }, { startTime: '21:00', activity: '洗漱' }],
+          flowNarrative: { '19:00': '' },
+        },
+        songPool: [],
+      },
+    });
+    const fake = createFakeDb();
+    const block = await buildAutonomyPerceptionBlock({ db: fake.db, charId: CHAR_ID, pack, nowMs: NOW });
+    expect(block).toContain('【此刻的感知】');
+    expect(block).toContain('写方案');
+    expect(block).toContain('情绪');
+    expect(block).toContain('不能');
+
+    const broken = buildPack({ tzId: 'Not/AZone' });
+    const fallback = await buildAutonomyPerceptionBlock({ db: fake.db, charId: CHAR_ID, pack: broken, nowMs: NOW });
+    expect(typeof fallback).toBe('string');
+  });
+});
+
+describe('P5 工作流提议（W1/W2）', () => {
+  it('解析层收下 workflows；非数组整轮判坏', () => {
+    const ok = parseAutonomyRoundReply(JSON.stringify({
+      v: 1, experiences: [], workflows: [{ kind: 'diary' }],
+    }));
+    expect(ok?.workflowCandidates).toHaveLength(1);
+    expect(parseAutonomyRoundReply(JSON.stringify({ v: 1, workflows: 'x' }))).toBeNull();
+  });
+
+  it('回合里提的合法提议落成 planned 计划；非法提议丢掉，不影响本轮', async () => {
+    const reply = JSON.stringify({
+      v: 1,
+      experiences: [{ q: 'q', note: '记一条', kind: 'surf' }],
+      workflows: [
+        {
+          v: 1, kind: 'diary', purpose: '把今天的事记下来',
+          trigger: { kind: 'idle', afterMinutes: 120 },
+          action: { kind: 'diary', title: '今天的一点小事', maxChars: 400 },
+          expiresInHours: 24, basis: 'virtual',
+        },
+        { v: 1, kind: 'post_moment', purpose: '发朋友圈', action: { kind: 'post_moment', title: 'x' } },
+      ],
+    });
+    const { emitResult, sql } = await runRound({ reply });
+    const payload = emitResult.mock.calls[0]![0] as any;
+    expect(payload.workflows).toHaveLength(1);
+    expect(payload.workflows[0]).toMatchObject({ kind: 'diary', title: '今天的一点小事', basis: 'virtual' });
+    expect(payload.basis).toBe('virtual');
+    expect(sql.some((text) => text.includes('INSERT OR IGNORE INTO autonomy_plans'))).toBe(true);
+    // 朋友圈这类不可自动公开的动作没有进计划表
+    expect(JSON.stringify(payload.workflows)).not.toContain('post_moment');
+  });
+
+  it('提议带 URL / 工具 / 权限 → 不落计划', async () => {
+    for (const bad of [
+      { kind: 'diary', purpose: 'p', trigger: { kind: 'now' }, action: { kind: 'diary', title: 't', url: 'https://x' } },
+      { kind: 'diary', purpose: 'p', trigger: { kind: 'now' }, action: { kind: 'diary', title: 't', tool: 'mcp__x' } },
+      { kind: 'diary', purpose: 'p', trigger: { kind: 'now' }, action: { kind: 'diary', title: 't', permissions: {} } },
+    ]) {
+      const { emitResult } = await runRound({
+        reply: JSON.stringify({ v: 1, experiences: [], workflows: [bad] }),
+      });
+      const payload = emitResult.mock.calls[0]![0] as any;
+      expect(payload.workflows).toBeUndefined();
+    }
+  });
+});
+
+describe('P5 到点执行（独立后台请求）', () => {
+  const planColumns = (over: Record<string, unknown> = {}) => ({
+    id: 'plan-1', char_id: CHAR_ID, kind: 'diary', status: 'scheduled',
+    purpose: '把今天下午的事记下来', title: '今天的一点小事', note_hint: null,
+    max_chars: 400, trigger_kind: 'now', trigger_value: null,
+    scheduled_at: NOW - 1000, expires_at: NOW + 60 * 60_000,
+    created_at: NOW - 3 * 60 * 60_000, updated_at: NOW - 3 * 60 * 60_000,
+    source: 'autonomy_round', source_ref: 'round-1', basis: 'virtual',
+    evidence_json: '[]', predecessor_id: null, dedupe_key: 'wf:diary:abc',
+    attempts: 0, lease_until: 0, last_error: null,
+    ...over,
+  });
+
+  const createWorkflowDb = (plan: Record<string, unknown>) => {
+    const statements: Array<{ sql: string; args: unknown[] }> = [];
+    const experiences: Array<Record<string, unknown>> = [];
+    const db: AutonomyDb = {
+      prepare(text: string) {
+        let args: unknown[] = [];
+        const stmt: AutonomyStatement = {
+          bind(...next: unknown[]) { args = next; return stmt; },
+          async run() {
+            statements.push({ sql: text, args });
+            if (text.startsWith('INSERT INTO autonomy_experiences')) {
+              experiences.push({
+                id: args[0], basis: args[8], source: args[9], plan_id: args[10],
+              });
+            }
+            return { meta: { changes: 1 } };
+          },
+          async first() {
+            statements.push({ sql: text, args });
+            // owner 反查：计划到点前必须先认得出 userId（真库是角色命名空间那一行）。
+            if (text.includes('SELECT user_id FROM client_state')) return { user_id: 'u1' };
+            if (text.includes('FROM autonomy_plans WHERE id')) return plan;
+            return null;
+          },
+          async all() {
+            statements.push({ sql: text, args });
+            return { results: [] };
+          },
+        };
+        return stmt;
+      },
+    };
+    return { db, statements, experiences };
+  };
+
+  const runWorkflow = async (args: {
+    plan?: Record<string, unknown>;
+    reply: string;
+    kind?: 'diary' | 'plan' | 'interest_note';
+  }) => {
+    const fake = createWorkflowDb(args.plan ?? planColumns(args.kind ? { kind: args.kind } : {}));
+    configureAutonomyFireDb(fake.db);
+  configureAutonomyFireMasterKey('test-master-key');
+    configureAutonomyFireMasterKey('test-master-key');
+    const pack = buildPack();
+    const { ctx: fireCtx, scratch } = makeFireCtx(pack);
+    (fireCtx as any).task.metadata.amsgAutonomyPlan = {
+      planId: 'plan-1', kind: args.kind ?? 'diary', title: '今天的一点小事',
+      purpose: '把今天下午的事记下来', maxChars: 400,
+    };
+    const plan = await amsgHooks.onBeforeFire(fireCtx);
+    // skip 的计划不会挂 stash，也不该再跑 onLLMOutput（防止替上游掩盖 bug）。
+    if ('skip' in plan) return { plan, decision: null, emitResult: vi.fn(), ...fake };
+    const { ctx, emitResult } = makeSessionCtx(scratch, args.reply, { total_tokens: 500 });
+    const decision = await amsgHooks.onLLMOutput(ctx);
+    return { plan, decision, emitResult, ...fake };
+  };
+
+  it('metadata → 独立提示词（人格全文 + 这件事 + 无工具），不是聊天回合', async () => {
+    const { plan } = await runWorkflow({ reply: '今天下了很久的雨。' });
+    expect('messages' in plan).toBe(true);
+    if (!('messages' in plan)) return;
+    const prompt = (plan.messages[0] as { content: string }).content;
+    expect(prompt).toContain('你是一个会在深夜突然想起对方的人');
+    expect(prompt).toContain('今天的一点小事');
+    expect(prompt).toContain('没有可用工具');
+    expect(prompt).not.toContain('"experiences"');
+  });
+
+  it('写完 → 落虚拟经历（basis=virtual / source=workflow）+ 计划 completed + 不推送', async () => {
+    const { decision, experiences, statements, emitResult } = await runWorkflow({ reply: '今天下了很久的雨。' });
+    expect(experiences).toHaveLength(1);
+    expect(experiences[0]).toMatchObject({ basis: 'virtual', source: 'workflow', plan_id: 'plan-1' });
+    const settle = statements.find((s) => s.sql.includes('UPDATE autonomy_plans') && s.args.includes('completed'));
+    expect(settle).toBeTruthy();
+    expect(emitResult).not.toBeNull();
+    const payload = emitResult!.mock.calls[0]![0] as any;
+    expect(payload.workflow).toMatchObject({ planId: 'plan-1', kind: 'diary', basis: 'virtual' });
+    expect(payload.notification).toEqual({ show: false });
+    expect(payload.basis).toBe('virtual');
+    expect(decision).toEqual({ decision: 'skip-push', reason: 'autonomy-workflow-completed' });
+  });
+
+  it('计划调整必须给结构化条目：一段散文 → 失败终态，不重试', async () => {
+    const { decision, experiences, statements } = await runWorkflow({
+      kind: 'plan', reply: '我打算周末去买伞。',
+    });
+    expect(experiences).toEqual([]);
+    expect(decision).toEqual({ decision: 'skip-push', reason: AUTONOMY_WORKFLOW_SKIP.badOutput });
+    const settle = statements.find((s) => s.sql.includes('UPDATE autonomy_plans') && s.args.includes('failed'));
+    expect(settle).toBeTruthy();
+  });
+
+  it('计划不是 scheduled/running（已取消/已完成/unknown）→ 直接跳过，不重复生成', async () => {
+    for (const status of ['cancelled', 'completed', 'unknown']) {
+      const { plan } = await runWorkflow({ reply: 'x', plan: planColumns({ status }) });
+      // 上游 onBeforeFire 只把 skip 交出去（reason 只进 worker 日志）；这里验「没进生成」。
+      expect(plan).toEqual({ skip: true });
+    }
+  });
+
+  it('handler 层对非待执行计划给出明确原因（不误报成坏数据）', async () => {
+    const fake = createWorkflowDb(planColumns({ status: 'cancelled' }));
+    configureAutonomyFireDb(fake.db);
+  configureAutonomyFireMasterKey('test-master-key');
+    configureAutonomyFireMasterKey('test-master-key');
+    const plan = await autonomyRoundHandler.beforeFire({
+      ctx: {
+        task: { id: 1, metadata: {} },
+        readState: async () => [{ key: AMSG_FIRE_PACK_KEY, value: JSON.stringify(buildPack()) }],
+        now: new Date(NOW), scratch: {},
+      } as never,
+      charId: CHAR_ID,
+      taskMeta: { amsgAutonomyPlan: { planId: 'plan-1', kind: 'diary', title: 't', maxChars: 400 } },
+    });
+    expect(plan).toEqual({ skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planNotPending });
+  });
+
+  it('旧 task payload 只能碰自己那一代：planId 是旧代 → 跳过，绝不执行/结算新代', async () => {
+    // 人工重试后旧代是 failed 终态，新代有新的 planId；一条早就排好的旧任务到点只能看到旧 id。
+    const fake = createWorkflowDb(planColumns({ id: 'plan-old', status: 'failed' }));
+    configureAutonomyFireDb(fake.db);
+    configureAutonomyFireMasterKey('test-master-key');
+    const plan = await autonomyRoundHandler.beforeFire({
+      ctx: {
+        task: { id: 1, metadata: {} },
+        readState: async () => [{ key: AMSG_FIRE_PACK_KEY, value: JSON.stringify(buildPack()) }],
+        now: new Date(NOW), scratch: {},
+      } as never,
+      charId: CHAR_ID,
+      taskMeta: { amsgAutonomyPlan: { planId: 'plan-old', kind: 'diary', title: 't', maxChars: 400 } },
+    });
+    expect(plan).toEqual({ skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planNotPending });
+    // 一个写语句都不该落到新代（更不该把它标成 failed/completed）
+    expect(fake.statements.some((s) => s.args.includes('plan-new'))).toBe(false);
+    expect(fake.statements.some((s) => s.sql.includes('UPDATE autonomy_plans'))).toBe(false);
+  });
+
+  it('unknown 是终态：超时/未知的那一代不会自动重跑（只有人工重试能开新代）', async () => {
+    const fake = createWorkflowDb(planColumns({ status: 'unknown' }));
+    configureAutonomyFireDb(fake.db);
+    configureAutonomyFireMasterKey('test-master-key');
+    const plan = await autonomyRoundHandler.beforeFire({
+      ctx: {
+        task: { id: 1, metadata: {} },
+        readState: async () => [{ key: AMSG_FIRE_PACK_KEY, value: JSON.stringify(buildPack()) }],
+        now: new Date(NOW), scratch: {},
+      } as never,
+      charId: CHAR_ID,
+      taskMeta: { amsgAutonomyPlan: { planId: 'plan-1', kind: 'diary', title: 't', maxChars: 400 } },
+    });
+    expect(plan).toEqual({ skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planNotPending });
+    // 没有建任务 / 没有重试写入
+    expect(fake.statements.some((s) => s.sql.includes('INSERT OR IGNORE INTO autonomy_plan_runs'))).toBe(false);
+  });
+
+  it('metadata 形状坏 → 不认（按普通回合走，不误跑计划）', () => {
+    expect(readAutonomyPlanMeta({ amsgAutonomyPlan: { planId: '', kind: 'diary', title: 't' } })).toBeNull();
+    expect(readAutonomyPlanMeta({ amsgAutonomyPlan: { planId: 'p', kind: 'post', title: 't' } })).toBeNull();
+    expect(readAutonomyPlanMeta(undefined)).toBeNull();
+    expect(readAutonomyPlanMeta({})).toBeNull();
+  });
+
+  it('执行提示词对计划类明确要求 JSON 条目（散文不算计划）', () => {
+    const prompt = buildWorkflowExecutionPrompt({
+      pack: buildPack(), nowMs: NOW,
+      plan: { kind: 'plan', title: 'T', purpose: 'P', maxChars: 300 },
+    });
+    expect(prompt).toContain('"plans"');
+    expect(prompt).toContain('至少一条');
   });
 });

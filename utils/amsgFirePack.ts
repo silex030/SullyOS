@@ -359,6 +359,12 @@ export interface AmsgFirePack {
   /** 用户上次真实主动发消息的时间（epoch ms）；没有聊天记录时为 null。 */
   lastUserMessageAt: number | null;
   /**
+   * 那条用户消息的 id（可选）。只给「取消待办计划」用：判断某条计划是不是**这一条**
+   * 用户消息催出来的，避免「刚提的计划被同一条消息立刻撤掉」（客户端时钟歪一点就会发生）。
+   * 老包没有这个字段，按「不知道是哪条」处理（退回只比时间戳）。
+   */
+  lastUserMessageId?: number | null;
+  /**
    * 角色的 IANA 时区 id（角色开了自定义时区用角色的，没开用打包设备的）。
    * worker 渲染一切给角色看的时间都以它为参照系（Intl 处理夏令时）。必填：
    * 缺了整包按格式不对打回（parseFirePack → null，worker 抛 fire-state 错）。
@@ -936,6 +942,9 @@ export const parseFirePack = (value: string): AmsgFirePack | null => {
       chatFieldOk(parsed.chat) &&
       typeof parsed.template === 'string' && parsed.template.length > 0 &&
       (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === 'number') &&
+      (parsed.lastUserMessageId === undefined
+        || parsed.lastUserMessageId === null
+        || typeof parsed.lastUserMessageId === 'number') &&
       typeof parsed.tzId === 'string' && parsed.tzId.length > 0 &&
       typeof parsed.userTzId === 'string' && parsed.userTzId.length > 0 &&
       typeof parsed.targetName === 'string' &&

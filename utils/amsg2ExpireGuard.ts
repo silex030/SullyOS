@@ -82,6 +82,8 @@ export function shouldExpireFire(input: ExpireFireInput): boolean {
 export interface RealUserMessageLike {
   role: string;
   timestamp: number;
+  /** 消息 id（IndexedDB 自增主键）。有的调用方只给时间戳，所以可选。 */
+  id?: number;
   metadata?: Record<string, unknown> | null;
 }
 
@@ -89,11 +91,29 @@ export interface RealUserMessageLike {
 const isRealUserMessage = (m: RealUserMessageLike): boolean =>
   m.role === 'user' && !(m.metadata as { proactiveHint?: unknown } | null | undefined)?.proactiveHint;
 
-export function getLastRealUserMessageAt(messages: RealUserMessageLike[]): number | null {
+/**
+ * 最后一条真实用户消息的**身份**（时间戳 + 消息 id）。
+ *
+ * 只有时间戳时，「取消待办计划」只能比大小：客户端时钟一歪（消息时间戳来自客户端，
+ * 计划 createdAt 来自服务端），同一句话刚提的计划就会被判成「用户又开口了」而立刻撤掉。
+ * 带上真实消息 id 后，取消逻辑可以认出「这条计划就是回复这一条消息提的」，从而跳过。
+ */
+export function getLastRealUserMessage(
+  messages: RealUserMessageLike[],
+): { timestamp: number; id: number | null } | null {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (isRealUserMessage(messages[i])) return messages[i].timestamp;
+    if (!isRealUserMessage(messages[i])) continue;
+    const id = messages[i].id;
+    return {
+      timestamp: messages[i].timestamp,
+      id: typeof id === 'number' && Number.isFinite(id) ? id : null,
+    };
   }
   return null;
+}
+
+export function getLastRealUserMessageAt(messages: RealUserMessageLike[]): number | null {
+  return getLastRealUserMessage(messages)?.timestamp ?? null;
 }
 
 /** (afterMs, beforeMs] 内是否有真实用户消息。 */

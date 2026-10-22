@@ -8,7 +8,7 @@ import type {
   AirpSourceRef,
 } from './types';
 import { AIRP_CAPABILITIES } from './capabilityCatalog';
-import { mergeAirpSettings } from './settings';
+import { mergeAirpSettings, resolveAirpCapabilityPolicy } from './settings';
 import { mergeAutonomySettings } from './autonomySettings';
 import { resolveCharTimeZone } from '../timezone';
 import { injectMemoryPalace } from '../memoryPalace/pipeline';
@@ -111,17 +111,23 @@ function readAutonomyLevel(char: CharacterProfile): AirpAutonomyLevel {
 }
 
 /**
- * 能力清单闸门：默认只给只读/确认类能力；白名单非空时再按 id 收窄；
- * 未显式允许写入（writable=false）时剔除全部 low_write 项。
+ * 能力清单闸门（运行时侧，与 AirpPanel 共用 resolveAirpCapabilityPolicy 同一契约）。
+ *
+ * - 显式 none：一个都不给（空数组不再等于全开）。
+ * - 显式 all / 旧数据空数组：目录内全部可用。
+ * - allowlist：只保留白名单内。
+ * 之后仍然过 writable 总闸：未显式允许写入时剔除全部 low_write 项。
  */
-function resolveCapabilities(char: CharacterProfile): AirpCapability[] {
+export function resolveCapabilities(char: CharacterProfile): AirpCapability[] {
   let caps = [...AIRP_CAPABILITIES];
   try {
-    const settings = mergeAirpSettings(char?.airp);
-    if (settings.capabilities.length > 0) {
-      const allowed = new Set(settings.capabilities);
+    const policy = resolveAirpCapabilityPolicy(char?.airp);
+    if (policy.mode === 'none') return [];
+    if (policy.mode === 'allowlist') {
+      const allowed = new Set(policy.allow);
       caps = caps.filter((cap) => allowed.has(cap.id));
     }
+    const settings = mergeAirpSettings(char?.airp);
     if (!settings.writable) {
       caps = caps.filter((cap) => cap.risk !== 'low_write');
     }

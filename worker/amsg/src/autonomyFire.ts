@@ -34,6 +34,22 @@
 
 import { AUTONOMY_RESULT_KIND } from '../../../utils/airp/autonomySettings';
 import {
+  computeScheduledAt,
+  parseWorkflowExecutionOutput,
+  validateAutonomyWorkflowProposals,
+  type AutonomyPlanRecord,
+  type AutonomyWorkflowKind,
+} from '../../../utils/airp/lifeWorkflow';
+import { canRunPrivateLifeAction } from '../../../utils/airp/lifeWorkflowPermissions';
+import {
+  activityPerception,
+  clockPerception,
+  filterPerceptionEvents,
+  perceptionDedupeRows,
+  renderPerceptionSnapshot,
+  type AirpPerceptionEvent,
+} from '../../../utils/airp/perception';
+import {
   AMSG_FIRE_PACK_KEY,
   amsgStateNamespace,
   parseFirePack,
@@ -50,11 +66,23 @@ import {
   ruminationVerdict,
   type RuminationPage,
 } from './autonomyRumination';
-import { autonomyDateKey, reportAutonomyOutcome } from './autonomyScheduler';
+import {
+  autonomyDateKey,
+  readAutonomyGuardrailsForUserDetailed,
+  reportAutonomyOutcome,
+  type AutonomyPlanMeta,
+} from './autonomyScheduler';
 import {
   addAutonomyExperience,
   ensureAutonomySchema,
+  getAutonomyPlan,
   getAutonomyState,
+  insertAutonomyPlan,
+  loadPerceptionSeen,
+  markAutonomyPlanRunning,
+  savePerceptionSeen,
+  settleAutonomyPlan,
+  updateAutonomyPlanRun,
   type AutonomyDb,
 } from './autonomyStore';
 import type {
@@ -66,6 +94,7 @@ import type {
 } from './fireKinds';
 import { buildWantToSharePush } from './instantChat';
 import type { ResolvedAirpAutonomy } from '../../../utils/airp/autonomySettings';
+import { resolveScheduleSlots } from '../../../utils/scheduleInjection';
 
 /** 只为单测导出：让测试能不经 index.ts 直接喂一份 ctx。 */
 export type { KindFireCtx, KindSessionCtx };
@@ -73,6 +102,8 @@ export type { KindFireCtx, KindSessionCtx };
 // ─── D1 holder（见文件头第 1 点） ────────────────────────────────────────
 
 let fireDb: AutonomyDb | null = null;
+/** 共享护栏行是加密的：到点复核必须用同一把 master key。缺省 = 复核必失败 = 整轮暂停。 */
+let fireMasterKey = '';
 
 /**
  * `buildWorkerConfig` 的写入口；export 只为单测注入假库。
@@ -80,6 +111,11 @@ let fireDb: AutonomyDb | null = null;
  */
 export function configureAutonomyFireDb(db: AutonomyDb | null | undefined): void {
   fireDb = db ?? null;
+}
+
+/** `buildWorkerConfig` 的写入口（与 configureAutonomyFireDb 同模式）；传空 = 无法复核护栏。 */
+export function configureAutonomyFireMasterKey(masterKey: string | null | undefined): void {
+  fireMasterKey = (masterKey ?? '').trim();
 }
 
 // ─── 跳过原因（日志与单测共用的字面量） ──────────────────────────────────
@@ -91,6 +127,15 @@ export const AUTONOMY_FIRE_SKIP = {
   packUnreadable: 'autonomy-pack-unreadable',
   disabled: 'autonomy-disabled',
   tzInvalid: 'autonomy-tz-invalid',
+  /** 用户级护栏读不出来（缺钥/密文坏/D1 错）：fail-closed，不执行。 */
+  guardrailsUnreadable: 'autonomy-guardrails-unreadable',
+  /**
+   * 认不出这个角色的 owner（client_state 没有带 user_id 的角色行 / 查询出错）：
+   * 没有 userId 就读不到用户级总暂停，**不能**当成「一个还没暂停的新用户」放行。
+   */
+  ownerUnresolved: 'autonomy-owner-unresolved',
+  /** 用户在我们建任务之后、到点之前按了总暂停。 */
+  pausedByUser: 'autonomy-paused-by-user',
 } as const;
 
 export const AUTONOMY_BAD_OUTPUT_REASON = 'autonomy-bad-output';
@@ -196,6 +241,11 @@ export interface AutonomyRoundReply {
   rested: boolean;
   experiences: AutonomyParsedExperience[];
   proposedEvents: AutonomyProposedEvent[];
+  /**
+   * P5：模型顺带提的低风险生活工作流（原始值，形状未校验）。
+   * 真正落计划前必须过 lifeWorkflow 的白名单校验器；这里只负责「掏出来」。
+   */
+  workflowCandidates: unknown[];
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -277,6 +327,9 @@ export function parseAutonomyRoundReply(text: string): AutonomyRoundReply | null
   if (raw.rest !== undefined && typeof raw.rest !== 'boolean') return null;
   if (raw.experiences !== undefined && !Array.isArray(raw.experiences)) return null;
   if (raw.proposedEvents !== undefined && !Array.isArray(raw.proposedEvents)) return null;
+  // workflows 是 P5 追加的可选段：形状不对就整轮判坏（跟 experiences 同一条纪律），
+  // 缺省 = 这一轮没提任何生活工作流。
+  if (raw.workflows !== undefined && !Array.isArray(raw.workflows)) return null;
 
   const rest = raw.rest === true;
   const experiences = rest
@@ -289,13 +342,16 @@ export function parseAutonomyRoundReply(text: string): AutonomyRoundReply | null
     .filter(isRecord)
     .map(toProposedEvent)
     .filter((item): item is AutonomyProposedEvent => item !== null);
+  const workflowCandidates: unknown[] = raw.workflows ?? [];
 
-  const hasKnownField = raw.rest !== undefined || raw.experiences !== undefined || raw.proposedEvents !== undefined;
+  const hasKnownField = raw.rest !== undefined || raw.experiences !== undefined
+    || raw.proposedEvents !== undefined || raw.workflows !== undefined;
   if (!hasKnownField) return null;
   return {
     rested: rest || (experiences.length === 0 && proposedEvents.length === 0),
     experiences,
     proposedEvents,
+    workflowCandidates,
   };
 }
 
@@ -409,12 +465,17 @@ export const AUTONOMY_ROUND_OUTPUT = [
   '上面那份聊天模板是你在正常聊天时的规矩；这一轮不一样：不发给任何人，也不聊天，'
     + '只把结果写成一个 JSON 对象。',
   '{"v":1,"experiences":[{"q":"为什么会有这条（一句话）","note":"第一人称随手记，口语、具体、有画面",'
-    + '"kind":"surf|game|forum|rest","importance":0}],"proposedEvents":[],"rest":false}',
+    + '"kind":"surf|game|forum|rest","importance":0}],"proposedEvents":[],"workflows":[],"rest":false}',
   'kind 只能从 surf（上网闲逛）、game（玩游戏）、forum（逛社区）、rest（发呆歇着）里挑一个；'
     + 'importance 是 0 到 3 的数字。',
   'proposedEvents 只在「这件事会影响你之后的生活」时才写，每项 '
     + '{"type":"conversation|activity|movement|schedule|relationship|discovery|social_trace",'
     + '"summary":"...","impact":"trace|minor|major"}；平时就写空数组。',
+  'workflows 只写「你之后想为自己做的一件低风险小事」，不要为了填而填，平时就写空数组；'
+    + '最多一条，每项形如 {"kind":"diary|plan|interest_note","purpose":"为什么想做（一句话）",'
+    + '"trigger":{"kind":"idle","afterMinutes":120} 或 {"kind":"at_time","atLocalTime":"21:30"},'
+    + '"action":{"kind":"与外面一致","title":"标题","maxChars":400},"expiresInHours":24}。'
+    + '它只是提议，不是命令，也不能带网址、工具、代码或权限；不写就什么都不做。',
   '想说的那条放 experiences 最前面。这一轮什么都不想记就写 {"v":1,"rest":true}。',
   '除了这个 JSON 什么都别输出（不要解释、不要代码块之外的话）。',
 ].join('\n');
@@ -425,6 +486,8 @@ export function buildAutonomyRoundPrompt(args: {
   nowMs: number;
   pages: readonly RuminationPage[];
   autonomy: ResolvedAirpAutonomy;
+  /** P4：本地过滤后的感知小快照（没有就省略，不硬凑一段）。 */
+  perceptionBlock?: string;
 }, overrides?: Record<string, string>): string {
   // 人格全文：fire_pack 的完整模板（含人设 + 对话尾巴 + 此刻的读数），槽位在 fire
   // 时刻填掉。「本次任务」留空——这一轮的任务书在下面，不借用聊天那条路的指令槽。
@@ -459,9 +522,233 @@ export function buildAutonomyRoundPrompt(args: {
     topicBlock,
     banLine,
     noteHint,
+    args.perceptionBlock ?? '',
     noToolsBlock,
     outputBlock,
   ].filter((block) => block.length > 0).join('\n\n');
+}
+
+// ─── P4：感知小快照（后台这一轮） ────────────────────────────────────────
+//
+// 后台只吃「已经随包带上来的」素材：角色时区（现在几点）与 fire_pack.scene 里当天的
+// 日程槽位。天气/热搜/用户日历在前台链路由各自缓存的持有者归一后传进来（同一份
+// perception 叶子），worker 不为了感知另起监控或抓取。
+
+export async function buildAutonomyPerceptionBlock(args: {
+  db: AutonomyDb;
+  charId: string;
+  pack: AmsgFirePack;
+  nowMs: number;
+}): Promise<string> {
+  const events: AirpPerceptionEvent[] = [];
+  try {
+    events.push(clockPerception({ nowMs: args.nowMs, tzId: args.pack.tzId, subject: args.charId }));
+  } catch { /* 时区坏掉时 perception 自己回落 UTC，这里不再兜 */ }
+
+  try {
+    const scene = args.pack.scene;
+    if (scene && scene.dateKey === autonomyDateKey(args.nowMs, args.pack.tzId) && scene.schedule) {
+      const p = wallClockPartsInZone(args.nowMs, { tzId: args.pack.tzId });
+      const localNow = new Date(p.year, p.month - 1, p.day, p.hour, p.minute);
+      const { current, next } = resolveScheduleSlots(scene.schedule, localNow);
+      if (current?.activity) {
+        events.push(activityPerception({
+          label: current.activity,
+          ...(current.startTime ? { startLabel: current.startTime } : {}),
+          ...(next?.startTime ? { endLabel: next.startTime } : {}),
+          observedAt: args.nowMs,
+          subject: args.charId,
+        }));
+      }
+    }
+  } catch (error) {
+    console.warn('[amsg:autonomy] 日程感知没读出来（这一轮少一段）', args.charId, error);
+  }
+
+  let seen: Awaited<ReturnType<typeof loadPerceptionSeen>> = [];
+  try {
+    seen = await loadPerceptionSeen(args.db, args.charId, args.nowMs);
+  } catch { /* 读不到就当没喂过，最多重复一小段 */ }
+
+  const filtered = filterPerceptionEvents({
+    events,
+    nowMs: args.nowMs,
+    seen,
+    subjectAllow: [args.charId, 'user'],
+    maxItems: 4,
+  });
+  if (filtered.kept.length === 0) return '';
+
+  try {
+    await savePerceptionSeen(args.db, args.charId, perceptionDedupeRows(filtered.kept));
+  } catch { /* best-effort：下一轮重复喂一次，不影响本轮 */ }
+
+  return renderPerceptionSnapshot(filtered.kept, { nowMs: args.nowMs, maxItems: 4 });
+}
+
+// ─── P5：到点执行生活工作流 ──────────────────────────────────────────────
+//
+// 关键边界：这是**另起的一次后台请求**（与聊天首字无关），没有工具面、不推送、不向用户
+// 报「任务完成」。产物只是角色自己账本里的一条虚拟经历（basis='virtual'）。
+
+export const AUTONOMY_WORKFLOW_SKIP = {
+  planMissing: 'autonomy-plan-missing',
+  planNotPending: 'autonomy-plan-not-pending',
+  planExpired: 'autonomy-plan-expired',
+  planLeaseLost: 'autonomy-plan-lease-lost',
+  badMeta: 'autonomy-plan-meta-invalid',
+  badOutput: 'autonomy-workflow-bad-output',
+} as const;
+
+/** 执行租约：一轮后台生成（含一次 LLM）最多占用 10 分钟；超时由调度器按过期收。 */
+export const AUTONOMY_PLAN_RUN_LEASE_MS = 10 * 60 * 1000;
+
+const WORKFLOW_LABEL: Record<AutonomyWorkflowKind, string> = {
+  diary: '私人日记',
+  plan: '个人计划调整',
+  interest_note: '阅读/兴趣笔记',
+};
+
+export function readAutonomyPlanMeta(taskMeta: Record<string, unknown> | undefined): AutonomyPlanMeta | null {
+  const raw = taskMeta?.['amsgAutonomyPlan'];
+  if (!isRecord(raw)) return null;
+  const planId = typeof raw.planId === 'string' ? raw.planId.trim() : '';
+  const kind = raw.kind;
+  if (!planId) return null;
+  if (kind !== 'diary' && kind !== 'plan' && kind !== 'interest_note') return null;
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  if (!title) return null;
+  const maxChars = typeof raw.maxChars === 'number' && Number.isFinite(raw.maxChars)
+    ? Math.max(80, Math.min(1200, Math.trunc(raw.maxChars))) : 400;
+  return {
+    planId,
+    kind,
+    title,
+    purpose: typeof raw.purpose === 'string' ? raw.purpose.trim() : '',
+    ...(typeof raw.noteHint === 'string' && raw.noteHint.trim() ? { noteHint: raw.noteHint.trim() } : {}),
+    maxChars,
+  };
+}
+
+/**
+ * 工作流这一轮的覆盖句：人格模板末尾的【开口之前】只服务实时聊天，这一轮的产出
+ * 由工作流自己的契约决定（日记/笔记是散文，计划调整是 JSON）——不能借用回合那句
+ * 「按 JSON 契约输出」，否则日记会被逼成 JSON。
+ */
+export const AUTONOMY_WORKFLOW_OVERRIDE =
+  '注意：上面是你在正常聊天时的完整规矩，但【开口之前】那段只管实时聊天、不管这一轮——'
+  + '这一轮按下面的产出要求写，不要输出空内容，也不要向任何人说话。';
+
+/**
+ * 这一轮「替自己做完一件小事」的提示词。
+ * 顺序：人格全文 → 覆盖句 → 这一轮要做什么 → 感知 → 无工具 → 产出契约。
+ */
+export function buildWorkflowExecutionPrompt(args: {
+  pack: AmsgFirePack;
+  nowMs: number;
+  plan: Pick<AutonomyPlanRecord, 'kind' | 'title' | 'purpose' | 'maxChars'> & { noteHint?: string };
+  perceptionBlock?: string;
+}): string {
+  const personality = renderFirePack(args.pack, args.nowMs, '');
+  const label = WORKFLOW_LABEL[args.plan.kind];
+  const situ = [
+    `【这一轮要替自己做完的一件事：${label}】`,
+    `- 标题：${args.plan.title}`,
+    args.plan.purpose ? `- 为什么想做：${args.plan.purpose}` : '',
+    args.plan.noteHint ? `- 记录的语气：${args.plan.noteHint}` : '',
+    '- 这是你自己想做的事，不是任务、不用向谁交代，也不发给任何人看。',
+    '- 只写你这一轮真实做/想到的内容；没发生的事不要写成已经发生，也不要替对方决定感受。',
+  ].filter(Boolean).join('\n');
+
+  const output = args.plan.kind === 'plan'
+    ? [
+        '【这一轮的产出】',
+        '只输出一个 JSON 对象：{"v":1,"text":"用第一人称说一句你此刻的想法","plans":[{"title":"之后想做的一件小事"}]}。',
+        'plans 至少一条、最多三条；只写你自己之后想做的事，不要排对方的时间。',
+      ].join('\n')
+    : [
+        '【这一轮的产出】',
+        '只输出一段第一人称的文字（不要 JSON、不要解释、不要向任何人说话），'
+          + `长度控制在 ${args.plan.maxChars} 字以内，像你私下随手记的那样。`,
+      ].join('\n');
+
+  return [
+    personality,
+    AUTONOMY_WORKFLOW_OVERRIDE,
+    situ,
+    args.perceptionBlock ?? '',
+    AUTONOMY_ROUND_NO_TOOLS,
+    output,
+  ].filter((block) => block.length > 0).join('\n\n');
+}
+
+/** 把这一轮模型提的工作流降成计划行（P5 W1/W2）。返回真正落库的提议。 */
+export async function persistWorkflowProposals(args: {
+  db: AutonomyDb;
+  charId: string;
+  reply: AutonomyRoundReply;
+  nowMs: number;
+  tzId: string;
+  lastUserMessageAt: number | null;
+  sourceRef: string;
+}): Promise<AutonomyPlannedWorkflow[]> {
+  if (args.reply.workflowCandidates.length === 0) return [];
+  const validated = validateAutonomyWorkflowProposals(args.reply.workflowCandidates, {
+    nowMs: args.nowMs,
+    source: 'autonomy_round',
+    sourceRef: args.sourceRef,
+    tzId: args.tzId,
+  });
+  const accepted: AutonomyPlannedWorkflow[] = [];
+  for (const proposal of validated.accepted) {
+    const scheduledAt = computeScheduledAt(proposal, {
+      nowMs: args.nowMs,
+      tzId: args.tzId,
+      lastUserMessageAt: args.lastUserMessageAt,
+    });
+    const plan: AutonomyPlanRecord = {
+      id: crypto.randomUUID(),
+      charId: args.charId,
+      kind: proposal.kind,
+      status: 'proposed',
+      purpose: proposal.purpose,
+      title: proposal.action.title,
+      ...(proposal.action.noteHint ? { noteHint: proposal.action.noteHint } : {}),
+      maxChars: proposal.action.maxChars,
+      trigger: proposal.trigger,
+      scheduledAt,
+      expiresAt: proposal.expiresAt,
+      createdAt: args.nowMs,
+      updatedAt: args.nowMs,
+      source: 'autonomy_round',
+      sourceRef: args.sourceRef,
+      basis: proposal.basis,
+      evidence: proposal.evidence,
+      ...(proposal.predecessorId ? { predecessorId: proposal.predecessorId } : {}),
+      dedupeKey: proposal.dedupeKey,
+      attempts: 0,
+      leaseUntil: 0,
+    };
+    try {
+      const inserted = await insertAutonomyPlan(args.db, plan);
+      if (!inserted) {
+        // 同一天同类同目的已经提过：不重复建，也不报错。
+        continue;
+      }
+      accepted.push({
+        id: plan.id,
+        kind: plan.kind,
+        title: plan.title,
+        purpose: plan.purpose,
+        scheduledAt: plan.scheduledAt,
+        expiresAt: plan.expiresAt,
+        basis: plan.basis,
+      });
+    } catch (error) {
+      console.warn('[amsg:autonomy] 生活工作流提议没落库（丢了这条，不影响本轮）', args.charId, error);
+    }
+  }
+  return accepted;
 }
 
 // ─── 推送判定（纯） ──────────────────────────────────────────────────────
@@ -542,6 +829,28 @@ export interface AutonomyUsage {
   total: number;
 }
 
+/** P5：这一轮提出来、已经落库的计划（给客户端看「角色想做什么」，不是任务完成报告）。 */
+export interface AutonomyPlannedWorkflow {
+  id: string;
+  kind: AutonomyWorkflowKind;
+  title: string;
+  purpose: string;
+  scheduledAt: number;
+  expiresAt: number;
+  basis: 'inference' | 'virtual';
+}
+
+/** P5：一次已经完成/失败的工作流执行结果（默认不推送，只进角色账本与收件箱）。 */
+export interface AutonomyWorkflowResult {
+  planId: string;
+  kind: AutonomyWorkflowKind;
+  title: string;
+  text: string;
+  plans: string[];
+  /** 虚拟经历：这是角色自己的私事，不是现实观测。 */
+  basis: 'virtual';
+}
+
 export interface AutonomyResultPayload {
   resultKind: typeof AUTONOMY_RESULT_KIND;
   charId: string;
@@ -552,6 +861,12 @@ export interface AutonomyResultPayload {
   toolsUsed: string[];
   did: string;
   rested: boolean;
+  /** P5：这一轮顺带提的低风险生活工作流（已校验、已落库）。 */
+  workflows?: AutonomyPlannedWorkflow[];
+  /** P5：这一轮是「做完一件小事」的执行结果（与回合产物互斥）。 */
+  workflow?: AutonomyWorkflowResult;
+  /** P4/P5：产物认知档。回合产物 = virtual；workflow 同样是 virtual。 */
+  basis?: 'virtual';
 }
 
 /** 信封只带 big/small：D1 保留 0..3 数字，跨边界的档位在这里收窄（>=2 视为 big）。 */
@@ -564,6 +879,8 @@ export function buildAutonomyResultPayload(args: {
   usage: AutonomyUsage;
   did: string;
   rested: boolean;
+  workflows?: AutonomyPlannedWorkflow[];
+  workflow?: AutonomyWorkflowResult;
 }): AutonomyResultPayload {
   return {
     resultKind: AUTONOMY_RESULT_KIND,
@@ -574,6 +891,9 @@ export function buildAutonomyResultPayload(args: {
     toolsUsed: [],
     did: args.did,
     rested: args.rested,
+    basis: 'virtual',
+    ...(args.workflows && args.workflows.length > 0 ? { workflows: args.workflows } : {}),
+    ...(args.workflow ? { workflow: args.workflow } : {}),
   };
 }
 
@@ -589,6 +909,7 @@ export function dominantAutonomyKind(experiences: readonly { kind: string }[]): 
 // ─── llmOutput 的随身状态（beforeFire → llmOutput） ──────────────────────
 
 interface AutonomyFireState {
+  mode: 'round' | 'workflow';
   charId: string;
   autonomy: ResolvedAirpAutonomy;
   pages: RuminationPage[];
@@ -596,6 +917,16 @@ interface AutonomyFireState {
   dateKey: string;
   lastPushAt: number;
   nowMs: number;
+  /** 回合的稳定引用：提议的 sourceRef 用它，便于回溯是哪一轮提的。 */
+  roundRef: string;
+  /** 打包那一刻用户最后一条消息的时间（idle 触发排期用）。 */
+  lastUserMessageAt: number | null;
+  /** workflow 模式专属。 */
+  planId?: string;
+  planTitle?: string;
+  workflowKind?: AutonomyWorkflowKind;
+  planMaxChars?: number;
+  idempotencyKey?: string;
 }
 
 const readCarriedState = (state: unknown): AutonomyFireState | null => {
@@ -607,6 +938,7 @@ const readCarriedState = (state: unknown): AutonomyFireState | null => {
   if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) return null;
   if (!isRecord(state.autonomy)) return null;
   return {
+    mode: state.mode === 'workflow' ? 'workflow' : 'round',
     charId,
     tzId,
     dateKey,
@@ -614,6 +946,15 @@ const readCarriedState = (state: unknown): AutonomyFireState | null => {
     autonomy: state.autonomy as unknown as ResolvedAirpAutonomy,
     pages: Array.isArray(state.pages) ? (state.pages as RuminationPage[]) : [],
     lastPushAt: typeof state.lastPushAt === 'number' && Number.isFinite(state.lastPushAt) ? state.lastPushAt : 0,
+    roundRef: typeof state.roundRef === 'string' ? state.roundRef : '',
+    lastUserMessageAt: typeof state.lastUserMessageAt === 'number' && Number.isFinite(state.lastUserMessageAt)
+      ? state.lastUserMessageAt : null,
+    ...(typeof state.planId === 'string' ? { planId: state.planId } : {}),
+    ...(typeof state.planTitle === 'string' ? { planTitle: state.planTitle } : {}),
+    ...(state.workflowKind === 'diary' || state.workflowKind === 'plan' || state.workflowKind === 'interest_note'
+      ? { workflowKind: state.workflowKind as AutonomyWorkflowKind } : {}),
+    ...(typeof state.planMaxChars === 'number' ? { planMaxChars: state.planMaxChars } : {}),
+    ...(typeof state.idempotencyKey === 'string' ? { idempotencyKey: state.idempotencyKey } : {}),
   };
 };
 
@@ -679,6 +1020,27 @@ const findFirePackRow = (
 ): { key: string; value: string } | undefined => rows.find((row) => row.key === AMSG_FIRE_PACK_KEY);
 
 /**
+ * 这个角色属于哪个用户（共享护栏按 user_id 存，计划行里只有 char_id）。
+ * 从 client_state 的角色命名空间反查：**这是 owner 的唯一可信来源**（服务端 D1 的行，
+ * 不读 task metadata / 请求体里的任何 userId）。
+ *
+ * 查不到 / user_id 不是非空字符串 / 查询出错，一律回空串 = 「owner 未解析」。
+ * 调用方必须据此 fail-closed：空串不是「新用户」，读不到 userId 就不可能证明用户没按暂停。
+ */
+const readAutonomyOwnerUserId = async (db: AutonomyDb, charId: string): Promise<string> => {
+  try {
+    const row = await db
+      .prepare('SELECT user_id FROM client_state WHERE namespace = ? AND key = ?')
+      .bind(amsgStateNamespace(charId), AMSG_FIRE_PACK_KEY)
+      .first();
+    const userId = (row as { user_id?: unknown } | null)?.user_id;
+    return typeof userId === 'string' ? userId.trim() : '';
+  } catch {
+    return '';
+  }
+};
+
+/**
  * 回账只记日志、不往外抛。
  *
  * 走到回账这一步时副作用已经落地（经历写进 D1、结果送进收件箱）。抛出去的话上游会把整轮
@@ -725,8 +1087,144 @@ async function persistHomeEvents(env: any, charId: string, events: Array<{ kind:
   } catch { /* 回退旧链：只 emitResult，不阻断 */ }
 }
 
+// ─── workflow 执行结果落账（P5） ─────────────────────────────────────────
+
+/**
+ * 到点执行完这一轮之后：解析产物 → 落一条虚拟经历 → 结算计划/预留 → 回结果。
+ *
+ * 三个「不」：
+ *   - 不推送（W5：默认不新增推送，也不生成面向用户的「任务完成报告」）；
+ *   - 不把失败/未知写成完成（状态机终态语义）；
+ *   - 不在解析失败后重试（LLM 已经烧过一次，重试只会重复计费）。
+ */
+async function handleWorkflowOutput(
+  db: AutonomyDb,
+  ctx: KindSessionCtx,
+  carried: AutonomyFireState,
+): Promise<KindDecision> {
+  const usage = readUsage(ctx);
+  const planId = carried.planId ?? '';
+  const kind = carried.workflowKind ?? 'diary';
+  const idempotencyKey = carried.idempotencyKey ?? `plan:${planId}`;
+  const maxChars = carried.planMaxChars ?? 400;
+
+  const settle = async (status: 'completed' | 'failed' | 'unknown', error?: string): Promise<void> => {
+    try {
+      await updateAutonomyPlanRun(db, {
+        idempotencyKey,
+        status: status === 'completed' ? 'settled' : status === 'unknown' ? 'unknown' : 'failed',
+        actualTokens: usage.total,
+        error: error ?? null,
+        nowMs: carried.nowMs,
+      });
+    } catch (runError) {
+      console.warn('[amsg:autonomy] 工作流执行预留没结算', planId, runError);
+    }
+    try {
+      await settleAutonomyPlan(db, {
+        planId, status, nowMs: carried.nowMs, error: error ?? null,
+      });
+    } catch (planError) {
+      console.warn('[amsg:autonomy] 计划状态没写进去（不再重跑）', planId, planError);
+    }
+  };
+
+  const parsed = parseWorkflowExecutionOutput(ctx.llmOutputText || '', kind, maxChars);
+  if (!parsed.ok) {
+    console.warn('[amsg:autonomy] 工作流产物解析不出来（按失败收，不自动重试）', {
+      charId: carried.charId, planId, reason: parsed.reason,
+    });
+    await settle('failed', `bad-output:${parsed.reason}`);
+    await reportOutcome(
+      carried.charId,
+      { ok: false, tokens: usage.total },
+      { db, dateKey: carried.dateKey, nowMs: carried.nowMs },
+    );
+    return { decision: 'skip-push', reason: AUTONOMY_WORKFLOW_SKIP.badOutput };
+  }
+
+  const note = parsed.text.trim() || `计划：${parsed.plans.join('、')}`;
+  let experienceId = '';
+  try {
+    experienceId = await addAutonomyExperience(db, {
+      charId: carried.charId,
+      createdAt: carried.nowMs,
+      q: carried.planTitle ?? '',
+      note,
+      kind,
+      importance: 1,
+      pushed: false,
+      // 这是角色自己的虚拟经历，不是现实观测；客户端/投影不得当既成事实转述。
+      basis: 'virtual',
+      source: 'workflow',
+      planId,
+    });
+  } catch (error) {
+    console.warn('[amsg:autonomy] 工作流产物没落进经历表（计划仍按失败收）', planId, error);
+    await settle('failed', 'experience-write-failed');
+    await reportOutcome(
+      carried.charId,
+      { ok: false, tokens: usage.total },
+      { db, dateKey: carried.dateKey, nowMs: carried.nowMs },
+    );
+    return { decision: 'skip-push', reason: 'autonomy-workflow-write-failed' };
+  }
+
+  await settle('completed');
+  await reportOutcome(
+    carried.charId,
+    { ok: true, tokens: usage.total },
+    { db, dateKey: carried.dateKey, nowMs: carried.nowMs },
+  );
+
+  const payload = buildAutonomyResultPayload({
+    charId: carried.charId,
+    experiences: [{
+      id: experienceId,
+      q: carried.planTitle ?? '',
+      note,
+      kind,
+      importance: 'small',
+      pushed: false,
+    }],
+    proposedEvents: [],
+    usage,
+    did: kind,
+    rested: false,
+    workflow: {
+      planId,
+      kind,
+      title: carried.planTitle ?? '',
+      text: parsed.text,
+      plans: parsed.plans,
+      basis: 'virtual',
+    },
+  });
+
+  if (typeof ctx.emitResult !== 'function') {
+    console.warn('[amsg:autonomy] 这台 worker 不支持 emitResult，工作流结果送不回去', carried.charId);
+    return { decision: 'skip-push', reason: 'autonomy-emit-result-unsupported' };
+  }
+
+  try {
+    await ctx.emitResult({
+      ...payload,
+      // 默认不推送：结果只进收件箱与角色账本，不响铃、不弹「任务完成」。
+      notification: { show: false },
+    });
+  } catch (error) {
+    console.warn('[amsg:autonomy] 工作流结果送不进收件箱（已经落库，不再重跑）', carried.charId, error);
+    return { decision: 'skip-push', reason: 'autonomy-emit-result-failed' };
+  }
+
+  console.log('[amsg:autonomy] 工作流跑完', {
+    charId: carried.charId, planId, kind, tokens: usage.total,
+  });
+  return { decision: 'skip-push', reason: 'autonomy-workflow-completed' };
+}
+
 export const autonomyRoundHandler: FireKindHandler = {
-  async beforeFire({ ctx, charId }): Promise<KindFirePlan> {
+  async beforeFire({ ctx, charId, taskMeta }): Promise<KindFirePlan> {
     const db = fireDb;
     if (!db) return { skip: true, reason: AUTONOMY_FIRE_SKIP.dbUnavailable };
 
@@ -763,12 +1261,114 @@ export const autonomyRoundHandler: FireKindHandler = {
     }
 
     await ensureAutonomySchema(db);
+
+    // 用户级总暂停的**到点复核**：建任务时读到的 pack / 护栏都可能是几分钟前的旧值，
+    // 用户在这中间按了暂停就必须立刻生效。读不出来（缺钥/密文坏/D1 错）一律按暂停处理
+    // （fail-closed），绝不用「默认不暂停」放行。普通自主回合与生活工作流都走这里。
+    const ownerUserId = await readAutonomyOwnerUserId(db, charId);
+    // 空 = owner 未解析：没有 userId 就没有「用户级总暂停」这一行可读，读不到不等于没暂停
+    // （readAutonomyGuardrailsForUserDetailed 会把它当成 absent 新用户 → paused:false 放行）。
+    // 信任边界只在这里：owner 来自服务端 client_state 行，绝不从任务 metadata / 请求体取。
+    // 普通自主回合与计划到点执行都必须停在这里。
+    if (!ownerUserId) {
+      console.warn('[amsg:autonomy] 认不出这个角色的 owner，这一轮暂停（fail-closed）', charId);
+      return { skip: true, reason: AUTONOMY_FIRE_SKIP.ownerUnresolved };
+    }
+    const guardrailRead = await readAutonomyGuardrailsForUserDetailed(db, fireMasterKey, ownerUserId);
+    if (guardrailRead.status === 'unreadable') {
+      console.warn('[amsg:autonomy] 到点复核护栏读不出来，这一轮暂停', charId, guardrailRead.error);
+      return { skip: true, reason: AUTONOMY_FIRE_SKIP.guardrailsUnreadable };
+    }
+    const userPaused = guardrailRead.guardrails.paused === true;
+
+    // P5：这一条是不是「计划到点执行」？metadata 由调度器建任务时写入。
+    // 走独立的一次后台请求：没有人格之外的聊天上下文，没有工具，也不推送。
+    const planMeta = readAutonomyPlanMeta(taskMeta);
+    if (planMeta) {
+      const plan = await getAutonomyPlan(db, planMeta.planId);
+      if (!plan || plan.charId !== charId) {
+        console.warn('[amsg:autonomy] 计划行不在（任务与库对不上），这一轮跳过', charId, planMeta.planId);
+        return { skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planMissing };
+      }
+      if (userPaused) {
+        // 建任务之后用户按了暂停：计划收成 cancelled（不生成、不推送），不假称已执行。
+        try {
+          await settleAutonomyPlan(db, { planId: plan.id, status: 'cancelled', nowMs, error: 'user-paused' });
+        } catch { /* 下一跳再收 */ }
+        return { skip: true, reason: AUTONOMY_FIRE_SKIP.pausedByUser };
+      }
+      if (plan.status !== 'scheduled' && plan.status !== 'running') {
+        // 已被取消 / 已完成 / unknown：绝不重跑（unknown 不自动重试）。
+        return { skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planNotPending };
+      }
+      if (plan.expiresAt <= nowMs) {
+        try {
+          await settleAutonomyPlan(db, { planId: plan.id, status: 'failed', nowMs, error: 'expired' });
+        } catch { /* 下一跳再收 */ }
+        return { skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planExpired };
+      }
+      // 后台同样尊重用户的能力白名单/全禁与写入总闸；不允许角色改配置。
+      if (!canRunPrivateLifeAction(autonomy, plan.kind)) {
+        try {
+          await settleAutonomyPlan(db, { planId: plan.id, status: 'failed', nowMs, error: 'capability-not-allowed' });
+        } catch { /* 下一跳再收 */ }
+        return { skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planNotPending };
+      }
+      const running = await markAutonomyPlanRunning(db, {
+        planId: plan.id, nowMs, leaseMs: AUTONOMY_PLAN_RUN_LEASE_MS,
+      });
+      if (!running) {
+        // 另一台设备/另一个 tick 已经把它拉起来：这次任务不重复生成。
+        return { skip: true, reason: AUTONOMY_WORKFLOW_SKIP.planLeaseLost };
+      }
+      const perceptionBlock = await buildAutonomyPerceptionBlock({ db, charId, pack, nowMs });
+      const prompt = buildWorkflowExecutionPrompt({
+        pack,
+        nowMs,
+        plan: {
+          kind: plan.kind,
+          title: plan.title,
+          purpose: plan.purpose,
+          maxChars: plan.maxChars,
+          ...(plan.noteHint ? { noteHint: plan.noteHint } : {}),
+        },
+        perceptionBlock,
+      });
+      return {
+        messages: [{ role: 'user', content: prompt }],
+        state: {
+          mode: 'workflow',
+          charId,
+          autonomy,
+          pages: [],
+          tzId: pack.tzId,
+          dateKey,
+          lastPushAt: 0,
+          nowMs,
+          roundRef: `plan:${plan.id}`,
+          lastUserMessageAt: typeof pack.lastUserMessageAt === 'number' ? pack.lastUserMessageAt : null,
+          planId: plan.id,
+          planTitle: plan.title,
+          workflowKind: plan.kind,
+          planMaxChars: plan.maxChars,
+          idempotencyKey: `plan:${plan.id}`,
+        } satisfies AutonomyFireState,
+      };
+    }
+
+    if (userPaused) {
+      return { skip: true, reason: AUTONOMY_FIRE_SKIP.pausedByUser };
+    }
+
     const pages = await readRecentExperiencePages(db, charId, nowMs - RUMIN_WINDOW_H * HOUR_MS);
     const state = await getAutonomyState(db, charId);
+    // P4：只把本地过滤后的相关小快照放进动态尾段（没有就不占位）。
+    const perceptionBlock = await buildAutonomyPerceptionBlock({ db, charId, pack, nowMs });
 
     return {
-      messages: [{ role: 'user', content: buildAutonomyRoundPrompt({ pack, nowMs, pages, autonomy }) }],
+      messages: [{ role: 'user', content: buildAutonomyRoundPrompt({ pack, nowMs, pages, autonomy, perceptionBlock }) }],
       state: {
+        mode: 'round',
         charId,
         autonomy,
         pages,
@@ -776,6 +1376,8 @@ export const autonomyRoundHandler: FireKindHandler = {
         dateKey,
         lastPushAt: state.lastPushAt,
         nowMs,
+        roundRef: `round:${crypto.randomUUID()}`,
+        lastUserMessageAt: typeof pack.lastUserMessageAt === 'number' ? pack.lastUserMessageAt : null,
       } satisfies AutonomyFireState,
     };
   },
@@ -785,6 +1387,9 @@ export const autonomyRoundHandler: FireKindHandler = {
     if (!db) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.dbUnavailable };
     const carried = readCarriedState(state);
     if (!carried) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.stateMissing };
+
+    // P5：计划到点执行走独立分支——不产出经历列表/反刍闸/推送，只落一条虚拟经历并结算计划。
+    if (carried.mode === 'workflow') return handleWorkflowOutput(db, ctx, carried);
 
     const reply = parseAutonomyRoundReply(ctx.llmOutputText || '');
     if (!reply) {
@@ -848,6 +1453,9 @@ export const autonomyRoundHandler: FireKindHandler = {
         // D1 行的 importance 保持 0..3 数字（没有任何读侧按它分档）。
         importance: item.importance,
         pushed: isPushed,
+        // P4：自主回合产物是角色的虚拟经历，不是现实观测。
+        basis: 'virtual',
+        source: 'autonomy_round',
       });
       written.push({
         id,
@@ -863,6 +1471,25 @@ export const autonomyRoundHandler: FireKindHandler = {
     // 这一轮没产出任何可用经历（含被后处理削空）= 事实上的 rest。
     const finalRested = rested || written.length === 0;
     const did = dominantAutonomyKind(written);
+
+    // P5 W1/W2：模型顺带提的生活工作流先过白名单校验再落计划；坏的逐条丢掉，不影响本轮。
+    let plannedWorkflows: AutonomyPlannedWorkflow[] = [];
+    if (reply.workflowCandidates.length > 0) {
+      try {
+        plannedWorkflows = await persistWorkflowProposals({
+          db,
+          charId: carried.charId,
+          reply,
+          nowMs: carried.nowMs,
+          tzId: carried.tzId,
+          lastUserMessageAt: carried.lastUserMessageAt,
+          sourceRef: carried.roundRef || `round:${carried.nowMs}`,
+        });
+      } catch (error) {
+        console.warn('[amsg:autonomy] 工作流提议处理失败（这一轮其余产物照发）', carried.charId, error);
+      }
+    }
+
     const payload = buildAutonomyResultPayload({
       charId: carried.charId,
       experiences: written,
@@ -870,6 +1497,7 @@ export const autonomyRoundHandler: FireKindHandler = {
       usage,
       did,
       rested: finalRested,
+      workflows: plannedWorkflows,
     });
     // P4 接线：wantToShare 命中走 instant-chat 信封的通知策略（一定弹/按角色折叠/
     // 前台静音），下发仍走现有 ctx.emitResult 出口，不新开通道。

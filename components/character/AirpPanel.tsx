@@ -2,7 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { Check, ClockCounterClockwise, SlidersHorizontal } from '@phosphor-icons/react';
 import type { CharacterProfile } from '../../types';
 import { buildAirpSettings } from './AutonomyPanel';
-import { mergeAirpSettings, type AirpSettings } from '../../utils/airp/settings';
+import {
+  capabilityPolicyPatch,
+  mergeAirpSettings,
+  resolveAirpCapabilityPolicy,
+  type AirpCapabilityMode,
+  type AirpCapabilityPolicy,
+  type AirpSettings,
+} from '../../utils/airp/settings';
 import { AIRP_CAPABILITIES } from '../../utils/airp/capabilityCatalog';
 import type { AirpAutonomyLevel, AirpCapabilityRisk } from '../../utils/airp/types';
 import type { AirpCommittedEvent } from '../../utils/airp/commit';
@@ -11,17 +18,18 @@ import { listAirpEventsByChar } from '../../utils/airp/eventStore';
 /**
  * AIRP 运行时的角色管理面板。
  *
- * 字段归属（LOCKED）：本面板只写 char.airp 的 `autonomyLevel` 与 `capabilities`
- * 两个字段，另只读 `airp_events` 展示活动记录。`enabled` / `mcpAllow` / `writable`
- * 归 AutonomyPanel 独占——两边都不碰对方的字段，避免双写打架。
+ * 字段归属（LOCKED）：本面板只写 char.airp 的 `autonomyLevel`、`capabilities` 与
+ * `capabilityMode` 三个字段，另只读 `airp_events` 展示活动记录。`enabled` / `mcpAllow` /
+ * `writable` 归 AutonomyPanel 独占——两边都不碰对方的字段，避免双写打架。
  *
  * 落库走 apps/Character.tsx 的既有自动保存链路（formData 一变 → updateCharacter →
  * DB.saveCharacter + markAmsgStateDirty 重传 fire_pack），这里不新增任何同步代码。
  * 写回复用 AutonomyPanel 的 buildAirpSettings()：默认值打底 → 现有字段 → patch，
  * 面板不管的字段（enabled / directorModel / mcpAllow / writable / autonomy）原样保留。
  *
- * 空白名单语义已核对运行时快照（utils/airp/snapshot.ts:116-132 resolveCapabilities）：
- * `capabilities` 为空 = 全部能力可用（再受档位与 writable 总闸约束）；非空 = 只保留白名单内。
+ * 权限契约（B4）：能力授权有显式三态 all / allowlist / none，判定统一走
+ * utils/airp/settings.ts 的 resolveAirpCapabilityPolicy()（运行时快照用的是同一个函数）。
+ * 旧数据「capabilities 为空 = 全部可用」的语义保留；新写的 none 不会因为数组空而变回 all。
  *
  * 风格：外壳与控件沿用本页既有卡片语言（bg-white rounded-3xl p-4 shadow-sm border-slate-100）
  * 与 AutonomyPanel 的选项卡 / 徽标写法，不引入新视觉语言、不用动画库。
@@ -43,6 +51,13 @@ export const AIRP_RISK_LABELS: Record<AirpCapabilityRisk, string> = {
   forbidden: '禁用',
 };
 
+/** 三态授权的展示文案（none 是新增的显式态，不再是"空数组=全开"的副作用）。 */
+export const AIRP_CAPABILITY_MODE_LABELS: Record<AirpCapabilityMode, string> = {
+  all: '全部允许',
+  allowlist: '仅勾选',
+  none: '全部禁止',
+};
+
 const EVENT_TYPE_LABELS: Record<string, string> = {
   conversation: '对话',
   activity: '活动',
@@ -61,27 +76,52 @@ const IMPACT_LABELS: Record<string, string> = {
 
 const CAPABILITY_IDS: readonly string[] = AIRP_CAPABILITIES.map((capability) => capability.id);
 
-/**
- * 空白名单 = 全部能力可用（与 resolveCapabilities 同口径）。
- * UI 的勾选态按「有效状态」显示：数组空 → 全部勾上。
- */
-export const isCapabilityEnabled = (ids: readonly string[], id: string): boolean =>
-  ids.length === 0 || ids.includes(id);
+/** 勾选态按显式策略算：all 全真、none 全假、allowlist 精确匹配。 */
+export const isCapabilityEnabled = (policy: AirpCapabilityPolicy, id: string): boolean =>
+  policy.mode === 'all' || (policy.mode === 'allowlist' && policy.allow.includes(id));
 
 /**
- * 勾选 / 取消能力 id，返回新的显式白名单：
- * 空数组先展开成「全部」，再增删；若结果覆盖全部目录项则收敛回空数组（空 = 全部可用）。
+ * 勾选 / 取消一个能力，返回新的策略：
+ *  - 当前 all：以全目录为基准增删；
+ *  - 当前 none：从空白开始（勾一个就是只放行它）；
+ *  - 勾满整个目录 → all；一项都不剩 → none；其余 → allowlist。
  */
 export const toggleCapability = (
-  ids: readonly string[],
+  policy: AirpCapabilityPolicy,
   id: string,
   allIds: readonly string[],
-): string[] => {
-  const base = ids.length === 0 ? allIds.slice() : ids.filter((item) => typeof item === 'string');
+): AirpCapabilityPolicy => {
+  const base = policy.mode === 'all'
+    ? allIds.slice()
+    : policy.mode === 'allowlist'
+      ? policy.allow.slice()
+      : [];
   const enabled = base.includes(id);
   const next = enabled ? base.filter((item) => item !== id) : [...base, id];
-  const coversAll = allIds.every((candidate) => next.includes(candidate));
-  return coversAll && next.length === allIds.length ? [] : next;
+  if (allIds.every((candidate) => next.includes(candidate))) return { mode: 'all', allow: [] };
+  if (next.length === 0) return { mode: 'none', allow: [] };
+  return { mode: 'allowlist', allow: next };
+};
+
+/**
+ * 面板上的「全部允许 / 全部禁止」预设。切到 allowlist 时沿用当前有效集合
+ * （从 none 切过去仍是 none：空白名单不等于全开）。
+ */
+export const setCapabilityMode = (
+  policy: AirpCapabilityPolicy,
+  mode: AirpCapabilityMode,
+  allIds: readonly string[],
+): AirpCapabilityPolicy => {
+  if (mode === 'all') return { mode: 'all', allow: [] };
+  if (mode === 'none') return { mode: 'none', allow: [] };
+  const effective = policy.mode === 'all'
+    ? allIds.slice()
+    : policy.mode === 'allowlist'
+      ? policy.allow.slice()
+      : [];
+  return effective.length > 0
+    ? { mode: 'allowlist', allow: effective }
+    : { mode: 'none', allow: [] };
 };
 
 /** 换档位：只动 autonomyLevel，其余 airp 字段原样保留（复用 AutonomyPanel 的写回形态）。 */
@@ -91,10 +131,14 @@ export const applyAutonomyLevel = (
 ): AirpSettings => buildAirpSettings(current, { autonomyLevel: level });
 
 /**
- * 面板读取能力白名单：经 mergeAirpSettings 归一化，保证是字符串数组。
- * 损坏 / 导入的非数组值（字符串、数字、null…）一律回落 []，渲染期不抛错。
+ * 面板读取能力授权：统一走 resolveAirpCapabilityPolicy，旧数据空数组读成 all、
+ * 显式 none 保持 none。损坏 / 导入的非数组值（字符串、数字、null…）一律当旧空值，渲染期不抛错。
  */
-export const selectCapabilities = (airp: unknown): string[] => mergeAirpSettings(airp).capabilities;
+export const selectCapabilityPolicy = (airp: unknown): AirpCapabilityPolicy =>
+  resolveAirpCapabilityPolicy(airp);
+
+/** 面板读取能力白名单（策略里的显式 id 列表；all / none 时为空）。 */
+export const selectCapabilities = (airp: unknown): string[] => selectCapabilityPolicy(airp).allow;
 
 /** 事件时间：M/D HH:mm（与 AutonomyPanel formatStamp 同格式）；坏值回落占位符。 */
 export const formatAirpEventTime = (ts: unknown): string => {
@@ -165,6 +209,12 @@ const IMPACT_BADGE: Record<string, string> = {
   major: 'border-amber-200 bg-amber-50 text-amber-600',
 };
 
+/** 「全部允许 / 全部禁止」两个显式预设；白名单态由下面逐项勾选自然形成。 */
+const MODE_PRESETS: readonly { mode: AirpCapabilityMode; label: string; desc: string }[] = [
+  { mode: 'all', label: '全部允许', desc: '目录内能力全开' },
+  { mode: 'none', label: '全部禁止', desc: '一个能力都不给' },
+];
+
 // ── 主面板 ────────────────────────────────────────────────────────────────
 
 interface AirpPanelProps {
@@ -176,9 +226,11 @@ interface AirpPanelProps {
 const AirpPanel: React.FC<AirpPanelProps> = ({ char, onChange }) => {
   const airp = char.airp;
   const level = mergeAirpSettings(airp).autonomyLevel;
-  const selectedCapabilities = selectCapabilities(airp);
+  const capabilityPolicy = selectCapabilityPolicy(airp);
 
   const emit = (patch: Partial<AirpSettings>) => onChange(buildAirpSettings(airp, patch));
+  const emitPolicy = (next: AirpCapabilityPolicy) =>
+    emit(capabilityPolicyPatch(next));
   const setLevel = (next: AirpAutonomyLevel) => onChange(applyAutonomyLevel(airp, next));
 
   // 活动记录（只读；airp_events 最近 50 条，store 排序为 at 倒序）
@@ -202,6 +254,11 @@ const AirpPanel: React.FC<AirpPanelProps> = ({ char, onChange }) => {
       alive = false;
     };
   }, [char.id]);
+
+  const modeLabel = AIRP_CAPABILITY_MODE_LABELS[capabilityPolicy.mode];
+  const modeSummary = capabilityPolicy.mode === 'allowlist'
+    ? `${modeLabel}（${capabilityPolicy.allow.filter((id) => CAPABILITY_IDS.includes(id)).length}/${CAPABILITY_IDS.length} 项）`
+    : modeLabel;
 
   return (
     <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100 space-y-4">
@@ -239,21 +296,51 @@ const AirpPanel: React.FC<AirpPanelProps> = ({ char, onChange }) => {
         </div>
       </Group>
 
-      {/* 能力白名单 */}
+      {/* 能力授权模式 */}
       <Group
-        label="能力白名单"
-        hint="不勾选任何一项 = 全部能力都可用（仍受上面档位与「自主背景生活」里的「自主可写」开关约束）；勾选后只保留勾中的。"
+        label="能力授权"
+        hint="「全部禁止」不等于关闭 AIRP：TA 还能聊天，只是不碰任何工具。取消任一项就自动变成白名单，只放行勾中的那些（仍受上面档位与「自主可写」开关约束）。"
+      >
+        <div className="grid grid-cols-2 gap-2">
+          {MODE_PRESETS.map((preset) => {
+            const active = capabilityPolicy.mode === preset.mode;
+            return (
+              <button
+                key={preset.mode}
+                type="button"
+                onClick={() => emitPolicy(setCapabilityMode(capabilityPolicy, preset.mode, CAPABILITY_IDS))}
+                className={`text-left rounded-2xl border px-3 py-2.5 transition-all ${active ? 'border-violet-400 bg-violet-50' : 'border-slate-200 bg-white active:scale-[0.98]'}`}
+              >
+                <p className={`text-[11px] font-bold ${active ? 'text-violet-700' : 'text-slate-600'}`}>{preset.label}</p>
+                <p className="text-[10px] text-slate-400 mt-0.5 leading-relaxed">{preset.desc}</p>
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-[10px] font-bold text-slate-500">
+          当前：{modeSummary}
+        </p>
+      </Group>
+
+      {/* 能力清单 */}
+      <Group
+        label="能力清单"
+        hint={
+          capabilityPolicy.mode === 'none'
+            ? '现在全部禁止。点任意一项即可只放行它（自动转为白名单）。'
+            : '勾选即放行；把整个目录勾满会回到「全部允许」。'
+        }
       >
         <div className="space-y-1.5">
           {AIRP_CAPABILITIES.map((capability) => {
-            const checked = isCapabilityEnabled(selectedCapabilities, capability.id);
+            const checked = isCapabilityEnabled(capabilityPolicy, capability.id);
             return (
               <button
                 key={capability.id}
                 type="button"
                 role="checkbox"
                 aria-checked={checked}
-                onClick={() => emit({ capabilities: toggleCapability(selectedCapabilities, capability.id, CAPABILITY_IDS) })}
+                onClick={() => emitPolicy(toggleCapability(capabilityPolicy, capability.id, CAPABILITY_IDS))}
                 className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-2xl border text-left transition-all ${checked ? 'border-violet-400 bg-violet-50' : 'border-slate-200 bg-white active:scale-[0.98]'}`}
               >
                 <span className="min-w-0 flex items-center gap-2">
