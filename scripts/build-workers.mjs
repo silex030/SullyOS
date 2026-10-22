@@ -131,18 +131,68 @@ const VERBATIM_COPIES = [
   // amsg 的 Deno 门面：给 Cloudflare worker 换一个国内能直连的地址。
   // 设置页「复制 Deno 代理代码」按钮 fetch 这份。
   { from: 'worker/amsg/deno-proxy.ts', to: 'public/amsg-deno-proxy.ts' },
-  // VPS 宿主加载的单文件 worker：bundle 是 src 的原样副本。以前靠手写
-  // `cp src/index.js worker.bundle.js`，改了 src 忘 cp 时线上跑的仍是旧代码
-  // ——纳入构建脚本保证每次 build 后两者一定同步。
-  { from: 'worker/main-agent/src/index.js', to: 'worker/main-agent/worker.bundle.js' },
-  // main-agent 的 bundle 是原样副本，所以它 import 的兄弟模块也必须一起落到
-  // worker/main-agent/ 下 —— 否则线上 `import './local-embedding-route.js'` 直接
-  // ERR_MODULE_NOT_FOUND（src/ 里的副本不会被部署面加载）。源文件只有一个：
-  // src/local-embedding-route.js（测试与类型都指它），这里是 verbatim 复制。
-  { from: 'worker/main-agent/src/local-embedding-route.js', to: 'worker/main-agent/local-embedding-route.js' },
+  // 注意：main-agent 不在这个列表里 —— 它有一个相对 import，见下面 buildMainAgentBundle。
   { from: 'worker/heartbeat/src/index.js', to: 'worker/heartbeat/worker.bundle.js' },
   { from: 'worker/wake-bridge/src/index.js', to: 'worker/wake-bridge/worker.bundle.js' },
 ];
+
+// ── main-agent：自包含 bundle（内联 local-embedding 路由）──────────────
+//
+// 为什么不像以前那样 `cp src/index.js worker.bundle.js`：
+// VPS 的加载器是 `vps-backend/src/shim/bundle-loader.js`，它把整份源码塞进
+// `data:text/javascript;base64,…` 再 `import()`。data: URL **没有 base**，bundle 里
+// 任何相对 import 都会 ERR_UNSUPPORTED_RESOLVE_REQUEST（实测线上 8830 起不来、
+// Caddy 全 502）。所以 bundle 必须自包含：把 src/local-embedding-route.js 内联进来，
+// 并剥掉 index.js 里那一行 import。src/ 侧保持正常模块（测试与类型仍 import 真模块）。
+//
+// 内联体包在 IIFE 里，避免与 index.js 的同名工具函数（json / CORS_HEADERS / num …）冲突。
+const MAIN_AGENT_ROUTE = 'worker/main-agent/src/local-embedding-route.js';
+const MAIN_AGENT_ENTRY = 'worker/main-agent/src/index.js';
+const MAIN_AGENT_BUNDLE = 'worker/main-agent/worker.bundle.js';
+const MAIN_AGENT_IMPORT_LINE = "import { handleLocalEmbedding } from './local-embedding-route.js';";
+
+function buildMainAgentBundle() {
+  const routeSrc = readFileSync(resolve(root, MAIN_AGENT_ROUTE), 'utf8');
+  const indexSrc = readFileSync(resolve(root, MAIN_AGENT_ENTRY), 'utf8');
+
+  // 前置校验：路由模块必须自包含，否则内联不成立，直接失败而不是产出坏 bundle。
+  if (/^\s*import\s/m.test(routeSrc)) {
+    console.error(`ERROR: ${MAIN_AGENT_ROUTE} 不能再有 import（内联进 bundle 时无处解析）`);
+    process.exit(1);
+  }
+  if (!indexSrc.includes(MAIN_AGENT_IMPORT_LINE)) {
+    console.error(`ERROR: ${MAIN_AGENT_ENTRY} 缺少预期的 local-embedding import 行，构建脚本需要同步更新`);
+    process.exit(1);
+  }
+
+  const routeBody = routeSrc
+    .replace(/^export\s+(?=(?:async\s+)?function|const|let|class|default)/gm, '');
+  if (/\bexport\b/.test(routeBody)) {
+    console.error(`ERROR: ${MAIN_AGENT_ROUTE} 仍有未处理的 export，内联会产出语法错误`);
+    process.exit(1);
+  }
+  if (!/function\s+handleLocalEmbedding|const\s+handleLocalEmbedding/.test(routeBody)) {
+    console.error(`ERROR: ${MAIN_AGENT_ROUTE} 没有 handleLocalEmbedding，内联约定已变`);
+    process.exit(1);
+  }
+
+  const inlined = [
+    '// [build-workers] 内联自 src/local-embedding-route.js —— VPS 用 data: URL 加载，',
+    '// 相对 import 无 base 可解析，所以路由必须与入口同一个文件。改路由请改 src/ 那份。',
+    'const { handleLocalEmbedding } = (() => {',
+    routeBody.trimEnd(),
+    '  return { handleLocalEmbedding };',
+    '})();',
+    '',
+    indexSrc.replace(MAIN_AGENT_IMPORT_LINE + '\n', ''),
+  ].join('\n');
+
+  writeFileSync(resolve(root, MAIN_AGENT_BUNDLE), inlined);
+  const kb = (statSync(resolve(root, MAIN_AGENT_BUNDLE)).size / 1024).toFixed(1);
+  console.log(`✓ ${'main-agent'.padEnd(16)} ${kb} KB  → ${MAIN_AGENT_BUNDLE} (内联 local-embedding 路由)`);
+}
+
+buildMainAgentBundle();
 
 for (const { from, to } of VERBATIM_COPIES) {
   const src = resolve(root, from);
