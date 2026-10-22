@@ -21,7 +21,6 @@ import { exportSignalLocal, importSignalLocal } from './vrWorld/signal';
 import { exportLuckinLocal, importLuckinLocal } from './luckinMcpClient';
 import { exportMcdLocal, importMcdLocal } from './mcdMcpClient';
 import { exportMcpLocal, importMcpLocal } from './mcpClient';
-import { exportOpencodeLocal, importOpencodeLocal } from './opencodeClient';
 import { exportAmsg2GlobalConfig, importAmsg2GlobalConfig } from './activeMsgStore';
 import { exportWorldHomeLocal, importWorldHomeLocal } from './worldHome/localBackup';
 import { exportDesktopSkinLocal, importDesktopSkinLocal } from './desktopSkinBackup';
@@ -3567,7 +3566,6 @@ export const DB = {
           luckinLocal: exportLuckinLocal(),       // 瑞幸 token + 启用状态（存 localStorage）
           mcdLocal: exportMcdLocal(),             // 麦当劳 token + 启用状态（存 localStorage）
           mcpLocal: exportMcpLocal(),             // 通用 MCP 服务器配置（存 localStorage）
-          opencodeLocal: exportOpencodeLocal(),   // 终端本机 opencode 连接（含密码，存 localStorage）
           amsg2GlobalConfig: await exportAmsg2GlobalConfig(options), // 主动消息 2.0 全局配置（存独立的 ActiveMsg 库；后端连接默认不带走）
           desktopSkinLocal: await exportDesktopSkinLocal(), // 桌面皮肤：界面配色 + 看板 banner（看板图令牌解析为 data URL）
       };
@@ -4075,10 +4073,6 @@ export const DB = {
       await runSection('MCP 服务器配置', (data as any).mcpLocal !== undefined, async () => {
           importMcpLocal((data as any).mcpLocal); // 用户自配的 MCP 服务器列表
           (data as any).mcpLocal = undefined;
-      }, 1);
-      await runSection('终端连接配置', (data as any).opencodeLocal !== undefined, async () => {
-          importOpencodeLocal((data as any).opencodeLocal); // 本机 opencode 连接（含密码）
-          (data as any).opencodeLocal = undefined;
       }, 1);
       await runSection('主动消息配置', (data as any).amsg2GlobalConfig !== undefined, async () => {
           // 必须在 OSContext 那段「导入后跟云端对一次账」之前落地：那段的第一道门是

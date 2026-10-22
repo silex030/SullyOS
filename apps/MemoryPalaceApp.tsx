@@ -27,6 +27,9 @@ import { confirmExportSafety } from '../utils/exportGuard';
 import type { CharacterAccommodationPolicy, CharacterProfile, MemoryPalaceWaterlinePreset, Message } from '../types';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import TokenImg from '../components/os/TokenImg';
+import MemoryPalaceLocalEmbedding from '../components/memoryPalace/MemoryPalaceLocalEmbedding';
+import { readAgentRoutingConfig } from '../utils/agentRouting';
+import { LOCAL_GEMMA_PROFILE } from '../utils/memoryPalace/localEmbedding';
 import {
     CONTEXT_RANGE_POLICY_VERSION,
     DEFAULT_MANUAL_CONTEXT_LIMIT,
@@ -1015,6 +1018,21 @@ export default function MemoryPalaceApp() {
 
     // 判断是否已配置（使用全局配置）
     const hasEmbeddingConfig = !!(memoryPalaceConfig.embedding.baseUrl && memoryPalaceConfig.embedding.apiKey);
+
+    // 本地 EmbeddingGemma2 选择卡要用的主代理地址/token（浏览器只持有 agent 凭据，
+    // 本地服务的 EMB_API_KEY 始终留在服务端）
+    const agentRouting = useMemo(() => readAgentRoutingConfig(), []);
+    // 只有当前保存的就是本地模型时才开放「重建向量索引」：云端配置走原来的路径，
+    // 不在本地卡里提供任何重建入口，避免误触云端全量重编码。
+    const localRebuildConfig = useMemo(() => {
+        const emb = memoryPalaceConfig.embedding;
+        if (!emb?.model || !/embeddinggemma/i.test(emb.model)) return undefined;
+        return {
+            ...emb,
+            dimensions: LOCAL_GEMMA_PROFILE.dimensions,
+            provider: 'local-gemma' as const,
+        };
+    }, [memoryPalaceConfig.embedding]);
     const hasLightApi = !!(memoryPalaceConfig.lightLLM.baseUrl && memoryPalaceConfig.lightLLM.apiKey);
 
     // 加载数据
@@ -1468,24 +1486,20 @@ export default function MemoryPalaceApp() {
     };
 
     const handleSaveEmbeddingConfig = () => {
-        updateMemoryPalaceConfig({
-            embedding: {
-                baseUrl: embUrl.trim(),
-                apiKey: embKey.trim(),
-                model: embModel.trim() || 'BAAI/bge-m3',
-                dimensions: embDimensions || 1024,
-            },
-        });
+        // 本地模型额外落 provider/prefixScheme/dimensions，让索引身份不依赖模型名猜测；
+        // 云端配置保持四个字段不变（老路径零行为变化）。
+        const isLocal = /embeddinggemma/i.test(embModel.trim());
+        const embedding = {
+            baseUrl: embUrl.trim(),
+            apiKey: embKey.trim(),
+            model: embModel.trim() || 'BAAI/bge-m3',
+            dimensions: isLocal ? LOCAL_GEMMA_PROFILE.dimensions : (embDimensions || 1024),
+            ...(isLocal ? { provider: 'local-gemma', prefixScheme: LOCAL_GEMMA_PROFILE.prefixScheme } : {}),
+        };
+        updateMemoryPalaceConfig({ embedding });
         // 同步到当前角色的 embeddingConfig（兼容已有的 injectMemoryPalace 调用）
         if (char) {
-            updateCharacter(char.id, {
-                embeddingConfig: {
-                    baseUrl: embUrl.trim(),
-                    apiKey: embKey.trim(),
-                    model: embModel.trim() || 'BAAI/bge-m3',
-                    dimensions: embDimensions || 1024,
-                },
-            } as any);
+            updateCharacter(char.id, { embeddingConfig: embedding } as any);
         }
         setConfigSaved(true);
         setTimeout(() => setConfigSaved(false), 2000);
@@ -3483,6 +3497,22 @@ export default function MemoryPalaceApp() {
                             <StatusMessage msg={testResult} />
                         </div>
                     )}
+
+                    {/* 本地 EmbeddingGemma2：一键选择（不覆盖现有云配置）+ 索引身份/重建入口 */}
+                    <MemoryPalaceLocalEmbedding
+                        charId={char?.id}
+                        agentUrl={agentRouting.agentUrl}
+                        agentToken={agentRouting.agentToken}
+                        current={memoryPalaceConfig.embedding}
+                        rebuildConfig={localRebuildConfig}
+                        onSelect={sel => {
+                            setEmbUrl(sel.baseUrl);
+                            setEmbKey(sel.apiKey);
+                            setEmbModel(sel.model);
+                            setEmbDimensions(sel.dimensions);
+                            addToast('已填入本地模型配置，点「保存配置」生效', 'success');
+                        }}
+                    />
                 </div>
 
                 {/* Rerank API（可选 cross-encoder 二次排序） */}

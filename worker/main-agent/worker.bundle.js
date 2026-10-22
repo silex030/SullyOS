@@ -17,6 +17,8 @@
  */
 'use strict';
 
+import { handleLocalEmbedding } from './local-embedding-route.js';
+
 const DONE_MARKER = '[DONE]';
 
 // CORS 契约（见 docs/superpowers/specs/2026-09-11-cors-unification-design.md）：
@@ -1176,6 +1178,19 @@ export default {
 
     const authFail = checkAuth(request, env);
     if (authFail) return authFail;
+
+    // 本地 EmbeddingGemma2（127.0.0.1:8850，只 publish 到回环）——
+    // **精确三个路径**，全部在鉴权之后：
+    //   /v1/local-embedding              POST（兼容 baseUrl 不带 /embeddings 的写法）
+    //   /v1/local-embedding/embeddings   POST（前端 embedding.ts 拼的就是这个）
+    //   /v1/local-embedding/health       GET（轻量探活，不触上游推理；同样要 token）
+    // 上游地址与 key 只来自 env（LOCAL_EMBEDDING_URL / LOCAL_EMBEDDING_API_KEY），
+    // 不接受请求体里的 server URL，浏览器也永远拿不到那把 key。
+    if (plain === '/v1/local-embedding'
+        || plain === '/v1/local-embedding/embeddings'
+        || plain === '/v1/local-embedding/health') {
+      return handleLocalEmbedding(request, env, { authorize: (req) => checkAuth(req, env) });
+    }
 
     if (plain === '/v1/chat/completions') return handleChat(request, env);
     if (plain === '/v1/tools') return handleToolsList(env);

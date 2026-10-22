@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import JSZip from 'jszip';
 import { stripBackupSecrets, hasBackupSecrets } from './backupSecrets';
+import { writeV2Backup, type ZipFileWriter } from './backupFormat';
 
 const apiConfig = () => ({
   baseUrl: 'https://api.example.dev/v1',
@@ -75,13 +77,13 @@ describe('backup secrets redaction', () => {
   });
 
   it('blanks secret-looking keys in opaque local maps, keeps the rest', () => {
+    // opencodeLocal 已随「外部 agent 整体退役」删除（字段不再导出），这里不再造它：
+    // 旧包里的该字段由 runSection 静默忽略，不需要脱敏断言。
     const data: any = {
-      opencodeLocal: { host: 'h', password: 'pw', token: 't' },
       worldHomeLocal: { world_home_api: '{"apiKey":"sk-w"}', world_custom_styles: '[]' },
       mcpLocal: { servers: '[]' },
     };
     expect(stripBackupSecrets(data)).toBe(true);
-    expect(data.opencodeLocal).toEqual({ host: 'h', password: '', token: '' });
     expect(data.mcpLocal).toEqual({ servers: '[]' });
     // world_home_api 整段 JSON 含 key：整值清空比留下半截安全
     expect(data.worldHomeLocal.world_home_api).toBe('');
@@ -237,5 +239,83 @@ describe('keepBackendConnection（导出面板勾选「包含主动消息后端�
     expect(data.cloudBackupConfig.githubToken).toBe('');
     expect(data.pushVapid.vapidPrivateKey).toBe('');
     expect(data.amsg2GlobalConfig.serverToken).toBe('s');
+  });
+});
+
+// ── 真实导出链路回归：合成标记不得出现在最终 zip（metadata.json / stores 分片）──
+// 只走内存 zip，不落真实备份包、不联网、不读用户数据。
+// 锁住的契约：
+//   ① apiConfig.agentToken（主代理 X-Client-Token）、apiConfig.bridge.token、
+//      apiConfig.bridges[].token 一律清零；
+//   ② includeBackendConnection 只放行既有授权范围（amsg2GlobalConfig.serverToken/masterKey），
+//      不得顺带放行 api/bridge 凭据；
+//   ③ 结构留住（agentUrl / bridge.url 仍在），恢复后用户只需重填钥匙。
+describe('备份包最终产物里不得出现 apiConfig/bridge 凭据（真实 writeV2Backup）', () => {
+  const AGENT = 'MARKER-AGENT-TOKEN-7Q2';
+  const BRIDGE = 'MARKER-BRIDGE-TOKEN-7Q2';
+  const BRIDGES = 'MARKER-BRIDGES-TOKEN-7Q2';
+  const APIKEY = 'MARKER-API-KEY-7Q2';
+  const SRV = 'MARKER-SERVER-TOKEN-7Q2';
+  const MK = 'MARKER-MASTER-KEY-7Q2';
+  const EMOTION = 'MARKER-EMOTION-KEY-7Q2';
+
+  const payload = () => ({
+    timestamp: 1,
+    apiConfig: {
+      baseUrl: 'https://relay.example.dev/v1',
+      model: 'm',
+      apiKey: APIKEY,
+      agentUrl: 'https://vps.example.dev',
+      agentToken: AGENT,
+      bridge: { url: 'https://bridge.example.dev', token: BRIDGE, enabled: true },
+      bridges: [{ url: 'https://bridge2.example.dev', token: BRIDGES, enabled: true }],
+    },
+    amsg2GlobalConfig: { workerUrl: 'https://worker.example.dev', serverToken: SRV, masterKey: MK },
+    characters: [{ id: 'c1', emotionConfig: { enabled: true, api: { baseUrl: 'u', apiKey: EMOTION, model: 'm' } } }],
+    messages: [{ id: 1, text: 'hi' }],
+  });
+
+  /** 走真实导出：脱敏 → writeV2Backup，再把所有 zip 条目文本拼起来查标记。 */
+  const exportToZip = async (opts: { keepBackendConnection?: boolean } = {}) => {
+    const data: any = payload();
+    expect(stripBackupSecrets(data, opts)).toBe(true);
+    const zip = new JSZip() as unknown as ZipFileWriter;
+    await writeV2Backup(zip, data, { mode: 'full', createdAt: 1 });
+    const files = (zip as any).files as Record<string, { async(t: 'string'): Promise<string> }>;
+    const names = Object.keys(files);
+    const texts: string[] = [];
+    for (const n of names) texts.push(await files[n].async('string'));
+    return {
+      names,
+      all: texts.join('\n'),
+      meta: JSON.parse(await files['metadata.json'].async('string')),
+    };
+  };
+
+  it('默认导出：agentToken / bridge.token / bridges[].token 不进 metadata.json，也不进任何分片', async () => {
+    const { names, all, meta } = await exportToZip();
+    expect(names).toContain('metadata.json');
+    for (const marker of [AGENT, BRIDGE, BRIDGES, APIKEY, EMOTION]) {
+      expect(all.includes(marker), `包内仍出现标记：${marker}`).toBe(false);
+    }
+    // 结构保留，恢复后只需重填钥匙
+    expect(meta.apiConfig.agentUrl).toBe('https://vps.example.dev');
+    expect(meta.apiConfig.bridge.url).toBe('https://bridge.example.dev');
+    expect(meta.apiConfig.bridges[0].url).toBe('https://bridge2.example.dev');
+    expect(meta.apiConfig.agentToken).toBe('');
+    expect(meta.apiConfig.bridge.token).toBe('');
+    expect(meta.apiConfig.bridges[0].token).toBe('');
+  });
+
+  it('勾选 includeBackendConnection：只放行 amsg2 的两把钥匙，api/bridge 凭据仍然不进包', async () => {
+    const { all, meta } = await exportToZip({ keepBackendConnection: true });
+    // 现有授权范围：这两把按勾选保留
+    expect(meta.amsg2GlobalConfig.serverToken).toBe(SRV);
+    expect(meta.amsg2GlobalConfig.masterKey).toBe(MK);
+    expect(all.includes(SRV)).toBe(true);
+    // 授权范围之外一律不许跟着漏
+    for (const marker of [AGENT, BRIDGE, BRIDGES, APIKEY, EMOTION]) {
+      expect(all.includes(marker), `勾选后包内仍出现标记：${marker}`).toBe(false);
+    }
   });
 });

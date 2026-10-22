@@ -38,7 +38,6 @@ import VersionInfo from '../components/settings/VersionInfo';
 import ApiCallLogModal from '../components/settings/ApiCallLogModal';
 import StorageUsagePanel from '../components/settings/StorageUsagePanel';
 import McpConnectionConsole from '../components/settings/McpConnectionConsole';
-import OpencodeConnectionConsole from '../components/settings/OpencodeConnectionConsole';
 import { DB } from '../utils/db';
 import { getBackupReminderState, setBackupReminderIntervalDays, daysSinceLastBackup, BACKUP_REMINDER_MIN_DAYS, BACKUP_REMINDER_MAX_DAYS } from '../utils/backupReminder';
 import {
@@ -719,7 +718,6 @@ const Settings: React.FC = () => {
   const [showRealtimeModal, setShowRealtimeModal] = useState(false);
   const [showMcpModal, setShowMcpModal] = useState(false);
   const [showMcpHelp, setShowMcpHelp] = useState(false);
-  const [showOpencodeModal, setShowOpencodeModal] = useState(false);
   const [showBleModal, setShowBleModal] = useState(false);
   const [bleSavedCount, setBleSavedCount] = useState(0);
   const [bleConnectedCount, setBleConnectedCount] = useState(0);
@@ -3266,8 +3264,11 @@ const Settings: React.FC = () => {
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
                     <div className="space-y-2">
                         {([
-                            [true, 'MOSS 自建语音', '中文克隆，走 VPS 自建服务'],
-                            [false, '语音合成 API', 'MiniMax / 鱼声 / ElevenLabs 三家'],
+                            // 本机 GPT-SoVITS 已实测不达标（41 字 65.3s、常驻 >4GB、宿主可用内存压到 1.95GB），
+                            // 服务保持 disabled + inactive，**没有**接通。这里如实标「未启用」，
+                            // 不再写成可用的「中文克隆」；保留这一项是为了让老配置能改回来。
+                            [true, '本地语音（GPT-SoVITS，未启用）', '本机 SoVITS 试验未达标：慢且吃内存，服务保持停用'],
+                            [false, '语音合成 API', 'MiniMax / 鱼声 / ElevenLabs 三家（当前唯一可用）'],
                         ] as const).map(([isGenie, name, desc]) => {
                             const active = localGenieEnabled === isGenie;
                             return (
@@ -3284,12 +3285,23 @@ const Settings: React.FC = () => {
                                         <span className={`text-sm font-semibold ${active ? 'text-primary' : 'text-slate-700'}`}>{name}</span>
                                         <span className="block text-[11px] text-slate-400 mt-0.5">{desc}</span>
                                     </span>
-                                    {active && <span className="text-[10px] font-bold text-primary shrink-0">使用中</span>}
+                                    {active && (
+                                        <span className={`text-[10px] font-bold shrink-0 ${isGenie ? 'text-amber-600' : 'text-primary'}`}>
+                                            {isGenie ? '已选 · 不可用' : '使用中'}
+                                        </span>
+                                    )}
                                 </button>
                             );
                         })}
                     </div>
                 </div>
+
+                {localGenieEnabled && (
+                    <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200/70 rounded-xl px-3 py-2 leading-relaxed">
+                        本机语音（GPT-SoVITS）已实测不达标并保持停用：合成 41 字需要 65 秒、常驻内存超过 4GB。
+                        选它合成会直接失败——请改回「语音合成 API」，云端三家不受影响。
+                    </p>
+                )}
 
                 {!localGenieEnabled ? (<>
 
@@ -3451,7 +3463,7 @@ const Settings: React.FC = () => {
                     </div>
                 </div>
                 </>) : (
-                    <p className="text-[11px] text-slate-400 pl-1 leading-relaxed">当前使用 MOSS 自建语音，切回 API 可继续使用三家引擎</p>
+                    <p className="text-[11px] text-amber-700 pl-1 leading-relaxed">当前选的是本地语音（GPT-SoVITS），但它实测未达标、服务保持停用，合成会失败；切回「语音合成 API」可继续使用三家云引擎</p>
                 )}
 
                 {/* 语音提示词（高级）—— 自定义注入角色 system prompt 的「语音表演指南」，按服务商分别保存 */}
@@ -3777,28 +3789,6 @@ const Settings: React.FC = () => {
                     </p>
                 );
             })()}
-        </SettingsSection>
-
-        {/* 终端：本机 opencode 远程控制台的连接 */}
-        <SettingsSection
-            title="终端 · 我的电脑"
-            icon={
-                <div className="p-2 bg-emerald-100/60 rounded-xl text-emerald-600">
-                    <PlugsConnected size={16} weight="fill" />
-                </div>
-            }
-            actions={
-                <button onClick={() => setShowOpencodeModal(true)} className="text-[10px] bg-emerald-100 text-emerald-700 px-3 py-1.5 rounded-full font-bold shadow-sm active:scale-95 transition-transform">
-                    连接
-                </button>
-            }
-        >
-            <p className="text-xs text-slate-500 leading-relaxed">
-                连上你电脑上的 opencode，桌面「终端」App 就能远程遥控它：发任务、看改动、跑命令。
-            </p>
-            <p className="text-[10px] text-slate-400 mt-2 leading-relaxed border-l-2 border-emerald-200 pl-2">
-                只连你自己的一台电脑；地址与密码保存在本机，不碰角色聊天。
-            </p>
         </SettingsSection>
 
         {/* 蓝牙 BLE 外设：配对 + 指令控制台入口，摘要随 Modal 关闭刷新 */}
@@ -5139,13 +5129,6 @@ const Settings: React.FC = () => {
                   // 旧 token 去直连它。重试和底账由 syncAmsgToolConfig 负责。
                   scheduleMcpToolConfigSync(() => syncAmsgToolConfig(realtimeConfig));
               }} />
-          </div>
-      </Modal>
-
-      {/* 终端连接管理（本机 opencode，单连接） */}
-      <Modal isOpen={showOpencodeModal} title="终端 · 我的电脑" onClose={() => setShowOpencodeModal(false)}>
-          <div className="space-y-4">
-              <OpencodeConnectionConsole addToast={addToast} />
           </div>
       </Modal>
 

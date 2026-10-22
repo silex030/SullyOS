@@ -12,8 +12,6 @@
     "start:all": "node bin/run-all.js",
     "service": "node bin/sullyos-service.js",
     "gen-vapid": "node bin/gen-vapid.js",
-    "backup": "bash deploy/scripts/backup.sh",
-    "restore": "bash deploy/scripts/restore.sh",
     "secret-scan": "bash deploy/scripts/secret-scan.sh"
   },
   "dependencies": {

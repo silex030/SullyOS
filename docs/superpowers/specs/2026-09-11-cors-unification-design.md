@@ -5,6 +5,11 @@
 > 不包含：自动降级/自愈、通道合并、鉴权模型变更、计费行为变更。
 > 执行计划：`docs/superpowers/plans/2026-09-11-cors-unification-plan.md`。
 
+> 🔻 2026-10-22 追记：外部 agent 桥（桌面「终端」App）整块退役，`worker/opencode-proxy/`、
+> `scripts/opencode-proxy.mjs`、`docs/opencode-terminal.md` 随之下线，`worker/corsContract.test.ts`
+> 里对应的两条契约断言已删。下文提到 opencode-proxy 的位置均属**历史记录**，不再有该通道；
+> 契约实现方式（净化回显）对剩余通道不变。
+
 ## 1. 背景
 
 SullyOS 是纯浏览器静态应用（页面源 vercel.app），第三方 API 默认由浏览器直发、受同源策略约束；多数第三方服务不回 CORS 头。历史上为此撞出多层通道：主代理中转（VPS main-agent）、中心 worker（`worker/index.js`，公共实例可自部署）、mcp-proxy、opencode-proxy。

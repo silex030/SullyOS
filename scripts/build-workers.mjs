@@ -135,6 +135,11 @@ const VERBATIM_COPIES = [
   // `cp src/index.js worker.bundle.js`，改了 src 忘 cp 时线上跑的仍是旧代码
   // ——纳入构建脚本保证每次 build 后两者一定同步。
   { from: 'worker/main-agent/src/index.js', to: 'worker/main-agent/worker.bundle.js' },
+  // main-agent 的 bundle 是原样副本，所以它 import 的兄弟模块也必须一起落到
+  // worker/main-agent/ 下 —— 否则线上 `import './local-embedding-route.js'` 直接
+  // ERR_MODULE_NOT_FOUND（src/ 里的副本不会被部署面加载）。源文件只有一个：
+  // src/local-embedding-route.js（测试与类型都指它），这里是 verbatim 复制。
+  { from: 'worker/main-agent/src/local-embedding-route.js', to: 'worker/main-agent/local-embedding-route.js' },
   { from: 'worker/heartbeat/src/index.js', to: 'worker/heartbeat/worker.bundle.js' },
   { from: 'worker/wake-bridge/src/index.js', to: 'worker/wake-bridge/worker.bundle.js' },
 ];

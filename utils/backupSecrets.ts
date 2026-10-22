@@ -2,7 +2,7 @@
  * 备份出包前的密钥脱敏。
  *
  * 备份包会被用户到处传（网盘/聊天软件/仓库），而包里躺着 LLM Key、TTS Key、
- * WebDAV 密码、GitHub Token、VAPID 私钥、opencode 密码……XSS 或一次误分享
+ * WebDAV 密码、GitHub Token、VAPID 私钥、各家 API Key……XSS 或一次误分享
  * 即全泄。导出时把密钥值清空、只留地址/模型等非敏感配置；恢复后用户重填一次 Key。
  *
  * 约定：
@@ -23,16 +23,27 @@ const blankField = (hit: { hit: boolean }, obj: any, field: string): void => {
   }
 };
 
-/** APIConfig 形态（含各家 TTS/生图 Key + 视觉副 API）。Partial 亦可。 */
+/** APIConfig 形态（含各家 TTS/生图 Key + 视觉副 API + 主代理/桥接凭据）。Partial 亦可。 */
 function stripApiConfig(hit: { hit: boolean }, cfg: any): void {
   if (!cfg || typeof cfg !== 'object') return;
   for (const f of [
     'apiKey', 'minimaxApiKey', 'fishAudioApiKey', 'elevenLabsApiKey',
     'aceStepApiKey', 'latentImageKey',
+    // 主代理（VPS /agent/v1 中转）的 X-Client-Token：等价于后端共享密钥，绝不进包。
+    'agentToken',
   ]) blankField(hit, cfg, f);
   if (cfg.visionApi && typeof cfg.visionApi === 'object') blankField(hit, cfg.visionApi, 'apiKey');
   if (cfg.secondaryApi && typeof cfg.secondaryApi === 'object') blankField(hit, cfg.secondaryApi, 'apiKey');
   if (cfg.api && typeof cfg.api === 'object') blankField(hit, cfg.api, 'apiKey');
+  // 外部连接桥的 Bearer（单桥 bridge / 多桥 bridges[]）：URL 留着、令牌清零。
+  // 注意：这条不在「包含主动消息后端连接」的授权范围里——勾选项只放行 amsg2 的
+  // serverToken/masterKey，不能顺带放行 api/桥接凭据。
+  if (cfg.bridge && typeof cfg.bridge === 'object') blankField(hit, cfg.bridge, 'token');
+  if (Array.isArray(cfg.bridges)) {
+    for (const b of cfg.bridges) {
+      if (b && typeof b === 'object') blankField(hit, b, 'token');
+    }
+  }
 }
 
 /** RealtimeConfig 形态（天气/高德/新闻/Notion/飞书/小红书 cookie/透视窗 anonKey）。Partial 亦可。 */
@@ -108,7 +119,9 @@ export function stripBackupSecrets(data: any, opts: { keepBackendConnection?: bo
   stripRealtimeConfig(hit, data.realtimeConfig);
   blankField(hit, data.browserConfig, 'braveKey');
 
-  stripOpaqueMap(hit, data.opencodeLocal);
+  // 外部 agent（终端 / 本机 opencode 遥控）已于 2026-10-22 整体退役：导出侧不再有
+  // opencodeLocal 字段，这里不留死分支。旧备份包里的该字段在导入时被 runSection
+  // 静默忽略（无白名单校验），无害且不会回写 localStorage。
   stripOpaqueMap(hit, data.luckinLocal);
   stripOpaqueMap(hit, data.mcdLocal);
   stripOpaqueMap(hit, data.mcpLocal);

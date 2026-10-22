@@ -118,13 +118,13 @@ curl -s https://ethernet-vps.bot.cd/google-api/api/health
 curl -s -H 'X-Google-Bridge-Token: <见 /opt/sullyos/.env 的 GOOGLE_BRIDGE_TOKEN>' \
   https://ethernet-vps.bot.cd/google-api/api/accounts
 
-# 部署新代码：直接上传文件，不要 git pull（VPS 是自动快照提交，跟远端不同步）
-# 上传到 /opt/sullyos/sullyos-repo/vps-backend/src/google/ 后 restart
+# 部署新代码：按仓库惯例在本地改 → push origin/ethernet → VPS pull（VPS 不再是自动快照提交）
+# 不要在 VPS 上直接改仓库文件：本地改 → push → VPS `git pull` → restart（运行时只有 .env / systemd unit / Caddyfile 在 VPS 上改）
 ```
 
 **重要凭据（在 `/opt/sullyos/.env`，不在仓库）**
 - `GOOGLE_CLIENT_ID=349693036921-d93seuvobpng1aiq40hcl0m0msbbscrb.apps.googleusercontent.com`
-- `GOOGLE_BRIDGE_TOKEN=IQiSoAb5EynURu8QQyCnK7bJ0tFov93Y`
+- `GOOGLE_BRIDGE_TOKEN`：见 `/opt/sullyos/.env`（**唯一生产源是服务器 .env**；2026-10-22 已轮换，别再贴进仓库）
 - `GOOGLE_SESSION_KEY=<64 hex>`
 - `GOOGLE_REDIRECT_URI=http://localhost:5173/settings/google/callback.html`
 

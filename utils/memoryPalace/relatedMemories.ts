@@ -18,7 +18,8 @@
 import type { EmbeddingConfig, RemoteVectorConfig } from './types';
 import type { RelatedMemoryRef } from './extraction';
 import { getEmbeddings } from './embedding';
-import { vectorSearch, isRemoteSearchBroken } from './vectorSearch';
+import { vectorSearch, isRemoteSearchBroken, partitionVectorsForQuery } from './vectorSearch';
+import { buildEmbeddingFingerprint } from './localEmbedding';
 import { ensureFloat32 } from './db';
 
 /** 从 localStorage 读取远程向量配置，判断本次是走远程还是本地路径。
@@ -93,8 +94,14 @@ export async function fetchRelatedMemoriesForExtraction(
     const contentTruncate = opts.contentTruncate ?? 100;
 
     try {
-        // 并行 batch embedding（一次请求拿回所有向量，便宜）
-        const vectors = await getEmbeddings(workingSnippets, embeddingConfig);
+        // 并行 batch embedding（一次请求拿回所有向量，便宜）。
+        // 这些 snippet 是「查询」：本地 EmbeddingGemma2 必须走 query 前缀（批量默认是
+        // document），否则等于拿文档去比对文档，分数整体偏移。
+        const vectors = await getEmbeddings(workingSnippets, { ...embeddingConfig, task: 'query' });
+        // 指纹用查询向量的真实长度：老云端配置可能没写 dimensions，写成 dim:0 会永远匹配不上。
+        const queryFingerprint = buildEmbeddingFingerprint(embeddingConfig, {
+            dimensions: (vectors[0] as { length?: number } | undefined)?.length || 0,
+        });
 
         const searchResults: Array<{ node: any; similarity: number }[]> = [];
 
@@ -127,9 +134,23 @@ export async function fetchRelatedMemoriesForExtraction(
             localNodeMap = new Map(allNodes.map(n => [n.id, n]));
             return true;
         }
+        // 本地快路径同样只能消费「身份一致」的向量：库里可能同时有旧模型/旧前缀的向量，
+        // 直接 cosineSimilarity 在维度不等时会 throw，同维度异模型则给出噪声分数。
+        let localCompatible: any[] | null = null;
+        let localCompatibleDims = 0;
+        function localVectorsFor(qv: Float32Array): any[] {
+            if (localCompatible && localCompatibleDims === qv.length) return localCompatible;
+            const { compatible } = partitionVectorsForQuery(localVectors!, {
+                dimensions: qv.length,
+                fingerprint: queryFingerprint,
+            });
+            localCompatible = compatible;
+            localCompatibleDims = qv.length;
+            return compatible;
+        }
         function localScoreOne(qv: Float32Array): { node: any; similarity: number }[] {
             const scored: { memoryId: string; similarity: number }[] = [];
-            for (const ev of localVectors!) {
+            for (const ev of localVectorsFor(qv)) {
                 // ensureFloat32 兼容三种存储形态，防御式兜底；正常情况下
                 // ev.vector 出 DB 时已是 Float32Array，这一支几乎是 no-op。
                 const sim = cosineSimilarity(qv, ensureFloat32(ev.vector));
@@ -159,7 +180,7 @@ export async function fetchRelatedMemoriesForExtraction(
                 }
                 const batch = vectors.slice(i, i + CONCURRENCY);
                 const batchResults = await Promise.all(
-                    batch.map(vec => vectorSearch(vec, charId, threshold, perQueryTopK, remoteCfg))
+                    batch.map(vec => vectorSearch(vec, charId, threshold, perQueryTopK, remoteCfg, undefined, queryFingerprint))
                 );
                 searchResults.push(...batchResults);
                 consumed = i + batch.length;

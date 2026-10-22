@@ -89,6 +89,22 @@ describe('synthesizeSpeechGenieDetailed', () => {
     vi.stubGlobal('fetch', vi.fn(async () => makeResponse(413, '{"error":"bad_request"}', 'application/json')));
     await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/格式不正确/);
   });
+
+  // 本地 GPT-SoVITS relay 的细码：没配参考音频时绝不能返回假音频，只能明确报「待配置」。
+  it('409 no_ref_voice 提示参考音频待配置（不是笼统失败）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(409, '{"error":"no_ref_voice"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/还没有配置本地声音/);
+  });
+
+  it('503 model_loading 提示模型正在加载', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(503, '{"error":"model_loading"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/正在加载/);
+  });
+
+  it('429 busy 提示排队已满（快速失败，不干等）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(429, '{"error":"busy"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/正在忙/);
+  });
 });
 
 describe('isGenieVoiceEnabled', () => {

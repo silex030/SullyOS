@@ -13,11 +13,156 @@
 import type { MemoryNode, MemoryVector, RemoteVectorConfig } from './types';
 import { MemoryNodeDB, MemoryVectorDB, ensureFloat32 } from './db';
 import { cosineSimilarity } from './embedding';
-import { searchVectors as remoteSearch } from './supabaseVector';
+import { isRemoteVectorDimensionCompatible, searchVectors as remoteSearch } from './supabaseVector';
 
 export interface VectorSearchResult {
     node: MemoryNode;
     similarity: number;
+}
+
+/**
+ * 按维度拆分候选向量（低层工具，只比维度）。
+ *
+ * 为什么需要：换了 embedding 模型（1024 → 本地 768）之后，库里必然有一段时间
+ * 新旧向量共存。直接把 1024 维向量喂进 `cosineSimilarity` 会 throw
+ * （"Vector dimension mismatch"），把用户整条检索打挂。
+ *
+ * ⚠️ 只按维度不够：两个恰好同维度的模型（或同模型不同前缀方案）会被判成同一个
+ * 空间，相似度是纯噪声。检索路径必须用 `partitionVectorsForQuery`（带指纹），
+ * 本函数只保留给尺寸相关的调用方/回归用例。
+ */
+export function partitionVectorsByDimension(
+    vectors: MemoryVector[],
+    queryDimensions: number,
+): { compatible: MemoryVector[]; incompatible: MemoryVector[] } {
+    const compatible: MemoryVector[] = [];
+    const incompatible: MemoryVector[] = [];
+    for (const vec of vectors) {
+        (dimsOf(vec) === queryDimensions ? compatible : incompatible).push(vec);
+    }
+    return { compatible, incompatible };
+}
+
+function dimsOf(vec: MemoryVector): number {
+    const declared = Number((vec as unknown as { dimensions?: number }).dimensions || 0);
+    if (declared > 0) return declared;
+    const raw = vec.vector as unknown;
+    return Array.isArray(raw) ? raw.length : Number((raw as { length?: number })?.length || 0);
+}
+
+function storedFingerprintOf(vec: MemoryVector): string {
+    const raw = (vec as unknown as { fingerprint?: unknown }).fingerprint;
+    return typeof raw === 'string' ? raw.trim() : '';
+}
+
+function modelSegmentOf(fingerprint: string): string {
+    const hit = fingerprint.split('|').find(part => part.startsWith('model:'));
+    return hit ? hit.slice('model:'.length).trim().toLowerCase() : '';
+}
+
+/**
+ * legacy（无 fingerprint）向量能不能当成本次查询的同一空间用？
+ *
+ * 只有一种情况可以：**云端同名同维度**。老版本的向量只写了 `model` + `dimensions`，
+ * 云端路径的前缀方案固定为 none、revision 也从未记录，所以「模型名一致 + 维度一致」
+ * 已经是我们能证明的最大范围。本地模型（provider:local-gemma）不在此列——它的前缀
+ * 方案与 task 语义是后加的，没有指纹的旧向量无法证明是按同一规则生成的。
+ */
+function legacyMatchesExpectedCloud(fingerprint: string, vec: MemoryVector): boolean {
+    if (!fingerprint.startsWith('provider:cloud|')) return false;
+    const expectedModel = modelSegmentOf(fingerprint);
+    if (!expectedModel) return false;
+    const storedModel = String(vec.model || '').trim().toLowerCase();
+    return !!storedModel && storedModel === expectedModel;
+}
+
+export interface VectorQueryIdentity {
+    dimensions: number;
+    /** 期望的向量空间指纹；缺省/空串 ⇒ 退回纯维度分区（老调用方） */
+    fingerprint?: string;
+}
+
+/**
+ * 按「向量空间身份」挑出可参与打分的子集。
+ *
+ * 规则（严格优先）：
+ *   1. 维度不同 ⇒ 排除；
+ *   2. 有指纹且与期望一致 ⇒ 参与；
+ *   3. 有指纹但不一致 ⇒ 排除（同维度不同模型/前缀，绝不能混检）；
+ *   4. 无指纹（legacy）⇒ 只有云端同名同维度才参与，其余一律排除（不能当成新模型）。
+ */
+export function partitionVectorsForQuery(
+    vectors: MemoryVector[],
+    query: VectorQueryIdentity,
+): {
+    compatible: MemoryVector[];
+    incompatible: MemoryVector[];
+    /** 被排除的 legacy（无指纹）条数 */
+    legacy: number;
+    /** 被排除的「有指纹但身份不一致」条数 */
+    mismatchedFingerprint: number;
+} {
+    const expected = String(query.fingerprint || '').trim();
+    const compatible: MemoryVector[] = [];
+    const incompatible: MemoryVector[] = [];
+    let legacy = 0;
+    let mismatchedFingerprint = 0;
+
+    for (const vec of vectors) {
+        if (dimsOf(vec) !== query.dimensions) {
+            incompatible.push(vec);
+            continue;
+        }
+        if (!expected) {
+            compatible.push(vec);
+            continue;
+        }
+        const stored = storedFingerprintOf(vec);
+        if (stored) {
+            if (stored === expected) compatible.push(vec);
+            else {
+                mismatchedFingerprint++;
+                incompatible.push(vec);
+            }
+            continue;
+        }
+        legacy++;
+        if (legacyMatchesExpectedCloud(expected, vec)) compatible.push(vec);
+        else incompatible.push(vec);
+    }
+
+    return { compatible, incompatible, legacy, mismatchedFingerprint };
+}
+
+// 身份不一致的告警只喊一次（每角色 + 每空间），避免每轮召回刷屏
+const identityMismatchNotified = new Set<string>();
+
+function notifyIdentityMismatch(
+    charId: string,
+    skipped: number,
+    usable: number,
+    query: VectorQueryIdentity,
+    detail: { legacy: number; mismatchedFingerprint: number },
+): void {
+    const key = `${charId}:${query.fingerprint || `dim:${query.dimensions}`}`;
+    if (identityMismatchNotified.has(key)) return;
+    identityMismatchNotified.add(key);
+    const parts: string[] = [];
+    if (detail.mismatchedFingerprint > 0) parts.push(`${detail.mismatchedFingerprint} 条是另一个模型/前缀方案`);
+    if (detail.legacy > 0) parts.push(`${detail.legacy} 条是旧数据（无身份指纹）`);
+    console.warn(
+        `🏰 [VectorSearch] ${skipped} 条向量与当前查询（${query.dimensions} 维）不是同一个向量空间，已跳过` +
+        (query.fingerprint ? `【${parts.join('，')}】` : '') +
+        (usable > 0
+            ? `（本次只用 ${usable} 条身份一致的向量检索）`
+            : '（本次向量检索结果为空，已降级为词法/关键词检索）') +
+        '。请到记忆宫殿设置里「重建向量索引」以恢复完整召回',
+    );
+}
+
+/** 供测试重置「只喊一次」的告警去重（生产代码不调用）。 */
+export function __resetVectorIdentityNoticesForTest(): void {
+    identityMismatchNotified.clear();
 }
 
 // Worker 单例（懒初始化）
@@ -109,10 +254,18 @@ export async function vectorSearch(
      * 远程路径不消费这个字段。
      */
     prefetchedVectors?: MemoryVector[],
+    /**
+     * 期望的向量空间指纹（provider|model|revision|dim|prefix|norm）。
+     * 传了就按指纹严格隔离；不传（老调用方）退回维度分区，但仍不做跨维混算。
+     */
+    queryFingerprint?: string,
 ): Promise<VectorSearchResult[]> {
     // ─── 远程路径：Supabase pgvector ─────────────────
     // 注意：远程 RPC 已内置 archived=false 过滤
-    if (remoteConfig?.enabled && remoteConfig.initialized && !remoteSearchBroken) {
+    // 远端表是 vector(1024)（schema v1）：查询向量不是 1024 维时不能发过去。
+    // 这不是「远程坏了」，所以不熔断；直接走本地路径，由本地降级策略决定怎么检索。
+    if (remoteConfig?.enabled && remoteConfig.initialized && !remoteSearchBroken
+        && isRemoteVectorDimensionCompatible(queryVector.length)) {
         try {
             const remoteResults = await remoteSearch(remoteConfig, queryVector, charId, threshold, topK);
             if (remoteResults.length > 0) {
@@ -153,8 +306,18 @@ export async function vectorSearch(
     }
 
     // ─── 本地路径：IndexedDB + Worker ────────────────
-    const vectors = prefetchedVectors ?? await MemoryVectorDB.getAllByCharId(charId);
-    if (vectors.length === 0) return [];
+    const allVectors = prefetchedVectors ?? await MemoryVectorDB.getAllByCharId(charId);
+    if (allVectors.length === 0) return [];
+
+    // 新旧向量共存期：只喂「身份一致」的子集打分（维度 + 指纹；legacy 不能当新模型），
+    // 其余计数并提示重建。一条都不剩 ⇒ 返回空，hybridSearch 自然融合成纯 BM25。
+    const identity: VectorQueryIdentity = { dimensions: queryVector.length, fingerprint: queryFingerprint };
+    const { compatible, incompatible, legacy, mismatchedFingerprint } = partitionVectorsForQuery(allVectors, identity);
+    if (incompatible.length > 0) {
+        notifyIdentityMismatch(charId, incompatible.length, compatible.length, identity, { legacy, mismatchedFingerprint });
+    }
+    if (compatible.length === 0) return [];
+    const vectors = compatible;
 
     // 尝试使用 Worker 计算
     let scored: { memoryId: string; similarity: number }[];

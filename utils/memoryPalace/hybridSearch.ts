@@ -7,6 +7,7 @@
 import type { EmbeddingConfig, MemoryNode, MemoryRoom, MemoryVector, ScoredMemory, RemoteVectorConfig } from './types';
 import { MemoryNodeDB } from './db';
 import { getEmbedding } from './embedding';
+import { buildEmbeddingFingerprint } from './localEmbedding';
 import { vectorSearch } from './vectorSearch';
 import { bm25Search, bm25SearchIndexed, bm25SearchDualRun } from './bm25';
 import { bm25Index } from './bm25Index';
@@ -118,7 +119,12 @@ export async function hybridSearch(
     // 落在 study 房间，imp 衰减过）。
     // 结论：候选池不应作为召回广度的旋钮。精准度靠 per-message 多路搜
     // + imp floor 在 pipeline 层解决，候选池 30 已足够。
-    const vectorResults = await vectorSearch(queryVector, charId, 0.3, 30, remoteVectorConfig, prefetch?.allVectors);
+    // 指纹 = 向量空间身份：同一角色库里可能同时存在旧模型/旧前缀的向量，
+    // 只喂身份一致的子集（见 partitionVectorsForQuery），否则同维度异模型会静默混检。
+    const vectorResults = await vectorSearch(
+        queryVector, charId, 0.3, 30, remoteVectorConfig, prefetch?.allVectors,
+        buildEmbeddingFingerprint(embeddingConfig, { dimensions: queryVector.length }),
+    );
 
     // 3. BM25 搜索（排除 archived 节点 —— 它们已被压入 EventBox summary）
     const allNodes = prefetch?.allNodes ?? await MemoryNodeDB.getByCharId(charId);

@@ -314,6 +314,22 @@ function isLegacyVec(vec: unknown): boolean {
 }
 
 /**
+ * 写入前把 `dimensions` 校正成向量**实际长度**。
+ *
+ * 为什么必须做：MRL（768/512/256）与换模型（1024→768）之后，调用方传下来的
+ * `config.dimensions` 可能与真实向量长度不一致。备份格式钉死
+ * `byteLength === dimensions * 4` 不变量（见 encodeVectorsForBackup / 导入校验），
+ * 元数据写错会让备份往返直接判失败，也会让索引身份判断失真。
+ */
+function withActualDimensions<T extends { vector?: unknown; dimensions?: number }>(record: T): T {
+    const raw = record?.vector as number[] | Float32Array | Uint8Array | undefined;
+    if (!raw) return record;
+    const actual = ensureFloat32(raw).length;
+    if (record.dimensions === actual) return record;
+    return { ...record, dimensions: actual };
+}
+
+/**
  * 记忆正文与向量**同一个事务**提交（P0·B3）。
  *
  * 为什么不能用「先 MemoryNodeDB.save(node) 再 MemoryVectorDB.save(vec)」：
@@ -326,7 +342,8 @@ function isLegacyVec(vec: unknown): boolean {
  */
 export async function saveNodeWithVector(node: MemoryNode, vector: MemoryVector): Promise<void> {
     const db = await openDB();
-    const storedVector: MemoryVector = { ...vector, vector: vecForStorage(vector.vector) };
+    const normalized = withActualDimensions(vector);
+    const storedVector: MemoryVector = { ...normalized, vector: vecForStorage(normalized.vector) };
 
     let tx: IDBTransaction;
     try {
@@ -379,7 +396,8 @@ export async function saveNodeWithVector(node: MemoryNode, vector: MemoryVector)
 
 export const MemoryVectorDB = {
     save: async (vec: MemoryVector) => {
-        const stored = { ...vec, vector: vecForStorage(vec.vector) };
+        const normalized = withActualDimensions(vec);
+        const stored = { ...normalized, vector: vecForStorage(normalized.vector) };
         await put<MemoryVector>(STORE_MEMORY_VECTORS, stored);
         // 写入验证
         const verify = await getByKey<MemoryVector>(STORE_MEMORY_VECTORS, vec.memoryId);

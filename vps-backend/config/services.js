@@ -51,6 +51,15 @@ export const services = [
       'AMSG_CLIENT_TOKEN',
       'DUFS_PORT', 'DUFS_AUTH', 'DUFS_ROOT',
       'INSTANT_PUSH_URL', 'AMSG_URL', 'PROACTIVE_PUSH_URL',
+      // 本地 EmbeddingGemma2（127.0.0.1:8850）：这几个只服务 main-agent 的
+      // /v1/local-embedding* 路由，由 systemd EnvironmentFile
+      // /opt/sullyos/secrets/local-embedding.env 注入（600 root），
+      // 不写进 .env、不回传浏览器、不进备份。缺 key 时路由返回 503 而不是匿名放行。
+      'LOCAL_EMBEDDING_API_KEY', 'LOCAL_EMBEDDING_URL', 'LOCAL_EMBEDDING_MODEL',
+      'LOCAL_EMBEDDING_DIMENSIONS', 'LOCAL_EMBEDDING_TIMEOUT_MS',
+      'LOCAL_EMBEDDING_MAX_BATCH', 'LOCAL_EMBEDDING_MAX_ITEM_CHARS',
+      'LOCAL_EMBEDDING_MAX_BODY_BYTES', 'LOCAL_EMBEDDING_MAX_QUEUE',
+      'LOCAL_EMBEDDING_MAX_CONCURRENCY',
     ],
     crons: [],
   },

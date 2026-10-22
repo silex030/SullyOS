@@ -127,7 +127,7 @@
 - **启动器改版**：Dock 与桌面网格共用一套排序，支持长按编辑、跨区域拖动互换；手机主网格 4x4 紧凑图标。
 - **动效统一**：全 App 页面切换、弹层入场、按钮按压、编辑抖动统一动效，并适配系统的「减少动效」偏好。
 - **聊天图片点开看大图**：单聊与群聊点图片缩略图打开全屏灯箱（复用 TokenImg，blobref / data: / 外链通吃）；普通图居中完整显示，超长图（高宽比 > 1.6）按宽度铺满、可纵向滚动；点遮罩、右上角按钮、Esc、系统返回键都能关；群聊不再开新标签页。
-- **终端 App**：手机远程控制电脑上的 opencode，可看会话、传文件、遥控执行。连的是电脑上自己运行的 opencode serve 服务，手机端只当遥控器，不依赖额外云服务。后续增强：项目作用域、模型选择器、自动放行审批；Windows 开机自启。
+- ~~**终端 App**~~（已于 2026-10-22 整块退役，见「减法项」）：手机远程控制电脑上的 opencode。
 
 ## 十一、新内容来源
 
@@ -203,9 +203,22 @@
 
 ## 十六、减法项（退役与移除）
 
+- **外部 agent 桥（终端 App + opencode 遥控）整块删除**（2026-10-22）：桌面「终端」App、`components/terminal/*`、`components/settings/OpencodeConnectionConsole`、`utils/opencodeClient.ts`、两条代理（`scripts/opencode-proxy.mjs` / `worker/opencode-proxy/`）与 `docs/opencode-terminal.md` 全部下线；`AppID.Terminal`、`Opencode*` 类型、备份字段 `opencodeLocal` 与旧连接的本机键（`aetheros.opencode.connection`，含明文 Basic 密码）一并清理（启动期一次性迁移 `utils/retiredExternalAgent.ts`）。**保留** `opencode.ai` 作为聊天模型供应商的兼容层（`utils/llmIdentity.ts` 身份头 + `/models` 中转）——同名不同物，别顺手删。不要重新加回终端 App。
 - Instant Push UI 整体退役，主动消息收拢为 amsg2 唯一模块；VAPID 凭据面板退役。
 - 移除 umami 统计（含残留 `trackEvent` 引用与注释）；移除 Capacitor 安卓壳与整套原生推送 fallback（含 APK 流水线）；移除桌面 PiP 投屏按钮；应用内更新提示下线。
 - 塔罗牌图转 webp 并删 mediapipe nosimd fallback，首屏资源减肥。
+
+## 十八、本地记忆（v3.20 Local Memory，2026-10-23 已发布）
+
+- **本地 embedding 全链路可调用**：本机 `127.0.0.1:8850`（容器 `embgemma2:440m-local2`，只 bind 回环、`/health` 不跑推理 3ms）→ 主代理 `/agent/v1/local-embedding{,/embeddings,/health}` 三个精确路径（在既有 `AMSG_CLIENT_TOKEN` 鉴权之后，无匿名、key 只存在服务端 env、不接受浏览器自定义上游地址）→ 浏览器侧 `utils/memoryPalace/localEmbedding.ts`（task=query/document 前缀由服务端加一次，客户端只剥不加）→ 记忆宫殿「本地 EmbeddingGemma2」选择卡（一键填入、不覆盖云配置、重建可取消/可续）。
+- **向量空间身份指纹**：`provider|model|revision|dim|prefix|norm`。写入时每条向量带指纹；检索与去重都按指纹严格分区——维度相同但模型/前缀不同**不混检**，legacy（无指纹）只允许「云端同名同维度」继续用，本地模型下 legacy 一律排除。换模型只标「待重建」，不自动重建、不删向量。
+- **远端 Supabase 保持 schema v1（vector(1024)）**：本地 768 维写入被显式拒绝并**告警一次**（不是"已同步"），查询端直接跳过远端走本地/词法；迁移 SQL 只作为纯文本方案产出，需用户自己在 SQL Editor 执行，**本轮未跑任何 DDL**。
+- **运行环境**：`sullyos.service` 增加 `EnvironmentFile=/opt/sullyos/secrets/local-embedding.env`（600 root），unit 备份在 `/opt/sullyos/secrets/sullyos.service.bak-*`；改 unit 不重启服务，部署时随 `systemctl restart` 生效。`vps-backend/config/services.js` 的 `envKeys` 补文档，env 实际是全量直通。
+- **本机语音明确未启用**：GPT-SoVITS 环境保留（`/opt/gpt-sovits`，4.0GB），实测 41 字 65.3s、常驻 >4GB、宿主可用内存触到 1.95GB，`gpt-sovits-tts.service` 保持 `disabled`+`inactive`，**未接主代理、未改 env、未上 UI 开关**；设置里那一项改标「未启用 · 试验未达标」并给出警告，不再冒充「中文克隆可用」。云 TTS 三家默认不变。
+- **减法**：`backupSecrets` 里 `opencodeLocal` 死分支删除（旧包导入静默忽略）；外部 agent 桥全部下线（见「十六、减法项」）；VPS 自动备份链退役（见下文与 `BACKUP-RETIRED.md`）；Windows 端 opencode 登录自启脚本 `scripts/opencode-autostart-win.ps1` 一并删除（它注册的计划任务指向已删的 `opencode-proxy.mjs`，属坏自启；`opencode.ai` 作为聊天供应商的身份头/`/models` 中转**不受影响**）。
+- **发布轮收口（3 项有限修正）**：① 删掉上述坏自启脚本，并加守卫用例（`scripts/` 下不得再引用 `opencode-proxy`，同时锁住 `llmIdentity.ts` 仍在）；② 本地 embedding 的 `/health` 不再回显上游内网地址，只留 `model / dimensions=768 / fingerprint / configured / tasks`；③ 设置页语音项标题改为「本地语音（GPT-SoVITS，未启用）」，选中时明示「已选 · 不可用」+ 未达标原因，云 TTS 三家仍是唯一可用选项。
+- 版本名 `v3.20 (Local Memory)`。
+- **明确未完成（别当已完成）**：SoVITS 本机 CPU 推理不达标，服务保持 `disabled`+`inactive`，未接主代理；云端 BGE 无同题实测，仅保留为可选；前端备份 ZIP 仍未加密；Cloudflare `worker/amsg` 的 Google secret 未同步（本机无 wrangler/无 CF 凭据）；Supabase 零 DDL（768 迁移仍是文本方案，需用户自己执行）；索引重建需用户自选触发，不自动全量重建；「架构一键向导」不是本轮内容。**上线回滚资产只有旧前端静态产物 + 旧代码 SHA，不做数据库备份/恢复。**
 
 ## 开发备注（自用）
 
@@ -232,4 +245,6 @@
 - 2026-10-22：**可靠记忆 / 缓存可观测 / 记忆协商 / 角色连续生活（P0–P5 批）**——记忆清空两份水位 + 云端三态 + 正文向量原子事务 + 能力 all/allowlist/none；usage 缓存字段保真（缺失≠0）+ 提示词稳定结构（易变段落后移、工具 schema 稳定化）+ 缓存诊断叶子；记忆协商走同一次提取调用（证据等级、未决候选账本、纠正追加失效、默认关）；感知归一与自主生活工作流（聊天工具 + 后台计划 + 预算双门禁 + 客户端可查看记录 DB v79）。未部署；门禁数字见 `/srv/model-tests/implementation/FINAL-INTEGRATION.md`。
 - 2026-10-22：**P3 记忆协商数据闭环（离线实现，未部署）**——记忆提取同一次调用内新增证据字段（evidence / subject / scope / timeRange / topic / sourceMsgIds），零额外 LLM 请求；否定、引用、假设、角色猜测、主体不明、来源不可核对一律不落库，改存未决候选账本（按角色隔离、localStorage、有上限），候选只在模型显式 `resolve` + 新消息 + 议题/主体一致时才物化成确定性 ID 的事实节点，重放幂等；用户纠正记录带来源消息的失效关系、原正文不删；短期状态不进消化材料与门牌。开关沿用 `featureFlags.epistemicState`，默认关闭。文件：`utils/memoryPalace/negotiation*.ts`（新）、`extraction.ts` / `pipeline.ts` / `digestion.ts`（最小接入）。清空记忆时需由 wipe 调用 `clearNegotiationLedger(charId)`（未接，属另一位代理文件）。
 - 2026-10-22：**发布前最后两个硬阻断修复**——人工重试换新代去重键（`旧键:gen:新id`，真 SQLite UNIQUE 回归）；owner 未解析一律 fail-closed 跳过（普通回合与计划到点都停）；备份恢复按每库真实落点安装、必填库全集校验（缺库默认拒，`--allow-partial` 才「部分恢复」）。发布门禁：全量 562 文件 / 6869 用例、tsc 55 条 0 新增、worker bundle 两次同哈希、vite build 通过；上线读回见 `/srv/model-tests/implementation/RELEASE-RESULT.md`。
+- 2026-10-23：**本地记忆候选（v3.20，未提交/未部署）**——本地 EmbeddingGemma2 主代理路由三路径挂载 + `sullyos.service` 载入受限 env 文件（未重启）+ 向量空间指纹（检索/去重严格分区，legacy 不当新模型）+ 记忆宫殿本地模型卡（重建可取消/可续）+ Supabase 1024 不兼容显式告警（不静默假同步、无 DDL）+ 设置页本地语音改标「未启用」+ 版本号 `v3.20 (Local Memory)`。门禁：全量 566 文件 / 6853 用例全绿、`tsc` 0 新增（55 条，基线实测 56）、`build:workers` 两次同哈希、`vite build` 通过；`check:workers` 因未提交必红。详见 `/srv/model-tests/next-phase/INTEGRATION-CANDIDATE.md`。
+- 2026-10-23：**本地记忆（v3.20 Local Memory）发布**——本地 EmbeddingGemma2 主代理三路径 + 受限 env + 向量空间指纹严格分区 + 记忆宫殿本地模型卡 + Supabase 不兼容显式告警（无 DDL）+ 设置页本地语音改标「未启用」；发布轮只做 3 项有限修正（删坏自启脚本、`/health` 去内网地址回显、语音项标题准确化）并补守卫用例。SoVITS 仍停用、CF Google secret 仍未同步、前端备份 ZIP 仍未加密、索引需用户自选重建。门禁与线上读回见 `/srv/model-tests/next-phase/RELEASE-RESULT.md`。
 - 2026-10-22：**发布候选收尾（三路阻断修复后的最终打通）**——①记忆协商开关前后台统一走 `getMemoryNegotiationGate()`（正式 config 的 false 压过旧 localkey，config 读坏按关且不回落）；②导入备份后清空旧协商账本（OSContext 收尾 + `db.importFullData` 两条入口，幂等，清不掉如实提示）；③角色面板改用权威快照显示全局护栏（读不到云端显示「后台未确认」，不再拿默认 6 次的兜底值冒充）；④补上「角色自己排着的事」提示段（服务端 id + 标题 + 能不能撤），聊天工具登记/撤销后同步本地 `airp_workflow_plans`，取消不再被同一条用户消息误判；⑤人工重试保留旧 run 审计（released 行改名让位而非删除），旧 task payload 只认自己那一代计划；⑥全局护栏新增受鉴权专用 CAS 写路由（`POST /autonomy-guardrails/patch`），并在泛写入口拦「把远端暂停改回未暂停」的普通保存，带真 SQL 并发回归。未提交/未部署；门禁与产物哈希见 `/srv/model-tests/implementation/RELEASE-CANDIDATE.md`。

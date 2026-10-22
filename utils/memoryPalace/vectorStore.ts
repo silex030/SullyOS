@@ -9,9 +9,62 @@
 import type { EmbeddingConfig, MemoryNode, MemoryVector, RemoteVectorConfig } from './types';
 import { MemoryNodeDB, MemoryVectorDB, ensureFloat32, saveNodeWithVector } from './db';
 import { getEmbeddings, cosineSimilarity } from './embedding';
-import { upsertVector as remoteUpsert } from './supabaseVector';
+import { buildEmbeddingFingerprint, resolveDimensions, type LocalAwareEmbeddingConfig } from './localEmbedding';
+import { surveyVectorIndex } from './localEmbeddingIndex';
+import { partitionVectorsForQuery } from './vectorSearch';
+import {
+    REMOTE_VECTOR_SCHEMA,
+    isRemoteVectorDimensionCompatible,
+    upsertVector as remoteUpsert,
+} from './supabaseVector';
+
+/**
+ * 远端维度不兼容时的显式告知（每个维度只喊一次）。
+ *
+ * 远端表是 `vector(1024)`（schema v1）；本地 768 维写不进去。**必须说出来**：
+ * 静默 return false 会让用户以为"云端也同步了"，下次换设备发现记忆检索退化，
+ * 而且没有任何线索。这里只告警、不改远端 schema、不做任何 DDL。
+ */
+const remoteSkipNotified = new Set<number>();
+function warnRemoteDimensionSkipped(dimensions: number): void {
+    if (isRemoteVectorDimensionCompatible(dimensions)) return;
+    if (remoteSkipNotified.has(dimensions)) return;
+    remoteSkipNotified.add(dimensions);
+    console.warn(
+        `🏰 [VectorStore] 远端 pgvector 未同步：本地向量是 ${dimensions} 维，远端表只接受 ` +
+        `${REMOTE_VECTOR_SCHEMA.dimensions} 维（schema v${REMOTE_VECTOR_SCHEMA.version}）。` +
+        `本地照常写入，远端本次跳过——这不是"已同步"。迁移方案见 buildRemoteVectorMigrationSQL（需用户手工执行 DDL）`,
+    );
+}
 
 const DEDUP_THRESHOLD = 0.9;
+
+/**
+ * 构造要落库的向量记录。
+ *
+ * 与旧实现的差别（都是为了「换模型/换维度不被静默混用」）：
+ *   - `dimensions` 写成向量**实际长度**（MRL 512/256 时不能还写 768）；
+ *   - 额外写入 `fingerprint`（模型 ID + revision + 维度 + 前缀方案 + 归一化）。
+ *     MemoryVector 的公共类型在 types.ts 里，不能随手扩；这里用结构类型附带，
+ *     IndexedDB 是 schema-less 的，读写都会原样带出来。
+ */
+function buildMemoryVector(
+    node: MemoryNode,
+    vector: Float32Array | number[],
+    embeddingConfig: EmbeddingConfig,
+): MemoryVector {
+    const dims = (vector as { length: number }).length;
+    return {
+        memoryId: node.id,
+        charId: node.charId,
+        vector,
+        dimensions: dims,
+        model: embeddingConfig.model,
+        // 用向量真实长度参与指纹：老云端配置可能没有 `dimensions`，否则会写成 dim:0，
+        // 之后按真实维度查询就永远匹配不上（检索静默变空）。
+        fingerprint: buildEmbeddingFingerprint(embeddingConfig as LocalAwareEmbeddingConfig, { dimensions: dims }),
+    };
+}
 
 /**
  * 向量化并存储记忆节点
@@ -34,13 +87,17 @@ export async function vectorizeAndStore(
 ): Promise<{ stored: number; skipped: number }> {
     if (nodes.length === 0) return { stored: 0, skipped: 0 };
 
-    // 1. 批量向量化
+    // 1. 批量向量化（建索引 = document 语义；本地模型据此选择 document 前缀）
     const texts = nodes.map(n => n.content);
-    const vectors = await getEmbeddings(texts, embeddingConfig);
+    const vectors = await getEmbeddings(texts, { ...embeddingConfig, task: 'document' } as EmbeddingConfig);
 
     // 2. 加载已有向量用于去重（EventBox summary / 迁移等场景跳过）
     const charId = nodes[0].charId;
     const existingVectors = options.skipDedup ? [] : await MemoryVectorDB.getAllByCharId(charId);
+    const expectedFingerprint = buildEmbeddingFingerprint(embeddingConfig as LocalAwareEmbeddingConfig, {
+        // 批量向量长度一致（同一模型同一档位）；用第一条的真实长度参与指纹
+        dimensions: (vectors[0] as { length?: number } | undefined)?.length || 0,
+    });
 
     let stored = 0;
     let skipped = 0;
@@ -51,8 +108,17 @@ export async function vectorizeAndStore(
 
         // 去重检查 — ensureFloat32 兼容三种存储形态（number[] / Float32Array
         // / Uint8Array），同时保护 cosineSimilarity 不被 Uint8Array 误读字节当数。
+        //
+        // 只在「同一个向量空间」里比：跨维度会 throw，跨模型（即使同维度）的相似度是噪声，
+        // 用来去重会误删本该写入的新记忆 —— 那等于换模型时静默丢数据。
         const queryF32 = ensureFloat32(vector);
-        const isDuplicate = !options.skipDedup && existingVectors.some(
+        const comparableExisting = options.skipDedup
+            ? []
+            : partitionVectorsForQuery(existingVectors, {
+                dimensions: queryF32.length,
+                fingerprint: expectedFingerprint,
+            }).compatible;
+        const isDuplicate = comparableExisting.some(
             ev => cosineSimilarity(queryF32, ensureFloat32(ev.vector)) > DEDUP_THRESHOLD
         );
 
@@ -66,19 +132,16 @@ export async function vectorizeAndStore(
         //    分两次写的旧实现一旦第二次失败，就会留下「新正文 + 旧向量」且标着
         //    embedded=true 的假完成态（P0·B3）。
         const storedNode: MemoryNode = { ...node, embedded: true };
-        const memoryVector: MemoryVector = {
-            memoryId: node.id,
-            charId: node.charId,
-            vector,
-            dimensions: embeddingConfig.dimensions,
-            model: embeddingConfig.model,
-        };
+        const memoryVector = buildMemoryVector(node, vector, embeddingConfig);
         await saveNodeWithVector(storedNode, memoryVector);
         node.embedded = true;
 
-        // 同步写入远程（fire-and-forget，不阻塞本地流程）
+        // 同步写入远程（fire-and-forget，不阻塞本地流程）。
+        // 维度不兼容时远端明确返回 false：告警一次（不是"已同步"），本地索引不受影响。
         if (remoteVectorConfig?.enabled && remoteVectorConfig.initialized) {
-            remoteUpsert(remoteVectorConfig, node.id, node.charId, vector, node, embeddingConfig.dimensions, embeddingConfig.model).catch(() => {});
+            remoteUpsert(remoteVectorConfig, node.id, node.charId, vector, node, memoryVector.dimensions, embeddingConfig.model)
+                .then((ok) => { if (!ok) warnRemoteDimensionSkipped(memoryVector.dimensions); })
+                .catch(() => {});
         }
 
         // 将新向量也加入已有列表，后续去重时可以检测同批次内的重复
@@ -181,11 +244,20 @@ export async function checkModelConsistency(
 /**
  * 重新向量化：用新模型重新 embedding 所有已有记忆。
  * 保留 MemoryNode 不动，只替换 MemoryVector。
+ *
+ * 迁移安全（2026-10 本地 768 维适配）：
+ *   - 支持 signal 取消：取消后已写入的条目保留（不删、不回滚），下次可继续；
+ *   - 逐条 onProgress 汇报进度，UI 可显示「已完成 N/M」；
+ *   - 每条都写实际维度 + 指纹，避免 MRL/换模型后新旧向量混库。
  */
 export async function rebuildAllVectors(
     charId: string,
     embeddingConfig: EmbeddingConfig,
     remoteVectorConfig?: RemoteVectorConfig,
+    options: {
+        signal?: AbortSignal;
+        onProgress?: (done: number, total: number) => void;
+    } = {},
 ): Promise<{ rebuilt: number }> {
     const nodes = await MemoryNodeDB.getByCharId(charId);
     const embeddedNodes = nodes.filter(n => n.embedded);
@@ -194,27 +266,69 @@ export async function rebuildAllVectors(
 
     console.log(`🔄 [VectorStore] 开始重建 ${embeddedNodes.length} 条向量（${embeddingConfig.model}）...`);
 
-    // 批量 embedding
+    // 批量 embedding（重建索引 = document 语义）
     const texts = embeddedNodes.map(n => n.content);
-    const vectors = await getEmbeddings(texts, embeddingConfig);
+    const vectors = await getEmbeddings(texts, { ...embeddingConfig, task: 'document' } as EmbeddingConfig);
 
     // 逐条替换
+    let rebuilt = 0;
     for (let i = 0; i < embeddedNodes.length; i++) {
-        const mv: MemoryVector = {
-            memoryId: embeddedNodes[i].id,
-            charId,
-            vector: vectors[i],
-            dimensions: embeddingConfig.dimensions,
-            model: embeddingConfig.model,
-        };
+        if (options.signal?.aborted) {
+            console.warn(`🔄 [VectorStore] 重建被取消：已完成 ${rebuilt}/${embeddedNodes.length} 条（已写入的保留）`);
+            return { rebuilt };
+        }
+        const mv = buildMemoryVector({ ...embeddedNodes[i], charId }, vectors[i], embeddingConfig);
         await MemoryVectorDB.save(mv);
 
-        // 同步到远程
+        // 同步到远程（同样：维度不兼容 = 显式告警 + 跳过，不静默假装同步）
         if (remoteVectorConfig?.enabled && remoteVectorConfig.initialized) {
-            remoteUpsert(remoteVectorConfig, embeddedNodes[i].id, charId, vectors[i], embeddedNodes[i], embeddingConfig.dimensions, embeddingConfig.model).catch(() => {});
+            remoteUpsert(remoteVectorConfig, embeddedNodes[i].id, charId, vectors[i], embeddedNodes[i], mv.dimensions, embeddingConfig.model)
+                .then((ok) => { if (!ok) warnRemoteDimensionSkipped(mv.dimensions); })
+                .catch(() => {});
         }
+        rebuilt++;
+        options.onProgress?.(rebuilt, embeddedNodes.length);
     }
 
     console.log(`✅ [VectorStore] 重建完成：${embeddedNodes.length} 条向量已更新为 ${embeddingConfig.model}`);
-    return { rebuilt: embeddedNodes.length };
+    return { rebuilt };
+}
+
+/** 库里出现最多的向量维度（用于配置没写 dimensions 时兜底）。 */
+function dominantDimensions(vectors: MemoryVector[]): number {
+    const tally = new Map<number, number>();
+    for (const vec of vectors) {
+        const dims = Number((vec as { dimensions?: number }).dimensions || 0);
+        if (dims > 0) tally.set(dims, (tally.get(dims) || 0) + 1);
+    }
+    let best = 0;
+    let bestCount = 0;
+    for (const [dims, count] of tally) {
+        if (count > bestCount) { best = dims; bestCount = count; }
+    }
+    return best;
+}
+
+/**
+ * 指纹级一致性检查（替代只看模型名的 checkModelConsistency）。
+ *
+ * 差别：模型名相同但维度/revision/前缀方案变了（例如本地 768 ↔ 云端 1024、
+ * 或同模型换 MRL 维度）也算 mismatch。只要有一条第不上就返回 mismatch，
+ * 由调用方决定「标记待重建」而不是自动重建。
+ */
+export async function checkEmbeddingFingerprintConsistency(
+    charId: string,
+    embeddingConfig: EmbeddingConfig,
+): Promise<'match' | 'mismatch' | 'empty'> {
+    const existing = await MemoryVectorDB.getAllByCharId(charId);
+    if (existing.length === 0) return 'empty';
+    const aware = embeddingConfig as LocalAwareEmbeddingConfig;
+    // 期望维度：配置里没写时用库里的主流维度兜底（否则指纹 dim:0 会把所有向量判成 mismatch）
+    const dominant = Number(aware.dimensions || 0) || dominantDimensions(existing) || 0;
+    const survey = surveyVectorIndex(
+        existing,
+        buildEmbeddingFingerprint(aware, { dimensions: dominant }),
+        dominant || resolveDimensions(aware),
+    );
+    return survey.matches === survey.total ? 'match' : 'mismatch';
 }

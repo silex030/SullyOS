@@ -936,6 +936,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   useEffect(() => {
       let cancelled = false;
       const run = async () => {
+          // 已退役的外部 agent 桥（终端 App）本机残留清理：只删 aetheros.opencode.* 前缀，
+          // 旧连接里是明文 Basic 密码。幂等、存储不可用也不阻断启动。
+          try {
+              const { retireExternalAgentStorage } = await import('../utils/retiredExternalAgent');
+              retireExternalAgentStorage();
+          } catch (e) {
+              console.warn('[RetiredExternalAgent] legacy terminal key cleanup failed', e);
+          }
           try {
               const { seedBuiltinPromptPresets, migrateLegacyVoiceOverrides } = await import('../utils/promptPresetSeeding');
               const { getResolvedPromptPresets } = await import('../utils/promptPresetRuntime');
@@ -4719,7 +4727,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           }
 
           // 密钥脱敏：包会被用户到处传，LLM/TTS Key、WebDAV 密码、GitHub Token、
-          // VAPID 私钥、opencode 密码等绝不能进包。只清值、留结构（地址/模型保留），
+          // VAPID 私钥、MCP token 等绝不能进包。只清值、留结构（地址/模型保留），
           // 恢复后用户重填一次 Key。动过手就在包上打标，导入端据此提醒。
           // 详见 utils/backupSecrets.ts（新增密钥字段时先补那里的清单）。
           if (stripBackupSecrets(backupData, {

@@ -47,7 +47,6 @@ export enum AppID {
   Takeout = 'takeout',   // 外卖 — 美团式点单（OSM 真实店面 + 品牌 SKU，模拟下单不真实支付）
   Pomodoro = 'pomodoro', // 番茄钟 — 自定义主题与时长的水波纹专注陪伴（打开才计时）
   Tarot = 'tarot', // 塔罗 — 每日运势与经典牌阵占卜（RWS 真实牌义，本地速览 + 角色解读）
-  Terminal = 'terminal', // 终端 — 本机 opencode serve 远程控制台（直连用户自己电脑上的 opencode）
 }
 
 export interface SystemLog {
@@ -64,131 +63,6 @@ export interface AppConfig {
   name: string;
   icon: string;
   color: string;
-}
-
-/** 终端 App：本机 opencode 服务器连接配置（只连一台电脑，存 localStorage）。 */
-export interface OpencodeConnection {
-  id: string;
-  name: string;
-  /** opencode serve 地址，如 http://127.0.0.1:4096（直连）或公网地址 */
-  baseUrl: string;
-  /** HTTP Basic Auth 用户名（默认 opencode；留空 = 无鉴权） */
-  username?: string;
-  /** HTTP Basic Auth 密码（即 OPENCODE_SERVER_PASSWORD；留空 = 无鉴权） */
-  password?: string;
-  /** 代理 URL，可空。约定 <代理URL>?target=<url-encoded 目标>（与 MCP 代理一致） */
-  proxyUrl?: string;
-  /** 自部署 Worker 防白嫖密钥（X-Proxy-Key 头），可选 */
-  proxyKey?: string;
-  /** 选中的项目目录（worktree 绝对路径），对应 serve 的 ?directory=。空 = 不传（服务端默认项目） */
-  directory?: string;
-  /** 选中的项目 ID（GET /project 项，仅展示/记忆用，请求只带 directory） */
-  projectID?: string;
-  /** 选中的模型（发 prompt_async/shell 时带上，与 PC 端 TUI 同一来源） */
-  model?: { providerID: string; modelID: string };
-  /** 自动允许所有权限请求（收到 permission.updated 直接回 once，不弹卡） */
-  autoAllow?: boolean;
-  enabled: boolean;
-  updatedAt: number;
-}
-
-/** opencode 会话状态：idle 空闲 / busy 运行中 / retry 重试中。 */
-export type OpencodeSessionStatus = 'idle' | 'busy' | 'retry';
-
-/** opencode 会话（GET /session 项的子集；未知字段透传保留）。 */
-export interface OpencodeSessionInfo {
-  id: string;
-  title: string;
-  directory: string;
-  projectID: string;
-  time: { created: number; updated: number };
-  [key: string]: unknown;
-}
-
-/** opencode 消息体（user / assistant）。 */
-export interface OpencodeMessageInfo {
-  id: string;
-  sessionID: string;
-  role: 'user' | 'assistant';
-  time: { created: number; completed?: number };
-  agent?: string;
-  modelID?: string;
-  providerID?: string;
-  error?: { name: string; data: { message?: string } };
-  [key: string]: unknown;
-}
-
-/** opencode 消息 part（text / reasoning / tool / step-finish 等，用 type 区分）。 */
-export interface OpencodeMessagePart {
-  id: string;
-  sessionID: string;
-  messageID: string;
-  type: string;
-  text?: string;
-  tool?: string;
-  state?: {
-    status: 'pending' | 'running' | 'completed' | 'error';
-    input?: Record<string, unknown>;
-    output?: string;
-    error?: string;
-    title?: string;
-  };
-  tokens?: { input: number; output: number; reasoning?: number };
-  cost?: number;
-  [key: string]: unknown;
-}
-
-/** GET /session/:id/message 的数组项。 */
-export interface OpencodeMessageItem {
-  info: OpencodeMessageInfo;
-  parts: OpencodeMessagePart[];
-}
-
-/** opencode 文件树节点（GET /file）。 */
-export interface OpencodeFileNode {
-  name: string;
-  path: string;
-  absolute: string;
-  type: 'file' | 'directory';
-  ignored: boolean;
-}
-
-/** opencode 会话 diff 项（GET /session/:id/diff）。 */
-export interface OpencodeFileDiff {
-  file: string;
-  before: string;
-  after: string;
-  additions: number;
-  deletions: number;
-}
-
-/** opencode 待审批权限（permission.updated 事件）。 */
-export interface OpencodePermission {
-  id: string;
-  type: string;
-  sessionID: string;
-  messageID: string;
-  title: string;
-  pattern?: string | string[];
-  [key: string]: unknown;
-}
-
-/** opencode 项目（GET /project 项的子集）。 */
-export interface OpencodeProject {
-  id: string;
-  worktree: string;
-  vcs?: string;
-  vcsDir?: string;
-  time?: { created: number; initialized?: number };
-  [key: string]: unknown;
-}
-
-/** opencode 可用模型（GET /config/providers 拍平后的一项）。 */
-export interface OpencodeModelOption {
-  providerID: string;
-  modelID: string;
-  name: string;
-  [key: string]: unknown;
 }
 
 export interface DesktopDecoration {
@@ -4529,7 +4403,6 @@ export interface FullBackupData {
     luckinLocal?: Record<string, string>;      // 瑞幸：token + 启用状态（存 localStorage）
     mcdLocal?: Record<string, string>;         // 麦当劳：token + 启用状态（存 localStorage）
     mcpLocal?: Record<string, string>;         // 通用 MCP：用户自配的服务器列表（存 localStorage）
-    opencodeLocal?: Record<string, string>;      // 终端：本机 opencode 连接配置（存 localStorage，含密码，备份包妥善保管）
     desktopSkinLocal?: Record<string, string>; // 桌面皮肤偏好：电子宠物/手游风的界面配色 + 看板 banner（存 localStorage；看板图令牌导出时解析为 data URL）
     songs?: SongSheet[]; // Songwriting app data
     

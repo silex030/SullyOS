@@ -16,11 +16,24 @@ import { cleanTextForTts, cleanVoiceMarkupForDisplay, type TtsResult } from './m
 import type { SynthOptions } from './ttsRouter';
 import { readAgentRoutingConfig } from './agentRouting';
 
+/**
+ * 错误码 → 人话。
+ * 本地 GPT-SoVITS relay 会返回比 Nano 更细的码（no_ref_voice / model_loading / busy …）；
+ * 主代理目前把它们统一折成 synth_failed / nano_unavailable，所以这里两套都映射，
+ * 将来接线改成直连时不用再改前端。
+ * no_ref_voice 必须说清「待配置」——绝不能拿假音频糊过去。
+ */
 const ERROR_TEXT: Record<string, string> = {
   bad_request: '请求格式不正确',
   empty: '没有可朗读的文字',
-  synth_failed: '语音合成失败',
+  synth_failed: '语音合成失败；若用本地语音，请先为该角色配置参考音频',
   nano_unavailable: '语音服务暂时不可用',
+  no_ref_voice: '该角色还没有配置本地声音（需要 3-10 秒干净中文录音 + 逐字稿）',
+  model_loading: '本地语音模型正在加载，请稍后再试',
+  model_unavailable: '本地语音模型未就绪',
+  resource_low: '服务器内存紧张，暂时无法本地合成',
+  busy: '本地语音正在忙，请稍后再试',
+  timeout: '语音合成超时（本地排队过久）',
 };
 
 /**
@@ -69,8 +82,9 @@ export async function synthesizeSpeechGenieDetailed(
   const base = agentUrl.replace(/\/+$/, '');
 
   const controller = new AbortController();
-  // 与适配层的 120 秒整次合成上限对齐，留 15 秒余量。
-  const timer = setTimeout(() => controller.abort(), 135_000);
+  // 本地 relay 自己的排队上限是 60 秒（超时后返回 504 timeout），这里留 15 秒余量。
+  // 从 135s 收到 75s：本地合成失败时要快速反馈，不能让用户干等两分多钟。
+  const timer = setTimeout(() => controller.abort(), 75_000);
   try {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (agentToken) headers['X-Client-Token'] = agentToken;

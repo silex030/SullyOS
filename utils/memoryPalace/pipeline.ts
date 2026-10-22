@@ -70,7 +70,9 @@ import { commitPromotedMemories } from './negotiationPlan';
 import { recordExtractionCorrection } from './negotiation';
 import { fetchRelatedMemoriesForExtraction, sampleSnippetsFromMessages, splitMessagesToSpikes } from './relatedMemories';
 import { getReceiptIdsInRange } from './recallReceipts';
-import { vectorizeAndStore, checkModelConsistency, rebuildAllVectors } from './vectorStore';
+import { vectorizeAndStore } from './vectorStore';
+import { buildEmbeddingFingerprint, resolveDimensions, type LocalAwareEmbeddingConfig } from './localEmbedding';
+import { IndexStatusStore, checkIndexIdentity } from './localEmbeddingIndex';
 import { buildLinks, strengthenCoActivated } from './links';
 import { hybridSearch } from './hybridSearch';
 import { getEmbeddings } from './embedding';
@@ -626,7 +628,9 @@ export async function retrieveMemories(
                 remoteVectorConfig?.enabled && remoteVectorConfig.initialized && !isRemoteSearchBroken()
             );
             const [queryVectors, allNodes, allVectors, allEventBoxes] = await Promise.all([
-                tRetrieve(`getEmbeddings(${queriesToEmbed.length})`, 'NET', getEmbeddings(queriesToEmbed, embeddingConfig)),
+                // 这些全是「查询」向量（spikes / contextQuery / rerank 的 joined query）：
+                // 本地 EmbeddingGemma2 必须走 query 前缀，否则等于把查询喂进文档空间
+                tRetrieve(`getEmbeddings(${queriesToEmbed.length})`, 'NET', getEmbeddings(queriesToEmbed, { ...embeddingConfig, task: 'query' } as EmbeddingConfig)),
                 tRetrieve('MemoryNodeDB.getByCharId', 'IDB', MemoryNodeDB.getByCharId(charId)),
                 useRemoteVector
                     ? Promise.resolve(undefined)
@@ -1152,6 +1156,38 @@ function getEmbeddingConfig(charEmbeddingConfig?: any): EmbeddingConfig | null {
         return charEmbeddingConfig as EmbeddingConfig;
     }
     return null;
+}
+
+/**
+ * 换 embedding 身份（模型 / revision / 维度 / 前缀方案）时，**只标记「待重建」**。
+ *
+ * 旧行为是检测到模型名变化就自动 `rebuildAllVectors`：对本地 768 维迁移来说这等于
+ * 在用户不知情时整片重写真实索引——中途关页面/断网就留下半新半旧的两套向量。
+ * 现在改为显式迁移：状态落盘（UI 可显示进度、可取消、可续），检索期间自动只用
+ * 身份一致的向量子集，一条都没有时降级为词法匹配并给出提示。
+ */
+async function flagEmbeddingIdentityChange(charId: string, embeddingConfig: EmbeddingConfig): Promise<void> {
+    const aware = embeddingConfig as LocalAwareEmbeddingConfig;
+    const vectors = await MemoryVectorDB.getAllByCharId(charId);
+    // 配置里没写 dimensions 的老云端配置：用库里主流维度兜底，避免指纹写成 dim:0 后把全部向量判成待重建
+    const storedDimensions = vectors.reduce((best, vec) => {
+        const dims = Number((vec as { dimensions?: number }).dimensions || 0);
+        return dims > best ? dims : best;
+    }, 0);
+    const expectedDimensions = Number(aware.dimensions || 0) || storedDimensions || resolveDimensions(aware);
+    const { status, decision } = await checkIndexIdentity({
+        charId,
+        expectedFingerprint: buildEmbeddingFingerprint(aware, { dimensions: expectedDimensions }),
+        expectedDimensions,
+        vectors,
+        store: new IndexStatusStore(),
+    });
+    if (status === 'pending_rebuild') {
+        console.warn(
+            `🏰 [Pipeline] embedding 身份与已有向量不一致 → 已标记「待重建」并跳过自动全量重建。` +
+            `${decision.notice ?? ''}`,
+        );
+    }
 }
 
 export async function injectMemoryPalace(
@@ -1968,14 +2004,9 @@ async function extractAndStoreMemories(
             };
         }
 
-        // 7b. 检测 embedding 模型是否变更，如果变了则重建所有已有向量
+        // 7b. embedding 身份变化检测：只标记待重建，不自动重建（见 flagEmbeddingIdentityChange）
         try {
-            const consistency = await checkModelConsistency(charId, embeddingConfig.model);
-            if (consistency === 'mismatch') {
-                console.warn(`🔄 [Pipeline] 检测到 embedding 模型变更，开始重建已有向量...`);
-                const result = await rebuildAllVectors(charId, embeddingConfig, getRemoteVectorConfig());
-                console.log(`🔄 [Pipeline] 重建完成：${result.rebuilt} 条向量已更新`);
-            }
+            await flagEmbeddingIdentityChange(charId, embeddingConfig);
         } catch (e: any) {
             console.warn(`🔄 [Pipeline] 模型一致性检查失败（不影响新记忆存储）: ${e.message}`);
         }
@@ -2454,11 +2485,7 @@ export async function importExternalMemoryText(
         }
 
         try {
-            const consistency = await checkModelConsistency(charId, embeddingConfig.model);
-            if (consistency === 'mismatch') {
-                onProgress?.('检测到向量模型已更换，正在重建已有向量…');
-                await rebuildAllVectors(charId, embeddingConfig, getRemoteVectorConfig());
-            }
+            await flagEmbeddingIdentityChange(charId, embeddingConfig);
         } catch (error: any) {
             console.warn(`🏰 [ExternalImport] 模型一致性检查失败（继续导入）: ${error?.message || error}`);
         }

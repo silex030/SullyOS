@@ -96,4 +96,30 @@ describe('launcherLayout', () => {
             expect(sameOrder(['a'], ['a', 'b'])).toBe(false);
         });
     });
+
+    // 终端 App（外部 agent 桥）退役后，老设备的 theme.launcher*Order 里可能还留着
+    // 'terminal'。归一必须把它当未知 id 丢掉并补齐，而不是留空洞或抛错。
+    describe('退役 App 残项归一（terminal）', () => {
+        it('网格顺序里的 terminal 被丢弃，其余顺序不变', () => {
+            // 已存顺序里的 terminal 当未知 id 丢弃；网格 = 可用 App − Dock 成员，
+            // 所以这里只剩 music / gallery 两项，顺序按存档。
+            expect(normalizeAppOrder(['terminal', 'gallery', 'music'], AVAILABLE, DEFAULTS))
+                .toEqual(['gallery', 'music']);
+            expect(normalizeAppOrder(['terminal', 'music'], AVAILABLE, DEFAULTS))
+                .toEqual(['music', 'gallery']);
+        });
+
+        it('Dock 顺序里的 terminal 被丢弃并按默认值补满 4 格', () => {
+            expect(normalizeDockOrder(['terminal', 'chat'], AVAILABLE, DEFAULTS))
+                .toEqual(['chat', 'group', 'social', 'settings']);
+        });
+
+        it('只剩 terminal 的存档不会崩，两个方向都回落可用集合', () => {
+            const dock = normalizeDockOrder(['terminal'], AVAILABLE, DEFAULTS);
+            const grid = normalizeAppOrder(['terminal'], AVAILABLE, DEFAULTS);
+            expect(dock).toEqual(['chat', 'group', 'social', 'settings']);
+            expect(grid).toEqual(['music', 'gallery']);
+            expect([...dock, ...grid].sort()).toEqual([...AVAILABLE].sort());
+        });
+    });
 });

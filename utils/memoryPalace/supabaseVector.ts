@@ -141,6 +141,131 @@ function headers(config: RemoteVectorConfig): Record<string, string> {
     };
 }
 
+// ─── 远端 schema 版本化 ─────────────────────────────
+//
+// pgvector 的维度是**列类型**（`vector(1024)`），不是运行时参数：768 维向量既写不进
+// 这张表，`match_vectors(vector(1024))` 也调不动。所以远端 schema 必须显式版本化，
+// 而不是「本地换了 768 就顺手写回去」。
+//
+// 这里只声明版本与守卫，**不执行任何 DDL**：生产库 DDL 由用户在 Supabase SQL Editor
+// 手工核对后运行（见 buildRemoteVectorMigrationSQL 产出的迁移脚本）。
+
+export const REMOTE_VECTOR_SCHEMA = {
+    version: 1,
+    dimensions: 1024,
+    table: 'memory_vectors',
+    rpc: 'match_vectors',
+} as const;
+
+/** 当前代码/当前远端表能不能接受这个维度的查询向量与写入。 */
+export function isRemoteVectorDimensionCompatible(dimensions: number): boolean {
+    return dimensions === REMOTE_VECTOR_SCHEMA.dimensions;
+}
+
+export interface RemoteVectorMigrationPlan {
+    fromVersion: number;
+    version: number;
+    targetDimensions: number;
+    /** 纯 SQL 文本：新表 + 新 RPC，先并存再切换，不 drop 旧表 */
+    sql: string;
+    /** 必须由用户手工完成的前置/后置步骤（脚本不会替用户执行） */
+    manualSteps: string[];
+}
+
+/**
+ * 生成「远端 pgvector 从 1024 迁移到本地维度」的迁移方案（纯文本，不执行）。
+ *
+ * 设计成并存而不是原地改：
+ *   - `vector(1024)` → `vector(768)` 无法原地改（会丢全部向量），只能建新表；
+ *   - 旧表保留 = 随时可回滚，也不会在迁移中途让当前线上检索断掉；
+ *   - RPC 用新名字 match_vectors_v2，避免 drop/replace 期间旧客户端报错。
+ */
+export function buildRemoteVectorMigrationSQL(
+    { targetDimensions }: { targetDimensions: number },
+): RemoteVectorMigrationPlan {
+    if (!Number.isFinite(targetDimensions) || targetDimensions <= 0) {
+        throw new Error(`无效的目标维度：${targetDimensions}`);
+    }
+    const sql = `-- 远端向量表迁移：vector(${REMOTE_VECTOR_SCHEMA.dimensions}) → vector(${targetDimensions})
+-- 由用户在自己的 Supabase 项目 SQL Editor 手工执行；SullyOS 不会自动跑这段 DDL。
+create extension if not exists vector;
+
+create table if not exists memory_vectors_v2 (
+  memory_id text primary key,
+  char_id text not null,
+  content text not null default '',
+  vector vector(${targetDimensions}),
+  dimensions int default ${targetDimensions},
+  model text,
+  room text,
+  importance int default 5,
+  tags text[] default '{}',
+  mood text default '',
+  valence real default null,
+  arousal real default null,
+  created_at bigint default (extract(epoch from now()) * 1000)::bigint,
+  last_accessed_at bigint default 0,
+  access_count int default 0,
+  pinned_until bigint default null,
+  source_id text default null,
+  origin text default null,
+  archived boolean default false,
+  is_summary boolean default false,
+  event_box_id text default null,
+  fingerprint text default null
+);
+
+create index if not exists idx_mv2_char_id on memory_vectors_v2(char_id);
+create index if not exists idx_mv2_hnsw on memory_vectors_v2
+  using hnsw (vector vector_cosine_ops);
+create index if not exists idx_mv2_archived on memory_vectors_v2(archived);
+
+create or replace function match_vectors_v2(
+  query_embedding vector(${targetDimensions}),
+  match_char_id text,
+  match_threshold float default 0.3,
+  match_count int default 20
+)
+returns table (
+  memory_id text, char_id text, content text, similarity float, room text,
+  importance int, tags text[], mood text, valence real, arousal real,
+  created_at bigint, last_accessed_at bigint, access_count int,
+  pinned_until bigint, source_id text, origin text, archived boolean,
+  is_summary boolean, event_box_id text
+)
+language sql stable
+as $$
+  select
+    mv.memory_id, mv.char_id, mv.content,
+    1 - (mv.vector <=> query_embedding) as similarity,
+    mv.room, mv.importance, mv.tags, mv.mood, mv.valence, mv.arousal,
+    mv.created_at, mv.last_accessed_at, mv.access_count,
+    mv.pinned_until, mv.source_id, mv.origin, mv.archived,
+    mv.is_summary, mv.event_box_id
+  from memory_vectors_v2 mv
+  where mv.char_id = match_char_id
+    and mv.archived = false
+    and 1 - (mv.vector <=> query_embedding) >= match_threshold
+  order by mv.vector <=> query_embedding
+  limit match_count;
+$$;
+`;
+
+    return {
+        fromVersion: REMOTE_VECTOR_SCHEMA.version,
+        version: REMOTE_VECTOR_SCHEMA.version + 1,
+        targetDimensions,
+        sql,
+        manualSteps: [
+            '在 Supabase SQL Editor 手工运行上面的 SQL（SullyOS 不会自动执行 DDL）',
+            '确认 memory_vectors_v2 已建好、match_vectors_v2 可调用（select count(*) from memory_vectors_v2）',
+            '用本地 embedding 重新生成全部向量后再回填 memory_vectors_v2（客户端重建完成后逐条 upsert）',
+            '核对行数与抽样相似度后，再手工把旧表改名为 memory_vectors_1024_backup（保留用于回滚，不 drop）',
+            '远端表切换完成前，SullyOS 的远端路径会自动跳过不兼容维度，检索降级到本地/词法，不会报错',
+        ],
+    };
+}
+
 function restUrl(config: RemoteVectorConfig, path: string): string {
     return `${config.supabaseUrl.replace(/\/+$/, '')}/rest/v1${path}`;
 }
@@ -214,7 +339,11 @@ export async function upsertVector(
     model?: string,
 ): Promise<boolean> {
     try {
+        // 远端表是 vector(1024)：本地 768 维写进去必然 400（且每次都要白跑一趟网络）。
+        // 直接拒绝，让调用方保持「本地已写、远端待迁移」的显式状态。
+        if (!isRemoteVectorDimensionCompatible(dimensions)) return false;
         const vecArray = vectorToWireArray(vector);
+        if (!isRemoteVectorDimensionCompatible(vecArray.length)) return false;
         const body = {
             memory_id: memoryId,
             char_id: charId,
@@ -270,6 +399,10 @@ export async function upsertVectorBatch(
 ): Promise<boolean> {
     if (items.length === 0) return true;
     try {
+        if (items.some(item => !isRemoteVectorDimensionCompatible(item.dimensions)
+            || !isRemoteVectorDimensionCompatible(item.vector.length))) {
+            return false;
+        }
         const body = items.map(item => {
             const vecArray = vectorToWireArray(item.vector);
             return {
@@ -346,6 +479,12 @@ export async function searchVectors(
     isSummary: boolean;
     eventBoxId: string | null;
 }[]> {
+    if (!isRemoteVectorDimensionCompatible(queryVector.length)) {
+        throw new Error(
+            `远端向量表只接受 ${REMOTE_VECTOR_SCHEMA.dimensions} 维（schema v${REMOTE_VECTOR_SCHEMA.version}），` +
+            `当前查询是 ${queryVector.length} 维：需要先按 buildRemoteVectorMigrationSQL 的方案迁移远端表`,
+        );
+    }
     const vecArray = vectorToWireArray(queryVector);
 
     const res = await fetch(rpcUrl(config, 'match_vectors'), {

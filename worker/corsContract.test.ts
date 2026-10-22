@@ -2,8 +2,6 @@ import { describe, expect, it } from 'vitest';
 // @ts-expect-error 本地代理脚本无类型声明，仓库没开 allowJs（同 worker/*/worker.test.ts 惯例）
 import { corsHeadersFor as mcpProxyCors } from '../scripts/mcp-proxy.mjs';
 // @ts-expect-error 同上
-import { corsHeadersFor as opencodeProxyCors } from '../scripts/opencode-proxy.mjs';
-// @ts-expect-error 同上
 import { corsHeadersFor as xhsBridgeCors } from '../scripts/xhs-bridge.mjs';
 
 export interface CorsTestableHandler {
@@ -88,12 +86,6 @@ assertCorsContract('mcp-proxy worker', async () => (await import('./mcp-proxy/wo
   expose: 'Mcp-Session-Id',
 });
 
-// opencode-proxy（用户自部署 CF；Expose WWW-Authenticate）
-// @ts-expect-error 纯 JS worker 无类型声明
-assertCorsContract('opencode-proxy worker', async () => (await import('./opencode-proxy/worker.js')) as any, {
-  expose: 'WWW-Authenticate',
-});
-
 // post-office（esbuild worker）
 assertCorsContract('post-office worker', async () => (await import('./post-office/src/index.ts')) as any, {});
 
@@ -126,6 +118,5 @@ describe('CORS contract: local proxy scripts', () => {
   };
 
   it('mcp-proxy 脚本', () => assertScriptContract(mcpProxyCors, 'Mcp-Session-Id'));
-  it('opencode-proxy 脚本', () => assertScriptContract(opencodeProxyCors, 'WWW-Authenticate'));
   it('xhs-bridge 脚本', () => assertScriptContract(xhsBridgeCors));
 });

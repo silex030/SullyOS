@@ -17,5 +17,3 @@ bundles/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-# 本地备份暂存（GitHub 备份工作目录）
-deploy/scripts/.gh-backup-repo/

@@ -2,18 +2,35 @@
  * Memory Palace — Embedding 服务
  *
  * 调用 OpenAI 兼容的 Embedding API，将文本转为向量。
- * 支持硅基流动 / 阿里云 / 字节等端点。
+ * 支持硅基流动 / 阿里云 / 字节等端点，以及走主代理的本地 EmbeddingGemma2。
+ *
+ * 任务语义（2026-10 起）：
+ *   - 单条 `getEmbedding` = 检索 **query**
+ *   - 批量 `getEmbeddings` = 建索引 **document**
+ *   - 调用方可用 `task` 显式覆盖（pipeline 的 query 预取就显式传 query）
+ * 只有本地 EmbeddingGemma2 会收到 `task` 字段（服务端据此加官方前缀）；
+ * 云端供应商请求体保持不变，避免未知字段被上游拒绝。
  */
 
 import type { EmbeddingConfig } from './types';
+import {
+    embedTextsLocally,
+    resolveEmbeddingProvider,
+    type LocalAwareEmbeddingConfig,
+} from './localEmbedding';
+
+export type { EmbeddingTask } from './localEmbedding';
 
 // ─── 核心 API 调用 ────────────────────────────────────
 
 /**
  * 单条文本向量化 — 返回 Float32Array 节省内存
+ *
+ * 单条默认按 **query** 处理：它主要服务于「拿查询去检索」，包括 hybridSearch 里
+ * 未预取 queryVector 的兜底路径。
  */
-export async function getEmbedding(text: string, config: EmbeddingConfig): Promise<Float32Array> {
-    const results = await getEmbeddings([text], config);
+export async function getEmbedding(text: string, config: LocalAwareEmbeddingConfig): Promise<Float32Array> {
+    const results = await getEmbeddings([text], { ...config, task: config.task ?? 'query' });
     return results[0];
 }
 
@@ -21,8 +38,19 @@ export async function getEmbedding(text: string, config: EmbeddingConfig): Promi
  * 批量文本向量化（一次最多 10 条，超出自动分批）
  * 返回 Float32Array[] — 比 number[][] 节省约 50% 内存
  */
-export async function getEmbeddings(texts: string[], config: EmbeddingConfig): Promise<Float32Array[]> {
+export async function getEmbeddings(texts: string[], config: LocalAwareEmbeddingConfig): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
+
+    // 本地 EmbeddingGemma2：走独立适配层（task 字段 / 前缀去重 / 768 维校验 / MRL 重归一）。
+    // 批量默认按 document 处理（这里是建索引的主路径）；query 由单条入口或显式 task 传入。
+    const localConfig = config;
+    if (resolveEmbeddingProvider(localConfig) === 'local-gemma') {
+        const out = await embedTextsLocally(texts, {
+            ...localConfig,
+            task: localConfig.task ?? 'document',
+        });
+        return out.vectors;
+    }
 
     // DashScope（Qwen 官端）的 text-embedding-v3/v4、Qwen3-Embedding 单次 batch
     // 硬上限是 10 条，超过直接 400 InvalidParameter。取 10 作为通用安全值：

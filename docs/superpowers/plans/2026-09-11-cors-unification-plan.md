@@ -4,6 +4,10 @@
 > 本计划按「弱执行者」标准编写：每步有文件路径、定位、代码意图/代码块、验收命令与预期。禁止凭感觉补全。
 > 用户已批准方案 A（契约统一 + 语义化入口，不做自动重试/自愈）。
 
+> 🔻 2026-10-22 追记：外部 agent 桥（桌面「终端」App）整块退役，`worker/opencode-proxy/`、
+> `scripts/opencode-proxy.mjs`、`docs/opencode-terminal.md` 已下线。本计划里涉及 opencode-proxy
+> 的 Step 1.8 / 1.14 / 部署清单均属**历史记录**，不再执行。
+
 ## 0. 执行前提（每阶段开工前重读）
 
 - 分支必须是 `ethernet`。工作区已有**另一条线**未提交改动：`apps/TarotApp.tsx`、`apps/tarot/LibraryView.tsx`、`apps/tarot/RitualView.tsx`、`apps/tarot/TarotParticles.tsx`、`plans/2026-09-11-tarot-mystic-redesign.md`。

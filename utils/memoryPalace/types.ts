@@ -143,6 +143,14 @@ export interface MemoryVector {
     vector: number[] | Float32Array | Uint8Array;
     dimensions: number;
     model?: string;             // 生成此向量的 embedding 模型名（用于换模型检测）
+    /**
+     * 向量空间身份指纹（provider|model|revision|dim|prefix|norm）。
+     *
+     * 为什么不能只看 model：同一个模型换 revision / 前缀方案 / MRL 档位也是另一个
+     * 向量空间，混着检索会静默给出无意义相似度。旧数据没有这个字段（legacy）——
+     * 它无法证明自己属于当前空间，**不能**当成"和当前模型一样"（见 vectorSearch）。
+     */
+    fingerprint?: string;
 }
 
 // ─── 关联网络 ─────────────────────────────────────────
@@ -379,6 +387,17 @@ export interface EmbeddingConfig {
     apiKey: string;
     model: string;              // 默认 text-embedding-3-small
     dimensions: number;         // 默认 1024
+    /**
+     * 本地/自建模型的身份扩展（云端不填，老配置零变化）。
+     * 三者共同参与 `buildEmbeddingFingerprint`，换任一即视为另一个向量空间。
+     */
+    provider?: 'local-gemma' | 'cloud';
+    prefixScheme?: string;      // 前缀方案 id，如 eg2-retrieval-v1
+    modelRevision?: string;     // 权重 revision（换模型卷即换空间）
+    /** 请求级任务语义；缺省由入口决定（单条=query，批量=document） */
+    task?: 'query' | 'document';
+    /** MRL 目标维度（仅本地 EmbeddingGemma2，官方档位 768/512/256/128） */
+    mrlDimensions?: number;
 }
 
 // ─── 远程向量存储配置 (Supabase pgvector) ────────────
