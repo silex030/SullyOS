@@ -27,7 +27,12 @@ import {
     type TravelTransport,
 } from './api';
 import { readBudgetView, type TravelBudgetView } from './budgetClient';
-import { createTravelStateStore, type TravelStateStore } from './state';
+import {
+    createTravelMultiStateStore,
+    createTravelStateStore,
+    type TravelMultiStateStore,
+    type TravelStateStore,
+} from './state';
 import { buildTravelPromptBlock } from './prompt';
 import { readAgentRoutingConfig } from '../agentRouting';
 import { externalFetch } from '../externalRequest';
@@ -216,7 +221,12 @@ export function createTravelRuntime(deps: TravelRuntimeDeps = {}) {
     const api =
         deps.api ??
         createTravelApi({ session: session as () => TravelSession | null, baseUrl, transport, now });
-    const store = deps.store ?? createTravelStateStore({ now });
+    // 默认是多角色 store：每个角色一条独立轮询，切角色不停别人（旧单 store 会 stop 上一个）。
+    const store: TravelStateStore = deps.store ?? createTravelMultiStateStore({ now });
+    const multi: TravelMultiStateStore | null =
+        typeof (store as Partial<TravelMultiStateStore>).getMultiState === 'function'
+            ? (store as TravelMultiStateStore)
+            : null;
 
     let stopPolling: (() => void) | null = null;
     let settings: TravelSettings | null = null;
@@ -291,14 +301,30 @@ export function createTravelRuntime(deps: TravelRuntimeDeps = {}) {
     };
 
     const startPollingFor = (charId: string) => {
+        if (multi) {
+            multi.setActiveChar(charId);
+            // 只替换这个角色的取消句柄；其它角色继续按自己的节奏轮询。
+            multi.startPolling({ charId, api });
+            return;
+        }
         stopPolling?.();
         stopPolling = store.startPolling({ charId, api });
     };
 
-    const stopPollingNow = () => {
+    const stopPollingFor = (charId?: string | null) => {
+        if (multi) {
+            if (charId) multi.stopChar(charId);
+            else multi.stopAll();
+            return;
+        }
         stopPolling?.();
         stopPolling = null;
     };
+
+    const stopPollingNow = () => stopPollingFor(null);
+
+    const shareVersionFor = (charId: string): number =>
+        multi ? multi.getStateFor(charId).shareVersion : store.getState().shareVersion;
 
     return {
         api,
@@ -312,6 +338,8 @@ export function createTravelRuntime(deps: TravelRuntimeDeps = {}) {
             },
             open: (charId: string) => {
                 overlayState = { open: true, charId };
+                // 只切「聚焦」角色，不动别人的轮询与数据。
+                multi?.setActiveChar(charId);
                 emitOverlay();
             },
             close: () => {
@@ -324,28 +352,39 @@ export function createTravelRuntime(deps: TravelRuntimeDeps = {}) {
         async refreshShare(charId: string): Promise<boolean> {
             const res = await api.readState(charId);
             if (!res.ok) {
-                store.applyShareUnavailable();
-                stopPollingNow();
+                // 只影响这个角色：另一个人的共享位与轮询保持不变。
+                if (multi) multi.applyShareUnavailableFor(charId);
+                else store.applyShareUnavailable();
+                stopPollingFor(charId);
                 return false;
             }
-            store.applyShare(res.data.share);
+            if (multi) multi.applyShareFor(charId, res.data.share);
+            else store.applyShare(res.data.share);
             if (res.data.share.shareEnabled) startPollingFor(charId);
-            else stopPollingNow();
+            else stopPollingFor(charId);
             return true;
         },
 
         /** 写共享位（CAS）。成功后才改本地；失败不改。 */
         async setShare(charId: string, enabled: boolean): Promise<{ ok: boolean; code?: TravelApiErrorCode }> {
-            const baseVersion = store.getState().shareVersion;
+            const baseVersion = shareVersionFor(charId);
             const res = await api.setShare(charId, enabled, baseVersion);
             if (!res.ok) return { ok: false, code: res.code };
-            store.applyShare(res.data);
+            if (multi) multi.applyShareFor(charId, res.data);
+            else store.applyShare(res.data);
             if (res.data.shareEnabled) startPollingFor(charId);
-            else stopPollingNow();
+            else stopPollingFor(charId);
             return { ok: true };
         },
 
-        polling: { start: startPollingFor, stop: stopPollingNow },
+        polling: {
+            start: startPollingFor,
+            stop: stopPollingNow,
+            /** 只停这一个角色（共享关掉时用），别人的轮询继续。 */
+            stopChar: (charId: string) => stopPollingFor(charId),
+        },
+        /** 多角色视图入口（未注入多 store 时为 null，调用方退回单角色读法）。 */
+        multi,
 
         /** 预算只读视图（读失败两列全关）。 */
         async readBudget(): Promise<TravelBudgetView> {

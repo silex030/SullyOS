@@ -4,7 +4,7 @@ import { sanitizeForBubble } from './sanitize';
 import { extractTransferCommands } from './transferFormat';
 import { executeLifeDirectives } from './lifeRecords';
 import { wallClockToTimestamp } from './timezone';
-import { enrichMoveToPlace, readAmapAuth } from './cityPlaces';
+import { enrichMoveToPlace, resolveAmapAuth } from './cityPlaces';
 import { CollaborationStore } from '../features/collaboration/store';
 import {
     collaborationFileMessageMetadata,
@@ -486,7 +486,7 @@ export const ChatParser = {
                     const chars = await DB.getAllCharacters();
                     const self = chars.find(c => c.id === charId);
                     if (self && (self.location?.city || '') !== city) {
-                        const enriched = await enrichMoveToPlace(city, readAmapAuth()).catch(() => null);
+                        const enriched = await enrichMoveToPlace(city, await resolveAmapAuth()).catch(() => null);
                         const finalProvince = enriched?.province ?? province;
                         const finalCity = enriched?.city || city;
                         const next: CharacterProfile = {

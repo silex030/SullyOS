@@ -14,11 +14,26 @@
  */
 
 export interface AmapAuth {
-    /** 代理 worker 根地址，如 getProxyWorkerUrl() 的返回值；叶子只负责拼串。 */
+    /** 取数根地址：REST 中转时为 `<base>/travel/map/rest`，旧直连时为代理 worker 根。 */
     proxyUrl: string;
-    /** 高德 Web 服务 Key。 */
+    /** 高德 Web 服务 Key。**只有** legacy 直连通道才在浏览器持有；中转模式下恒为空。 */
     key: string;
+    /**
+     * true = 走本站鉴权 REST 中转（`/travel/map/rest`）：Web 服务 Key 只由服务端按用户读出，
+     * 浏览器不见 Key，只需出行会话 Bearer。此时 `key` 必须为空串。
+     */
+    relay?: boolean;
+    /** 中转请求头（`Authorization: Bearer <出行会话>`）；legacy 直连不传。 */
+    headers?: Record<string, string>;
 }
+
+/**
+ * 凭证是否可用：中转会话就绪，或（过渡期）确有旧的 Web 服务 Key。
+ * 消费方统一用它判「未配置」，不要再直接看 `auth.key`。
+ */
+export const isAmapAuthReady = (auth: AmapAuth | null | undefined): boolean =>
+    !!auth && (auth.relay === true || !!String(auth.key ?? '').trim());
+
 
 /** 高德官方 REST 根（只出现在注释与测试里：真实请求一律走 proxyUrl + /amap 透传）。 */
 export const AMAP_REST_HOST = 'https://restapi.amap.com';
@@ -101,29 +116,37 @@ export const isAbroadErrorCode = (code?: string): boolean => code === '20011';
 // ==================== 底层 ====================
 
 /**
- * 拼代理透传地址：`<proxy>/amap` + 高德 path + query（含 key）。
- * path 白名单由代理端收敛（只放行 /v3/ 前缀），这里只保证拼出来的串合法。
+ * 拼取数地址。
+ * - legacy 直连：`<proxy>/amap` + 高德 path + query（含 key，代理只透传）；
+ * - REST 中转：`<base>/travel/map/rest` + 高德 path + query（**不带** key，服务端按用户注入）。
  */
 export const buildAmapUrl = (
     proxyUrl: string,
     path: string,
     params: Record<string, string | number | undefined>,
     key: string,
+    relay = false,
 ): string => {
     const base = proxyUrl.replace(/\/+$/, '');
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
         if (v !== undefined && v !== '') qs.set(k, String(v));
     }
-    qs.set('key', key);
-    return `${base}/amap${path}?${qs.toString()}`;
+    if (key && !relay) qs.set('key', key);
+    const prefix = relay ? '' : '/amap';
+    const query = qs.toString();
+    return `${base}${prefix}${path}${query ? `?${query}` : ''}`;
 };
 
-const fetchWithTimeout = async (url: string, ms: number): Promise<Response> => {
+const fetchWithTimeout = async (
+    url: string,
+    ms: number,
+    headers?: Record<string, string>,
+): Promise<Response> => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
-        return await fetch(url, { signal: ctrl.signal });
+        return await fetch(url, { signal: ctrl.signal, ...(headers ? { headers } : {}) });
     } finally {
         clearTimeout(timer);
     }
@@ -137,11 +160,12 @@ export const fetchAmap = async (
     key: string,
     label: string,
     timeoutMs = 8000,
+    opts?: { relay?: boolean; headers?: Record<string, string> },
 ): Promise<any> => {
-    const url = buildAmapUrl(proxyUrl, path, params, key);
+    const url = buildAmapUrl(proxyUrl, path, params, key, opts?.relay === true);
     let res: Response;
     try {
-        res = await fetchWithTimeout(url, timeoutMs);
+        res = await fetchWithTimeout(url, timeoutMs, opts?.headers);
     } catch (e: any) {
         throw new Error(`高德${label}请求失败（代理不可达或超时）: ${e?.message || e}`);
     }
@@ -163,6 +187,19 @@ export const fetchAmap = async (
     }
     return data;
 };
+
+/** 单次取数（带凭证通道选择）：消费方只传 AmapAuth，不再自己拼 proxyUrl/key。 */
+export const fetchAmapFor = async (
+    auth: AmapAuth,
+    path: string,
+    params: Record<string, string | number | undefined>,
+    label: string,
+    timeoutMs = 8000,
+): Promise<any> =>
+    fetchAmap(auth.proxyUrl, path, params, auth.key, label, timeoutMs, {
+        relay: auth.relay === true,
+        headers: auth.headers,
+    });
 
 /** 高德 location 串 "lng,lat"（经度在前）→ 数字。解析不出返回 undefined。 */
 export const parseAmapLocation = (loc: unknown): { lat: number; lng: number } | undefined => {
@@ -191,8 +228,8 @@ export const geocodeCity = async (
     timeoutMs = 8000,
 ): Promise<(StructuredPlace & { citycode?: string }) | null> => {
     const name = city.trim();
-    if (!name || !auth.key) return null;
-    const data = await fetchAmap(auth.proxyUrl, '/v3/geocode/geo', { address: name }, auth.key, '地理编码', timeoutMs);
+    if (!name || !isAmapAuthReady(auth)) return null;
+    const data = await fetchAmapFor(auth, '/v3/geocode/geo', { address: name }, '地理编码', timeoutMs);
     const hit = data?.geocodes?.[0];
     if (!hit) return null;
     const place: StructuredPlace & { citycode?: string } = {
@@ -222,12 +259,12 @@ export const regeoCity = async (
     auth: AmapAuth,
     timeoutMs = 8000,
 ): Promise<StructuredPlace | null> => {
-    if (!Number.isFinite(latWgs) || !Number.isFinite(lngWgs) || !auth.key) return null;
+    if (!Number.isFinite(latWgs) || !Number.isFinite(lngWgs) || !isAmapAuthReady(auth)) return null;
     const gcj = wgs84ToGcj02(latWgs, lngWgs);
-    const data = await fetchAmap(
-        auth.proxyUrl, '/v3/geocode/regeo',
+    const data = await fetchAmapFor(
+        auth, '/v3/geocode/regeo',
         { location: `${gcj.lng},${gcj.lat}`, extensions: 'base' },
-        auth.key, '逆地理编码', timeoutMs,
+        '逆地理编码', timeoutMs,
     );
     const comp = data?.regeocode?.addressComponent;
     if (!comp) return null;
@@ -254,13 +291,13 @@ export const fetchInputTips = async (
     timeoutMs = 8000,
 ): Promise<AmapInputTip[]> => {
     const kw = keywords.trim();
-    if (!kw || !auth.key) return [];
-    const data = await fetchAmap(auth.proxyUrl, '/v3/assistant/inputtips', {
+    if (!kw || !isAmapAuthReady(auth)) return [];
+    const data = await fetchAmapFor(auth, '/v3/assistant/inputtips', {
         keywords: kw,
         city,
         citylimit: city ? 'true' : 'false',
         datatype: 'poi',
-    }, auth.key, '输入提示', timeoutMs);
+    }, '输入提示', timeoutMs);
     const tips: any[] = Array.isArray(data?.tips) ? data.tips : [];
     return tips
         .filter((t) => t && typeof t.name === 'string' && t.name)
@@ -295,15 +332,15 @@ export const searchPlaces = async (
     auth: AmapAuth,
     opts?: { pageSize?: number; timeoutMs?: number },
 ): Promise<CityPlace[]> => {
-    if (!keywords.trim() || !city.trim() || !auth.key) return [];
-    const data = await fetchAmap(auth.proxyUrl, '/v3/place/text', {
+    if (!keywords.trim() || !city.trim() || !isAmapAuthReady(auth)) return [];
+    const data = await fetchAmapFor(auth, '/v3/place/text', {
         keywords: keywords.trim(),
         city: city.trim(),
         citylimit: 'true',
         extensions: 'base',
         page_size: opts?.pageSize ?? 8,
         page: 1,
-    }, auth.key, 'POI 检索', opts?.timeoutMs ?? 10000);
+    }, 'POI 检索', opts?.timeoutMs ?? 10000);
     const pois: any[] = Array.isArray(data?.pois) ? data.pois : [];
     const out: CityPlace[] = [];
     for (const p of pois) {

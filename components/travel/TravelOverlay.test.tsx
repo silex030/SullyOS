@@ -226,3 +226,81 @@ describe('TravelOverlay · 聊天入口', () => {
         host.remove();
     });
 });
+
+describe('TravelOverlay · 多角色顶部合并（真实 runtime 多 store）', () => {
+    const CHARS2 = [
+        { id: 'c1', name: '小满', avatarUrl: null },
+        { id: 'c2', name: '阿岚', avatarUrl: null },
+    ];
+
+    const snapshotFor = (charId: string) => {
+        const base = snapshotOf('en_route');
+        return {
+            ...base,
+            trip: {
+                ...base.trip,
+                dest: { label: charId === 'c2' ? '灵隐寺' : '西湖文化广场', city: '杭州' },
+            },
+        };
+    };
+
+    it('两人各自共享出行：合并成一条顶栏 + 两个切换按钮，切人不停另一个', async () => {
+        const seen: string[] = [];
+        const transport = vi.fn(async (url: string) => {
+            const charId = new URL(url).searchParams.get('charId') ?? 'c1';
+            seen.push(charId);
+            if (url.includes('/travel/state')) {
+                return new Response(
+                    JSON.stringify({
+                        snapshot: snapshotFor(charId),
+                        share: { userId: 'u1', charId, shareEnabled: true, version: 1 },
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response(JSON.stringify({}), { status: 404 });
+        });
+        const api = createTravelApi({
+            session: () => ({ token: TOKEN }),
+            baseUrl: () => 'https://backend.example',
+            transport: transport as never,
+            now: () => NOW,
+        });
+        const runtime = createTravelRuntime({
+            api,
+            session: () => ({ token: TOKEN }),
+            baseUrl: () => 'https://backend.example',
+            transport: transport as never,
+            now: () => NOW,
+        });
+
+        const host = document.createElement('div');
+        document.body.appendChild(host);
+        const root = createRoot(host);
+        await act(async () => {
+            root.render(<TravelOverlay characters={CHARS2} runtime={runtime} />);
+        });
+
+        // 只渲染一条顶栏，但它聚合了两个人（切换按钮 2 个）。
+        expect(host.querySelectorAll('[data-testid="travel-island"]')).toHaveLength(1);
+        expect(host.querySelectorAll('[data-testid="travel-island-switch"]')).toHaveLength(2);
+        // 两个角色都被读过共享位（不是只读第一个）。
+        expect(seen).toContain('c1');
+        expect(seen).toContain('c2');
+
+        const switches = host.querySelectorAll('[data-testid="travel-island-switch"]');
+        await act(async () => {
+            (switches[1] as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+
+        const multi = runtime.multi;
+        expect(multi).not.toBeNull();
+        // 切到 c2：聚焦变了，但 c1 的快照照样在（没被另一个人覆盖）。
+        expect(runtime.overlay.get().charId).toBe('c2');
+        expect(multi!.getMultiState().byChar.c1?.view?.trip?.dest?.label).toBe('西湖文化广场');
+        expect(multi!.getMultiState().byChar.c2?.view?.trip?.dest?.label).toBe('灵隐寺');
+
+        await act(async () => root.unmount());
+        host.remove();
+    });
+});

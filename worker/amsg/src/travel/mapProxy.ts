@@ -142,7 +142,11 @@ export const resetAmapProxyRateLimitForTesting = (): void => {
   rateBuckets.clear();
 };
 
-const takeRateLimit = (userId: string, nowMs: number, rpm: number): boolean => {
+/**
+ * 按用户固定窗口限流（进程级；测试可重置）。
+ * 导出给 REST 中转（`mapRest.ts`）共用同一本账：一次外部出口、一份额度。
+ */
+export const takeAmapRateLimit = (userId: string, nowMs: number, rpm: number): boolean => {
   const windowMs = 60_000;
   const bucket = rateBuckets.get(userId);
   if (!bucket || nowMs - bucket.windowStart >= windowMs) {
@@ -237,7 +241,7 @@ export async function handleAmapServiceProxy(
   }
 
   const rpm = Number.isFinite(deps.rpm ?? NaN) ? Math.max(1, Math.trunc(deps.rpm as number)) : DEFAULT_AMAP_PROXY_RPM;
-  if (!takeRateLimit(userId, nowMs, rpm)) {
+  if (!takeAmapRateLimit(userId, nowMs, rpm)) {
     return json(429, { error: { code: 'TOO_MANY_REQUESTS' } }, { 'Retry-After': '30' });
   }
 

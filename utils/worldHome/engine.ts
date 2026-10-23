@@ -31,7 +31,7 @@ import {
 } from './prompts';
 import { ensureThreads, applyBeatToThreads, applyNpcGroupLines, applyNpcDms, npcInboxes } from './threads';
 import { shouldCloseChapter, summarizeChapter, SIM_CHAPTER_CLOCKS } from './chapters';
-import { getCityLibrary, readAmapAuth } from '../cityPlaces';
+import { getCityLibrary, resolveAmapAuth } from '../cityPlaces';
 import { renderPlaceLibraryDating } from '../amapCore';
 
 /**
@@ -42,7 +42,7 @@ const resolveWorldPlaceBlock = async (world: WorldProfile): Promise<string | und
     const city = (world.city || '').trim();
     if (!city) return undefined;
     try {
-        const lib = await getCityLibrary(city, readAmapAuth());
+        const lib = await getCityLibrary(city, await resolveAmapAuth());
         return lib ? renderPlaceLibraryDating(lib) : undefined;
     } catch (e) {
         console.warn('[WorldHome] 世界地点库拉取失败:', e instanceof Error ? e.message : e);

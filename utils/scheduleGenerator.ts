@@ -10,7 +10,7 @@ import { loadCharacterContextRange } from './chatContextRange';
 import { ChatPrompts } from './chatPrompts';
 import { cleanApiMessages, flattenImageContentParts } from './promptMessageCleanup';
 import { getFlowNarrativeKey, isScheduleFeatureOn } from './scheduleFeature';
-import { getCityLibrary, readAmapAuth } from './cityPlaces';
+import { getCityLibrary, resolveAmapAuth } from './cityPlaces';
 import { matchPlace } from './geoMatch';
 import { renderPlaceLibraryFull, type CityPlaceLibrary } from './amapCore';
 
@@ -303,7 +303,7 @@ export async function generateDailyScheduleForChar(
     const scheduleCity = (char.location?.city || '').trim();
     if (style !== 'mindful' && scheduleCity) {
         try {
-            placeLib = await getCityLibrary(scheduleCity, readAmapAuth());
+            placeLib = await getCityLibrary(scheduleCity, await resolveAmapAuth());
             if (placeLib) placeBlock = renderPlaceLibraryFull(placeLib);
         } catch (e) {
             console.warn('[Schedule] 地点库拉取失败，本次无真实地点注入:', e instanceof Error ? e.message : e);

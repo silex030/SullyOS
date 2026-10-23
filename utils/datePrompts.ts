@@ -25,7 +25,7 @@ import { injectMemoryPalace } from './memoryPalace/pipeline';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
 import { getVoicePromptOverride } from './ttsProvider';
 import { matchPlace } from './geoMatch';
-import { getCityLibrary, readAmapAuth } from './cityPlaces';
+import { getCityLibrary, resolveAmapAuth } from './cityPlaces';
 import { renderPlaceLibraryDating, type CityPlace } from './amapCore';
 
 export type ApiMessage = { role: string; content: any };
@@ -776,7 +776,7 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
         const placeLibPromise = (() => {
             const dateCity = (char.location?.city || '').trim();
             if (!dateCity) return Promise.resolve(null);
-            return getCityLibrary(dateCity, readAmapAuth()).catch(() => null);
+            return resolveAmapAuth().then((auth) => getCityLibrary(dateCity, auth)).catch(() => null);
         })();
 
         // 向量召回挂到 char.memoryPalaceInjection，buildCoreContext 会读取

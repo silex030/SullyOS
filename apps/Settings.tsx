@@ -12,11 +12,11 @@ import { buildGoogleAuthUrl } from '../utils/googleCalendar';
 import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled as saveMcdEnabled, testMcdConnection, resetMcdSession } from '../utils/mcdMcpClient';
 import { getLuckinToken, setLuckinToken as saveLuckinToken, isLuckinEnabled, setLuckinEnabled as saveLuckinEnabled, testLuckinConnection, resetLuckinSession } from '../utils/luckinMcpClient';
 import { consumeProxyWorkerSettingsFocus, getProxyWorkerUrl, setProxyWorkerUrl, DEFAULT_PROXY_WORKER } from '../utils/proxyWorker';
-import { geocodeCity, isAuthErrorCode, isQuotaErrorCode } from '../utils/amapCore';
+import { geocodeCity, isAmapAuthReady, isAuthErrorCode, isQuotaErrorCode } from '../utils/amapCore';
 import { probeMossVoiceStatus } from '../utils/genieTts';
 import { describeMossVoiceStatus, type MossVoiceStatus } from '../utils/mossTtsStatus';
 import MossVoicePicker from '../components/voice/MossVoicePicker';
-import { deleteCachedLibrary, getCityLibrary, listCachedLibraries } from '../utils/cityPlaces';
+import { deleteCachedLibrary, getCityLibrary, listCachedLibraries, resolveAmapAuth } from '../utils/cityPlaces';
 import { VOICE_ACTING_GUIDE } from '../utils/minimaxTts';
 import { FISH_VOICE_ACTING_GUIDE } from '../utils/fishAudioTts';
 import {
@@ -1952,14 +1952,16 @@ const Settings: React.FC = () => {
 
   // 测试地点数据源：用默认城市做一次地理编码（只验 key 与连通，不建地点库）
   const testAmapApi = async () => {
-      if (!rtAmapKey.trim()) {
-          setRtTestStatus('请先填写高德 Web 服务 Key');
+      // 凭证只看服务端那份（经出行会话的 REST 中转）；本机旧 Key 不再是消费来源。
+      const auth = await resolveAmapAuth();
+      if (!isAmapAuthReady(auth)) {
+          setRtTestStatus('还没有可用的地图服务：先在下面「申请连接」并保存 Web 服务 Key');
           return;
       }
       const city = rtWeatherCity.trim() || '上海';
       setRtTestStatus('正在测试地点数据源...');
       try {
-          const place = await geocodeCity(city, { proxyUrl: getProxyWorkerUrl(), key: rtAmapKey.trim() });
+          const place = await geocodeCity(city, auth);
           if (!place) {
               setRtTestStatus(`连接失败: 高德找不到城市「${city}」`);
               return;
@@ -1975,13 +1977,14 @@ const Settings: React.FC = () => {
 
   // 地点库管理：手动刷新（强制重拉）/ 删除（下次用到自动重建）
   const refreshPlaceLib = async (city: string) => {
-      if (!rtAmapKey.trim()) {
-          setRtTestStatus('请先填写高德 Key 再刷新地点库');
+      const auth = await resolveAmapAuth();
+      if (!isAmapAuthReady(auth)) {
+          setRtTestStatus('还没有可用的地图服务：先保存 Web 服务 Key 再刷新地点库');
           return;
       }
       setRtTestStatus(`正在刷新${city}的地点库...`);
       try {
-          await getCityLibrary(city, { proxyUrl: getProxyWorkerUrl(), key: rtAmapKey.trim() }, { forceRefresh: true });
+          await getCityLibrary(city, auth, { forceRefresh: true });
           setRtPlaceLibs(await listCachedLibraries());
           setRtTestStatus(`刷新成功！${city}地点库已更新`);
       } catch (e: any) {

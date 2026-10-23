@@ -60,6 +60,7 @@ import {
   type TravelMapCredentialPatch,
 } from './mapCredentials';
 import { mintTravelMapServiceHost } from './mapProxy';
+import { handleMapRestRelay } from './mapRest';
 
 import { isTerminalStatus, pickAnchorFields, sanitizeAnchorLabel } from '../../../../utils/travel/core';
 
@@ -111,6 +112,10 @@ export interface TravelRouteDeps {
   mapTestFetch?: typeof globalThis.fetch;
   /** 「测试连接」的上游地址（测试注入；生产固定官方 restapi）。 */
   mapTestUpstreamBase?: string;
+  /** 地图 REST 中转（cityPlaces / 地理编码 / 地点检索）的上游与 fetch 注入。 */
+  mapRestFetch?: typeof globalThis.fetch;
+  mapRestUpstreamBase?: string;
+  mapRestRpm?: number;
 }
 
 export interface TravelRouteEnv {
@@ -267,6 +272,7 @@ export async function handleTravelRequest(
   const method = request.method.toUpperCase();
   if (!/\/travel\/(state|share|budget|settings|config|char|anchor|context)$/.test(pathname)
     && !/\/travel\/anchor\/search$/.test(pathname)
+    && !/\/travel\/map\/rest(\/.*)?$/.test(pathname)
     && !/\/travel\/map\/credentials(\/test)?$/.test(pathname)) {
     return null;
   }
@@ -299,6 +305,20 @@ export async function handleTravelRequest(
   const userId = resolved.userId;
 
   if (!db) return fail(503, 'PROVIDER_FAILED');
+
+  // 地图 REST 中转：已鉴权（上面已解出主体）→ 按该用户读 **Web 服务 Key** → allowlist 转发。
+  // 放在 suffix 分派之前：路径 `/travel/map/rest/v3/...` 不匹配 travel 的简单后缀。
+  if (pathname.includes('/travel/map/rest')) {
+    return await handleMapRestRelay(request, {
+      db: db as never,
+      masterKey: readMapMasterKey(env),
+      userId,
+      nowMs,
+      fetch: deps.mapRestFetch,
+      upstreamBase: deps.mapRestUpstreamBase,
+      rpm: deps.mapRestRpm,
+    });
+  }
 
   const charAllowed = (charId: string): boolean => {
     if (!charId) return false;

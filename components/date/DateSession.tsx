@@ -6,7 +6,7 @@ import { DB } from '../../utils/db';
 import DateSettings from './DateSettings';
 import ObserveHUD from './ObserveHUD';
 import { extractObservation, hasObservation, enrichObservationPlace } from '../../utils/datePrompts';
-import { getCityLibrary, readAmapAuth } from '../../utils/cityPlaces';
+import { getCityLibrary, resolveAmapAuth } from '../../utils/cityPlaces';
 import type { CityPlace } from '../../utils/amapCore';
 import { useBlobRefUrl } from '../../utils/blobRef';
 import TokenImg from '../os/TokenImg';
@@ -230,7 +230,7 @@ const DateSession: React.FC<DateSessionProps> = ({
             return null;
         }
         try {
-            const lib = await getCityLibrary(city, readAmapAuth());
+            const lib = await getCityLibrary(city, await resolveAmapAuth());
             datePlacesRef.current = lib ? lib.places : null;
         } catch {
             datePlacesRef.current = null;

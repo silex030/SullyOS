@@ -290,3 +290,166 @@ export function createTravelStateStore(options: TravelStateStoreOptions = {}): T
         getProgress,
     };
 }
+
+// ==================== 多角色（每角色独立 store + 独立取消句柄） ====================
+
+/** 多角色聚合视图：一次渲染拿到所有角色的脱敏快照（不跨角色复用别人的数据）。 */
+export interface TravelMultiStateView {
+    /** 面板/预算当前聚焦的角色（不改变其它角色是否在轮询）。 */
+    activeCharId: string | null;
+    byChar: Record<string, TravelStateView>;
+}
+
+/**
+ * 多角色 store：每个 char 一个独立 store 与独立轮询取消句柄。
+ *
+ * 旧实现（单 store）在切角色时会 `stop` 上一个角色的轮询，导致顶部只剩一个人；
+ * 这里的硬约定：
+ * - `startPolling` 只影响传入的 charId，切角色不停别人的轮询；
+ * - `stopChar` / `revokeChar` 只清该角色（共享关掉不会抹掉另一个人的在途行程）；
+ * - 聚合视图只暴露各角色自己 store 里已经过 `sanitize` 的数据，不共享快照、不串数据；
+ * - `getState()` 返回当前聚焦角色的视图（面板/预算沿用单角色读法）。
+ */
+export interface TravelMultiStateStore extends TravelStateStore {
+    getMultiState: () => TravelMultiStateView;
+    subscribeMulti: (listener: (state: TravelMultiStateView) => void) => () => void;
+    setActiveChar: (charId: string | null) => void;
+    getStateFor: (charId: string) => TravelStateView;
+    /** 只改这个角色的共享位（别的角色不受影响）。 */
+    applyShareFor: (charId: string, share: TravelShareState) => void;
+    /** 只把这个角色的共享位标成「读不到可信值」。 */
+    applyShareUnavailableFor: (charId: string) => void;
+    getCharIds: () => string[];
+    stopChar: (charId: string) => void;
+    stopAll: () => void;
+    /** 撤销：立刻清掉该角色的 trip/坐标/路线/历史（不停别人）。 */
+    revokeChar: (charId: string) => void;
+}
+
+/**
+ * 空视图必须是**同一个对象**：`getState` 要喂给 useSyncExternalStore，
+ * 每次返回新字面量会被 React 判成「快照一直在变」而无限重渲染。
+ */
+const EMPTY_VIEW: TravelStateView = Object.freeze({
+    view: null,
+    status: 'idle',
+    error: null,
+    shareEnabled: false,
+    shareKnown: false,
+    shareVersion: 0,
+    receivedAt: 0,
+    serverNow: 0,
+    clockSkewMs: 0,
+    confirmedAt: 0,
+    staleDropCount: 0,
+});
+
+const emptyView = (): TravelStateView => EMPTY_VIEW;
+
+export function createTravelMultiStateStore(
+    options: TravelStateStoreOptions = {},
+): TravelMultiStateStore {
+    const perChar = new Map<string, TravelStateStore>();
+    const cancels = new Map<string, () => void>();
+    const listeners = new Set<(state: TravelMultiStateView) => void>();
+    let active: string | null = null;
+    let snapshot: TravelMultiStateView = { activeCharId: null, byChar: {} };
+
+    const rebuild = () => {
+        const byChar: Record<string, TravelStateView> = {};
+        for (const [id, store] of perChar) byChar[id] = store.getState();
+        snapshot = { activeCharId: active, byChar };
+        for (const fn of listeners) fn(snapshot);
+    };
+
+    const storeFor = (charId: string): TravelStateStore => {
+        const existing = perChar.get(charId);
+        if (existing) return existing;
+        const created = createTravelStateStore(options);
+        perChar.set(charId, created);
+        created.subscribe(() => rebuild());
+        rebuild();
+        return created;
+    };
+
+    const getStateFor = (charId: string): TravelStateView =>
+        perChar.get(charId)?.getState() ?? emptyView();
+
+    const current = (): TravelStateView => {
+        if (active) return getStateFor(active);
+        const ids = [...perChar.keys()];
+        return ids.length === 1 ? getStateFor(ids[0]!) : emptyView();
+    };
+
+    return {
+        getState: current,
+        getStateFor,
+        subscribe: (listener) => {
+            const wrapped = () => listener(current());
+            listeners.add(wrapped);
+            return () => listeners.delete(wrapped);
+        },
+        getMultiState: () => snapshot,
+        subscribeMulti: (listener) => {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        },
+        setActiveChar: (charId) => {
+            const next = charId && charId.trim() ? charId.trim() : null;
+            if (next === active) return;
+            if (next) storeFor(next);
+            active = next;
+            rebuild();
+        },
+        getCharIds: () => [...perChar.keys()],
+        startPolling: (args) => {
+            const store = storeFor(args.charId);
+            cancels.get(args.charId)?.();
+            const stop = store.startPolling(args);
+            cancels.set(args.charId, stop);
+            return () => {
+                cancels.get(args.charId)?.();
+                cancels.delete(args.charId);
+            };
+        },
+        stopChar: (charId) => {
+            cancels.get(charId)?.();
+            cancels.delete(charId);
+        },
+        stopAll: () => {
+            for (const stop of cancels.values()) stop();
+            cancels.clear();
+        },
+        revokeChar: (charId) => {
+            cancels.get(charId)?.();
+            cancels.delete(charId);
+            const store = perChar.get(charId);
+            if (!store) return;
+            const prev = store.getState();
+            // 立刻本地撤销：按「本周期共享已关」清 trip/坐标/路线/历史，把版本推进一格，
+            // 避免紧跟着到达的旧包把内容又贴回来；只影响这个角色。
+            store.applyShare({
+                shareEnabled: false,
+                version: prev.shareVersion + 1,
+            } as TravelShareState);
+        },
+        applyShareFor: (charId, share) => {
+            storeFor(charId).applyShare(share);
+        },
+        applyShareUnavailableFor: (charId) => {
+            storeFor(charId).applyShareUnavailable();
+        },
+        applyShare: (share) => {
+            if (active) storeFor(active).applyShare(share);
+        },
+        applyShareUnavailable: () => {
+            if (active) storeFor(active).applyShareUnavailable();
+        },
+        applySnapshot: (snapshotValue) => (active ? storeFor(active).applySnapshot(snapshotValue) : false),
+        markUnconfirmed: (error) => {
+            if (active) storeFor(active).markUnconfirmed(error);
+        },
+        serverNowAt: (localNow) => current().confirmedAt ? localNow + current().clockSkewMs : localNow,
+        getProgress: () => (active ? perChar.get(active)?.getProgress() ?? null : null),
+    };
+}

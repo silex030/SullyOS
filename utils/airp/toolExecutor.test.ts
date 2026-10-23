@@ -139,26 +139,31 @@ describe('createChatToolExecutor —— weather_lookup_place runner', () => {
 });
 
 describe('createChatToolExecutor —— amap_search_places runner', () => {
-    const AMAP_CONFIG_KEY = 'os_realtime_config';
-
-    function seedAmapConfig(key: string | null): void {
-        if (key === null) localStorage.removeItem(AMAP_CONFIG_KEY);
-        else localStorage.setItem(AMAP_CONFIG_KEY, JSON.stringify({ amapApiKey: key }));
-    }
+    // 凭证来源已是「出行会话 → 本站 REST 中转」，不再读 localStorage 旧 Key。
+    // 单测通过注入缝给一个已就绪的中转 auth（key 恒为空，浏览器不见 Web 服务 Key）。
+    const RELAY_AUTH = {
+        proxyUrl: 'https://app.example/travel/map/rest',
+        key: '',
+        relay: true,
+        headers: { Authorization: 'Bearer test-session-token-0123456789' },
+    };
 
     function makeAmapExecutor(impl: (
         keywords: string,
         city: string,
         category: unknown,
         auth: unknown,
-    ) => Promise<CityPlace[]>): {
+    ) => Promise<CityPlace[]>, auth: unknown = RELAY_AUTH): {
         executor: AirpToolExecutor;
         amapSearch: ReturnType<typeof vi.fn>;
         dispatch: ReturnType<typeof vi.fn>;
     } {
         const amapSearch = vi.fn(impl);
         const dispatch = vi.fn(async () => 'never');
-        const executor = createChatToolExecutor(dispatch as any, ctx, { amapSearch });
+        const executor = createChatToolExecutor(dispatch as any, ctx, {
+            amapSearch,
+            amapAuth: async () => auth as never,
+        });
         return { executor, amapSearch, dispatch };
     }
 
@@ -174,10 +179,7 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
         }));
     }
 
-    beforeEach(() => { seedAmapConfig(null); });
-
-    it('命中：固定 spot 类别、带真实 auth 调取数，最多渲染 5 行 name — address', async () => {
-        seedAmapConfig('test-amap-key');
+    it('命中：固定 spot 类别、带中转 auth 调取数（不含明文 Key），最多渲染 5 行 name — address', async () => {
         const { executor, amapSearch, dispatch } = makeAmapExecutor(async () => makePlaces(6));
 
         const result = await executor.executeTool('amap_search_places', { keywords: '咖啡馆', city: '杭州' });
@@ -187,7 +189,8 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
         expect(call[0]).toBe('咖啡馆');
         expect(call[1]).toBe('杭州');
         expect(call[2]).toBe('spot');
-        expect(call[3]).toEqual({ proxyUrl: expect.any(String), key: 'test-amap-key' });
+        expect(call[3]).toEqual(RELAY_AUTH);
+        expect((call[3] as { key: string }).key).toBe('');
         expect(dispatch).not.toHaveBeenCalled();
         expect(result).toEqual({
             ok: true,
@@ -196,7 +199,6 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
     });
 
     it('结果为空：报「附近没搜到相关地点」', async () => {
-        seedAmapConfig('test-amap-key');
         const { executor } = makeAmapExecutor(async () => []);
 
         expect(await executor.executeTool('amap_search_places', { keywords: '咖啡馆', city: '杭州' }))
@@ -204,7 +206,6 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
     });
 
     it('keywords / city 空白：点名缺的那一项，不调取数（city 无 ctx 回落）', async () => {
-        seedAmapConfig('test-amap-key');
         const { executor, amapSearch } = makeAmapExecutor(async () => []);
 
         expect(await executor.executeTool('amap_search_places', { city: '杭州' }))
@@ -216,9 +217,8 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
         expect(amapSearch).not.toHaveBeenCalled();
     });
 
-    it('没配 key：报「地图服务未配置」，不让空结果冒充搜过了', async () => {
-        seedAmapConfig(null);
-        const { executor, amapSearch } = makeAmapExecutor(async () => []);
+    it('没有可用凭证（无会话/未配对）：报「地图服务未配置」，不让空结果冒充搜过了', async () => {
+        const { executor, amapSearch } = makeAmapExecutor(async () => [], { proxyUrl: '', key: '' });
 
         expect(await executor.executeTool('amap_search_places', { keywords: '咖啡馆', city: '杭州' }))
             .toEqual({ ok: true, text: '地图服务未配置' });
@@ -226,7 +226,6 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
     });
 
     it('取数抛错：降级成文本，不把异常抛给 directorClient', async () => {
-        seedAmapConfig('test-amap-key');
         const { executor } = makeAmapExecutor(async () => { throw new Error('proxy down'); });
 
         expect(await executor.executeTool('amap_search_places', { keywords: '咖啡馆', city: '杭州' }))
@@ -234,7 +233,6 @@ describe('createChatToolExecutor —— amap_search_places runner', () => {
     });
 
     it('amap_route 保持未接线：目录里没有它，执行直接抛错', async () => {
-        seedAmapConfig('test-amap-key');
         const { executor, amapSearch, dispatch } = makeAmapExecutor(async () => []);
 
         await expect(executor.executeTool('amap_route', { from: 'A', to: 'B' }))

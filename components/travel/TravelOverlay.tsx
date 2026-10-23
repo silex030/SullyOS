@@ -58,11 +58,23 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
 }) => {
     const runtime = injected ?? getTravelRuntime();
     const state = useSyncExternalStore(runtime.store.subscribe, runtime.store.getState, runtime.store.getState);
+    // 多角色聚合视图：每个角色自己的 store（互不覆盖），一次渲染拿到全部条目。
+    const multiStore = runtime.multi ?? null;
+    const subscribeMulti = useCallback(
+        (cb: () => void) => (multiStore ? multiStore.subscribeMulti(cb) : () => {}),
+        [multiStore],
+    );
+    const readMulti = useCallback(
+        () => (multiStore ? multiStore.getMultiState() : null),
+        [multiStore],
+    );
+    const readMultiServer = useCallback(() => null, []);
+    const multiView = useSyncExternalStore(subscribeMulti, readMulti, readMultiServer);
     const overlay = useSyncExternalStore(runtime.overlay.subscribe, runtime.overlay.get, runtime.overlay.get);
     const personaSim = usePersonaSim();
     const dreamSim = useDreamSim();
     const [confirmEnd, setConfirmEnd] = useState(false);
-    const refreshedFor = useRef<string | null>(null);
+    const refreshedFor = useRef<Set<string>>(new Set());
     // 地图配置：先在首帧用构建期兜底，随后按已签名会话拉服务端凭据（用户自己填的优先）。
     const [config, setConfig] = useState<TravelMapRuntimeConfig>(
         () => mapConfig ?? readTravelMapConfig(),
@@ -97,12 +109,24 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
     const shareVisible = state.shareEnabled && state.shareKnown;
     const activeCharId = overlay.charId ?? characters[0]?.id ?? null;
 
-    // 打开面板 / 首次拿到角色时读一次共享位；之后交给轮询。失败 → fail-closed。
+    /**
+     * 挂载时给**每个**角色各读一次共享位（一次读 → 各自决定是否轮询；只有真的在共享的
+     * 角色才会进入 15s 轮询，未共享的角色不占用后台预算）。切角色只是切换聚焦，
+     * 不会停掉别人的轮询，也不会把别人的位置拿来展示。
+     * 读失败 → 该角色 fail-closed（不渲染条目），不影响其他角色。
+     */
     useEffect(() => {
-        const target = overlay.open ? activeCharId : characters[0]?.id ?? null;
-        if (!target || refreshedFor.current === target) return;
-        refreshedFor.current = target;
-        void runtime.refreshShare(target);
+        const ids = characters.map((c) => c.id).filter(Boolean);
+        if (ids.length === 0) return;
+        const pending = ids.filter((id) => !refreshedFor.current.has(id));
+        if (overlay.open && activeCharId && !refreshedFor.current.has(activeCharId)) {
+            // 打开面板时优先补当前角色，其余角色随后（顺序不影响数据隔离）。
+            pending.sort((a, b) => (a === activeCharId ? -1 : b === activeCharId ? 1 : 0));
+        }
+        for (const id of pending) {
+            refreshedFor.current.add(id);
+            void runtime.refreshShare(id);
+        }
     }, [runtime, overlay.open, activeCharId, characters]);
 
     /**
@@ -167,29 +191,46 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
      * 换人/合并逻辑在 `TravelActivityIsland` 里已就绪（等 store 支持多角色时直接接上）。
      */
     const islandEntries: TravelIslandEntry[] = useMemo(() => {
+        const build = (char: TravelCharacterView, s: typeof state): TravelIslandEntry | null => {
+            const trip = s.view?.code === 'OK' ? s.view.trip : null;
+            if (!trip) return null;
+            return {
+                char,
+                phase: trip.status,
+                destinationLabel: trip.dest?.label ?? null,
+                originLabel: trip.origin?.label ?? null,
+                // 面板与岛都不编 ETA：契约没有可信到达时间就空着。
+                etaMs: null,
+                updatedAt: s.confirmedAt || s.receivedAt || null,
+                paused: false,
+                stale: s.status === 'unconfirmed',
+                shareEnabled: s.shareEnabled,
+                shareKnown: s.shareKnown,
+            };
+        };
+        if (multiView) {
+            const out: TravelIslandEntry[] = [];
+            for (const char of characters) {
+                const s = multiView.byChar[char.id];
+                if (!s || !s.shareEnabled || !s.shareKnown) continue;
+                const entry = build(char, s);
+                if (entry) out.push(entry);
+            }
+            return out;
+        }
         if (!shareVisible) return [];
         const trip = state.view?.code === 'OK' ? state.view.trip : null;
         if (!trip) return [];
         const chars = activeCharId ? characters.filter((c) => c.id === activeCharId) : characters.slice(0, 1);
-        return chars.map((char) => ({
-            char,
-            phase: trip.status,
-            destinationLabel: trip.dest?.label ?? null,
-            originLabel: trip.origin?.label ?? null,
-            // 面板与岛都不编 ETA：契约没有可信到达时间就空着。
-            etaMs: null,
-            updatedAt: state.confirmedAt || state.receivedAt || null,
-            paused: false,
-            stale: state.status === 'unconfirmed',
-            shareEnabled: state.shareEnabled,
-            shareKnown: state.shareKnown,
-        }));
-    }, [shareVisible, state, characters, activeCharId]);
+        return chars
+            .map((char) => build(char, state))
+            .filter((e): e is TravelIslandEntry => e !== null);
+    }, [multiView, shareVisible, state, characters, activeCharId]);
 
     const handleSelect = useCallback(
         (charId: string) => {
             runtime.overlay.open(charId);
-            refreshedFor.current = charId;
+            refreshedFor.current.add(charId);
             void runtime.refreshShare(charId);
         },
         [runtime],
@@ -218,7 +259,7 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
                 activeCharId={activeCharId}
                 onOpen={(id) => {
                     runtime.overlay.open(id);
-                    refreshedFor.current = id;
+                    refreshedFor.current.add(id);
                     void runtime.refreshShare(id);
                 }}
                 onSelect={handleSelect}

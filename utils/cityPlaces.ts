@@ -13,13 +13,15 @@
 import {
     fetchCityLibrary,
     geocodeCity,
+    isAmapAuthReady,
     wgs84ToGcj02,
     type AmapAuth,
     type CityPlaceLibrary,
     type StructuredPlace,
 } from './amapCore';
 import { geocodeCityOpenMeteo } from './realtimeWorldCore';
-import { getProxyWorkerUrl } from './proxyWorker';
+import { readAgentRoutingConfig } from './agentRouting';
+import { ensureTravelSession, readTravelOwnerCredential, readTravelSession } from './travel/session';
 
 const GEO_DB_NAME = 'sully_geo_cache';
 const GEO_STORE = 'city_places';
@@ -148,7 +150,7 @@ export const getCityLibrary = async (
     opts?: { forceRefresh?: boolean },
 ): Promise<CityPlaceLibrary | null> => {
     const name = cityName.trim();
-    if (!name || !auth.key) return null;
+    if (!name || !isAmapAuthReady(auth)) return null;
 
     const cached = findLibrary(await readAllLibraries(), name);
     if (cached && isFresh(cached) && !opts?.forceRefresh) return cached;
@@ -196,7 +198,7 @@ export const resolveStructuredPlace = async (
     known?: { province?: string; city?: string; district?: string; lat?: number; lng?: number; adcode?: string },
 ): Promise<StructuredPlace | null> => {
     const name = cityName.trim();
-    if (!name || !auth.key) return null;
+    if (!name || !isAmapAuthReady(auth)) return null;
     if (known?.adcode && known.lat != null && known.lng != null && known.city) {
         return {
             province: known.province,
@@ -215,20 +217,48 @@ export const resolveStructuredPlace = async (
     }
 };
 
-/**
- * 浏览器侧读高德调用凭证：key（localStorage realtimeConfig）+ 代理地址。
- * Node/测试环境读不到存储时返回空 key（调用方按无 key 降级）。
- */
-export const readAmapAuth = (): AmapAuth => {
-    let key = '';
+/** 本站鉴权 REST 中转前缀（服务端按用户读 Web 服务 Key，浏览器不见 Key）。 */
+export const AMAP_REST_RELAY_PATH = '/travel/map/rest';
+
+const resolveBackendBase = (): string => {
+    const configured = String(readAgentRoutingConfig().agentUrl ?? '').trim();
+    if (configured) return configured.replace(/\/+$/, '');
     try {
-        const raw = localStorage.getItem('os_realtime_config');
-        if (raw) {
-            const cfg = JSON.parse(raw);
-            if (typeof cfg?.amapApiKey === 'string') key = cfg.amapApiKey.trim();
+        return typeof window !== 'undefined' ? window.location.origin : '';
+    } catch {
+        return '';
+    }
+};
+
+/**
+ * 浏览器侧解析高德取数凭证：**唯一**来源是「已签名出行会话 + 本站 REST 中转」。
+ *
+ * - 不再读 localStorage 里的旧 `amapApiKey`：旧 Key 只作为设置页「迁移本机旧 Key」的
+ *   输入，由用户显式迁到服务端加密存储，之后消费者只走服务端；
+ * - 没有出行会话（未配对 / 会话过期且无法续期）→ 返回未就绪（`key` 空、`relay` 假），
+ *   调用方按「未配置」降级，不拿空 Key 打请求，也不猜一个 Key 出来；
+ * - Key 类型分工：这里用的是 **Web 服务 Key**（经 REST 中转）；浏览器 JS SDK 的
+ *   `_AMapService` 走另一条只注入 JS Key + jscode 的通道，两者不混用。
+ */
+export const resolveAmapAuth = async (now: number = Date.now()): Promise<AmapAuth> => {
+    const base = resolveBackendBase();
+    if (!base) return { proxyUrl: '', key: '' };
+    let token = String(readTravelSession(now)?.token ?? '').trim();
+    if (!token && readTravelOwnerCredential()) {
+        try {
+            await ensureTravelSession({ now });
+        } catch {
+            /* 续期失败：按未登录处理，不发请求 */
         }
-    } catch { /* 非浏览器/存储不可用：无 key 降级 */ }
-    return { proxyUrl: getProxyWorkerUrl(), key };
+        token = String(readTravelSession(now)?.token ?? '').trim();
+    }
+    if (!token) return { proxyUrl: '', key: '' };
+    return {
+        proxyUrl: `${base}${AMAP_REST_RELAY_PATH}`,
+        key: '',
+        relay: true,
+        headers: { Authorization: `Bearer ${token}` },
+    };
 };
 
 /** localStorage 里的用户城市镜像键（updateUserProfile 单点写，只到城市级）。 */
@@ -269,7 +299,7 @@ export const enrichMoveToPlace = async (
 ): Promise<StructuredPlace | null> => {
     const name = city.trim();
     if (!name) return null;
-    if (auth.key) {
+    if (isAmapAuthReady(auth)) {
         try {
             const hit = await geocodeCity(name, auth, timeoutMs);
             if (hit) return hit;

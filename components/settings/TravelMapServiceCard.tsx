@@ -141,12 +141,20 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
     setWebKey(''); setJsKey(''); setJsCode(''); setMapbox('');
     setNote('已加密保存到服务端 · 输入框已清空');
     if (killLegacyAfterWrite && onLegacyMigrated && patch.amapWebKey) {
-      // 读回确认服务端确有该字段后才清本地旧值；失败保留。
-      onLegacyMigrated();
+      // 严格读回：只有服务端**再次 GET 就报 has.amapWebKey=true** 才删本机旧值。
+      // 保存响应乐观、网络/解密/版本冲突等都可能让写入实际没落地——那时必须保留旧 Key，
+      // 否则用户既没迁成功也丢了本地唯一一份。
+      const readback = await runtime.readMapCredentials().catch(() => null);
+      const confirmed = !!readback?.known && readback.credentials?.has?.amapWebKey === true;
       setKillLegacyAfterWrite(false);
+      if (!confirmed) {
+        setNote('服务端没确认这条 Web 服务 Key：本机旧 Key 已保留，可重试「保存地图凭据」');
+        return;
+      }
+      onLegacyMigrated();
       setNote('已迁移本机旧 Key 并清掉本地明文');
     }
-  }, [webKey, jsKey, jsCode, mapbox, writeCredentials, killLegacyAfterWrite, onLegacyMigrated]);
+  }, [webKey, jsKey, jsCode, mapbox, writeCredentials, killLegacyAfterWrite, onLegacyMigrated, runtime]);
 
   const handleMigrateLegacy = useCallback(async () => {
     const key = legacyKey.trim();

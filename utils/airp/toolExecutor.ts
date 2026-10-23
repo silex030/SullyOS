@@ -1,7 +1,8 @@
 import type { AgenticToolCtx, dispatchAgenticTool as DispatchFn } from '../agenticTools';
 import type { AirpToolExecution, AirpToolExecutor } from './directorClient';
 import { searchPlaces, type AmapAuth, type CityPlace, type PlaceCategory } from '../amapCore';
-import { readAmapAuth } from '../cityPlaces';
+import { isAmapAuthReady } from '../amapCore';
+import { resolveAmapAuth } from '../cityPlaces';
 import { fetchWeatherWithFallback, generateWeatherAdvice, type WeatherData } from '../realtimeWorldCore';
 import { DB } from '../db';
 
@@ -69,6 +70,11 @@ const AMAP_SEARCH_LIMIT = 5;
  */
 export interface AirpToolExecutorExtras {
     weatherLookup?: (city: string) => Promise<WeatherData | null>;
+    /**
+     * 地图取数凭证解析缝（单测注入用）。默认走 {@link resolveAmapAuth}：
+     * 已签名出行会话 → 本站 REST 中转，浏览器不持有 Web 服务 Key。
+     */
+    amapAuth?: () => Promise<AmapAuth>;
     amapSearch?: (
         keywords: string,
         city: string,
@@ -141,8 +147,8 @@ async function runAmapSearch(
 
     // key 检查必须在调用前：searchPlaces 没 key 时静默返回 []，那会被导演误读成
     // 「这里确实没有咖啡馆」，比明说「没配置」糟得多。
-    const auth = readAmapAuth();
-    if (!auth.key) return { ok: true, text: TEXT_AMAP_UNCONFIGURED };
+    const auth = await (extra?.amapAuth ?? resolveAmapAuth)();
+    if (!isAmapAuthReady(auth)) return { ok: true, text: TEXT_AMAP_UNCONFIGURED };
 
     // category 只是 App 侧的结果标签（PlaceCategory），从不作为参数进高德请求，
     // 也不在导演契约里；导演的关键字搜索没有类别概念，固定 'spot'。
