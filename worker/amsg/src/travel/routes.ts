@@ -50,6 +50,17 @@ import {
   shareGenerationStartMs,
 } from './state';
 import { buildStaticMapUrl } from './staticmap';
+import {
+  getTravelMapCredentialStatus,
+  resolveTravelMapCredentialValues,
+  saveTravelMapCredentials,
+  TRAVEL_MAP_CREDENTIAL_FIELDS,
+  type SaveFailureCode,
+  type TravelMapCredentialField,
+  type TravelMapCredentialPatch,
+} from './mapCredentials';
+import { mintTravelMapServiceHost } from './mapProxy';
+
 import { isTerminalStatus, pickAnchorFields, sanitizeAnchorLabel } from '../../../../utils/travel/core';
 
 export interface TravelPrincipal {
@@ -91,9 +102,15 @@ export interface TravelRouteDeps {
    * 锚点检索 / placeId 解析。按 userId 构造：地图预算是一账号一本账，
    * 端口必须知道这次请求花的是谁的额度（不能共用一个匿名端口）。
    */
-  anchorSearchFor?: ((userId: string) => TravelAnchorSearchPort | null) | null;
+  anchorSearchFor?: ((userId: string) => TravelAnchorSearchPort | null | Promise<TravelAnchorSearchPort | null>) | null;
   /** 静态图签名钥；缺 → 不给缩略图 URL（组件文字降级），不伪造图片。 */
   staticMapSecret?: string;
+  /** 地图代理短期会话签名钥（与 session secret 同源但域分隔）；缺 → 不回 serviceHost。 */
+  mapProxySecret?: string;
+  /** 「测试连接」的注入 fetch（测试用）；生产传 globalThis.fetch。 */
+  mapTestFetch?: typeof globalThis.fetch;
+  /** 「测试连接」的上游地址（测试注入；生产固定官方 restapi）。 */
+  mapTestUpstreamBase?: string;
 }
 
 export interface TravelRouteEnv {
@@ -185,6 +202,60 @@ const anchorView = (row: Awaited<ReturnType<typeof getTravelAnchor>>) =>
 const isSessionFailure = (value: unknown): value is TravelSessionFailure =>
   !!value && typeof value === 'object' && (value as TravelSessionFailure).ok === false;
 
+/** 「测试连接」30 秒冷却（显式点击才允许一次真实请求）。 */
+const MAP_TEST_COOLDOWN_MS = 30_000;
+const mapTestLastAt = new Map<string, number>();
+/** 仅供单测重置，不进生产路径。 */
+export const resetMapTestCooldownForTesting = (): void => {
+  mapTestLastAt.clear();
+};
+
+const readMapMasterKey = (env: TravelRouteEnv | null | undefined): string => {
+  const raw = (env as { AMSG_MASTER_KEY?: unknown } | null | undefined)?.AMSG_MASTER_KEY;
+  return typeof raw === 'string' ? raw.trim() : '';
+};
+
+const readCredentialField = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+/** 凭据视图：**只**含存在性与公开展示 Key（Web 服务 Key / jscode 永不回前端）。 */
+const mapCredentialView = async (args: {
+  db: TravelDb;
+  userId: string;
+  masterKey: string;
+  proxySecret?: string;
+  nowMs: number;
+}) => {
+  const status = await getTravelMapCredentialStatus({
+    db: args.db as never,
+    userId: args.userId,
+    masterKey: args.masterKey,
+  });
+  let serviceHost: string | null = null;
+  let serviceHostExpiresAt: number | null = null;
+  if (status.configured && status.has.amapJsKey && status.has.amapJsCode && args.proxySecret) {
+    const minted = await mintTravelMapServiceHost({
+      userId: args.userId,
+      secret: args.proxySecret,
+      nowMs: args.nowMs,
+    });
+    if (minted) {
+      serviceHost = minted.serviceHost;
+      serviceHostExpiresAt = minted.expiresAt;
+    }
+  }
+  return {
+    configured: status.configured,
+    unreadable: status.unreadable,
+    has: status.has,
+    amapJsKey: status.amapJsKey,
+    mapboxToken: status.mapboxToken,
+    mapboxStyleUrl: status.mapboxStyleUrl,
+    updatedAt: status.updatedAt,
+    serviceHost,
+    serviceHostExpiresAt,
+  };
+};
+
 /** 路由入口。返回 null = 不是本层认的 `/travel/*`，调用方继续原有分支。 */
 export async function handleTravelRequest(
   request: Request,
@@ -195,7 +266,8 @@ export async function handleTravelRequest(
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method.toUpperCase();
   if (!/\/travel\/(state|share|budget|settings|config|char|anchor|context)$/.test(pathname)
-    && !/\/travel\/anchor\/search$/.test(pathname)) {
+    && !/\/travel\/anchor\/search$/.test(pathname)
+    && !/\/travel\/map\/credentials(\/test)?$/.test(pathname)) {
     return null;
   }
 
@@ -421,6 +493,95 @@ export async function handleTravelRequest(
       });
     }
 
+    // 地图服务凭据：用户自己填，服务端按主体加密保存。保存本身不发任何收费请求。
+    if (suffix === 'map/credentials' && method === 'GET') {
+      return json(200, await mapCredentialView({
+        db,
+        userId,
+        masterKey: readMapMasterKey(env),
+        proxySecret: deps.mapProxySecret,
+        nowMs,
+      }));
+    }
+
+    if (suffix === 'map/credentials' && method === 'PUT') {
+      const body = await readJsonBody(request);
+      if (!body) return fail(400, 'UNAUTHORIZED');
+      const masterKey = readMapMasterKey(env);
+      if (!masterKey) return fail(503, 'PROVIDER_FAILED');
+      // 合规许可仍是运维 env：填 Key 不能顺手解锁几何落库。
+      if (body.geometryPersistence !== undefined || body.basemapDisplay !== undefined || body.licensedGeometry !== undefined) {
+        return fail(400, 'GEOMETRY_NOT_LICENSED');
+      }
+      const patch: TravelMapCredentialPatch = {};
+      for (const field of TRAVEL_MAP_CREDENTIAL_FIELDS) {
+        if (body[field] !== undefined) patch[field] = readCredentialField(body[field]);
+      }
+      const clear = Array.isArray(body.clear)
+        ? body.clear.filter((item): item is TravelMapCredentialField =>
+          typeof item === 'string' && (TRAVEL_MAP_CREDENTIAL_FIELDS as readonly string[]).includes(item))
+        : [];
+      const result = await saveTravelMapCredentials({
+        db: db as never,
+        userId,
+        masterKey,
+        patch,
+        clear,
+        nowMs,
+      });
+      if (!result.ok) {
+        const status = result.code === 'UNAUTHORIZED' ? 401 : result.code === 'INVALID_FIELD' ? 400 : 409;
+        return json(status, { error: { code: result.code satisfies SaveFailureCode } });
+      }
+      return json(200, await mapCredentialView({
+        db,
+        userId,
+        masterKey,
+        proxySecret: deps.mapProxySecret,
+        nowMs,
+      }));
+    }
+
+    // 显式「测试连接」：单次、有冷却、不扣自主出行预算；失败只回布尔与错误码。
+    if (suffix === 'map/credentials/test' && method === 'POST') {
+      const last = mapTestLastAt.get(userId) ?? 0;
+      if (nowMs - last < MAP_TEST_COOLDOWN_MS) {
+        return json(429, { ok: false, code: 'TOO_MANY_REQUESTS' });
+      }
+      mapTestLastAt.set(userId, nowMs);
+      const credentials = await resolveTravelMapCredentialValues({
+        db: db as never,
+        userId,
+        masterKey: readMapMasterKey(env),
+      });
+      const webKey = credentials?.amapWebKey ?? '';
+      if (!webKey) return json(200, { ok: false, code: 'MAP_NOT_CONFIGURED' });
+
+      const base = (deps.mapTestUpstreamBase ?? 'https://restapi.amap.com').replace(/\/+$/, '');
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      let ok = false;
+      let code = 'PROVIDER_FAILED';
+      try {
+        const params = new URLSearchParams({ address: '北京市', key: webKey });
+        const res = await (deps.mapTestFetch ?? globalThis.fetch)(
+          `${base}/v3/geocode/geo?${params.toString()}`,
+          { method: 'GET', signal: controller.signal, headers: { Accept: 'application/json' } },
+        );
+        if (res.ok) {
+          const body = await res.json().catch(() => null) as { status?: unknown; geocodes?: unknown } | null;
+          ok = String(body?.status ?? '') === '1' && Array.isArray(body?.geocodes) && body.geocodes.length > 0;
+          code = ok ? 'OK' : 'PROVIDER_FAILED';
+        }
+      } catch {
+        ok = false;
+        code = 'PROVIDER_FAILED';
+      } finally {
+        clearTimeout(timer);
+      }
+      return json(200, { ok, code });
+    }
+
     if (suffix === 'char' && method === 'GET') {
       const charId = readString(url.searchParams.get('charId'));
       if (!charAllowed(charId)) return fail(403, 'PRINCIPAL_MISMATCH');
@@ -482,7 +643,7 @@ export async function handleTravelRequest(
       const charId = scopedCharId;
       const q = readString(url.searchParams.get('q'));
       if (q.length < 2) return json(200, { results: [] });
-      const port = deps.anchorSearchFor?.(userId) ?? null;
+      const port = (await deps.anchorSearchFor?.(userId)) ?? null;
       if (!port) return json(200, { results: [], provider: 'unavailable' });
       // 高德文本检索是「城市内检索」，没有城市就不发请求（也不拿城市中心猜）。
       let city = readString(url.searchParams.get('city'));
@@ -518,7 +679,7 @@ export async function handleTravelRequest(
       let picked: ReturnType<typeof pickAnchorFields> = null;
       const placeId = readString(body.placeId);
       if (placeId) {
-        const port = deps.anchorSearchFor?.(userId) ?? null;
+        const port = (await deps.anchorSearchFor?.(userId)) ?? null;
         if (!port) return fail(503, 'ANCHOR_NOT_CONFIRMED');
         const place = await port.resolve(placeId);
         if (!place) return fail(400, 'ANCHOR_NOT_CONFIRMED');

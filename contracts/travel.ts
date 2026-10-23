@@ -175,7 +175,8 @@ export type TravelErrorCode =
     | 'ANCHOR_NOT_CONFIRMED'
     | 'ROUTE_UNAVAILABLE'
     | 'GEOMETRY_NOT_LICENSED'
-    | 'RETENTION_EXPIRED';
+    | 'RETENTION_EXPIRED'
+    | 'INVALID_FIELD';
 
 export const TRAVEL_ERROR_CODES = [
     'UNAUTHORIZED',
@@ -193,6 +194,8 @@ export const TRAVEL_ERROR_CODES = [
     'ROUTE_UNAVAILABLE',
     'GEOMETRY_NOT_LICENSED',
     'RETENTION_EXPIRED',
+    /** 用户填的地图凭据字段格式不合法（带控制字符 / 超长）。 */
+    'INVALID_FIELD',
 ] as const satisfies readonly TravelErrorCode[];
 
 /** 状态机：只列允许的边；其余一律非法（含终态自环）。 */
@@ -380,5 +383,15 @@ CREATE TABLE IF NOT EXISTS travel_share_state (
   version INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, char_id)
+);
+
+-- 地图服务凭据（用户在前端自己填）：整份 JSON 用 deriveUserEncryptionKey 派生的
+-- 每用户密钥加密后存这里。**只在服务端解密**；GET 只回存在性与浏览器必需的公开
+-- 展示 Key（JS API / Mapbox pk.），Web 服务 Key 与 jscode 永不出后端。
+CREATE TABLE IF NOT EXISTS travel_map_credentials (
+  user_id TEXT PRIMARY KEY,
+  encrypted_value TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
 );
 `.trim();

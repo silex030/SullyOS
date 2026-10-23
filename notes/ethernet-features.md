@@ -279,3 +279,15 @@
   契约表却没有）。
   **未完成**：高德/Mapbox 真实账号权限与配额、`/_AMapService` 反代、真机视觉验收（见
   `docs/travel-contract.md` §11.5）。
+- 2026-10-23（地图凭据补齐，未提交/未部署）：**用户在前端自己填高德 Key，后台加密保存，不再手改 env / 重构建**。
+  - 新表 `travel_map_credentials`（`contracts/travel.ts` DDL），整份 JSON 用 `deriveUserEncryptionKey` + `encryptForStorage` 按账号加密；
+    复用既有 crypto 与 `AMSG_MASTER_KEY`，**没有新建全局 owner**；换过 masterKey 时 `unreadable` 且拒绝覆盖。
+  - `GET/PUT /travel/map/credentials`（只回存在性 + JS API / Mapbox `pk.` 公开展示 Key + 短期 `serviceHost`；Web 服务 Key 与 jscode 永不出后端）、
+    `POST /travel/map/credentials/test`（显式一次、30 秒冷却、不扣出行预算）。空字段保持不变，清除走显式 `clear`；填 Key 不能解锁几何许可。
+  - `/_AMapService/t/<token>` 安全代理（`worker/amsg/src/travel/mapProxy.ts`）：HMAC 绑定 userId + 过期；白名单 7 个只读端点；
+    上游固定 `restapi.amap.com`；覆盖 `key`、服务端注入 `jscode`；跨用户/过期/非 GET/超限流一律拒绝。
+  - provider / 锚点检索 / 静态图 / tick 都改为**按主体解密凭据优先**，worker 级 env 仅在 `TRAVEL_MAP_ENV_FALLBACK=allow` 时兜底；
+    `TravelOverlay` 运行期从服务端取配置（`utils/travel/mapRuntime.ts`，内存缓存），设置后无需重构建。
+  - 设置页新增四个 password 输入 + 保存/清除/测试按钮，`autocomplete=new-password`，成功清空并读回存在性，失败不覆盖草稿。
+  - 回归 17（mapCredentials/mapProxy/mapProviders）+ routes 5 + 设置 UI 3 + 前端 runtime 5 + loader 3；全部合成 Key，未发真实收费请求。
+  - 未验证：VPS Caddy `handle /_AMapService/*` 路由（样板在 `docs/travel-map-credentials.md`，未应用）；用户真实 Key 的权限与出图。

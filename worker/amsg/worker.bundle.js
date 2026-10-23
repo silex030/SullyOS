@@ -7895,13 +7895,13 @@ var plateConsolidateHandler = {
       await discardJob(ctx.writeState, jobId);
       throw new Error(message);
     };
-    let json3;
+    let json4;
     try {
-      json3 = await unpackStateValue(row.value);
+      json4 = await unpackStateValue(row.value);
     } catch (error) {
       return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09\uFF1A${String(error)}`);
     }
-    const job = parsePlateJobInput(json3);
+    const job = parsePlateJobInput(json4);
     if (!job) return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u6790\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`);
     if (job.charId !== charId) {
       return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684 charId \u4E0E\u4EFB\u52A1\u5BF9\u4E0D\u4E0A`);
@@ -9870,9 +9870,9 @@ var isEncryptedEnvelope2 = (value) => {
   return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
 };
 var handleInstantChat = async (args) => {
-  const { request, env, upstream: upstream2, json: json3 } = args;
+  const { request, env, upstream: upstream2, json: json4 } = args;
   const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
-  const fail7 = (status, code, message, extra) => json3(status, { success: false, error: { code, message, ...extra ?? {} } });
+  const fail7 = (status, code, message, extra) => json4(status, { success: false, error: { code, message, ...extra ?? {} } });
   const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
   const clientToken = request.headers.get("X-Client-Token") ?? "";
   if (token) {
@@ -9941,7 +9941,7 @@ var handleInstantChat = async (args) => {
     if (stateResponse.status < 500) break;
   }
   if (!stateResponse.ok) {
-    return json3(stateResponse.status, {
+    return json4(stateResponse.status, {
       success: false,
       error: {
         code: "INSTANT_CHAT_STATE_FAILED",
@@ -9954,7 +9954,7 @@ var handleInstantChat = async (args) => {
   }
   const skippedEntries = stateBody?.data?.skippedEntries;
   if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
-    return json3(409, {
+    return json4(409, {
       success: false,
       error: {
         code: "INSTANT_CHAT_STATE_STALE",
@@ -9974,7 +9974,7 @@ var handleInstantChat = async (args) => {
   const taskBody = await readBody(taskResponse);
   if (!taskResponse.ok) {
     const taskCause = readUpstreamCause(taskResponse.status, taskBody);
-    return json3(taskResponse.status, {
+    return json4(taskResponse.status, {
       success: false,
       error: {
         code: "INSTANT_CHAT_TASK_FAILED",
@@ -9995,10 +9995,10 @@ var handleInstantChat = async (args) => {
   if (!kicked.ok && kicked.reason === "missing-binding") {
     if ((env.SULLYOS_RUNTIME ?? "").trim() === "vps") {
       console.warn("[amsg:instant-chat] VPS \u6A21\u5F0F\uFF1A\u65E0 INSTANT_TICK \u7ED1\u5B9A\uFF0C\u4EFB\u52A1\u5DF2\u53D7\u7406\u3001\u7B49 node-cron \u6361\u8D70", uuid);
-      return json3(202, { status: "accepted", uuid });
+      return json4(202, { status: "accepted", uuid });
     }
     console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
-    return json3(503, {
+    return json4(503, {
       success: false,
       error: {
         code: "INSTANT_CHAT_WORKER_OUTDATED",
@@ -10011,7 +10011,7 @@ var handleInstantChat = async (args) => {
   if (!kicked.ok) {
     console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
   }
-  return json3(202, { status: "accepted", uuid });
+  return json4(202, { status: "accepted", uuid });
 };
 
 // contracts/travel.ts
@@ -10030,7 +10030,9 @@ var TRAVEL_ERROR_CODES = [
   "ANCHOR_NOT_CONFIRMED",
   "ROUTE_UNAVAILABLE",
   "GEOMETRY_NOT_LICENSED",
-  "RETENTION_EXPIRED"
+  "RETENTION_EXPIRED",
+  /** 用户填的地图凭据字段格式不合法（带控制字符 / 超长）。 */
+  "INVALID_FIELD"
 ];
 var TRAVEL_TRANSITIONS = {
   considering: ["planned", "aborted", "expired", "unavailable"],
@@ -10198,6 +10200,16 @@ CREATE TABLE IF NOT EXISTS travel_share_state (
   version INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, char_id)
+);
+
+-- \u5730\u56FE\u670D\u52A1\u51ED\u636E\uFF08\u7528\u6237\u5728\u524D\u7AEF\u81EA\u5DF1\u586B\uFF09\uFF1A\u6574\u4EFD JSON \u7528 deriveUserEncryptionKey \u6D3E\u751F\u7684
+-- \u6BCF\u7528\u6237\u5BC6\u94A5\u52A0\u5BC6\u540E\u5B58\u8FD9\u91CC\u3002**\u53EA\u5728\u670D\u52A1\u7AEF\u89E3\u5BC6**\uFF1BGET \u53EA\u56DE\u5B58\u5728\u6027\u4E0E\u6D4F\u89C8\u5668\u5FC5\u9700\u7684\u516C\u5F00
+-- \u5C55\u793A Key\uFF08JS API / Mapbox pk.\uFF09\uFF0CWeb \u670D\u52A1 Key \u4E0E jscode \u6C38\u4E0D\u51FA\u540E\u7AEF\u3002
+CREATE TABLE IF NOT EXISTS travel_map_credentials (
+  user_id TEXT PRIMARY KEY,
+  encrypted_value TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
 );
 `.trim();
 
@@ -18864,7 +18876,8 @@ async function handleTravelStaticMap(request, env, deps) {
   if (!share?.shareEnabled) {
     return jsonNoStore(403, { error: { code: "SHARE_REVOKED" } });
   }
-  const key = String(env?.AMAP_WEB_KEY ?? "").trim();
+  const userKey = deps.resolveWebKey ? await deps.resolveWebKey().catch(() => null) : null;
+  const key = String(userKey ?? env?.AMAP_WEB_KEY ?? "").trim();
   if (!key) return jsonNoStore(503, { error: { code: "PROVIDER_FAILED" } });
   const trip = await getActiveTravelTrip(db, { userId, charId });
   if (!trip) return jsonNoStore(404, { error: { code: "ROUTE_UNAVAILABLE" } });
@@ -18909,19 +18922,376 @@ async function handleTravelStaticMap(request, env, deps) {
   }
 }
 
-// worker/amsg/src/travel/routes.ts
+// worker/amsg/src/travel/mapCredentials.ts
+var TRAVEL_MAP_CREDENTIAL_FIELDS = [
+  "amapWebKey",
+  "amapJsKey",
+  "amapJsCode",
+  "mapboxToken",
+  "mapboxStyleUrl"
+];
+var EMPTY = {
+  amapWebKey: "",
+  amapJsKey: "",
+  amapJsCode: "",
+  mapboxToken: "",
+  mapboxStyleUrl: ""
+};
+var isRecord8 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var cleanSecret = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.length > 512) return null;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return null;
+  return trimmed;
+};
+var parseStored = (raw) => {
+  if (!isRecord8(raw)) return null;
+  const out = { ...EMPTY };
+  for (const field of TRAVEL_MAP_CREDENTIAL_FIELDS) {
+    const value = raw[field];
+    if (typeof value === "string") out[field] = value;
+  }
+  return out;
+};
+var normalizeForStore = (values) => ({
+  amapWebKey: values.amapWebKey.trim(),
+  amapJsKey: values.amapJsKey.trim(),
+  amapJsCode: values.amapJsCode.trim(),
+  mapboxToken: values.mapboxToken.trim(),
+  mapboxStyleUrl: values.mapboxStyleUrl.trim()
+});
+async function readTravelMapCredentialRow(args) {
+  let row = null;
+  try {
+    row = await args.db.prepare("SELECT encrypted_value, version, updated_at FROM travel_map_credentials WHERE user_id = ?").bind(args.userId).first();
+  } catch {
+    return { kind: "absent" };
+  }
+  if (!row) return { kind: "absent" };
+  const version = Number(row.version ?? 0) || 0;
+  const updatedAt = Number(row.updated_at ?? 0) || 0;
+  const encrypted = typeof row.encrypted_value === "string" ? row.encrypted_value : "";
+  const masterKey = typeof args.masterKey === "string" ? args.masterKey.trim() : "";
+  if (!encrypted || !masterKey) return { kind: "unreadable", version, updatedAt };
+  try {
+    const userKey = await deriveUserEncryptionKey(args.userId, masterKey);
+    const plain = await decryptFromStorage(encrypted, userKey);
+    const parsed = parseStored(JSON.parse(plain));
+    if (!parsed) return { kind: "unreadable", version, updatedAt };
+    return { kind: "ok", values: normalizeForStore(parsed), version, updatedAt };
+  } catch {
+    return { kind: "unreadable", version, updatedAt };
+  }
+}
+var isPublicMapboxToken = (token) => token.startsWith("pk.") && token.length >= 20;
+async function getTravelMapCredentialStatus(args) {
+  const read = await readTravelMapCredentialRow(args);
+  if (read.kind === "absent") {
+    return {
+      configured: false,
+      unreadable: false,
+      has: { amapWebKey: false, amapJsKey: false, amapJsCode: false, mapboxToken: false },
+      amapJsKey: null,
+      mapboxToken: null,
+      mapboxStyleUrl: null,
+      updatedAt: null
+    };
+  }
+  if (read.kind === "unreadable") {
+    return {
+      configured: false,
+      unreadable: true,
+      has: { amapWebKey: false, amapJsKey: false, amapJsCode: false, mapboxToken: false },
+      amapJsKey: null,
+      mapboxToken: null,
+      mapboxStyleUrl: null,
+      updatedAt: read.updatedAt || null
+    };
+  }
+  const v = read.values;
+  return {
+    configured: true,
+    unreadable: false,
+    has: {
+      amapWebKey: !!v.amapWebKey,
+      amapJsKey: !!v.amapJsKey,
+      amapJsCode: !!v.amapJsCode,
+      mapboxToken: !!v.mapboxToken
+    },
+    amapJsKey: v.amapJsKey || null,
+    mapboxToken: isPublicMapboxToken(v.mapboxToken) ? v.mapboxToken : null,
+    mapboxStyleUrl: v.mapboxStyleUrl || null,
+    updatedAt: read.updatedAt || null
+  };
+}
+async function resolveTravelMapCredentialValues(args) {
+  const read = await readTravelMapCredentialRow(args);
+  return read.kind === "ok" ? read.values : null;
+}
+async function saveTravelMapCredentials(input) {
+  const masterKey = typeof input.masterKey === "string" ? input.masterKey.trim() : "";
+  if (!masterKey) return { ok: false, code: "UNAUTHORIZED" };
+  const patch = { ...EMPTY };
+  for (const field of TRAVEL_MAP_CREDENTIAL_FIELDS) {
+    const raw = input.patch[field];
+    if (raw === void 0) continue;
+    const cleaned = cleanSecret(raw);
+    if (cleaned === null) return { ok: false, code: "INVALID_FIELD" };
+    patch[field] = cleaned;
+  }
+  const clearSet = new Set(input.clear ?? []);
+  const existing = await readTravelMapCredentialRow({
+    db: input.db,
+    userId: input.userId,
+    masterKey
+  });
+  if (existing.kind === "unreadable") return { ok: false, code: "UNREADABLE" };
+  const base = existing.kind === "ok" ? existing.values : { ...EMPTY };
+  const next = { ...base };
+  for (const field of TRAVEL_MAP_CREDENTIAL_FIELDS) {
+    if (clearSet.has(field)) {
+      next[field] = "";
+    } else if (patch[field]) {
+      next[field] = patch[field];
+    }
+  }
+  let encrypted;
+  try {
+    const userKey = await deriveUserEncryptionKey(input.userId, masterKey);
+    encrypted = await encryptForStorage(JSON.stringify(normalizeForStore(next)), userKey);
+  } catch {
+    return { ok: false, code: "UNAUTHORIZED" };
+  }
+  try {
+    if (existing.kind === "absent") {
+      await input.db.prepare(
+        "INSERT INTO travel_map_credentials (user_id, encrypted_value, version, updated_at) VALUES (?, ?, 1, ?)"
+      ).bind(input.userId, encrypted, Math.trunc(input.nowMs)).run();
+    } else {
+      const result = await input.db.prepare(
+        "UPDATE travel_map_credentials SET encrypted_value = ?, version = version + 1, updated_at = ? WHERE user_id = ? AND version = ?"
+      ).bind(encrypted, Math.trunc(input.nowMs), input.userId, existing.version).run();
+      const changes = Number(
+        result?.meta?.changes ?? result?.changes ?? 0
+      );
+      if (changes !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+    }
+  } catch {
+    return { ok: false, code: "VERSION_CONFLICT" };
+  }
+  const status = await getTravelMapCredentialStatus({
+    db: input.db,
+    userId: input.userId,
+    masterKey
+  });
+  return { ok: true, status };
+}
+
+// worker/amsg/src/travel/mapProxy.ts
+var AMAP_SERVICE_PREFIX = "/_AMapService";
+var AMAP_PROXY_UPSTREAM = "https://restapi.amap.com";
+var AMAP_PROXY_TOKEN_TTL_MS = 30 * 6e4;
+var AMAP_PROXY_MAX_TTL_MS = 60 * 6e4;
+var AMAP_PROXY_ALLOWED_PATHS = [
+  "/v3/place/text",
+  "/v3/place/around",
+  "/v3/geocode/geo",
+  "/v3/geocode/regeo",
+  "/v3/direction/walking",
+  "/v3/direction/driving",
+  "/v3/distance"
+];
+var SIGN_LABEL = "sullyos-travel-amap-proxy-v1";
+var encoder3 = new TextEncoder();
+var toBase64Url3 = (bytes) => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+var fromBase64Url3 = (text) => {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  try {
+    const binary = atob(padded + pad);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+};
+var encodeUserTag = (userId) => toBase64Url3(encoder3.encode(`u:${userId}`));
+var decodeUserTag = (tag) => {
+  const bytes = fromBase64Url3(tag);
+  if (!bytes) return null;
+  const text = new TextDecoder().decode(bytes);
+  if (!text.startsWith("u:")) return null;
+  const userId = text.slice(2).trim();
+  return userId && userId.length <= 128 && !/[\u0000-\u001f]/.test(userId) ? userId : null;
+};
+var hmacKey2 = (secret) => crypto.subtle.importKey("raw", encoder3.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+var sign2 = async (secret, payload) => toBase64Url3(new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey2(secret), encoder3.encode(payload))));
+var constantTimeEqual3 = (a, b) => {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+};
+async function mintTravelMapServiceHost(input) {
+  const secret = (input.secret ?? "").trim();
+  const userId = String(input.userId ?? "").trim();
+  if (secret.length < 32 || !userId) return null;
+  const ttl = Math.min(
+    Math.max(Math.trunc(input.ttlMs ?? AMAP_PROXY_TOKEN_TTL_MS), 3e4),
+    AMAP_PROXY_MAX_TTL_MS
+  );
+  const exp = Math.trunc(input.nowMs) + ttl;
+  const tag = encodeUserTag(userId);
+  const signature = await sign2(secret, `${SIGN_LABEL}.${tag}.${exp}`);
+  const token = `${tag}.${exp}.${signature}`;
+  return { serviceHost: `${AMAP_SERVICE_PREFIX}/t/${token}`, expiresAt: exp };
+}
+async function verifyTravelMapProxyToken(token, input) {
+  const secret = (input.secret ?? "").trim();
+  if (secret.length < 32) return { ok: false, reason: "proxy-secret-unconfigured" };
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "proxy-token-malformed" };
+  const [tag, expRaw, signature] = parts;
+  const exp = Number(expRaw);
+  if (!Number.isFinite(exp)) return { ok: false, reason: "proxy-token-malformed" };
+  if (exp <= input.nowMs) return { ok: false, reason: "proxy-token-expired" };
+  if (exp - input.nowMs > AMAP_PROXY_MAX_TTL_MS + 6e4) return { ok: false, reason: "proxy-token-ttl-invalid" };
+  const expected = await sign2(secret, `${SIGN_LABEL}.${tag}.${Math.trunc(exp)}`);
+  if (!constantTimeEqual3(expected, signature)) return { ok: false, reason: "proxy-token-signature-invalid" };
+  const userId = decodeUserTag(tag);
+  if (!userId) return { ok: false, reason: "proxy-token-user-invalid" };
+  return { ok: true, value: { userId, exp: Math.trunc(exp) } };
+}
+var rateBuckets = /* @__PURE__ */ new Map();
+var DEFAULT_AMAP_PROXY_RPM = 40;
+var takeRateLimit = (userId, nowMs, rpm) => {
+  const windowMs = 6e4;
+  const bucket = rateBuckets.get(userId);
+  if (!bucket || nowMs - bucket.windowStart >= windowMs) {
+    rateBuckets.set(userId, { windowStart: nowMs, count: 1 });
+    return true;
+  }
+  if (bucket.count >= rpm) return false;
+  bucket.count += 1;
+  return true;
+};
 var CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "600",
+  Vary: "Origin"
+};
+var json2 = (status, body, extra = {}) => new Response(JSON.stringify(body), {
+  status,
+  headers: {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    ...CORS_HEADERS,
+    ...extra
+  }
+});
+var isAmapServiceProxyPath = (pathname) => pathname.includes(AMAP_SERVICE_PREFIX);
+var parseProxyPath = (pathname) => {
+  const start = pathname.indexOf(AMAP_SERVICE_PREFIX);
+  if (start < 0) return null;
+  const prefix = `${AMAP_SERVICE_PREFIX}/t/`;
+  const scoped = pathname.slice(start);
+  if (!scoped.startsWith(prefix)) return null;
+  const rest = scoped.slice(prefix.length);
+  const slash = rest.indexOf("/");
+  if (slash <= 0) return null;
+  const token = rest.slice(0, slash);
+  const endpoint = rest.slice(slash);
+  if (!token || !endpoint) return null;
+  return { token, endpoint };
+};
+async function handleAmapServiceProxy(request, deps) {
+  const url = new URL(request.url);
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+  if (!isAmapServiceProxyPath(pathname)) return null;
+  if (request.method.toUpperCase() === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  if (request.method.toUpperCase() !== "GET") return json2(405, { error: { code: "METHOD_NOT_ALLOWED" } });
+  const parsed = parseProxyPath(pathname);
+  if (!parsed) return json2(400, { error: { code: "BAD_REQUEST" } });
+  const nowMs = (deps.now ?? (() => Date.now()))();
+  const verified = await verifyTravelMapProxyToken(parsed.token, { secret: deps.secret, nowMs });
+  if (!verified.ok) {
+    const status = verified.reason.includes("secret") ? 503 : 403;
+    return json2(status, { error: { code: status === 503 ? "UNAUTHORIZED" : "INVALID_CLIENT_TOKEN" } });
+  }
+  const userId = verified.value.userId;
+  if (!AMAP_PROXY_ALLOWED_PATHS.includes(parsed.endpoint)) {
+    return json2(403, { error: { code: "ENDPOINT_NOT_ALLOWED" } });
+  }
+  const rpm = Number.isFinite(deps.rpm ?? NaN) ? Math.max(1, Math.trunc(deps.rpm)) : DEFAULT_AMAP_PROXY_RPM;
+  if (!takeRateLimit(userId, nowMs, rpm)) {
+    return json2(429, { error: { code: "TOO_MANY_REQUESTS" } }, { "Retry-After": "30" });
+  }
+  const credentials = await resolveTravelMapCredentialValues({
+    db: deps.db,
+    userId,
+    masterKey: deps.masterKey
+  });
+  const jsKey = credentials?.amapJsKey ?? "";
+  const jsCode = credentials?.amapJsCode ?? "";
+  if (!jsKey || !jsCode) return json2(503, { error: { code: "MAP_NOT_CONFIGURED" } });
+  const search = url.search.slice(1);
+  if (search.length > 2048) return json2(400, { error: { code: "BAD_REQUEST" } });
+  const params = new URLSearchParams(search);
+  params.delete("jscode");
+  params.set("key", jsKey);
+  params.set("jscode", jsCode);
+  const base = (deps.upstreamBase ?? AMAP_PROXY_UPSTREAM).replace(/\/+$/, "");
+  const controller = new AbortController();
+  const timeoutMs = deps.timeoutMs ?? 8e3;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let upstream2;
+  try {
+    upstream2 = await (deps.fetch ?? globalThis.fetch)(`${base}${parsed.endpoint}?${params.toString()}`, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { Accept: "application/json" }
+    });
+  } catch {
+    return json2(502, { error: { code: "PROVIDER_FAILED" } });
+  } finally {
+    clearTimeout(timer);
+  }
+  const text = await upstream2.text().catch(() => "");
+  return new Response(text, {
+    status: upstream2.status,
+    headers: {
+      "Content-Type": upstream2.headers.get("Content-Type") ?? "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS
+    }
+  });
+}
+
+// worker/amsg/src/travel/routes.ts
+var CORS_HEADERS2 = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
   "Access-Control-Max-Age": "600",
   Vary: "Origin"
 };
-var json2 = (status, body) => new Response(JSON.stringify(body), {
+var json3 = (status, body) => new Response(JSON.stringify(body), {
   status,
-  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS }
+  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS2 }
 });
-var fail3 = (status, code) => json2(status, { error: { code } });
+var fail3 = (status, code) => json3(status, { error: { code } });
 var ERROR_SET = new Set(TRAVEL_ERROR_CODES);
 var readToken = (request) => {
   const raw = request.headers.get("Authorization") ?? "";
@@ -18968,15 +19338,53 @@ var anchorView = (row) => row ? {
   confirmedAt: row.confirmedAt
 } : null;
 var isSessionFailure = (value) => !!value && typeof value === "object" && value.ok === false;
+var MAP_TEST_COOLDOWN_MS = 3e4;
+var mapTestLastAt = /* @__PURE__ */ new Map();
+var readMapMasterKey = (env) => {
+  const raw = env?.AMSG_MASTER_KEY;
+  return typeof raw === "string" ? raw.trim() : "";
+};
+var readCredentialField = (value) => typeof value === "string" ? value : "";
+var mapCredentialView = async (args) => {
+  const status = await getTravelMapCredentialStatus({
+    db: args.db,
+    userId: args.userId,
+    masterKey: args.masterKey
+  });
+  let serviceHost = null;
+  let serviceHostExpiresAt = null;
+  if (status.configured && status.has.amapJsKey && status.has.amapJsCode && args.proxySecret) {
+    const minted = await mintTravelMapServiceHost({
+      userId: args.userId,
+      secret: args.proxySecret,
+      nowMs: args.nowMs
+    });
+    if (minted) {
+      serviceHost = minted.serviceHost;
+      serviceHostExpiresAt = minted.expiresAt;
+    }
+  }
+  return {
+    configured: status.configured,
+    unreadable: status.unreadable,
+    has: status.has,
+    amapJsKey: status.amapJsKey,
+    mapboxToken: status.mapboxToken,
+    mapboxStyleUrl: status.mapboxStyleUrl,
+    updatedAt: status.updatedAt,
+    serviceHost,
+    serviceHostExpiresAt
+  };
+};
 async function handleTravelRequest(request, env, deps) {
   const url = new URL(request.url);
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
   const method = request.method.toUpperCase();
-  if (!/\/travel\/(state|share|budget|settings|config|char|anchor|context)$/.test(pathname) && !/\/travel\/anchor\/search$/.test(pathname)) {
+  if (!/\/travel\/(state|share|budget|settings|config|char|anchor|context)$/.test(pathname) && !/\/travel\/anchor\/search$/.test(pathname) && !/\/travel\/map\/credentials(\/test)?$/.test(pathname)) {
     return null;
   }
   if (method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { status: 204, headers: CORS_HEADERS2 });
   }
   const nowMs = (deps.now ?? (() => Date.now()))();
   const licenses = resolveTravelLicenses(env);
@@ -18992,7 +19400,7 @@ async function handleTravelRequest(request, env, deps) {
   }
   if (isSessionFailure(resolved)) {
     const code = ERROR_SET.has(resolved.code) ? resolved.code : "UNAUTHORIZED";
-    return json2(resolved.status || 401, {
+    return json3(resolved.status || 401, {
       error: { code, ...resolved.detail ? { detail: resolved.detail } : {} }
     });
   }
@@ -19011,7 +19419,7 @@ async function handleTravelRequest(request, env, deps) {
         getTravelBudget(db, { userId, nowMs }),
         getTravelSettings(db, userId)
       ]);
-      return json2(200, {
+      return json3(200, {
         serverNow: nowMs,
         licenses,
         /** 页面关着也能推进；推送订阅只是通知通道，不是前置条件。 */
@@ -19069,7 +19477,7 @@ async function handleTravelRequest(request, env, deps) {
           height: 240
         });
       }
-      return json2(200, {
+      return json3(200, {
         snapshot,
         share,
         ...staticMapUrl ? { staticMapUrl } : {}
@@ -19090,12 +19498,12 @@ async function handleTravelRequest(request, env, deps) {
         nowMs
       });
       if (!result.ok) return fail3(409, "VERSION_CONFLICT");
-      return json2(200, { share: shareView(result.state, charId, userId) });
+      return json3(200, { share: shareView(result.state, charId, userId) });
     }
     if (suffix === "budget" && method === "GET") {
       const budget = await getTravelBudget(db, { userId, nowMs });
       if (!budget) return fail3(404, "BUDGET_BLOCKED");
-      return json2(200, { budget: budgetViewOf(budget) });
+      return json3(200, { budget: budgetViewOf(budget) });
     }
     if (suffix === "budget" && method === "PUT") {
       const body = await readJsonBody(request);
@@ -19112,11 +19520,11 @@ async function handleTravelRequest(request, env, deps) {
       }
       const budget = await getTravelBudget(db, { userId, nowMs });
       if (!budget) return fail3(404, "BUDGET_BLOCKED");
-      return json2(200, { budget: budgetViewOf(budget) });
+      return json3(200, { budget: budgetViewOf(budget) });
     }
     if (suffix === "settings" && method === "GET") {
       const settings = await getTravelSettings(db, userId);
-      return json2(200, {
+      return json3(200, {
         // 缺行 = 未开启（不回默认正数，也不假装已确认）。
         settings: settings ? {
           userId: settings.userId,
@@ -19148,7 +19556,7 @@ async function handleTravelRequest(request, env, deps) {
         ...typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}
       });
       if (!result.ok) return fail3(409, "VERSION_CONFLICT");
-      return json2(200, {
+      return json3(200, {
         settings: {
           userId: result.settings.userId,
           enabled: result.settings.enabled,
@@ -19160,11 +19568,90 @@ async function handleTravelRequest(request, env, deps) {
         }
       });
     }
+    if (suffix === "map/credentials" && method === "GET") {
+      return json3(200, await mapCredentialView({
+        db,
+        userId,
+        masterKey: readMapMasterKey(env),
+        proxySecret: deps.mapProxySecret,
+        nowMs
+      }));
+    }
+    if (suffix === "map/credentials" && method === "PUT") {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      const masterKey = readMapMasterKey(env);
+      if (!masterKey) return fail3(503, "PROVIDER_FAILED");
+      if (body.geometryPersistence !== void 0 || body.basemapDisplay !== void 0 || body.licensedGeometry !== void 0) {
+        return fail3(400, "GEOMETRY_NOT_LICENSED");
+      }
+      const patch = {};
+      for (const field of TRAVEL_MAP_CREDENTIAL_FIELDS) {
+        if (body[field] !== void 0) patch[field] = readCredentialField(body[field]);
+      }
+      const clear = Array.isArray(body.clear) ? body.clear.filter((item) => typeof item === "string" && TRAVEL_MAP_CREDENTIAL_FIELDS.includes(item)) : [];
+      const result = await saveTravelMapCredentials({
+        db,
+        userId,
+        masterKey,
+        patch,
+        clear,
+        nowMs
+      });
+      if (!result.ok) {
+        const status = result.code === "UNAUTHORIZED" ? 401 : result.code === "INVALID_FIELD" ? 400 : 409;
+        return json3(status, { error: { code: result.code } });
+      }
+      return json3(200, await mapCredentialView({
+        db,
+        userId,
+        masterKey,
+        proxySecret: deps.mapProxySecret,
+        nowMs
+      }));
+    }
+    if (suffix === "map/credentials/test" && method === "POST") {
+      const last = mapTestLastAt.get(userId) ?? 0;
+      if (nowMs - last < MAP_TEST_COOLDOWN_MS) {
+        return json3(429, { ok: false, code: "TOO_MANY_REQUESTS" });
+      }
+      mapTestLastAt.set(userId, nowMs);
+      const credentials = await resolveTravelMapCredentialValues({
+        db,
+        userId,
+        masterKey: readMapMasterKey(env)
+      });
+      const webKey = credentials?.amapWebKey ?? "";
+      if (!webKey) return json3(200, { ok: false, code: "MAP_NOT_CONFIGURED" });
+      const base = (deps.mapTestUpstreamBase ?? "https://restapi.amap.com").replace(/\/+$/, "");
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8e3);
+      let ok = false;
+      let code = "PROVIDER_FAILED";
+      try {
+        const params = new URLSearchParams({ address: "\u5317\u4EAC\u5E02", key: webKey });
+        const res = await (deps.mapTestFetch ?? globalThis.fetch)(
+          `${base}/v3/geocode/geo?${params.toString()}`,
+          { method: "GET", signal: controller.signal, headers: { Accept: "application/json" } }
+        );
+        if (res.ok) {
+          const body = await res.json().catch(() => null);
+          ok = String(body?.status ?? "") === "1" && Array.isArray(body?.geocodes) && body.geocodes.length > 0;
+          code = ok ? "OK" : "PROVIDER_FAILED";
+        }
+      } catch {
+        ok = false;
+        code = "PROVIDER_FAILED";
+      } finally {
+        clearTimeout(timer);
+      }
+      return json3(200, { ok, code });
+    }
     if (suffix === "char" && method === "GET") {
       const charId = readString2(url.searchParams.get("charId"));
       if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
       const row = await getTravelCharSettings(db, { userId, charId });
-      return json2(200, { char: { charId, enabled: row?.enabled === true } });
+      return json3(200, { char: { charId, enabled: row?.enabled === true } });
     }
     if (suffix === "char" && method === "PUT") {
       const body = await readJsonBody(request);
@@ -19173,7 +19660,7 @@ async function handleTravelRequest(request, env, deps) {
       if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
       if (typeof body.enabled !== "boolean") return fail3(400, "UNAUTHORIZED");
       const row = await setTravelCharEnabled(db, { userId, charId, enabled: body.enabled, nowMs });
-      return json2(200, { char: { charId: row.charId, enabled: row.enabled, updatedAt: row.updatedAt } });
+      return json3(200, { char: { charId: row.charId, enabled: row.enabled, updatedAt: row.updatedAt } });
     }
     if (suffix === "context" && method === "GET") {
       const charId = readString2(url.searchParams.get("charId"));
@@ -19186,7 +19673,7 @@ async function handleTravelRequest(request, env, deps) {
         listTravelWishes(db, { userId, charId, nowMs, states: ["open", "candidates_ready", "chosen"] })
       ]);
       const role = buildRoleTravelContext({ trip, nowMs });
-      return json2(200, {
+      return json3(200, {
         serverNow: nowMs,
         shareEnabled: !!shareRow?.shareEnabled,
         shareKnown: shareRow !== null,
@@ -19206,27 +19693,27 @@ async function handleTravelRequest(request, env, deps) {
       if (scopedCharId && !charAllowed(scopedCharId)) return fail3(403, "PRINCIPAL_MISMATCH");
       const charId = scopedCharId;
       const q = readString2(url.searchParams.get("q"));
-      if (q.length < 2) return json2(200, { results: [] });
-      const port = deps.anchorSearchFor?.(userId) ?? null;
-      if (!port) return json2(200, { results: [], provider: "unavailable" });
+      if (q.length < 2) return json3(200, { results: [] });
+      const port = await deps.anchorSearchFor?.(userId) ?? null;
+      if (!port) return json3(200, { results: [], provider: "unavailable" });
       let city = readString2(url.searchParams.get("city"));
       if (!city && charId) {
         const existing = await getTravelAnchor(db, { userId, charId });
         city = existing?.city ?? "";
       }
-      if (!city) return json2(200, { results: [], reason: "city_required" });
+      if (!city) return json3(200, { results: [], reason: "city_required" });
       try {
         const results = await port.search({ q: q.slice(0, 40), ...city ? { city } : {}, charId });
-        return json2(200, { results });
+        return json3(200, { results });
       } catch {
-        return json2(200, { results: [], reason: "provider_failed" });
+        return json3(200, { results: [], reason: "provider_failed" });
       }
     }
     if (suffix === "anchor" && method === "GET") {
       const charId = readString2(url.searchParams.get("charId"));
       if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
       const row = await getTravelAnchor(db, { userId, charId });
-      return json2(200, { anchor: anchorView(row), configured: row !== null });
+      return json3(200, { anchor: anchorView(row), configured: row !== null });
     }
     if (suffix === "anchor" && (method === "POST" || method === "PUT")) {
       const body = await readJsonBody(request);
@@ -19236,7 +19723,7 @@ async function handleTravelRequest(request, env, deps) {
       let picked = null;
       const placeId = readString2(body.placeId);
       if (placeId) {
-        const port = deps.anchorSearchFor?.(userId) ?? null;
+        const port = await deps.anchorSearchFor?.(userId) ?? null;
         if (!port) return fail3(503, "ANCHOR_NOT_CONFIRMED");
         const place = await port.resolve(placeId);
         if (!place) return fail3(400, "ANCHOR_NOT_CONFIRMED");
@@ -19282,7 +19769,7 @@ async function handleTravelRequest(request, env, deps) {
         confirmedAt: picked.confirmedAt,
         updatedAt: nowMs
       });
-      return json2(200, { anchor: anchorView(saved), configured: true });
+      return json3(200, { anchor: anchorView(saved), configured: true });
     }
     return null;
   } catch {
@@ -20715,13 +21202,13 @@ async function handleTravelScheduled(controller, env, wiring) {
 // worker/amsg/src/travel/anchorSearch.ts
 var TRAVEL_PLACE_TOKEN_TTL_MS = 15 * 6e4;
 var TOKEN_LABEL = "sullyos-travel-place-v1";
-var encoder3 = new TextEncoder();
-var toBase64Url3 = (bytes) => {
+var encoder4 = new TextEncoder();
+var toBase64Url4 = (bytes) => {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 };
-var fromBase64Url3 = (text) => {
+var fromBase64Url4 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
   const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
@@ -20734,11 +21221,11 @@ var fromBase64Url3 = (text) => {
     return null;
   }
 };
-var sign2 = async (secret, payload) => {
-  const key = await crypto.subtle.importKey("raw", encoder3.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return toBase64Url3(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder3.encode(`${TOKEN_LABEL}.${payload}`))));
+var sign3 = async (secret, payload) => {
+  const key = await crypto.subtle.importKey("raw", encoder4.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return toBase64Url4(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder4.encode(`${TOKEN_LABEL}.${payload}`))));
 };
-var isRecord8 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+var isRecord9 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 async function signPlaceToken(place, input) {
   const secret = (input.secret ?? "").trim();
   if (secret.length < 32) return null;
@@ -20752,8 +21239,8 @@ async function signPlaceToken(place, input) {
     coordSys: place.coordSys,
     exp: Math.trunc(input.nowMs) + ttl
   };
-  const body = toBase64Url3(encoder3.encode(JSON.stringify(payload)));
-  const signature = await sign2(secret, body);
+  const body = toBase64Url4(encoder4.encode(JSON.stringify(payload)));
+  const signature = await sign3(secret, body);
   return `${body}.${signature}`;
 }
 async function resolvePlaceToken(placeId, input) {
@@ -20762,12 +21249,12 @@ async function resolvePlaceToken(placeId, input) {
   const parts = String(placeId ?? "").split(".");
   if (parts.length !== 2) return null;
   const [body, signature] = parts;
-  const expected = await sign2(secret, body);
+  const expected = await sign3(secret, body);
   if (expected.length !== signature.length) return null;
   let diff = 0;
   for (let i = 0; i < expected.length; i += 1) diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
   if (diff !== 0) return null;
-  const bytes = fromBase64Url3(body);
+  const bytes = fromBase64Url4(body);
   if (!bytes) return null;
   let payload;
   try {
@@ -20775,7 +21262,7 @@ async function resolvePlaceToken(placeId, input) {
   } catch {
     return null;
   }
-  if (!isRecord8(payload)) return null;
+  if (!isRecord9(payload)) return null;
   const exp = Number(payload.exp);
   if (!Number.isFinite(exp) || exp <= input.nowMs) return null;
   const lat = Number(payload.lat);
@@ -21416,6 +21903,28 @@ var createWorldProvider = (config, deps) => {
   });
 };
 
+// worker/amsg/src/travel/mapProviders.ts
+var envFallbackAllowed = (env) => String(env?.TRAVEL_MAP_ENV_FALLBACK ?? "").trim().toLowerCase() === "allow";
+function resolveTravelMapProviderKeys(input) {
+  const userWeb = String(input.userCredentials?.amapWebKey ?? "").trim();
+  const userMapbox = String(input.userCredentials?.mapboxToken ?? "").trim();
+  const allowed = envFallbackAllowed(input.env);
+  const envWeb = allowed ? String(input.env?.AMAP_WEB_KEY ?? "").trim() : "";
+  const envMapbox = allowed ? String(input.env?.MAPBOX_TOKEN ?? "").trim() : "";
+  return {
+    amapWebKey: userWeb || envWeb,
+    mapboxToken: userMapbox || envMapbox
+  };
+}
+function createTravelMapProviders(keys, deps) {
+  const amapKey = keys.amapWebKey.trim();
+  const mapboxToken = keys.mapboxToken.trim();
+  return [
+    createAmapProvider({ resolveKey: () => amapKey || null }, deps),
+    createWorldProvider({ resolveToken: () => mapboxToken || null }, deps)
+  ];
+}
+
 // utils/travel/privacy.ts
 var COORD_PAIR = /-?\d{1,3}\.\d{3,}\s*[,，]\s*-?\d{1,3}\.\d{3,}/;
 var COORD_LABELLED = /(?:lat|lng|latitude|longitude|纬度|经度)\s*[:：=]?\s*-?\d{1,3}\.\d{2,}/i;
@@ -21568,9 +22077,9 @@ function createTravelDecisionPort(input) {
       const safe = assertPromptSafe(user);
       if (!safe.ok) throw new Error("travel-intent-context-unsafe");
       const raw = await call(INTENT_SYSTEM_PROMPT, safe.text);
-      const json3 = extractJsonObject(raw);
-      if (!json3) throw new Error("travel-intent-non-json");
-      return json3;
+      const json4 = extractJsonObject(raw);
+      if (!json4) throw new Error("travel-intent-non-json");
+      return json4;
     },
     async nextSegment(context) {
       const parts = contextLines();
@@ -21593,9 +22102,9 @@ ${where.join("\n")}`);
       const safe = assertPromptSafe(user);
       if (!safe.ok) throw new Error("travel-segment-context-unsafe");
       const raw = await call(SEGMENT_SYSTEM_PROMPT, safe.text);
-      const json3 = extractJsonObject(raw);
-      if (!json3) throw new Error("travel-segment-non-json");
-      return json3;
+      const json4 = extractJsonObject(raw);
+      if (!json4) throw new Error("travel-segment-non-json");
+      return json4;
     },
     async choose({ wishText, candidates, rerollsUsed }) {
       const parts = [];
@@ -21610,9 +22119,9 @@ ${where.join("\n")}`);
       const safe = assertPromptSafe(user);
       if (!safe.ok) throw new Error("travel-decision-context-unsafe");
       const raw = await call(SYSTEM_PROMPT, safe.text);
-      const json3 = extractJsonObject(raw);
-      if (!json3) throw new Error("travel-decision-non-json");
-      return json3;
+      const json4 = extractJsonObject(raw);
+      if (!json4) throw new Error("travel-decision-non-json");
+      return json4;
     }
   };
 }
@@ -21808,10 +22317,10 @@ var CHAT_LIFE_WORKFLOW_MAX_ACCEPTED = 1;
 var CHAT_LIFE_WORKFLOW_CHAR_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 var CHAT_LIFE_WORKFLOW_SOURCE_REF_MAX_CHARS = 120;
 var CHAT_LIFE_WORKFLOW_PLAN_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
-var isRecord9 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isRecord10 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var textOf2 = (value) => typeof value === "string" ? value.trim() : "";
 function proposalFromChatToolArgs(raw) {
-  if (!isRecord9(raw)) return { ok: false, reason: "not-object" };
+  if (!isRecord10(raw)) return { ok: false, reason: "not-object" };
   const kind = textOf2(raw.kind);
   if (!AUTONOMY_WORKFLOW_KINDS.includes(kind)) return { ok: false, reason: "unknown-kind" };
   const purpose = textOf2(raw.purpose);
@@ -21838,7 +22347,7 @@ function proposalFromChatToolArgs(raw) {
   };
 }
 function parseChatLifeWorkflowBody(raw) {
-  if (!isRecord9(raw)) return { ok: false, reason: "bad-body" };
+  if (!isRecord10(raw)) return { ok: false, reason: "bad-body" };
   if (raw.v !== CHAT_LIFE_WORKFLOW_REQUEST_VERSION) return { ok: false, reason: "bad-version" };
   const charId = textOf2(raw.charId);
   if (!CHAT_LIFE_WORKFLOW_CHAR_ID_RE.test(charId)) return { ok: false, reason: "bad-char-id" };
@@ -23287,7 +23796,7 @@ var inspectWorkerEnv = (env) => {
 };
 var CORS_ALLOW_HEADERS2 = "Content-Type, Content-Encoding, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token";
 var CORS_EXTRA_HEADERS = ["Content-Encoding", "X-User-Id", "X-Payload-Encrypted", "X-Encryption-Version", "X-Response-Encrypted"];
-var CORS_HEADERS2 = {
+var CORS_HEADERS3 = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS2,
@@ -23295,7 +23804,7 @@ var CORS_HEADERS2 = {
 };
 var jsonWithCors = (status, body) => new Response(JSON.stringify(body), {
   status,
-  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS2 }
+  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS3 }
 });
 var TICK_STALL_MINUTES = 5;
 var classifySchemaProbeError = (error) => {
@@ -23539,18 +24048,29 @@ var travelReserveFor = (env, userId) => async () => {
   const result = await reserveMapCall(db, { userId, nowMs: Date.now() });
   return result.ok ? { allowed: true } : { allowed: false, code: result.code };
 };
-var travelProvidersFor = (env, userId) => {
+function readStaticMapUserFromRequest(request) {
+  try {
+    const url = new URL(request.url);
+    return decodeStaticMapUser(url.searchParams.get("u") ?? "");
+  } catch {
+    return null;
+  }
+}
+var travelProvidersFor = async (env, userId) => {
   const deps = {
     fetch: globalThis.fetch,
     reserveMapCall: travelReserveFor(env, userId),
     now: Date.now
   };
-  return [
-    createAmapProvider({ resolveKey: () => (env.AMAP_WEB_KEY ?? "").trim() || null }, deps),
-    createWorldProvider({ resolveToken: () => (env.MAPBOX_TOKEN ?? "").trim() || null }, deps)
-  ];
+  const userCredentials = await resolveTravelMapCredentialValues({
+    db: env.DB,
+    userId,
+    masterKey: env.AMSG_MASTER_KEY
+  });
+  const keys = resolveTravelMapProviderKeys({ userCredentials, env });
+  return createTravelMapProviders(keys, deps);
 };
-function createTravelAnchorSearch(env, userId) {
+async function createTravelAnchorSearch(env, userId) {
   const secret = resolveTravelSecretString(env) ?? "";
   if (secret.length < 32) return null;
   const deps = {
@@ -23558,9 +24078,13 @@ function createTravelAnchorSearch(env, userId) {
     reserveMapCall: travelReserveFor(env, userId),
     now: Date.now
   };
-  const amapKey = (env.AMAP_WEB_KEY ?? "").trim();
-  const mapbox = (env.MAPBOX_TOKEN ?? "").trim();
-  const provider = amapKey ? createAmapProvider({ resolveKey: () => amapKey }, deps) : mapbox ? createWorldProvider({ resolveToken: () => mapbox }, deps) : null;
+  const userCredentials = await resolveTravelMapCredentialValues({
+    db: env.DB,
+    userId,
+    masterKey: env.AMSG_MASTER_KEY
+  });
+  const keys = resolveTravelMapProviderKeys({ userCredentials, env });
+  const provider = keys.amapWebKey ? createAmapProvider({ resolveKey: () => keys.amapWebKey }, deps) : keys.mapboxToken ? createWorldProvider({ resolveToken: () => keys.mapboxToken }, deps) : null;
   return createAnchorSearchPort({ provider, secret, now: () => Date.now() });
 }
 async function buildTravelSubjectWiring(env, subject) {
@@ -23596,7 +24120,7 @@ async function buildTravelSubjectWiring(env, subject) {
     }
   });
   return {
-    providers: travelProvidersFor(env, subject.userId),
+    providers: await travelProvidersFor(env, subject.userId),
     // 地区按锚点判：国内 → 高德；其余 → world（没 token 时 honest unavailable，不画直线）。
     region: inferRegionFromAnchor(anchor),
     readAnchor: async () => anchor,
@@ -23712,11 +24236,32 @@ var src_default = {
       return travelWithCors(sessionResponse);
     }
     if (method === "GET" && pathname.endsWith("/travel/staticmap")) {
+      const staticMapUserId = null;
       return handleTravelStaticMap(request, env, {
         sessionSecret: resolveTravelSecretString(env) ?? "",
-        userId: null,
+        userId: staticMapUserId,
+        now: () => Date.now(),
+        resolveWebKey: async () => {
+          const userId = readStaticMapUserFromRequest(request);
+          if (!userId) return null;
+          const creds = await resolveTravelMapCredentialValues({
+            db: env.DB,
+            userId,
+            masterKey: env.AMSG_MASTER_KEY
+          });
+          if (creds?.amapWebKey) return creds.amapWebKey;
+          return String(env.TRAVEL_MAP_ENV_FALLBACK ?? "").trim().toLowerCase() === "allow" ? (env.AMAP_WEB_KEY ?? "").trim() || null : null;
+        }
+      });
+    }
+    if (isAmapServiceProxyPath(pathname)) {
+      const proxied = await handleAmapServiceProxy(request, {
+        db: env.DB,
+        masterKey: env.AMSG_MASTER_KEY,
+        secret: resolveTravelSecretString(env) ?? "",
         now: () => Date.now()
       });
+      if (proxied) return proxied;
     }
     {
       const travel = await handleTravelRequest(request, env, {
@@ -23731,7 +24276,8 @@ var src_default = {
         },
         now: () => Date.now(),
         anchorSearchFor: (userId) => createTravelAnchorSearch(env, userId),
-        staticMapSecret: resolveTravelSecretString(env) ?? void 0
+        staticMapSecret: resolveTravelSecretString(env) ?? void 0,
+        mapProxySecret: resolveTravelSecretString(env) ?? void 0
       });
       if (travel) return travel;
     }

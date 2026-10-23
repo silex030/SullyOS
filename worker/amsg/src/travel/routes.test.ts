@@ -175,3 +175,121 @@ describe('出行路由：鉴权与共享脱敏', () => {
     expect(body.budget.paused).toBe(false);
   });
 });
+
+describe('出行路由：地图服务凭据（用户自己填）', () => {
+  const MASTER = 'test-master-key-0123456789abcdef-32';
+  const PROXY_SECRET = 'travel-session-secret-0123456789abcdef';
+  const credDeps = (overrides: Partial<TravelRouteDeps> = {}) =>
+    deps({ mapProxySecret: PROXY_SECRET, ...overrides });
+  const credEnv = () => ({ DB: db, AMSG_MASTER_KEY: MASTER });
+
+  it('PUT 保存后 GET 只回存在性与公开展示 Key，并给出短期 serviceHost', async () => {
+    const put = await call(
+      '/travel/map/credentials',
+      {
+        method: 'PUT',
+        body: {
+          amapWebKey: 'web-service-key-SECRET-0001',
+          amapJsKey: 'js-api-key-PUBLIC-0002',
+          amapJsCode: 'jscode-SECRET-0003',
+        },
+      },
+      credDeps(),
+      credEnv(),
+    );
+    expect(put?.status).toBe(200);
+    const putBody = (await put!.json()) as any;
+    expect(putBody.configured).toBe(true);
+    expect(putBody.has).toEqual({ amapWebKey: true, amapJsKey: true, amapJsCode: true, mapboxToken: false });
+    expect(putBody.amapJsKey).toBe('js-api-key-PUBLIC-0002');
+    expect(putBody.serviceHost).toMatch(/^\/_AMapService\/t\//);
+    const serialized = JSON.stringify(putBody);
+    expect(serialized).not.toContain('web-service-key-SECRET-0001');
+    expect(serialized).not.toContain('jscode-SECRET-0003');
+
+    const get = await call('/travel/map/credentials', {}, credDeps(), credEnv());
+    const getBody = (await get!.json()) as any;
+    expect(getBody.has.amapWebKey).toBe(true);
+    expect(JSON.stringify(getBody)).not.toContain('jscode-SECRET-0003');
+  });
+
+  it('空字段保持不变，显式 clear 才清除；跨用户互不可见', async () => {
+    await call(
+      '/travel/map/credentials',
+      { method: 'PUT', body: { amapWebKey: 'web-service-key-SECRET-0001', amapJsKey: 'js-api-key-PUBLIC-0002' } },
+      credDeps(),
+      credEnv(),
+    );
+    const keep = await call('/travel/map/credentials', { method: 'PUT', body: { amapJsKey: '' } }, credDeps(), credEnv());
+    expect(((await keep!.json()) as any).has.amapJsKey).toBe(true);
+
+    const cleared = await call(
+      '/travel/map/credentials',
+      { method: 'PUT', body: { clear: ['amapJsKey'] } },
+      credDeps(),
+      credEnv(),
+    );
+    const clearedBody = (await cleared!.json()) as any;
+    expect(clearedBody.has.amapJsKey).toBe(false);
+    expect(clearedBody.has.amapWebKey).toBe(true);
+
+    // 另一个主体（会话签名不同）看到的是自己的空配置。
+    const otherDeps = deps({
+      mapProxySecret: PROXY_SECRET,
+      resolveSession: async (token) => (token === 'other' ? { userId: 'u2' } : null),
+    });
+    const other = await call('/travel/map/credentials', { token: 'other' }, otherDeps, credEnv());
+    expect(((await other!.json()) as any).configured).toBe(false);
+  });
+
+  it('保存不会发起真实地图请求；测试连接是显式单次且有冷却', async () => {
+    await call(
+      '/travel/map/credentials',
+      { method: 'PUT', body: { amapWebKey: 'web-service-key-SECRET-0001' } },
+      credDeps(),
+      credEnv(),
+    );
+
+    const calls: string[] = [];
+    const testFetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ status: '1', geocodes: [{ location: '120.1,30.1' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const first = await call(
+      '/travel/map/credentials/test',
+      { method: 'POST' },
+      credDeps({ mapTestFetch: testFetch }),
+      credEnv(),
+    );
+    const firstBody = (await first!.json()) as any;
+    expect(firstBody).toEqual({ ok: true, code: 'OK' });
+    expect(calls).toHaveLength(1);
+    expect(new URL(calls[0]!).searchParams.get('key')).toBe('web-service-key-SECRET-0001');
+
+    const second = await call(
+      '/travel/map/credentials/test',
+      { method: 'POST' },
+      credDeps({ mapTestFetch: testFetch }),
+      credEnv(),
+    );
+    expect(second?.status).toBe(429);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('填 Key 不能解锁几何许可（仍是运维 env，请求体里的解锁字段被拒）', async () => {
+    const res = await call(
+      '/travel/map/credentials',
+      { method: 'PUT', body: { amapWebKey: 'k'.repeat(20), geometryPersistence: 'allowed' } },
+      credDeps(),
+      credEnv(),
+    );
+    expect(res?.status).toBe(400);
+    expect(((await res!.json()) as any).error.code).toBe('GEOMETRY_NOT_LICENSED');
+    const cfg = (await (await call('/travel/config', {}, credDeps(), credEnv()))!.json()) as any;
+    expect(cfg.licenses.geometryPersistence).toBe('not-licensed');
+  });
+});

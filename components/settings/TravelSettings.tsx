@@ -12,7 +12,12 @@
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowsClockwise, Key, MapTrifold, ShieldCheck, WarningCircle } from '@phosphor-icons/react';
-import { getTravelRuntime, type TravelRuntime, type TravelSettings } from '../../utils/travel/runtime';
+import {
+    getTravelRuntime,
+    type TravelMapCredentialView,
+    type TravelRuntime,
+    type TravelSettings,
+} from '../../utils/travel/runtime';
 import { readTravelMapConfig, type TravelMapRuntimeConfig } from '../../utils/travel/worldMapAdapter';
 import {
     ensureTravelSession,
@@ -66,6 +71,55 @@ const Switch: React.FC<{ checked: boolean; disabled?: boolean; onChange: (v: boo
     </button>
 );
 
+const SecretField: React.FC<{
+    testid: string;
+    label: string;
+    hint: string;
+    placeholder: string;
+    value: string;
+    has: boolean;
+    disabled?: boolean;
+    onChange: (v: string) => void;
+    onClear: () => void;
+}> = ({ testid, label, hint, placeholder, value, has, disabled, onChange, onClear }) => (
+    <label className="block min-w-0">
+        <span className="flex items-center gap-1 text-[9px] text-slate-500">
+            <span className="flex-1">{label}</span>
+            <span className={has ? 'text-emerald-600' : 'text-slate-400'}>{has ? '已保存' : '未保存'}</span>
+            {has && (
+                <button
+                    type="button"
+                    data-testid={`${testid}-clear`}
+                    disabled={disabled}
+                    onClick={(e) => {
+                        e.preventDefault();
+                        onClear();
+                    }}
+                    className="px-1 rounded-full text-[9px] text-rose-600 active:scale-95 transition-transform disabled:opacity-40"
+                >
+                    清除
+                </button>
+            )}
+        </span>
+        <input
+            data-testid={testid}
+            type="password"
+            name={`travel-secret-${testid}`}
+            value={value}
+            disabled={disabled}
+            placeholder={placeholder}
+            autoComplete="new-password"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            onChange={(e) => onChange(e.target.value)}
+            className="mt-0.5 w-full rounded-xl px-2 py-1 text-[11px] text-slate-700 outline-none placeholder:text-slate-500 disabled:opacity-50"
+            style={{ background: '#f8fafc', border: '1px solid rgba(226,232,240,0.9)' }}
+        />
+        <span className="mt-0.5 block text-[9px] leading-relaxed text-slate-500">{hint}</span>
+    </label>
+);
+
 const ReadinessRow: React.FC<{ ok: boolean; label: string; detail: string }> = ({ ok, label, detail }) => (
     <div className="flex items-start gap-1.5 text-[10px] leading-relaxed">
         {ok ? (
@@ -95,11 +149,27 @@ const TravelSettings: React.FC<TravelSettingsProps> = ({ runtime: injected, mapC
     const [pairUser, setPairUser] = useState('');
     const [pairKey, setPairKey] = useState('');
     const [paired, setPaired] = useState(() => !!readTravelOwnerCredential());
+    const [cred, setCred] = useState<TravelMapCredentialView | null>(null);
+    const [credKnown, setCredKnown] = useState(false);
+    const [credError, setCredError] = useState<string | null>(null);
+    const [webKey, setWebKey] = useState('');
+    const [jsKey, setJsKey] = useState('');
+    const [jsCode, setJsCode] = useState('');
+    const [mapbox, setMapbox] = useState('');
+    const [testing, setTesting] = useState(false);
+
+    const loadCredentials = useCallback(async () => {
+        const res = await runtime.readMapCredentials();
+        setCredKnown(res.known);
+        setCred(res.known ? res.credentials : null);
+        setCredError(res.known ? null : res.error ?? 'UNKNOWN');
+    }, [runtime]);
 
     const load = useCallback(async () => {
         setBusy(true);
         const res = await runtime.readSettings();
         const budget = await runtime.readBudget();
+        void loadCredentials();
         setBusy(false);
         if (!res.known || !res.settings) {
             setKnown(false);
@@ -203,6 +273,79 @@ const TravelSettings: React.FC<TravelSettingsProps> = ({ runtime: injected, mapC
         setNote(ready ? '已配对，短期会话已自动换取' : '已保存配对码，但服务端没签发会话（检查 owner 是否已登记）');
         await load();
     }, [pairUser, pairKey, load]);
+
+    /**
+     * 地图凭据：空字段 = 保持不变（不把「没填」当清除）；清除必须点对应的按钮。
+     * 前端只持有用户刚输入的草稿，成功保存后立刻清空输入并读回存在性。
+     */
+    const handleSaveCredentials = useCallback(async () => {
+        const patch: {
+            amapWebKey?: string;
+            amapJsKey?: string;
+            amapJsCode?: string;
+            mapboxToken?: string;
+        } = {};
+        if (webKey.trim()) patch.amapWebKey = webKey.trim();
+        if (jsKey.trim()) patch.amapJsKey = jsKey.trim();
+        if (jsCode.trim()) patch.amapJsCode = jsCode.trim();
+        if (mapbox.trim()) patch.mapboxToken = mapbox.trim();
+        if (Object.keys(patch).length === 0) {
+            setNote('没有新内容：已配置的会保持不变；要清除请点对应的「清除」');
+            return;
+        }
+        setBusy(true);
+        const res = await runtime.saveMapCredentials(patch);
+        setBusy(false);
+        if (!res.ok) {
+            setNote(
+                res.code === 'UNAUTHORIZED'
+                    ? '没有写进服务端（登录已过期或服务端未配置加密主密钥）'
+                    : res.code === 'INVALID_FIELD'
+                        ? '有字段格式不对（不能带换行或控制字符）'
+                        : '没写进服务端，原配置未被覆盖',
+            );
+            return;
+        }
+        setWebKey('');
+        setJsKey('');
+        setJsCode('');
+        setMapbox('');
+        setCred(res.credentials ?? null);
+        setCredKnown(!!res.credentials);
+        setNote('已加密保存到服务端 · 输入框已清空');
+        await loadCredentials();
+    }, [webKey, jsKey, jsCode, mapbox, runtime, loadCredentials]);
+
+    const handleClearCredential = useCallback(
+        async (field: 'amapWebKey' | 'amapJsKey' | 'amapJsCode' | 'mapboxToken') => {
+            setBusy(true);
+            const res = await runtime.saveMapCredentials({ clear: [field] });
+            setBusy(false);
+            if (!res.ok) {
+                setNote('清除没生效（服务端拒绝了这次写入）');
+                return;
+            }
+            if (field === 'amapWebKey') setWebKey('');
+            if (field === 'amapJsKey') setJsKey('');
+            if (field === 'amapJsCode') setJsCode('');
+            if (field === 'mapboxToken') setMapbox('');
+            setCred(res.credentials ?? null);
+            setCredKnown(!!res.credentials);
+            setNote('已清除该凭据');
+            await loadCredentials();
+        },
+        [runtime, loadCredentials],
+    );
+
+    const handleTestConnection = useCallback(async () => {
+        setTesting(true);
+        const res = await runtime.testMapConnection();
+        setTesting(false);
+        if (res.ok) setNote('连接正常（高德 Web 服务 Key 可用）');
+        else if (res.code === 'MAP_NOT_CONFIGURED') setNote('还没保存高德 Web 服务 Key');
+        else if (res.code === 'TOO_MANY_REQUESTS') setNote('刚测过，30 秒后再试');
+        else setNote('连接失败：Key 无效、未开通 Web 服务或额度受限（不会自动重试）');
+    }, [runtime]);
 
     return (
         <section data-testid="travel-settings" className={className}>
@@ -426,6 +569,107 @@ const TravelSettings: React.FC<TravelSettingsProps> = ({ runtime: injected, mapC
                         </button>
                     </div>
                 </div>
+                <div className="px-3 py-2.5">
+                    <div className="flex items-center gap-1.5">
+                        <MapTrifold size={11} weight="bold" className="text-slate-500" aria-hidden />
+                        <div className="text-[11px] text-slate-700">地图服务凭据</div>
+                        <span className="ml-auto text-[9px] text-slate-500">
+                            {!credKnown ? '未确认' : cred?.configured ? '已加密保存' : '未配置'}
+                        </span>
+                    </div>
+                    <div className="text-[9px] leading-relaxed text-slate-500">
+                        填一次即可，后台按你的账号加密保存；刷新、换设备都不需要重填，也不会写进备份或网址。
+                        Web 服务 Key 与安全密钥只在服务端使用，不会回到浏览器；JS API Key 是官方要求浏览器持有的展示 Key。
+                    </div>
+                    {!credKnown && (
+                        <div data-testid="travel-map-credentials-unknown" className="mt-1 text-[9px] text-amber-700">
+                            未确认：还没读到服务端凭据状态（{credError ?? '未登录或后端未就绪'}）。这里不会用空值覆盖已存配置。
+                        </div>
+                    )}
+                    {credKnown && cred?.unreadable && (
+                        <div data-testid="travel-map-credentials-unreadable" className="mt-1 text-[9px] text-rose-700">
+                            服务端有记录但解不开（主密钥变更过）。为避免覆盖，保存已被拒绝，请联系运维。
+                        </div>
+                    )}
+                    <div className="mt-1.5 grid grid-cols-1 gap-1.5">
+                        <SecretField
+                            testid="travel-map-web-key"
+                            label="高德 Web 服务 Key"
+                            hint="地理编码 / 地点检索 / 路线与静态图，只在服务端使用"
+                            placeholder="粘贴 Web 服务 Key"
+                            value={webKey}
+                            has={!!cred?.has.amapWebKey}
+                            disabled={!credKnown || busy}
+                            onChange={setWebKey}
+                            onClear={() => void handleClearCredential('amapWebKey')}
+                        />
+                        <SecretField
+                            testid="travel-map-js-key"
+                            label="高德 JS API Key（展示用）"
+                            hint="浏览器必需的公开展示 Key；请在高德控制台配置域名白名单"
+                            placeholder="粘贴 JS API Key"
+                            value={jsKey}
+                            has={!!cred?.has.amapJsKey}
+                            disabled={!credKnown || busy}
+                            onChange={setJsKey}
+                            onClear={() => void handleClearCredential('amapJsKey')}
+                        />
+                        <SecretField
+                            testid="travel-map-js-code"
+                            label="高德安全密钥 jscode"
+                            hint="只在服务端代理里注入；不会出现在页面、网址或日志里"
+                            placeholder="粘贴安全密钥"
+                            value={jsCode}
+                            has={!!cred?.has.amapJsCode}
+                            disabled={!credKnown || busy}
+                            onChange={setJsCode}
+                            onClear={() => void handleClearCredential('amapJsCode')}
+                        />
+                        <SecretField
+                            testid="travel-map-mapbox"
+                            label="Mapbox 公钥（可选，国外）"
+                            hint="pk. 开头的公钥；没有就不接国外底图，也不代为注册账号"
+                            placeholder="pk.…"
+                            value={mapbox}
+                            has={!!cred?.has.mapboxToken}
+                            disabled={!credKnown || busy}
+                            onChange={setMapbox}
+                            onClear={() => void handleClearCredential('mapboxToken')}
+                        />
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                        <button
+                            data-testid="travel-map-save"
+                            onClick={() => void handleSaveCredentials()}
+                            disabled={!credKnown || busy}
+                            className="px-2.5 py-1 rounded-full text-[10px] active:scale-95 transition-transform disabled:opacity-100"
+                            style={{
+                                background: !credKnown || busy ? 'rgba(148,163,184,0.30)' : 'rgba(15,23,42,0.88)',
+                                color: !credKnown || busy ? '#475569' : '#ffffff',
+                            }}
+                        >
+                            保存地图凭据
+                        </button>
+                        <button
+                            data-testid="travel-map-test"
+                            onClick={() => void handleTestConnection()}
+                            disabled={!credKnown || busy || testing}
+                            className="px-2.5 py-1 rounded-full text-[10px] active:scale-95 transition-transform disabled:opacity-100"
+                            style={{
+                                background: !credKnown || busy || testing ? 'rgba(148,163,184,0.18)' : 'rgba(241,245,249,0.95)',
+                                color: '#475569',
+                            }}
+                        >
+                            {testing ? '测试中…' : '测试连接（1 次）'}
+                        </button>
+                        <span className="ml-auto text-[9px] text-slate-500">
+                            {cred?.updatedAt ? `更新于 ${new Date(cred.updatedAt).toLocaleString()}` : ''}
+                        </span>
+                    </div>
+                    <div className="mt-0.5 text-[9px] text-slate-500">
+                        保存本身不会发起任何真实地图请求；「测试连接」是你点一次才打一次，有 30 秒冷却，不扣出行额度。
+                    </div>
+                </div>
             </div>
 
             <div className="mt-2">
@@ -471,19 +715,31 @@ const TravelSettings: React.FC<TravelSettingsProps> = ({ runtime: injected, mapC
             >
                 <div className="text-[11px] text-slate-700">地图与登录就绪状态</div>
                 <ReadinessRow
-                    ok={!!config.amapJsKey}
+                    ok={credKnown ? !!cred?.has.amapJsKey : !!config.amapJsKey}
                     label="高德 JS 地图 Key"
-                    detail={config.amapJsKey ? '已配置（展示用）' : '未配置 · 面板显示地图暂不可用，不画假地图'}
+                    detail={
+                        credKnown
+                            ? cred?.has.amapJsKey ? '已保存（服务端）· 面板可出图' : '未配置 · 面板显示地图暂不可用，不画假地图'
+                            : '未确认 · 未确认前不画假地图，也不把构建期兜底值当已配置'
+                    }
                 />
                 <ReadinessRow
-                    ok={!!config.amapServiceHost}
-                    label="同源安全代理"
-                    detail={config.amapServiceHost ? config.amapServiceHost : '未配置 · jscode 只能由服务端注入，不能进前端'}
+                    ok={credKnown ? !!cred?.serviceHost : !!config.amapServiceHost}
+                    label="jscode 安全代理"
+                    detail={
+                        credKnown
+                            ? cred?.serviceHost ? '已签发短期会话 · jscode 只在服务端注入' : '未配置 · 需要同时保存 JS Key 与安全密钥'
+                            : '未确认 · jscode 只能由服务端注入，不能进前端'
+                    }
                 />
                 <ReadinessRow
-                    ok={!!config.world}
-                    label="国外地图（Mapbox JS）"
-                    detail={config.world ? '已配置凭证' : '未配置凭证 · 国外暂不接图，也不代为注册付费账号'}
+                    ok={credKnown ? !!cred?.has.mapboxToken : !!config.world}
+                    label="国外地图（Mapbox）"
+                    detail={
+                        credKnown
+                            ? cred?.has.mapboxToken ? '已保存凭证 · 还需要样式地址' : '未配置凭证 · 国外暂不接图，也不代为注册付费账号'
+                            : '未确认 · 构建期兜底值不代表服务端配置'
+                    }
                 />
                 <ReadinessRow
                     ok={sessionState === 'ready'}

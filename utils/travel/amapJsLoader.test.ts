@@ -196,3 +196,26 @@ describe('amapJsLoader · 加载顺序与失败态', () => {
         ).rejects.toMatchObject({ code: 'TIMEOUT' });
     });
 });
+
+describe('amap JS loader · 短期签名 serviceHost', () => {
+    it('接受 /_AMapService/t/<token>（官方前缀不变，租户与过期都在 token 里）', () => {
+        expect(normalizeServiceHost('/_AMapService/t/abcDEF0123456789.1700000000000.sig')).toBe(
+            '/_AMapService/t/abcDEF0123456789.1700000000000.sig',
+        );
+        expect(normalizeServiceHost('https://link.example.com/_AMapService/t/abcDEF0123456789.x.y')).toBe(
+            'https://link.example.com/_AMapService/t/abcDEF0123456789.x.y',
+        );
+    });
+
+    it('拒绝 token 段的畸形形态（协议相对、带查询、太短）', () => {
+        expect(normalizeServiceHost('//evil.example/_AMapService/t/abcdefghijklmnop')).toBeNull();
+        expect(normalizeServiceHost('/_AMapService/t/short')).toBeNull();
+        expect(normalizeServiceHost('/_AMapService/t/abcdefghijklmnop?x=1')).toBeNull();
+    });
+
+    it('安全配置仍然只出 serviceHost，不带 securityJsCode', () => {
+        const cfg = buildAmapSecurityConfig('/_AMapService/t/abcDEF0123456789.1.sig');
+        expect(cfg).toEqual({ serviceHost: '/_AMapService/t/abcDEF0123456789.1.sig' });
+        expect(JSON.stringify(cfg)).not.toContain('securityJsCode');
+    });
+});

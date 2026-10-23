@@ -136,7 +136,7 @@ describe('TravelSettings', () => {
         await act(async () => root.unmount());
     });
 
-    it('就绪状态如实标注：缺 JS Key / 安全代理 / 国外凭证都写未配置，不提 GPS', async () => {
+    it('就绪状态如实标注：读不到凭据时写「未确认」，且不画假地图，不提 GPS', async () => {
         const { runtime } = makeRuntime((url, init) => {
             if (url.endsWith('/travel/settings') && init?.method === 'GET') return { settings: SETTINGS };
             if (url.endsWith('/travel/budget') && init?.method === 'GET') return { budget: BUDGET };
@@ -144,7 +144,7 @@ describe('TravelSettings', () => {
         });
         const { host, root } = await render(<TravelSettings runtime={runtime} />);
         const text = host.textContent ?? '';
-        expect(text).toContain('未配置');
+        expect(text).toContain('未确认');
         expect(text).toContain('不画假地图');
         expect(text).not.toContain('GPS');
         expect(text).not.toContain('精度');
@@ -202,6 +202,150 @@ describe('TravelAnchorCard', () => {
         });
         expect(calls.filter((c) => c.init?.method === 'POST' && c.url.endsWith('/travel/anchor'))).toHaveLength(0);
         expect(host.textContent).toContain('缺少服务端地点标识');
+        await act(async () => root.unmount());
+    });
+});
+
+describe('TravelSettings · 地图服务凭据输入', () => {
+    const CRED_EMPTY = {
+        configured: false,
+        unreadable: false,
+        has: { amapWebKey: false, amapJsKey: false, amapJsCode: false, mapboxToken: false },
+        amapJsKey: null,
+        mapboxToken: null,
+        mapboxStyleUrl: null,
+        updatedAt: null,
+        serviceHost: null,
+        serviceHostExpiresAt: null,
+    };
+
+    const makeRuntimeWithStatus = (
+        handler: (url: string, init: any) => { status: number; body: unknown },
+    ) => {
+        const calls: Array<{ url: string; init: any }> = [];
+        const transport = vi.fn(async (url: string, init: any) => {
+            calls.push({ url, init });
+            const { status, body } = handler(url, init);
+            return new Response(JSON.stringify(body ?? {}), { status });
+        });
+        const runtime = createTravelRuntime({
+            api: createTravelApi({
+                session: () => ({ token: TOKEN }),
+                baseUrl: () => 'https://backend.example',
+                transport: transport as never,
+                now: () => NOW,
+            }),
+            store: createTravelStateStore({ now: () => NOW }),
+            session: () => ({ token: TOKEN }),
+            baseUrl: () => 'https://backend.example',
+            transport: transport as never,
+            now: () => NOW,
+        });
+        return { runtime, calls };
+    };
+
+    const SAVED_VIEW = {
+        ...CRED_EMPTY,
+        configured: true,
+        has: { amapWebKey: true, amapJsKey: true, amapJsCode: false, mapboxToken: false },
+        amapJsKey: 'js-api-key-PUBLIC',
+        updatedAt: NOW,
+        serviceHost: '/_AMapService/t/token-0123456789',
+    };
+
+    const type = async (input: HTMLInputElement, value: string) => {
+        await act(async () => {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+            setter.call(input, value);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    };
+
+    const click = async (el: Element | null) => {
+        await act(async () => {
+            el!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+    };
+
+    it('输入框是 password 且禁用自动填充；保存成功清空并读回存在性', async () => {
+        let saved = false;
+        const { runtime, calls } = makeRuntimeWithStatus((url, init) => {
+            if (url.endsWith('/travel/settings') && init?.method === 'GET') return { status: 200, body: { settings: SETTINGS } };
+            if (url.endsWith('/travel/budget') && init?.method === 'GET') return { status: 200, body: { budget: BUDGET } };
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'GET') {
+                return { status: 200, body: saved ? SAVED_VIEW : CRED_EMPTY };
+            }
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'PUT') {
+                saved = true;
+                return { status: 200, body: SAVED_VIEW };
+            }
+            return { status: 404, body: {} };
+        });
+        const { host, root } = await render(<TravelSettings runtime={runtime} />);
+        const webInput = host.querySelector('[data-testid="travel-map-web-key"]') as HTMLInputElement;
+        const jsInput = host.querySelector('[data-testid="travel-map-js-key"]') as HTMLInputElement;
+        expect(webInput.type).toBe('password');
+        expect(webInput.getAttribute('autocomplete')).toBe('new-password');
+        expect(jsInput.type).toBe('password');
+
+        await type(webInput, 'web-service-key-SECRET');
+        await type(jsInput, 'js-api-key-PUBLIC');
+        await click(host.querySelector('[data-testid="travel-map-save"]'));
+
+        const put = calls.find((c) => c.init?.method === 'PUT' && c.url.endsWith('/travel/map/credentials'));
+        expect(put).toBeTruthy();
+        expect(JSON.parse(put!.init.body)).toEqual({
+            amapWebKey: 'web-service-key-SECRET',
+            amapJsKey: 'js-api-key-PUBLIC',
+        });
+        // 成功即清空输入（页面不保留明文），状态改为已保存
+        expect((host.querySelector('[data-testid="travel-map-web-key"]') as HTMLInputElement).value).toBe('');
+        expect((host.querySelector('[data-testid="travel-map-js-key"]') as HTMLInputElement).value).toBe('');
+        expect(host.textContent).toContain('已加密保存到服务端');
+        expect(host.textContent).toContain('已保存');
+        await act(async () => root.unmount());
+    });
+
+    it('清除必须显式：点清除才发 clear，不会把空输入当清除', async () => {
+        const savedView = {
+            ...CRED_EMPTY,
+            configured: true,
+            has: { amapWebKey: true, amapJsKey: false, amapJsCode: false, mapboxToken: false },
+            updatedAt: NOW,
+        };
+        const { runtime, calls } = makeRuntimeWithStatus((url, init) => {
+            if (url.endsWith('/travel/settings') && init?.method === 'GET') return { status: 200, body: { settings: SETTINGS } };
+            if (url.endsWith('/travel/budget') && init?.method === 'GET') return { status: 200, body: { budget: BUDGET } };
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'GET') return { status: 200, body: savedView };
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'PUT') return { status: 200, body: CRED_EMPTY };
+            return { status: 404, body: {} };
+        });
+        const { host, root } = await render(<TravelSettings runtime={runtime} />);
+        await click(host.querySelector('[data-testid="travel-map-web-key-clear"]'));
+        const put = calls.find((c) => c.init?.method === 'PUT' && c.url.endsWith('/travel/map/credentials'));
+        expect(put).toBeTruthy();
+        expect(JSON.parse(put!.init.body)).toEqual({ clear: ['amapWebKey'] });
+        await act(async () => root.unmount());
+    });
+
+    it('权限失败不覆盖本地草稿：401 时输入保留并明确提示', async () => {
+        const { runtime } = makeRuntimeWithStatus((url, init) => {
+            if (url.endsWith('/travel/settings') && init?.method === 'GET') return { status: 200, body: { settings: SETTINGS } };
+            if (url.endsWith('/travel/budget') && init?.method === 'GET') return { status: 200, body: { budget: BUDGET } };
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'GET') return { status: 200, body: CRED_EMPTY };
+            if (url.endsWith('/travel/map/credentials') && init?.method === 'PUT') {
+                return { status: 401, body: { error: { code: 'UNAUTHORIZED' } } };
+            }
+            return { status: 404, body: {} };
+        });
+        const { host, root } = await render(<TravelSettings runtime={runtime} />);
+        const webInput = host.querySelector('[data-testid="travel-map-web-key"]') as HTMLInputElement;
+        await type(webInput, 'web-service-key-SECRET');
+        await click(host.querySelector('[data-testid="travel-map-save"]'));
+        expect((host.querySelector('[data-testid="travel-map-web-key"]') as HTMLInputElement).value).toBe(
+            'web-service-key-SECRET',
+        );
+        expect(host.textContent).toContain('没有写进服务端');
         await act(async () => root.unmount());
     });
 });

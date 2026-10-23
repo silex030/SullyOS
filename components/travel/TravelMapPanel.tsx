@@ -72,6 +72,7 @@ export const TRAVEL_ERROR_COPY: Record<TravelErrorCode, string> = {
     SHARE_REVOKED: '位置共享已关闭，看不到 TA 现在在哪',
     UNKNOWN_CANDIDATE: '这个地点候选已失效，让 TA 重新选一次',
     WISH_EXPIRED: '这次的想法已经过期了',
+    INVALID_FIELD: '有一项填写格式不对，请检查后再保存',
     PROVIDER_UNSUPPORTED_REGION: '该地区暂不支持路线规划',
     PROVIDER_FAILED: '地图服务暂时不可用，TA 的愿望还留着，稍后重试',
     BUDGET_BLOCKED: '今天的出行额度已用完或已暂停',

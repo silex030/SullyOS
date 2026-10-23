@@ -17,6 +17,7 @@ import { GearSix, ShieldSlash } from '@phosphor-icons/react';
 import { TRAVEL_ERROR_CODES, type TravelErrorCode } from '../../contracts/travel';
 import { getTravelRuntime, type TravelRuntime } from '../../utils/travel/runtime';
 import { readTravelMapConfig, type TravelMapRuntimeConfig } from '../../utils/travel/worldMapAdapter';
+import { loadTravelMapRuntime } from '../../utils/travel/mapRuntime';
 import TravelBall, { type TravelCharacterView } from './TravelBall';
 import TravelMapPanel, { TRAVEL_PHASE_COPY, type TravelPanelView } from './TravelMapPanel';
 import TravelChatCard from './TravelChatCard';
@@ -51,7 +52,27 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
     const overlay = useSyncExternalStore(runtime.overlay.subscribe, runtime.overlay.get, runtime.overlay.get);
     const [confirmEnd, setConfirmEnd] = useState(false);
     const refreshedFor = useRef<string | null>(null);
-    const config = useMemo(() => mapConfig ?? readTravelMapConfig(), [mapConfig]);
+    // 地图配置：先在首帧用构建期兜底，随后按已签名会话拉服务端凭据（用户自己填的优先）。
+    const [config, setConfig] = useState<TravelMapRuntimeConfig>(
+        () => mapConfig ?? readTravelMapConfig(),
+    );
+    useEffect(() => {
+        if (mapConfig) {
+            setConfig(mapConfig);
+            return;
+        }
+        let alive = true;
+        void loadTravelMapRuntime({ runtime, force: true })
+            .then((state) => {
+                if (alive) setConfig(state.config);
+            })
+            .catch(() => {
+                /* 读不到就保持兜底，不画假地图 */
+            });
+        return () => {
+            alive = false;
+        };
+    }, [runtime, mapConfig]);
 
     const shareVisible = state.shareEnabled && state.shareKnown;
     const activeCharId = overlay.charId ?? characters[0]?.id ?? null;

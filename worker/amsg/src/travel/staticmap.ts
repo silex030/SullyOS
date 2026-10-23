@@ -38,6 +38,11 @@ export interface StaticMapDeps {
   fetch?: typeof globalThis.fetch;
   /** 上游地址（测试注入；生产固定官方 restapi）。 */
   upstreamBase?: string;
+  /**
+   * 按主体解析 Web 服务 Key（用户自己保存的加密凭据优先）。给了就用它；
+   * 没给才看 env（仅供老部署兼容，新链路必须传）。
+   */
+  resolveWebKey?: () => Promise<string | null>;
 }
 
 const toBase64Url = (bytes: Uint8Array): string => {
@@ -226,7 +231,8 @@ export async function handleTravelStaticMap(
   }
 
   // 配置缺口先报：缺 Web 服务 Key 是「没配」，不是「没有行程」。
-  const key = String(env?.AMAP_WEB_KEY ?? '').trim();
+  const userKey = deps.resolveWebKey ? await deps.resolveWebKey().catch(() => null) : null;
+  const key = String(userKey ?? env?.AMAP_WEB_KEY ?? '').trim();
   if (!key) return jsonNoStore(503, { error: { code: 'PROVIDER_FAILED' } });
 
   const trip = await getActiveTravelTrip(db, { userId, charId });

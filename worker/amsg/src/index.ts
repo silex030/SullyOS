@@ -207,10 +207,13 @@ import {
 import { createTravelSessionResolver } from './travel/auth';
 import { handleTravelRequest } from './travel/routes';
 import { handleTravelScheduled, inferRegionFromAnchor } from './travel/tick';
-import { handleTravelStaticMap } from './travel/staticmap';
+import { handleTravelStaticMap, decodeStaticMapUser } from './travel/staticmap';
 import { createAnchorSearchPort } from './travel/anchorSearch';
 import { createAmapProvider } from './travel/providerAmap';
 import { createWorldProvider } from './travel/providerWorld';
+import { resolveTravelMapCredentialValues } from './travel/mapCredentials';
+import { createTravelMapProviders, resolveTravelMapProviderKeys } from './travel/mapProviders';
+import { handleAmapServiceProxy, isAmapServiceProxyPath } from './travel/mapProxy';
 import { createTravelDecisionPort, createTravelModelCaller, isUsableModelCredentials } from './travel/modelDecision';
 import { resolveTravelModelCredentialsForUser } from './travel/credentials';
 import { listTravelTickSubjectsWithAuthorized, resolveIntentProbeWindowMs } from './travel/intent';
@@ -277,6 +280,11 @@ interface Env extends NativeFcmEnv {
   TRAVEL_BASEMAP_LICENSE?: string;
   /** 高德 Web 服务 Key（服务端专用；绝不能与 JS API Key 混用）。 */
   AMAP_WEB_KEY?: string;
+  /**
+   * 只有显式设 `allow` 才把上面的 worker 级地图 env 当作兜底。
+   * 默认只看用户自己在设置里保存的加密凭据（清除后不会神秘复活）。
+   */
+  TRAVEL_MAP_ENV_FALLBACK?: string;
   /** 国外地图 token（`pk.` 前缀）；没有 → 国外标未授权，不是「已支持」。 */
   MAPBOX_TOKEN?: string;
   /** 出行决策用的模型凭据（缺就用 LLM_*；再缺 → 决策端口缺席，tick 停在 wait）。 */
@@ -3351,21 +3359,35 @@ const travelReserveFor = (env: Env, userId: string) => async () => {
     : { allowed: false as const, code: result.code };
 };
 
+/** 静态图 URL 里的用户作用域（不透明编码，非凭据）；只用于按主体取 Key。 */
+function readStaticMapUserFromRequest(request: Request): string | null {
+  try {
+    const url = new URL(request.url);
+    return decodeStaticMapUser(url.searchParams.get('u') ?? '');
+  } catch {
+    return null;
+  }
+}
+
 /** 国内高德 + 国外 Mapbox 两套实现都挂上，地区由 tick 按锚点判。 */
-const travelProvidersFor = (env: Env, userId: string) => {
+const travelProvidersFor = async (env: Env, userId: string) => {
   const deps = {
     fetch: globalThis.fetch,
     reserveMapCall: travelReserveFor(env, userId),
     now: Date.now,
   };
-  return [
-    createAmapProvider({ resolveKey: () => (env.AMAP_WEB_KEY ?? '').trim() || null }, deps),
-    createWorldProvider({ resolveToken: () => (env.MAPBOX_TOKEN ?? '').trim() || null }, deps),
-  ];
+  // 凭据顺序：用户自己保存的加密凭据优先；env 只在 TRAVEL_MAP_ENV_FALLBACK=allow 时兜底。
+  const userCredentials = await resolveTravelMapCredentialValues({
+    db: env.DB as unknown as never,
+    userId,
+    masterKey: (env as { AMSG_MASTER_KEY?: string }).AMSG_MASTER_KEY,
+  });
+  const keys = resolveTravelMapProviderKeys({ userCredentials, env });
+  return createTravelMapProviders(keys, deps);
 };
 
 /** 锚点检索端口（前端只拿签名 placeId；坐标留在服务端）。 */
-function createTravelAnchorSearch(env: Env, userId: string) {
+async function createTravelAnchorSearch(env: Env, userId: string) {
   const secret = resolveTravelSecretString(env as never) ?? '';
   if (secret.length < 32) return null;
   const deps = {
@@ -3373,13 +3395,17 @@ function createTravelAnchorSearch(env: Env, userId: string) {
     reserveMapCall: travelReserveFor(env, userId),
     now: Date.now,
   };
-  const amapKey = (env.AMAP_WEB_KEY ?? '').trim();
-  const mapbox = (env.MAPBOX_TOKEN ?? '').trim();
+  const userCredentials = await resolveTravelMapCredentialValues({
+    db: env.DB as unknown as never,
+    userId,
+    masterKey: (env as { AMSG_MASTER_KEY?: string }).AMSG_MASTER_KEY,
+  });
+  const keys = resolveTravelMapProviderKeys({ userCredentials, env });
   // 锚点检索默认国内；只有没配高德 Web 服务 Key 时才用国外 provider。
-  const provider = amapKey
-    ? createAmapProvider({ resolveKey: () => amapKey }, deps)
-    : mapbox
-      ? createWorldProvider({ resolveToken: () => mapbox }, deps)
+  const provider = keys.amapWebKey
+    ? createAmapProvider({ resolveKey: () => keys.amapWebKey }, deps)
+    : keys.mapboxToken
+      ? createWorldProvider({ resolveToken: () => keys.mapboxToken }, deps)
       : null;
   return createAnchorSearchPort({ provider, secret, now: () => Date.now() });
 }
@@ -3420,7 +3446,7 @@ async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
     },
   });
   return {
-    providers: travelProvidersFor(env, subject.userId),
+    providers: await travelProvidersFor(env, subject.userId),
     // 地区按锚点判：国内 → 高德；其余 → world（没 token 时 honest unavailable，不画直线）。
     region: inferRegionFromAnchor(anchor),
     readAnchor: async () => anchor,
@@ -3583,11 +3609,37 @@ export default {
 
     // 2) 静态图（同源短签 URL）：URL 里没有 Bearer，验签 + 回查共享后才出图。
     if (method === 'GET' && pathname.endsWith('/travel/staticmap')) {
+      const staticMapUserId = null;
       return handleTravelStaticMap(request, env as never, {
         sessionSecret: resolveTravelSecretString(env as never) ?? '',
-        userId: null,
+        userId: staticMapUserId,
+        now: () => Date.now(),
+        resolveWebKey: async () => {
+          const userId = readStaticMapUserFromRequest(request);
+          if (!userId) return null;
+          const creds = await resolveTravelMapCredentialValues({
+            db: env.DB as unknown as never,
+            userId,
+            masterKey: (env as { AMSG_MASTER_KEY?: string }).AMSG_MASTER_KEY,
+          });
+          if (creds?.amapWebKey) return creds.amapWebKey;
+          return String(env.TRAVEL_MAP_ENV_FALLBACK ?? '').trim().toLowerCase() === 'allow'
+            ? (env.AMAP_WEB_KEY ?? '').trim() || null
+            : null;
+        },
+      });
+    }
+
+    // 2b) 高德 JS API 安全代理（官方 `_AMapService` 前缀 + 短期签名会话）。
+    //     不能用 Bearer：请求由地图 SDK 从 <script>/XHR 发出，跨脚本带不了头。
+    if (isAmapServiceProxyPath(pathname)) {
+      const proxied = await handleAmapServiceProxy(request, {
+        db: env.DB as unknown as never,
+        masterKey: (env as { AMSG_MASTER_KEY?: string }).AMSG_MASTER_KEY,
+        secret: resolveTravelSecretString(env as never) ?? '',
         now: () => Date.now(),
       });
+      if (proxied) return proxied;
     }
 
     // 3) 出行业务路由（state/share/budget/settings/char/anchor/context/config）。
@@ -3605,6 +3657,7 @@ export default {
         now: () => Date.now(),
         anchorSearchFor: (userId) => createTravelAnchorSearch(env, userId),
         staticMapSecret: resolveTravelSecretString(env as never) ?? undefined,
+        mapProxySecret: resolveTravelSecretString(env as never) ?? undefined,
       });
       if (travel) return travel;
     }

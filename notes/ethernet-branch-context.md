@@ -179,3 +179,11 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - 仍未完成（不许写成已完成）：SoVITS CPU 不达标（`disabled`+`inactive`，未接主代理）；云端 BGE 无同题实测只保留；前端备份 ZIP 无加密；CF `worker/amsg` 的 Google secret 无凭据未同步；Supabase 零 DDL；索引重建由用户自选；架构一键向导不在本轮。
   - **发布事故（真实发生，别当没发生过）**：第一次部署就是上面那条 data: URL 相对 import，main-agent 起不来、8830 无监听约 12 分钟（01:14–01:26），其余 6 个 worker 正常。停产窗口内只影响了 `/agent/*`，前端静态与后端其它路由仍可用。修复走独立提交 `fda84a0b`（内联 + 守卫用例），重新 pull/restart 后复验通过。**教训：源码级测试全绿不能证明部署面能启动，产物必须按部署加载方式实测。**
   - 上线读回（详细见 `RELEASE-RESULT.md`）：首页 200 + `v3.20 (Local Memory)`；本地 `dist` 与线上 **413/413 文件 sha256 逐字节一致**；`/agent` `/amsg` `/home` `/heartbeat` `/google-api` 健康 200（`/instant-push` 401 是设计）；本地 embedding 公网同源 health 200（无 `upstream`）、无 token/错 token 403、两条合成 query/doc 返回 768 维 L2=1.0；SoVITS `disabled`+`inactive`、19880 无监听；8850 仅回环；部署副本 backup/restore 脚本已消失、历史包 4 个未动、无新 timer；CF `worker/amsg` 的 Google secret 仍未同步（无凭据）。
+
+- 🧭 **2026-10-23 出行地图凭据（前端填写 → 后台加密）**：用户已有高德 Key、不肯改 env，所以凭据走「设置页输入 → 按账号加密存 `travel_map_credentials`」。
+  - **只有存在性和浏览器必需的展示 Key 能回前端**：Web 服务 Key 与 jscode 一旦出现在响应 JSON 就是事故（测试直接断言字符串不出现）。`serviceHost` 必须是短期签名（`/_AMapService/t/<token>`），别退回「前端塞 securityJsCode」。
+  - **代理不是开放转发**：白名单 7 个只读端点、上游固定 `restapi.amap.com`、覆盖 `key` 注入 `jscode`、按用户限流；`/ _AMapService` 路由在 Caddy 里必须用 `handle` 不能用 `handle_path`（剥前缀就 404，和 `/home/*` 同坑）。
+  - **env 只做显式兜底**：`TRAVEL_MAP_ENV_FALLBACK=allow` 才看 `AMAP_WEB_KEY`/`MAPBOX_TOKEN`；默认只看用户凭据，否则「清除后复活」会被当成已配置。
+  - 校验语义：空字段保持不变、清除必须显式 `clear`、解不开（换 masterKey）时 `unreadable` 且拒绝覆盖、已有行按 version CAS。
+  - 门禁：定向 36 文件 / 431 例绿；全量 604 文件 / 7298 例仅 `activeMsgClient.credRefs` 在全量负载下超时（单跑 16/16 绿）；tsc 56 与基线逐条相同（0 新增）；`check:workers` 提交后绿；`vite build` 绿。
+  - **未做**：生产 Caddy 未加 `/_AMapService` 路由，VPS 未部署，真实 Key 未验证。

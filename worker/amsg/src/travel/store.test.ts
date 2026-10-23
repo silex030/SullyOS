@@ -127,6 +127,7 @@ describe('ensureTravelSchema（契约原文 DDL）', () => {
       'travel_budget_state',
       'travel_candidates',
       'travel_char_settings',
+      'travel_map_credentials',
       'travel_settings',
       'travel_share_state',
       'travel_trip_events',

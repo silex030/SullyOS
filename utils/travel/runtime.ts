@@ -47,7 +47,51 @@ export const TRAVEL_RUNTIME_ENDPOINTS = {
     anchorSearch: '/travel/anchor/search',
     /** 角色内部（鉴权后）脱敏上下文：共享关闭也返回，用于角色自知，不含坐标。 */
     context: '/travel/context',
+    /** 地图服务凭据：用户自己填，服务端按主体加密保存。 */
+    mapCredentials: '/travel/map/credentials',
+    /** 显式「测试连接」（单次、有冷却，不扣自主出行预算）。 */
+    mapCredentialsTest: '/travel/map/credentials/test',
 } as const;
+
+/** 凭据存在性：**没有**任何密钥值，只有布尔。 */
+export interface TravelMapCredentialPresence {
+    amapWebKey: boolean;
+    amapJsKey: boolean;
+    amapJsCode: boolean;
+    mapboxToken: boolean;
+}
+
+/**
+ * 服务端回给前端的凭据视图：只有存在性 + 浏览器必需的公开 Key。
+ * `amapJsKey` / `mapboxToken` 是官方设计上就要进浏览器的公开展示 Key；
+ * Web 服务 Key 与 securityJsCode 不在这个形状里（也永远不会被加进来）。
+ */
+export interface TravelMapCredentialView {
+    configured: boolean;
+    unreadable: boolean;
+    has: TravelMapCredentialPresence;
+    amapJsKey: string | null;
+    mapboxToken: string | null;
+    mapboxStyleUrl: string | null;
+    updatedAt: number | null;
+    serviceHost: string | null;
+    serviceHostExpiresAt: number | null;
+}
+
+export interface TravelMapCredentialsView {
+    known: boolean;
+    credentials: TravelMapCredentialView | null;
+    error: TravelApiErrorCode | null;
+}
+
+export interface TravelMapCredentialPatch {
+    amapWebKey?: string;
+    amapJsKey?: string;
+    amapJsCode?: string;
+    mapboxToken?: string;
+    mapboxStyleUrl?: string;
+    clear?: readonly ('amapWebKey' | 'amapJsKey' | 'amapJsCode' | 'mapboxToken' | 'mapboxStyleUrl')[];
+}
 
 /**
  * 设置形状**以后端为准**（`GET /travel/settings`）：
@@ -121,6 +165,23 @@ const isSettings = (v: unknown): v is TravelSettings =>
     isFiniteNumber(v.eventRetentionDays) &&
     isFiniteNumber(v.version) &&
     isFiniteNumber(v.updatedAt);
+
+/** 凭据视图形状校验：只认布尔与公开展示 Key，出现「看起来像密钥」的额外字段也照形状拒绝。 */
+const isMapCredentialView = (v: unknown): v is TravelMapCredentialView =>
+    isRecord(v) &&
+    typeof v.configured === 'boolean' &&
+    typeof v.unreadable === 'boolean' &&
+    isRecord(v.has) &&
+    typeof (v.has as Record<string, unknown>).amapWebKey === 'boolean' &&
+    typeof (v.has as Record<string, unknown>).amapJsKey === 'boolean' &&
+    typeof (v.has as Record<string, unknown>).amapJsCode === 'boolean' &&
+    typeof (v.has as Record<string, unknown>).mapboxToken === 'boolean' &&
+    (v.amapJsKey === null || typeof v.amapJsKey === 'string') &&
+    (v.mapboxToken === null || typeof v.mapboxToken === 'string') &&
+    (v.mapboxStyleUrl === null || typeof v.mapboxStyleUrl === 'string') &&
+    (v.updatedAt === null || isFiniteNumber(v.updatedAt)) &&
+    (v.serviceHost === null || typeof v.serviceHost === 'string') &&
+    (v.serviceHostExpiresAt === null || isFiniteNumber(v.serviceHostExpiresAt));
 
 const isAnchor = (v: unknown): v is TravelAnchorView =>
     isRecord(v) &&
@@ -335,6 +396,53 @@ export function createTravelRuntime(deps: TravelRuntimeDeps = {}) {
 
         /** 内存缓存（刷新页面重新读；不进备份）。 */
         settingsCache: (): TravelSettings | null => settings,
+
+        /**
+         * 读地图凭据状态（只有存在性与公开展示 Key）。
+         * 读不到就 known:false —— 设置页写「未确认」，不按「未配置」覆盖用户判断。
+         */
+        async readMapCredentials(): Promise<TravelMapCredentialsView> {
+            const res = await request(TRAVEL_RUNTIME_ENDPOINTS.mapCredentials, {
+                method: 'GET',
+                purpose: '读取地图服务凭据状态',
+            });
+            if (!res.ok) return { known: false, credentials: null, error: res.code ?? null };
+            if (!isMapCredentialView(res.data)) {
+                return { known: false, credentials: null, error: 'MALFORMED_RESPONSE' };
+            }
+            return { known: true, credentials: res.data, error: null };
+        },
+
+        /**
+         * 保存 / 替换 / 清除。空字段表示「保持不变」，清除必须显式放进 `clear`。
+         * 保存动作本身**不发**任何收费的地图请求（测试连接是另一个显式动作）。
+         */
+        async saveMapCredentials(
+            patch: TravelMapCredentialPatch,
+        ): Promise<{ ok: boolean; code?: TravelApiErrorCode; credentials?: TravelMapCredentialView }> {
+            const res = await request(TRAVEL_RUNTIME_ENDPOINTS.mapCredentials, {
+                method: 'PUT',
+                body: { ...patch },
+                purpose: '保存地图服务凭据',
+            });
+            if (!res.ok) return { ok: false, code: res.code };
+            if (!isMapCredentialView(res.data)) return { ok: false, code: 'MALFORMED_RESPONSE' };
+            return { ok: true, credentials: res.data };
+        },
+
+        /** 显式测试连接：一次请求、服务端有冷却；返回布尔与错误码，不回显任何 Key。 */
+        async testMapConnection(): Promise<{ ok: boolean; code: string }> {
+            const res = await request(TRAVEL_RUNTIME_ENDPOINTS.mapCredentialsTest, {
+                method: 'POST',
+                purpose: '测试地图服务连接',
+            });
+            if (!res.ok) return { ok: false, code: res.code ?? 'NETWORK' };
+            const payload = isRecord(res.data) ? res.data : null;
+            return {
+                ok: payload?.ok === true,
+                code: typeof payload?.code === 'string' ? payload.code : 'PROVIDER_FAILED',
+            };
+        },
 
         /** 地址搜索：服务端代理（地图 Key 只在服务端），前端不接触 Web 服务 Key。 */
         async searchAnchor(

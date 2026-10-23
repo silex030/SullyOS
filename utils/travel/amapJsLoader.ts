@@ -114,13 +114,25 @@ export const buildAmapScriptUrl = (input: { key: string; version?: string }): st
     )}`;
 
 /**
- * 归一化 serviceHost：只接受以 `/_AMapService` 结尾的同源路径或绝对地址。
+ * 归一化 serviceHost：接受同源 `/_AMapService`、绝对 `https://host/_AMapService`，
+ * 以及带**短期签名会话**的 `.../_AMapService/t/<token>`（SDK 跨脚本带不了 Bearer，
+ * 租户与过期时间都在 token 里，官方前缀不变）。
  * 返回 null 表示「不合法」，调用方应判不可用，而不是猜一个能用的前缀。
  */
 export const normalizeServiceHost = (raw: string | null | undefined): string | null => {
     const value = typeof raw === 'string' ? raw.trim() : '';
     if (!value) return null;
     const withoutTrailing = value.replace(/\/+$/, '');
+    if (!withoutTrailing) return null;
+    const tokenSuffix = /\/_AMapService\/t\/([A-Za-z0-9_.-]{16,512})$/.exec(withoutTrailing);
+    if (tokenSuffix) {
+        const base = withoutTrailing.slice(0, tokenSuffix.index ?? 0);
+        // 只允许同源路径或单一 https 主机的绝对地址；不放 http、不放协议相对。
+        if (base === '') return withoutTrailing;
+        if (base.startsWith('/') && !base.startsWith('//')) return withoutTrailing;
+        if (/^https:\/\/[^\s/]+$/.test(base)) return withoutTrailing;
+        return null;
+    }
     if (!withoutTrailing.endsWith(AMAP_SERVICE_PREFIX)) return null;
     if (withoutTrailing === AMAP_SERVICE_PREFIX) return AMAP_SERVICE_PREFIX;
     // 允许 https://host/_AMapService 与 /_AMapService；其余（协议、相对路径）一律拒。
