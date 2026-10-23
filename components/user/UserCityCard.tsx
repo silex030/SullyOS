@@ -1,8 +1,15 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useOS } from '../../context/OSContext';
 import { getCurrentPositionSmart } from '../../utils/geo';
-import { fetchInputTips, geocodeCity, regeoCity, type AmapInputTip } from '../../utils/amapCore';
-import { getProxyWorkerUrl } from '../../utils/proxyWorker';
+import {
+    fetchInputTips,
+    geocodeCity,
+    isAmapAuthReady,
+    regeoCity,
+    type AmapAuth,
+    type AmapInputTip,
+} from '../../utils/amapCore';
+import { resolveAmapAuth } from '../../utils/cityPlaces';
 
 /**
  * 用户档案「所在城市」卡。
@@ -11,7 +18,7 @@ import { getProxyWorkerUrl } from '../../utils/proxyWorker';
  * prompt 里的「用户那边」段也只出现城市名 + 城市级天气。
  */
 const UserCityCard: React.FC = () => {
-    const { userProfile, updateUserProfile, realtimeConfig, addToast } = useOS();
+    const { userProfile, updateUserProfile, addToast } = useOS();
     const [locating, setLocating] = useState(false);
     const [saving, setSaving] = useState(false);
     const [input, setInput] = useState('');
@@ -20,8 +27,17 @@ const UserCityCard: React.FC = () => {
     const debounceRef = useRef<number | null>(null);
 
     const loc = userProfile.location;
-    const amapKey = realtimeConfig.amapApiKey?.trim() || '';
-    const auth = { proxyUrl: getProxyWorkerUrl(), key: amapKey };
+    // 凭证唯一来源：服务端加密保存的 Web 服务 Key，经出行会话的 REST 中转取数。
+    // 本机 localStorage 旧 Key 不再是消费来源（只作设置页的迁移输入）。
+    const [auth, setAuth] = useState<AmapAuth | null>(null);
+    useEffect(() => {
+        let alive = true;
+        void resolveAmapAuth()
+            .then((a) => { if (alive) setAuth(a); })
+            .catch(() => { if (alive) setAuth(null); });
+        return () => { alive = false; };
+    }, []);
+    const ready = isAmapAuthReady(auth);
 
     const saveCity = (province: string | undefined, city: string, source: 'gps' | 'user') => {
         updateUserProfile({
@@ -36,8 +52,8 @@ const UserCityCard: React.FC = () => {
 
     // GPS → 逆地理 → 只留省市
     const handleGps = async () => {
-        if (!amapKey) {
-            addToast('先去「设置 → 实时感知」填写高德 Key，定位才能解析成城市', 'error');
+        if (!ready || !auth) {
+            addToast('先去「设置 → 实时感知」完成地图服务连接，定位才能解析成城市', 'error');
             return;
         }
         setLocating(true);
@@ -61,8 +77,8 @@ const UserCityCard: React.FC = () => {
     const confirmInput = async () => {
         const name = input.trim();
         if (!name) return;
-        // 无 key：原样存城市名；有 key：地理编码验成标准省市
-        if (!amapKey) {
+        // 没有可用凭证：原样存城市名；有凭证：地理编码验成标准省市
+        if (!ready || !auth) {
             saveCity(undefined, name, 'user');
             setInput('');
             setTipOpen(false);
@@ -92,7 +108,7 @@ const UserCityCard: React.FC = () => {
         setInput(v);
         setTipOpen(true);
         if (debounceRef.current) window.clearTimeout(debounceRef.current);
-        if (!amapKey || v.trim().length < 1) {
+        if (!ready || !auth || v.trim().length < 1) {
             setTips([]);
             return;
         }
@@ -109,7 +125,7 @@ const UserCityCard: React.FC = () => {
     const pickTip = async (t: AmapInputTip) => {
         setTipOpen(false);
         setTips([]);
-        if (t.lat == null || t.lng == null) {
+        if (t.lat == null || t.lng == null || !auth) {
             setInput(t.name);
             return;
         }
@@ -208,8 +224,8 @@ const UserCityCard: React.FC = () => {
                     </button>
                 )}
             </div>
-            {!amapKey && (
-                <p className="text-[10px] text-amber-500 mt-2 leading-relaxed">未填高德 Key：可手填城市名，GPS 定位与联想不可用（去「设置 → 实时感知」填写）。</p>
+            {!ready && (
+                <p className="text-[10px] text-amber-500 mt-2 leading-relaxed">地图服务未连接：可手填城市名，GPS 定位与联想不可用（去「设置 → 实时感知」完成连接）。</p>
             )}
         </div>
     );

@@ -32,8 +32,14 @@ import { extractAppearanceFromPersona, extractAppearanceFromReferenceImage } fro
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { COMMON_TIMEZONES } from '../utils/timezone';
 import { fetchOpenMeteoWeather, geocodeCityOpenMeteo } from '../utils/realtimeWorldCore';
-import { fetchInputTips, geocodeCity, regeoCity, wgs84ToGcj02 } from '../utils/amapCore';
-import { getProxyWorkerUrl } from '../utils/proxyWorker';
+import {
+    fetchInputTips,
+    geocodeCity,
+    isAmapAuthReady,
+    regeoCity,
+    wgs84ToGcj02,
+} from '../utils/amapCore';
+import { resolveAmapAuth } from '../utils/cityPlaces';
 import { toMountedWorldbook } from '../utils/worldbook';
 import { stripSensitiveCardFields } from '../utils/characterCard';
 import { shareOrDownloadFile } from '../utils/shareExport';
@@ -100,7 +106,7 @@ const CharacterCard: React.FC<{
 );
 
 const Character: React.FC = () => {
-  const { closeApp, openApp, characters, activeCharacterId, setActiveCharacterId, addCharacter, updateCharacter, deleteCharacter, characterGroups, createCharacterGroup, renameCharacterGroup, deleteCharacterGroup, apiConfig, addToast, userProfile, worldbooks, addWorldbook, realtimeConfig } = useOS();
+  const { closeApp, openApp, characters, activeCharacterId, setActiveCharacterId, addCharacter, updateCharacter, deleteCharacter, characterGroups, createCharacterGroup, renameCharacterGroup, deleteCharacterGroup, apiConfig, addToast, userProfile, worldbooks, addWorldbook } = useOS();
 
   // 只有当前语音服务商是「本地语音（MOSS-TTS-Nano）」时，才去读音色目录并展示选择器。
   // 其他 provider 下不探测、不渲染，原来的 MiniMax / Fish / ElevenLabs 配置一律不动。
@@ -545,9 +551,10 @@ const Character: React.FC = () => {
       const timer = setTimeout(async () => {
           setLocSearching(true);
           try {
-              const key = realtimeConfig.amapApiKey?.trim();
-              if (key) {
-                  const tips = await fetchInputTips(q, { proxyUrl: getProxyWorkerUrl(), key });
+              // 凭证统一走服务端那份（经出行会话的 REST 中转），本机旧 Key 不再是来源。
+              const auth = await resolveAmapAuth();
+              if (isAmapAuthReady(auth)) {
+                  const tips = await fetchInputTips(q, auth);
                   if (!cancelled) {
                       setLocSuggestions(tips.slice(0, 6).map((t) => ({
                           name: t.name,
@@ -582,7 +589,7 @@ const Character: React.FC = () => {
           finally { if (!cancelled) setLocSearching(false); }
       }, LOC_SEARCH_DEBOUNCE_MS);
       return () => { cancelled = true; clearTimeout(timer); };
-  }, [locDraft, formData?.id, realtimeConfig.amapApiKey]);
+  }, [locDraft, formData?.id]);
 
   // 写进 formData（走 handleChange → 自动保存链）。location.lat/lng 恒为 GCJ-02
   //（Open-Meteo 来的 WGS-84 在写入前已转换，datum 混用会让距离展示偏几百米）。
@@ -607,9 +614,8 @@ const Character: React.FC = () => {
   // Open-Meteo 项自带坐标与 admin1，直接落。
   const applySuggestion = async (s: { name: string; admin1?: string; district?: string; adcode?: string; lat?: number; lng?: number; source: 'amap' | 'openmeteo' }) => {
       if (!formData) return;
-      const key = realtimeConfig.amapApiKey?.trim();
-      if (s.source === 'amap' && key) {
-          const auth = { proxyUrl: getProxyWorkerUrl(), key };
+      const auth = await resolveAmapAuth();
+      if (s.source === 'amap' && isAmapAuthReady(auth)) {
           if (s.lat != null && s.lng != null) {
               try {
                   const p = await regeoCity(s.lat, s.lng, auth, 5000);
@@ -641,10 +647,10 @@ const Character: React.FC = () => {
   const applyManualLocation = async (name: string) => {
       const c = name.trim();
       if (!formData || !c) return;
-      const key = realtimeConfig.amapApiKey?.trim();
-      if (key) {
+      const auth = await resolveAmapAuth();
+      if (isAmapAuthReady(auth)) {
           try {
-              const g = await geocodeCity(c, { proxyUrl: getProxyWorkerUrl(), key }, 5000);
+              const g = await geocodeCity(c, auth, 5000);
               if (g) {
                   writeLocation({ province: g.province, city: g.city, district: g.district, lat: g.lat, lng: g.lng, adcode: g.adcode });
                   return;
