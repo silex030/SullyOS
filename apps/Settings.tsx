@@ -27,6 +27,7 @@ import { loadMcpServers, saveMcpServers, createMcpServer, effectiveMcpRouting, m
 import { getMcpResultList, clearMcpResults } from '../utils/mcpResultMemory';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
 import AutonomyGuardrailsSettings from '../components/settings/AutonomyGuardrailsSettings';
+import TravelSettings from '../components/settings/TravelSettings';
 import MemoryNegotiationSettings from '../components/settings/MemoryNegotiationSettings';
 import BluetoothPanel from '../components/settings/BluetoothPanel';
 import { bleEngine } from '../utils/bleEngine';
@@ -3870,6 +3871,21 @@ const Settings: React.FC = () => {
                 角色自己安排生活时的总闸与预算：全局每天最多几次、每角色默认几次、同类动作最少隔多久、每天 token 预算。各角色面板里还能单独收紧；0 = 暂停。
             </p>
             <AutonomyGuardrailsSettings />
+        </SettingsSection>
+
+        {/* ───────── 角色自主出行（授权 / 预算 / 固定地点；设置只在服务端持久化） ───────── */}
+        <SettingsSection
+            title="角色自主出行"
+            icon={
+                <div className="p-2 bg-sky-100/60 rounded-xl text-sky-600">
+                    <MapPin size={16} weight="bold" />
+                </div>
+            }
+        >
+            <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+                角色可以自己出门、逛一逛再回来。这里只管授权与资源：能不能出门、能不能看位置、每天多少地图与模型额度、固定地点是哪儿。TA 想去哪、什么时候不想去，由 TA 自己决定。
+            </p>
+            <TravelSettings />
         </SettingsSection>
 
         {/* ───────── 记忆协商（全局实验开关；落记忆宫殿 config，默认关） ───────── */}

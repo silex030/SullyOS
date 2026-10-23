@@ -118,7 +118,7 @@ function cloudUsageMetadata(raw) {
 // worker/amsg/src/index.ts
 import { DurableObject } from "cloudflare:workers";
 
-// node_modules/.pnpm/@rei-standard+amsg-server@2.6.0-next.23_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
+// ../SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@2.6.0-next.23_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
 var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
   "user_id",
   "uuid",
@@ -137,7 +137,7 @@ var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
 var TASK_DELIVERY_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, retry_after, status, retry_count";
 var TASK_DETAIL_COLUMNS = "id, user_id, uuid, encrypted_payload, message_type, next_send_at, status, retry_count, last_error, created_at, updated_at";
 
-// node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0-next.8/node_modules/@rei-standard/amsg-shared/dist/index.mjs
+// ../SullyOS/node_modules/.pnpm/@rei-standard+amsg-shared@0.4.0-next.8/node_modules/@rei-standard/amsg-shared/dist/index.mjs
 var TEXT_ENCODER = new TextEncoder();
 var TEXT_DECODER = new TextDecoder("utf-8", { fatal: false });
 function toUint8(buf) {
@@ -1236,7 +1236,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// node_modules/.pnpm/@rei-standard+amsg-server@2.6.0-next.23_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-3JEWYDM4.mjs
+// ../SullyOS/node_modules/.pnpm/@rei-standard+amsg-server@2.6.0-next.23_@neondatabase+serverless@1.1.0_pg@8.22.0/node_modules/@rei-standard/amsg-server/dist/chunk-3JEWYDM4.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -7317,6 +7317,7 @@ function guardrailValuesEqual(a, b) {
 }
 
 // utils/airp/autonomySettings.ts
+var AUTONOMY_DAILY_TOKEN_BUDGET = 1e5;
 var AUTONOMOUS_ROUND_KIND = "autonomous_round";
 var AUTONOMY_RESULT_KIND = "autonomy_result";
 
@@ -7894,13 +7895,13 @@ var plateConsolidateHandler = {
       await discardJob(ctx.writeState, jobId);
       throw new Error(message);
     };
-    let json;
+    let json3;
     try {
-      json = await unpackStateValue(row.value);
+      json3 = await unpackStateValue(row.value);
     } catch (error) {
       return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09\uFF1A${String(error)}`);
     }
-    const job = parsePlateJobInput(json);
+    const job = parsePlateJobInput(json3);
     if (!job) return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684\u8F93\u5165\u89E3\u6790\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`);
     if (job.charId !== charId) {
       return discardAndFail(`\u95E8\u724C\u6574\u7406 job ${jobId} \u7684 charId \u4E0E\u4EFB\u52A1\u5BF9\u4E0D\u4E0A`);
@@ -9869,19 +9870,19 @@ var isEncryptedEnvelope2 = (value) => {
   return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
 };
 var handleInstantChat = async (args) => {
-  const { request, env, upstream: upstream2, json } = args;
+  const { request, env, upstream: upstream2, json: json3 } = args;
   const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
-  const fail3 = (status, code, message, extra) => json(status, { success: false, error: { code, message, ...extra ?? {} } });
+  const fail7 = (status, code, message, extra) => json3(status, { success: false, error: { code, message, ...extra ?? {} } });
   const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
   const clientToken = request.headers.get("X-Client-Token") ?? "";
   if (token) {
     if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
-      return fail3(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
+      return fail7(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
     }
   }
   const userId = request.headers.get("X-User-Id") ?? "";
-  if (!userId) return fail3(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
-  if (!UUID_V4_RE.test(userId)) return fail3(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
+  if (!userId) return fail7(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
+  if (!UUID_V4_RE.test(userId)) return fail7(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
   let body;
   try {
     const text = await readMaybeGzippedBody(request);
@@ -9889,13 +9890,13 @@ var handleInstantChat = async (args) => {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     body = parsed;
   } catch {
-    return fail3(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
+    return fail7(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
   }
   if (!isEncryptedEnvelope2(body.statePayload)) {
-    return fail3(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+    return fail7(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
   }
   if (!isEncryptedEnvelope2(body.taskPayload)) {
-    return fail3(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+    return fail7(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
   }
   const requestUrl = new URL(request.url);
   const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
@@ -9940,7 +9941,7 @@ var handleInstantChat = async (args) => {
     if (stateResponse.status < 500) break;
   }
   if (!stateResponse.ok) {
-    return json(stateResponse.status, {
+    return json3(stateResponse.status, {
       success: false,
       error: {
         code: "INSTANT_CHAT_STATE_FAILED",
@@ -9953,7 +9954,7 @@ var handleInstantChat = async (args) => {
   }
   const skippedEntries = stateBody?.data?.skippedEntries;
   if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
-    return json(409, {
+    return json3(409, {
       success: false,
       error: {
         code: "INSTANT_CHAT_STATE_STALE",
@@ -9973,7 +9974,7 @@ var handleInstantChat = async (args) => {
   const taskBody = await readBody(taskResponse);
   if (!taskResponse.ok) {
     const taskCause = readUpstreamCause(taskResponse.status, taskBody);
-    return json(taskResponse.status, {
+    return json3(taskResponse.status, {
       success: false,
       error: {
         code: "INSTANT_CHAT_TASK_FAILED",
@@ -9986,7 +9987,7 @@ var handleInstantChat = async (args) => {
   }
   const uuid = taskBody?.data?.uuid;
   if (typeof uuid !== "string" || !uuid) {
-    return fail3(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
+    return fail7(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
       step: "schedule-message"
     });
   }
@@ -9994,10 +9995,10 @@ var handleInstantChat = async (args) => {
   if (!kicked.ok && kicked.reason === "missing-binding") {
     if ((env.SULLYOS_RUNTIME ?? "").trim() === "vps") {
       console.warn("[amsg:instant-chat] VPS \u6A21\u5F0F\uFF1A\u65E0 INSTANT_TICK \u7ED1\u5B9A\uFF0C\u4EFB\u52A1\u5DF2\u53D7\u7406\u3001\u7B49 node-cron \u6361\u8D70", uuid);
-      return json(202, { status: "accepted", uuid });
+      return json3(202, { status: "accepted", uuid });
     }
     console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
-    return json(503, {
+    return json3(503, {
       success: false,
       error: {
         code: "INSTANT_CHAT_WORKER_OUTDATED",
@@ -10010,8 +10011,1369 @@ var handleInstantChat = async (args) => {
   if (!kicked.ok) {
     console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
   }
-  return json(202, { status: "accepted", uuid });
+  return json3(202, { status: "accepted", uuid });
 };
+
+// contracts/travel.ts
+var TRAVEL_ERROR_CODES = [
+  "UNAUTHORIZED",
+  "INVALID_CLIENT_TOKEN",
+  "PRINCIPAL_MISMATCH",
+  "SHARE_REVOKED",
+  "UNKNOWN_CANDIDATE",
+  "WISH_EXPIRED",
+  "PROVIDER_UNSUPPORTED_REGION",
+  "PROVIDER_FAILED",
+  "BUDGET_BLOCKED",
+  "BUDGET_ZERO",
+  "VERSION_CONFLICT",
+  "ANCHOR_NOT_CONFIRMED",
+  "ROUTE_UNAVAILABLE",
+  "GEOMETRY_NOT_LICENSED",
+  "RETENTION_EXPIRED"
+];
+var TRAVEL_TRANSITIONS = {
+  considering: ["planned", "aborted", "expired", "unavailable"],
+  planned: ["en_route", "aborted", "expired", "unavailable"],
+  en_route: ["dwelling", "aborted", "expired"],
+  // 闲逛在外正常结束（角色自己决定就地停下）→ stopped，与「回家」是同层终态但语义不同。
+  dwelling: ["returning", "stopped", "en_route", "aborted", "expired"],
+  returning: ["returned", "aborted", "expired"],
+  returned: [],
+  stopped: [],
+  aborted: [],
+  expired: [],
+  unavailable: ["considering", "planned", "aborted", "expired"]
+};
+var TRAVEL_TERMINAL_STATUSES = ["returned", "stopped", "aborted", "expired"];
+var TRAVEL_PLAN_CHANGEABLE_STATUSES = [
+  "considering",
+  "planned",
+  "en_route",
+  "dwelling",
+  "returning"
+];
+var MAX_CANDIDATES = 8;
+var DEFAULT_BUDGET_TZ = "Asia/Shanghai";
+var TRAVEL_RETENTION_DEFAULTS = { tripDays: 30, eventDays: 7 };
+var TRAVEL_STALE_TRIP_MS = 4 * 60 * 60 * 1e3;
+var TRAVEL_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS travel_settings (
+  user_id TEXT PRIMARY KEY,
+  budget_tz TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+  trip_retention_days INTEGER NOT NULL DEFAULT 30,
+  event_retention_days INTEGER NOT NULL DEFAULT 7,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS travel_char_settings (
+  user_id TEXT NOT NULL,
+  char_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, char_id)
+);
+
+CREATE TABLE IF NOT EXISTS travel_anchors (
+  user_id TEXT NOT NULL,
+  char_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  city TEXT NOT NULL,
+  district TEXT,
+  lat REAL NOT NULL,
+  lng REAL NOT NULL,
+  coord_sys TEXT NOT NULL,
+  precision TEXT NOT NULL DEFAULT 'area',
+  confirmed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, char_id)
+);
+
+CREATE TABLE IF NOT EXISTS travel_trip_positions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  trip_id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  lat REAL NOT NULL,
+  lng REAL NOT NULL,
+  coord_sys TEXT NOT NULL,
+  share_generation INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS travel_positions_trip ON travel_trip_positions (user_id, trip_id, at);
+
+CREATE TABLE IF NOT EXISTS travel_wishes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  char_id TEXT NOT NULL,
+  wish_text TEXT NOT NULL,
+  category TEXT,
+  selected_candidate_id TEXT,
+  state TEXT NOT NULL,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS travel_wishes_open ON travel_wishes (user_id, char_id, state, expires_at);
+
+CREATE TABLE IF NOT EXISTS travel_candidates (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  wish_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  place_id TEXT,
+  label TEXT NOT NULL,
+  category TEXT,
+  city TEXT,
+  district TEXT,
+  lat REAL NOT NULL,
+  lng REAL NOT NULL,
+  coord_sys TEXT NOT NULL,
+  distance_m INTEGER,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS travel_candidates_wish ON travel_candidates (user_id, wish_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS travel_trips (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  char_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  plan_version INTEGER NOT NULL DEFAULT 1,
+  revision INTEGER NOT NULL DEFAULT 1,
+  coord_sys TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  origin_json TEXT NOT NULL,
+  dest_json TEXT,
+  route_json TEXT,
+  route_fetched_at INTEGER,
+  depart_at INTEGER,
+  arrive_at INTEGER,
+  dwell_until INTEGER,
+  return_at INTEGER,
+  retention_expires_at INTEGER,
+  dedupe_key TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS travel_trips_dedupe ON travel_trips (user_id, char_id, dedupe_key);
+CREATE INDEX IF NOT EXISTS travel_trips_due ON travel_trips (user_id, status, dwell_until, return_at);
+CREATE INDEX IF NOT EXISTS travel_trips_retention ON travel_trips (retention_expires_at);
+
+CREATE TABLE IF NOT EXISTS travel_trip_events (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  trip_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  payload_json TEXT,
+  source TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS travel_events_seq ON travel_trip_events (user_id, trip_id, seq);
+CREATE INDEX IF NOT EXISTS travel_events_retention ON travel_trip_events (expires_at);
+
+CREATE TABLE IF NOT EXISTS travel_budget_state (
+  user_id TEXT PRIMARY KEY,
+  map_calls_used INTEGER NOT NULL DEFAULT 0,
+  map_calls_limit INTEGER NOT NULL,
+  map_attempts_used INTEGER NOT NULL DEFAULT 0,
+  llm_tokens_used INTEGER NOT NULL DEFAULT 0,
+  llm_tokens_limit INTEGER NOT NULL,
+  day_key TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS travel_share_state (
+  user_id TEXT NOT NULL,
+  char_id TEXT NOT NULL,
+  share_enabled INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, char_id)
+);
+`.trim();
+
+// utils/travel/core.ts
+var EARTH_RADIUS_M = 63710088e-1;
+var metersBetween = (a, b) => {
+  const toRad = (d) => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h)));
+};
+var routeDistanceMeters = (points) => {
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) total += metersBetween(points[i - 1], points[i]);
+  return total;
+};
+var positionAt = (points, ratio) => {
+  if (!points.length) return null;
+  if (points.length === 1) return { lat: points[0].lat, lng: points[0].lng };
+  const clamped = Number.isFinite(ratio) ? Math.min(1, Math.max(0, ratio)) : 0;
+  const total = routeDistanceMeters(points);
+  if (!(total > 0)) return { lat: points[0].lat, lng: points[0].lng };
+  const target = total * clamped;
+  let walked = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    const leg = metersBetween(points[i - 1], points[i]);
+    if (leg <= 0) continue;
+    if (walked + leg >= target) {
+      const t = (target - walked) / leg;
+      return {
+        lat: points[i - 1].lat + (points[i].lat - points[i - 1].lat) * t,
+        lng: points[i - 1].lng + (points[i].lng - points[i - 1].lng) * t
+      };
+    }
+    walked += leg;
+  }
+  const last = points[points.length - 1];
+  return { lat: last.lat, lng: last.lng };
+};
+var clamp012 = (v) => Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
+var ratioBetween = (from, to, now) => {
+  if (from === null || to === null || to <= from) return 0;
+  return clamp012((now - from) / (to - from));
+};
+var tripProgress = (trip, now) => {
+  const { departAt, arriveAt, dwellUntil, returnAt } = trip;
+  const base = {
+    outboundRatio: ratioBetween(departAt, arriveAt, now),
+    returnRatio: ratioBetween(dwellUntil, returnAt, now)
+  };
+  if (departAt === null || now < departAt) {
+    return { phase: "planned", ...base, outboundRatio: 0, returnRatio: 0, etaMs: null };
+  }
+  if (arriveAt !== null && now >= arriveAt) {
+    const etaMs2 = null;
+    if (dwellUntil !== null && now < dwellUntil) {
+      return { phase: "dwelling", ...base, etaMs: etaMs2 };
+    }
+    if (returnAt !== null && now < returnAt) return { phase: "returning", ...base, etaMs: etaMs2 };
+    if (returnAt !== null) return { phase: "returned", ...base, etaMs: etaMs2 };
+    return { phase: "dwelling", ...base, etaMs: etaMs2 };
+  }
+  const etaMs = arriveAt !== null ? Math.max(0, arriveAt - now) : null;
+  return { phase: "en_route", ...base, etaMs };
+};
+var isTerminalStatus = (status) => TRAVEL_TERMINAL_STATUSES.includes(status);
+var canTransition = (from, to) => TRAVEL_TRANSITIONS[from].includes(to);
+var canChangePlan = (status) => TRAVEL_PLAN_CHANGEABLE_STATUSES.includes(status);
+var HOUSEHOLD_PATTERN = /\d+\s*(栋|幢|单元|层|室|房|户)|\d+\s*号楼\s*\d+|门牌/;
+var COORDINATE_PATTERN = /-?\d{1,3}\.\d{3,}\s*[,，]\s*-?\d{1,3}\.\d{3,}/;
+var HOUSEHOLD_MESSAGE = "\u53EA\u586B\u5230\u5C0F\u533A/\u697C\u7FA4\u6216\u516C\u5171\u5730\u70B9\u540D\uFF0C\u4E0D\u8981\u95E8\u724C\u3001\u697C\u680B\u3001\u5355\u5143\u3001\u697C\u5C42\u6216\u623F\u53F7";
+var sanitizeAnchorLabel = (raw) => {
+  const label = typeof raw === "string" ? raw.trim() : "";
+  if (!label) return { ok: false, code: "HOUSEHOLD_DETAIL", message: HOUSEHOLD_MESSAGE };
+  if (HOUSEHOLD_PATTERN.test(label) || COORDINATE_PATTERN.test(label)) {
+    return { ok: false, code: "HOUSEHOLD_DETAIL", message: HOUSEHOLD_MESSAGE };
+  }
+  return { ok: true, label };
+};
+var isCoordSys = (v) => v === "gcj02" || v === "wgs84";
+var pickAnchorFields = (poi, confirmedAt) => {
+  if (!isCoordSys(poi.coordSys)) return null;
+  if (typeof poi.lat !== "number" || typeof poi.lng !== "number") return null;
+  if (!Number.isFinite(poi.lat) || !Number.isFinite(poi.lng)) return null;
+  const sanitized = sanitizeAnchorLabel(String(poi.label ?? poi.name ?? ""));
+  if (!sanitized.ok) return null;
+  const city = String(poi.city ?? "").trim();
+  if (!city) return null;
+  const district = String(poi.district ?? "").trim();
+  const anchor = {
+    label: sanitized.label,
+    city,
+    lat: poi.lat,
+    lng: poi.lng,
+    coordSys: poi.coordSys,
+    precision: "area",
+    confirmedAt,
+    source: "user"
+  };
+  if (district) anchor.district = district;
+  return anchor;
+};
+var sanitizeWishText = (raw) => {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return { ok: false, code: "EMPTY", message: "\u613F\u671B\u4E3A\u7A7A" };
+  if (COORDINATE_PATTERN.test(text)) {
+    return { ok: false, code: "HOUSEHOLD_DETAIL", message: "\u4E0D\u8981\u7ED9\u5750\u6807\uFF0C\u8BF4\u60F3\u53BB\u54EA\u7C7B\u5730\u65B9\u5C31\u884C" };
+  }
+  if (HOUSEHOLD_PATTERN.test(text)) {
+    return { ok: false, code: "HOUSEHOLD_DETAIL", message: HOUSEHOLD_MESSAGE };
+  }
+  return { ok: true, text };
+};
+var resolveBudgetGate = (state, kind) => {
+  if (!state) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (state.paused) return { allowed: false, code: "BUDGET_BLOCKED" };
+  const limit = kind === "map" ? state.mapCallsLimit : state.llmTokensLimit;
+  const used = kind === "map" ? state.mapCallsUsed : state.llmTokensUsed;
+  if (!Number.isFinite(limit) || limit < 0) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (limit === 0) return { allowed: false, code: "BUDGET_ZERO" };
+  if (!Number.isFinite(used) || used < 0 || used >= limit) {
+    return { allowed: false, code: "BUDGET_BLOCKED" };
+  }
+  return { allowed: true };
+};
+var dayKey = (nowMs, timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timeZone || "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date(nowMs));
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+};
+var clampCandidates = (candidates) => {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const c of candidates) {
+    if (!c || typeof c.id !== "string" || seen.has(c.id)) continue;
+    seen.add(c.id);
+    out.push(c);
+    if (out.length >= MAX_CANDIDATES) break;
+  }
+  return out;
+};
+
+// worker/amsg/src/travel/store.ts
+var TERMINAL_STATUS_SQL = TRAVEL_TERMINAL_STATUSES.map((status) => `'${status}'`).join(", ");
+var changesOf2 = (result) => {
+  const raw = result;
+  const value = raw?.meta?.changes ?? raw?.changes ?? 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+var asString = (value) => typeof value === "string" ? value : "";
+var asNumber2 = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+var asNullableNumber = (value) => value === null || value === void 0 ? null : asNumber2(value);
+var asBool = (value) => Number(value) === 1 || value === true;
+var parseJson = (raw, fallback) => {
+  if (typeof raw !== "string" || !raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+};
+var toJson = (value) => value === null || value === void 0 ? null : JSON.stringify(value);
+var schemaReady2 = false;
+var TRAVEL_SCHEMA_ALTERS = [
+  "ALTER TABLE travel_wishes ADD COLUMN selected_candidate_id TEXT",
+  "ALTER TABLE travel_settings ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0"
+];
+function splitTravelStatements(sql) {
+  const out = [];
+  let buffer = "";
+  let quote = null;
+  for (const char of sql) {
+    if (quote) {
+      buffer += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      buffer += char;
+      continue;
+    }
+    if (char === ";") {
+      if (buffer.trim()) out.push(buffer.trim());
+      buffer = "";
+      continue;
+    }
+    buffer += char;
+  }
+  if (buffer.trim()) out.push(buffer.trim());
+  return out;
+}
+async function ensureTravelSchema(db) {
+  if (schemaReady2) return;
+  for (const statement of splitTravelStatements(TRAVEL_SCHEMA_SQL)) {
+    await db.prepare(statement).run();
+  }
+  for (const alter of TRAVEL_SCHEMA_ALTERS) {
+    try {
+      await db.prepare(alter).run();
+    } catch {
+    }
+  }
+  schemaReady2 = true;
+}
+var SETTINGS_COLUMNS = "user_id, budget_tz, trip_retention_days, event_retention_days, enabled, version, updated_at";
+var readSettingsRow = (row) => ({
+  userId: asString(row.user_id),
+  budgetTz: asString(row.budget_tz) || DEFAULT_BUDGET_TZ,
+  tripRetentionDays: asNumber2(row.trip_retention_days),
+  eventRetentionDays: asNumber2(row.event_retention_days),
+  enabled: asBool(row.enabled),
+  version: asNumber2(row.version),
+  updatedAt: asNumber2(row.updated_at)
+});
+async function getTravelSettings(db, userId) {
+  const row = await db.prepare(`SELECT ${SETTINGS_COLUMNS} FROM travel_settings WHERE user_id = ?`).bind(userId).first();
+  return row ? readSettingsRow(row) : null;
+}
+async function upsertTravelSettings(db, input) {
+  const current = await getTravelSettings(db, input.userId);
+  if (!current) {
+    if (input.baseVersion !== null) return { ok: false, code: "VERSION_CONFLICT" };
+    const settings = {
+      userId: input.userId,
+      budgetTz: input.budgetTz?.trim() || DEFAULT_BUDGET_TZ,
+      tripRetentionDays: input.tripRetentionDays ?? TRAVEL_RETENTION_DEFAULTS.tripDays,
+      eventRetentionDays: input.eventRetentionDays ?? TRAVEL_RETENTION_DEFAULTS.eventDays,
+      enabled: input.enabled === true,
+      version: 1,
+      updatedAt: input.nowMs
+    };
+    const result2 = await db.prepare(
+      `INSERT OR IGNORE INTO travel_settings (${SETTINGS_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      settings.userId,
+      settings.budgetTz,
+      settings.tripRetentionDays,
+      settings.eventRetentionDays,
+      settings.enabled ? 1 : 0,
+      settings.version,
+      settings.updatedAt
+    ).run();
+    if (changesOf2(result2) !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+    return { ok: true, settings };
+  }
+  if (input.baseVersion !== current.version) return { ok: false, code: "VERSION_CONFLICT" };
+  const next = {
+    userId: current.userId,
+    budgetTz: input.budgetTz?.trim() || current.budgetTz,
+    tripRetentionDays: input.tripRetentionDays ?? current.tripRetentionDays,
+    eventRetentionDays: input.eventRetentionDays ?? current.eventRetentionDays,
+    enabled: input.enabled === void 0 ? current.enabled : input.enabled === true,
+    version: current.version + 1,
+    updatedAt: input.nowMs
+  };
+  const result = await db.prepare(
+    `UPDATE travel_settings
+       SET budget_tz = ?, trip_retention_days = ?, event_retention_days = ?, enabled = ?,
+           version = ?, updated_at = ?
+       WHERE user_id = ? AND version = ?`
+  ).bind(
+    next.budgetTz,
+    next.tripRetentionDays,
+    next.eventRetentionDays,
+    next.enabled ? 1 : 0,
+    next.version,
+    next.updatedAt,
+    next.userId,
+    current.version
+  ).run();
+  if (changesOf2(result) !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+  return { ok: true, settings: next };
+}
+var WISH_COLUMNS = "id, user_id, char_id, wish_text, category, selected_candidate_id, state, expires_at, created_at, updated_at";
+var readWishRow = (row) => ({
+  id: asString(row.id),
+  userId: asString(row.user_id),
+  charId: asString(row.char_id),
+  wishText: asString(row.wish_text),
+  category: typeof row.category === "string" ? row.category : null,
+  selectedCandidateId: typeof row.selected_candidate_id === "string" ? row.selected_candidate_id : null,
+  state: asString(row.state),
+  expiresAt: asNullableNumber(row.expires_at),
+  createdAt: asNumber2(row.created_at),
+  updatedAt: asNumber2(row.updated_at)
+});
+async function insertTravelWish(db, wish) {
+  const result = await db.prepare(`INSERT OR IGNORE INTO travel_wishes (${WISH_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+    wish.id,
+    wish.userId,
+    wish.charId,
+    wish.wishText,
+    wish.category ?? null,
+    wish.selectedCandidateId ?? null,
+    wish.state,
+    wish.expiresAt,
+    wish.createdAt,
+    wish.updatedAt
+  ).run();
+  return changesOf2(result) === 1;
+}
+async function listTravelWishes(db, args) {
+  const states = args.states?.length ? [...args.states] : null;
+  const filter = states ? ` AND state IN (${states.map(() => "?").join(", ")})` : "";
+  const rows = await db.prepare(
+    `SELECT ${WISH_COLUMNS} FROM travel_wishes
+       WHERE user_id = ? AND char_id = ? AND (expires_at IS NULL OR expires_at > ?)${filter}
+       ORDER BY created_at ASC, id ASC`
+  ).bind(args.userId, args.charId, args.nowMs, ...states ?? []).all();
+  return (rows.results ?? []).map(readWishRow);
+}
+var CANDIDATE_COLUMNS = "id, user_id, wish_id, provider, place_id, label, category, city, district, lat, lng, coord_sys, distance_m, expires_at, created_at";
+var readCandidateRow = (row) => ({
+  id: asString(row.id),
+  userId: asString(row.user_id),
+  wishId: asString(row.wish_id),
+  provider: asString(row.provider),
+  placeId: typeof row.place_id === "string" ? row.place_id : void 0,
+  label: asString(row.label),
+  category: typeof row.category === "string" ? row.category : void 0,
+  city: typeof row.city === "string" ? row.city : void 0,
+  district: typeof row.district === "string" ? row.district : void 0,
+  lat: asNumber2(row.lat),
+  lng: asNumber2(row.lng),
+  coordSys: asString(row.coord_sys),
+  distanceM: asNullableNumber(row.distance_m),
+  expiresAt: asNumber2(row.expires_at),
+  createdAt: asNumber2(row.created_at)
+});
+async function saveTravelCandidates(db, args) {
+  let inserted = 0;
+  let skipped = 0;
+  for (const candidate of args.candidates) {
+    if (candidate.userId !== args.userId || candidate.wishId !== args.wishId) {
+      skipped += 1;
+      continue;
+    }
+    const result = await db.prepare(
+      `INSERT OR IGNORE INTO travel_candidates (${CANDIDATE_COLUMNS})
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      candidate.id,
+      candidate.userId,
+      candidate.wishId,
+      candidate.provider,
+      candidate.placeId ?? null,
+      candidate.label,
+      candidate.category ?? null,
+      candidate.city ?? null,
+      candidate.district ?? null,
+      candidate.lat,
+      candidate.lng,
+      candidate.coordSys,
+      candidate.distanceM ?? null,
+      candidate.expiresAt,
+      candidate.createdAt
+    ).run();
+    if (changesOf2(result) === 1) inserted += 1;
+    else skipped += 1;
+  }
+  return { inserted, skipped };
+}
+async function listTravelCandidates(db, args) {
+  const rows = await db.prepare(
+    `SELECT ${CANDIDATE_COLUMNS} FROM travel_candidates
+       WHERE user_id = ? AND wish_id = ? AND expires_at > ?
+       ORDER BY created_at ASC, id ASC`
+  ).bind(args.userId, args.wishId, args.nowMs).all();
+  return (rows.results ?? []).map(readCandidateRow);
+}
+async function getTravelCandidate(db, args) {
+  const row = await db.prepare(
+    `SELECT ${CANDIDATE_COLUMNS} FROM travel_candidates
+       WHERE user_id = ? AND wish_id = ? AND id = ? AND expires_at > ?`
+  ).bind(args.userId, args.wishId, args.candidateId, args.nowMs).first();
+  return row ? readCandidateRow(row) : null;
+}
+var TRIP_COLUMNS = `id, user_id, char_id, status, phase, plan_version, revision, coord_sys, provider,
+  origin_json, dest_json, route_json, route_fetched_at, depart_at, arrive_at, dwell_until, return_at,
+  retention_expires_at, dedupe_key, created_at, updated_at`;
+var readTripRow = (row) => ({
+  id: asString(row.id),
+  userId: asString(row.user_id),
+  charId: asString(row.char_id),
+  status: asString(row.status),
+  phase: asString(row.phase),
+  planVersion: asNumber2(row.plan_version),
+  revision: asNumber2(row.revision),
+  coordSys: asString(row.coord_sys),
+  provider: asString(row.provider),
+  origin: parseJson(row.origin_json, { label: "", city: "", lat: 0, lng: 0 }),
+  dest: parseJson(row.dest_json, null),
+  route: parseJson(row.route_json, null),
+  routeFetchedAt: asNullableNumber(row.route_fetched_at),
+  departAt: asNullableNumber(row.depart_at),
+  arriveAt: asNullableNumber(row.arrive_at),
+  dwellUntil: asNullableNumber(row.dwell_until),
+  returnAt: asNullableNumber(row.return_at),
+  retentionExpiresAt: asNullableNumber(row.retention_expires_at),
+  dedupeKey: asString(row.dedupe_key),
+  createdAt: asNumber2(row.created_at),
+  updatedAt: asNumber2(row.updated_at)
+});
+async function upsertTravelTrip(db, trip) {
+  const result = await db.prepare(
+    `INSERT OR IGNORE INTO travel_trips (${TRIP_COLUMNS})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    trip.id,
+    trip.userId,
+    trip.charId,
+    trip.status,
+    trip.status,
+    trip.planVersion,
+    trip.revision,
+    trip.coordSys,
+    trip.provider,
+    JSON.stringify(trip.origin),
+    toJson(trip.dest),
+    toJson(trip.route),
+    trip.routeFetchedAt,
+    trip.departAt,
+    trip.arriveAt,
+    trip.dwellUntil,
+    trip.returnAt,
+    trip.retentionExpiresAt,
+    trip.dedupeKey,
+    trip.createdAt,
+    trip.updatedAt
+  ).run();
+  const inserted = changesOf2(result) === 1;
+  const byDedupe = await db.prepare(`SELECT ${TRIP_COLUMNS} FROM travel_trips WHERE user_id = ? AND char_id = ? AND dedupe_key = ?`).bind(trip.userId, trip.charId, trip.dedupeKey).first();
+  if (byDedupe) return { inserted, trip: readTripRow(byDedupe) };
+  const byId = await db.prepare(`SELECT ${TRIP_COLUMNS} FROM travel_trips WHERE user_id = ? AND id = ?`).bind(trip.userId, trip.id).first();
+  if (byId) return { inserted, trip: readTripRow(byId) };
+  throw new Error(`travel_trips id ${trip.id} \u5DF2\u88AB\u5176\u5B83\u79DF\u6237\u5360\u7528\uFF08\u62D2\u7EDD\u8DE8\u79DF\u6237\u6539\u5199\uFF09`);
+}
+async function getTravelTrip(db, args) {
+  const row = await db.prepare(`SELECT ${TRIP_COLUMNS} FROM travel_trips WHERE user_id = ? AND id = ?`).bind(args.userId, args.tripId).first();
+  return row ? readTripRow(row) : null;
+}
+async function getActiveTravelTrip(db, args) {
+  const row = await db.prepare(
+    `SELECT ${TRIP_COLUMNS} FROM travel_trips
+       WHERE user_id = ? AND char_id = ?
+         AND status NOT IN (${TERMINAL_STATUS_SQL})
+       ORDER BY plan_version DESC, updated_at DESC, id DESC
+       LIMIT 1`
+  ).bind(args.userId, args.charId).first();
+  return row ? readTripRow(row) : null;
+}
+async function casUpdateTravelTrip(db, args) {
+  const current = await getTravelTrip(db, { userId: args.userId, tripId: args.tripId });
+  if (!current || current.revision !== args.baseRevision) {
+    return { ok: false, code: "VERSION_CONFLICT" };
+  }
+  const nextStatus = args.patch.status ?? current.status;
+  const next = {
+    ...current,
+    status: nextStatus,
+    phase: nextStatus,
+    coordSys: args.patch.coordSys ?? current.coordSys,
+    provider: args.patch.provider ?? current.provider,
+    origin: args.patch.origin ?? current.origin,
+    dest: "dest" in args.patch ? args.patch.dest ?? null : current.dest,
+    route: "route" in args.patch ? args.patch.route ?? null : current.route,
+    routeFetchedAt: "routeFetchedAt" in args.patch ? args.patch.routeFetchedAt ?? null : current.routeFetchedAt,
+    departAt: "departAt" in args.patch ? args.patch.departAt ?? null : current.departAt,
+    arriveAt: "arriveAt" in args.patch ? args.patch.arriveAt ?? null : current.arriveAt,
+    dwellUntil: "dwellUntil" in args.patch ? args.patch.dwellUntil ?? null : current.dwellUntil,
+    returnAt: "returnAt" in args.patch ? args.patch.returnAt ?? null : current.returnAt,
+    retentionExpiresAt: "retentionExpiresAt" in args.patch ? args.patch.retentionExpiresAt ?? null : current.retentionExpiresAt,
+    revision: current.revision + 1,
+    updatedAt: args.nowMs
+  };
+  const result = await db.prepare(
+    `UPDATE travel_trips
+       SET status = ?, phase = ?, coord_sys = ?, provider = ?, origin_json = ?, dest_json = ?,
+           route_json = ?, route_fetched_at = ?, depart_at = ?, arrive_at = ?, dwell_until = ?,
+           return_at = ?, retention_expires_at = ?, revision = ?, updated_at = ?
+       WHERE user_id = ? AND id = ? AND revision = ?`
+  ).bind(
+    next.status,
+    next.phase,
+    next.coordSys,
+    next.provider,
+    JSON.stringify(next.origin),
+    toJson(next.dest),
+    toJson(next.route),
+    next.routeFetchedAt,
+    next.departAt,
+    next.arriveAt,
+    next.dwellUntil,
+    next.returnAt,
+    next.retentionExpiresAt,
+    next.revision,
+    next.updatedAt,
+    next.userId,
+    next.id,
+    current.revision
+  ).run();
+  if (changesOf2(result) !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+  return { ok: true, trip: next };
+}
+var EVENT_COLUMNS = "id, user_id, trip_id, seq, kind, at, payload_json, source, expires_at";
+var readEventRow = (row) => ({
+  id: asString(row.id),
+  userId: asString(row.user_id),
+  tripId: asString(row.trip_id),
+  seq: asNumber2(row.seq),
+  kind: asString(row.kind),
+  at: asNumber2(row.at),
+  payload: parseJson(row.payload_json, null),
+  source: asString(row.source),
+  expiresAt: asNumber2(row.expires_at)
+});
+async function appendTravelTripEvent(db, args) {
+  const id = args.id ?? `${args.tripId}:${args.kind}:${args.at}:${Math.random().toString(36).slice(2, 10)}`;
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await db.prepare(
+        `INSERT INTO travel_trip_events (${EVENT_COLUMNS})
+           SELECT ?, ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
+           FROM travel_trip_events WHERE user_id = ? AND trip_id = ?`
+      ).bind(
+        id,
+        args.userId,
+        args.tripId,
+        args.kind,
+        args.at,
+        toJson(args.payload ?? null),
+        args.source,
+        args.expiresAt,
+        args.userId,
+        args.tripId
+      ).run();
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastError) throw lastError;
+  const row = await db.prepare(`SELECT ${EVENT_COLUMNS} FROM travel_trip_events WHERE user_id = ? AND id = ?`).bind(args.userId, id).first();
+  if (!row) throw new Error(`travel_trip_events \u5199\u5165\u540E\u8BFB\u4E0D\u56DE\uFF08${args.tripId}/${args.kind}\uFF09`);
+  return readEventRow(row);
+}
+async function getTravelShareState(db, args) {
+  const row = await db.prepare(
+    "SELECT user_id, char_id, share_enabled, version, updated_at FROM travel_share_state WHERE user_id = ? AND char_id = ?"
+  ).bind(args.userId, args.charId).first();
+  if (!row) return null;
+  return {
+    userId: asString(row.user_id),
+    charId: asString(row.char_id),
+    shareEnabled: asBool(row.share_enabled),
+    version: asNumber2(row.version),
+    updatedAt: asNumber2(row.updated_at)
+  };
+}
+async function setTravelShareState(db, args) {
+  const current = await getTravelShareState(db, { userId: args.userId, charId: args.charId });
+  const flag = args.shareEnabled ? 1 : 0;
+  if (!current) {
+    if (args.baseVersion !== null) return { ok: false, code: "VERSION_CONFLICT" };
+    const result2 = await db.prepare(
+      `INSERT OR IGNORE INTO travel_share_state (user_id, char_id, share_enabled, version, updated_at)
+         VALUES (?, ?, ?, 1, ?)`
+    ).bind(args.userId, args.charId, flag, args.nowMs).run();
+    if (changesOf2(result2) !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+    return {
+      ok: true,
+      state: {
+        userId: args.userId,
+        charId: args.charId,
+        shareEnabled: args.shareEnabled,
+        version: 1,
+        updatedAt: args.nowMs
+      }
+    };
+  }
+  if (args.baseVersion !== current.version) return { ok: false, code: "VERSION_CONFLICT" };
+  const nextVersion = current.version + 1;
+  const result = await db.prepare(
+    `UPDATE travel_share_state SET share_enabled = ?, version = ?, updated_at = ?
+       WHERE user_id = ? AND char_id = ? AND version = ?`
+  ).bind(flag, nextVersion, args.nowMs, args.userId, args.charId, current.version).run();
+  if (changesOf2(result) !== 1) return { ok: false, code: "VERSION_CONFLICT" };
+  return {
+    ok: true,
+    state: {
+      userId: args.userId,
+      charId: args.charId,
+      shareEnabled: args.shareEnabled,
+      version: nextVersion,
+      updatedAt: args.nowMs
+    }
+  };
+}
+async function pruneTravelRetention(db, args) {
+  const scoped = typeof args.userId === "string" && args.userId.length > 0;
+  const tenant = (column = "user_id") => scoped ? ` AND ${column} = ?` : "";
+  const tenantParams = scoped ? [args.userId] : [];
+  const trips = await db.prepare(
+    `DELETE FROM travel_trips WHERE retention_expires_at IS NOT NULL AND retention_expires_at <= ?${tenant()}`
+  ).bind(args.nowMs, ...tenantParams).run();
+  const events = await db.prepare(`DELETE FROM travel_trip_events WHERE expires_at <= ?${tenant()}`).bind(args.nowMs, ...tenantParams).run();
+  const candidates = await db.prepare(`DELETE FROM travel_candidates WHERE expires_at <= ?${tenant()}`).bind(args.nowMs, ...tenantParams).run();
+  const wishes = await db.prepare(
+    `DELETE FROM travel_wishes
+       WHERE state IN ('dropped', 'expired', 'completed') AND expires_at IS NOT NULL AND expires_at <= ?${tenant()}`
+  ).bind(args.nowMs, ...tenantParams).run();
+  return {
+    trips: changesOf2(trips),
+    events: changesOf2(events),
+    candidates: changesOf2(candidates),
+    wishes: changesOf2(wishes)
+  };
+}
+async function getTravelCharSettings(db, args) {
+  const row = await db.prepare("SELECT user_id, char_id, enabled, updated_at FROM travel_char_settings WHERE user_id = ? AND char_id = ?").bind(args.userId, args.charId).first();
+  if (!row) return null;
+  return {
+    userId: asString(row.user_id),
+    charId: asString(row.char_id),
+    enabled: asBool(row.enabled),
+    updatedAt: asNumber2(row.updated_at)
+  };
+}
+async function setTravelCharEnabled(db, args) {
+  await db.prepare(
+    `INSERT INTO travel_char_settings (user_id, char_id, enabled, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id, char_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`
+  ).bind(args.userId, args.charId, args.enabled ? 1 : 0, args.nowMs).run();
+  return {
+    userId: args.userId,
+    charId: args.charId,
+    enabled: args.enabled === true,
+    updatedAt: args.nowMs
+  };
+}
+async function getTravelAnchor(db, args) {
+  const row = await db.prepare(
+    "SELECT user_id, char_id, label, city, district, lat, lng, coord_sys, precision, confirmed_at, updated_at FROM travel_anchors WHERE user_id = ? AND char_id = ?"
+  ).bind(args.userId, args.charId).first();
+  if (!row) return null;
+  const lat = asNumber2(row.lat);
+  const lng = asNumber2(row.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return {
+    userId: asString(row.user_id),
+    charId: asString(row.char_id),
+    label: asString(row.label),
+    city: asString(row.city),
+    district: asString(row.district) || null,
+    lat,
+    lng,
+    coordSys: asString(row.coord_sys) || "gcj02",
+    precision: "area",
+    confirmedAt: asNumber2(row.confirmed_at),
+    updatedAt: asNumber2(row.updated_at)
+  };
+}
+async function putTravelAnchor(db, record) {
+  await db.prepare(
+    `INSERT INTO travel_anchors (user_id, char_id, label, city, district, lat, lng, coord_sys, precision, confirmed_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'area', ?, ?)
+       ON CONFLICT(user_id, char_id) DO UPDATE SET
+         label = excluded.label, city = excluded.city, district = excluded.district,
+         lat = excluded.lat, lng = excluded.lng, coord_sys = excluded.coord_sys,
+         confirmed_at = excluded.confirmed_at, updated_at = excluded.updated_at`
+  ).bind(
+    record.userId,
+    record.charId,
+    record.label,
+    record.city,
+    record.district ?? null,
+    record.lat,
+    record.lng,
+    record.coordSys,
+    record.confirmedAt,
+    record.updatedAt
+  ).run();
+  return record;
+}
+async function appendTravelPosition(db, args) {
+  const id = `tp:${args.userId}:${args.tripId}:${args.at}:${Math.round(args.lat * 1e5)}:${Math.round(args.lng * 1e5)}`;
+  await db.prepare(
+    `INSERT OR IGNORE INTO travel_trip_positions
+        (id, user_id, trip_id, at, lat, lng, coord_sys, share_generation, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    id,
+    args.userId,
+    args.tripId,
+    args.at,
+    args.lat,
+    args.lng,
+    args.coordSys,
+    args.shareGeneration,
+    args.nowMs
+  ).run();
+}
+async function listTravelPositions(db, args) {
+  const limit = Math.min(Math.max(Math.trunc(args.limit ?? 120), 1), 480);
+  const minGen = Number.isFinite(args.minShareGeneration) ? Math.trunc(args.minShareGeneration) : 0;
+  const rows = await db.prepare(
+    `SELECT at, lat, lng, coord_sys, share_generation FROM travel_trip_positions
+       WHERE user_id = ? AND trip_id = ? AND share_generation >= ?
+       ORDER BY at ASC LIMIT ?`
+  ).bind(args.userId, args.tripId, minGen, limit).all();
+  const results = Array.isArray(rows?.results) ? rows.results : [];
+  return results.map((row) => ({
+    at: asNumber2(row.at),
+    lat: asNumber2(row.lat),
+    lng: asNumber2(row.lng),
+    coordSys: asString(row.coord_sys) || "gcj02",
+    shareGeneration: asNumber2(row.share_generation)
+  })).filter((row) => Number.isFinite(row.lat) && Number.isFinite(row.lng));
+}
+async function setTravelWishSelectedCandidate(db, args) {
+  const result = await db.prepare(
+    "UPDATE travel_wishes SET selected_candidate_id = ?, updated_at = ? WHERE user_id = ? AND id = ?"
+  ).bind(args.candidateId, args.nowMs, args.userId, args.wishId).run();
+  return changesOf2(result) === 1;
+}
+async function getLatestTripForWish(db, args) {
+  const row = await db.prepare(
+    `SELECT ${TRIP_COLUMNS} FROM travel_trips
+       WHERE user_id = ? AND char_id = ? AND dedupe_key LIKE ?
+       ORDER BY plan_version DESC LIMIT 1`
+  ).bind(args.userId, args.charId, `wish:${args.wishId}:plan:%`).first();
+  return row ? readTripRow(row) : null;
+}
+
+// worker/amsg/src/travel/budget.ts
+var BUDGET_COLUMNS = "user_id, map_calls_used, map_calls_limit, map_attempts_used, llm_tokens_used, llm_tokens_limit, day_key, paused, version, updated_at";
+var asString2 = (value) => typeof value === "string" ? value : "";
+var asNumber3 = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+var readBudgetRow = (row) => ({
+  userId: asString2(row.user_id),
+  dayKey: asString2(row.day_key),
+  mapCallsUsed: asNumber3(row.map_calls_used),
+  mapCallsLimit: asNumber3(row.map_calls_limit),
+  mapAttemptsUsed: asNumber3(row.map_attempts_used),
+  llmTokensUsed: asNumber3(row.llm_tokens_used),
+  llmTokensLimit: asNumber3(row.llm_tokens_limit),
+  paused: Number(row.paused) === 1,
+  version: asNumber3(row.version),
+  updatedAt: asNumber3(row.updated_at)
+});
+var warn = (message) => {
+  console.warn(`[amsg:travel] ${message}`);
+};
+async function readBudgetTimezone(db, userId) {
+  const settings = await getTravelSettings(db, userId);
+  const tz = settings?.budgetTz?.trim();
+  return tz || DEFAULT_BUDGET_TZ;
+}
+async function fetchBudgetRow(db, userId) {
+  const row = await db.prepare(`SELECT ${BUDGET_COLUMNS} FROM travel_budget_state WHERE user_id = ?`).bind(userId).first();
+  return row ? readBudgetRow(row) : null;
+}
+async function rolloverIfNeeded(db, row, todayKey, nowMs) {
+  if (row.dayKey === todayKey) return;
+  await db.prepare(
+    `UPDATE travel_budget_state
+       SET map_calls_used = 0, map_attempts_used = 0, llm_tokens_used = 0,
+           day_key = ?, version = version + 1, updated_at = ?
+       WHERE user_id = ? AND day_key <> ?`
+  ).bind(todayKey, nowMs, row.userId, todayKey).run();
+}
+async function ensureTravelBudgetRow(db, args) {
+  await ensureTravelSchema(db);
+  const mapCallsLimit = Math.trunc(args.mapCallsLimit);
+  if (!Number.isFinite(mapCallsLimit) || mapCallsLimit < 0) {
+    throw new Error("travel budget: mapCallsLimit \u5FC5\u987B\u662F\u975E\u8D1F\u6574\u6570");
+  }
+  const todayKey = dayKey(args.nowMs, await readBudgetTimezone(db, args.userId));
+  const llmTokensLimit = Math.max(0, Math.trunc(args.llmTokensLimit ?? 0));
+  await db.prepare(
+    `INSERT OR IGNORE INTO travel_budget_state
+        (user_id, map_calls_used, map_calls_limit, map_attempts_used,
+         llm_tokens_used, llm_tokens_limit, day_key, paused, version, updated_at)
+       VALUES (?, 0, ?, 0, 0, ?, ?, 0, 1, ?)`
+  ).bind(args.userId, mapCallsLimit, llmTokensLimit, todayKey, args.nowMs).run();
+}
+async function getTravelBudget(db, args) {
+  await ensureTravelSchema(db);
+  try {
+    const row = await fetchBudgetRow(db, args.userId);
+    if (!row) return null;
+    const todayKey = dayKey(args.nowMs, await readBudgetTimezone(db, args.userId));
+    if (row.dayKey !== todayKey) {
+      await rolloverIfNeeded(db, row, todayKey, args.nowMs);
+      return await fetchBudgetRow(db, args.userId);
+    }
+    return row;
+  } catch (error) {
+    warn(`\u9884\u7B97\u8BFB\u5931\u8D25\uFF08\u6309\u4E0D\u53EF\u7528\u5904\u7406\uFF09\uFF1A${error?.message ?? "unknown"}`);
+    return null;
+  }
+}
+async function reserveMapCall(db, args) {
+  const state = await getTravelBudget(db, args);
+  if (!state) return { ok: false, code: "BUDGET_BLOCKED" };
+  const gate = resolveBudgetGate(state, "map");
+  if (!gate.allowed) return { ok: false, code: gate.code };
+  const result = await db.prepare(
+    `UPDATE travel_budget_state
+       SET map_calls_used = map_calls_used + 1,
+           map_attempts_used = map_attempts_used + 1,
+           version = version + 1,
+           updated_at = ?
+       WHERE user_id = ? AND day_key = ? AND paused = 0
+         AND map_calls_limit > 0 AND map_calls_used < map_calls_limit`
+  ).bind(args.nowMs, args.userId, state.dayKey).run();
+  if (changesOf3(result) !== 1) {
+    const fresh2 = await fetchBudgetRow(db, args.userId);
+    if (fresh2 && fresh2.dayKey === state.dayKey && fresh2.mapCallsLimit === 0) {
+      return { ok: false, code: "BUDGET_ZERO" };
+    }
+    return { ok: false, code: "BUDGET_BLOCKED" };
+  }
+  const fresh = await fetchBudgetRow(db, args.userId);
+  return { ok: true, state: fresh ?? state };
+}
+async function setTravelMapCallsLimit(db, args) {
+  const limit = Math.trunc(args.limit);
+  if (!Number.isFinite(limit) || limit < 0) return { ok: false, code: "INVALID_LIMIT" };
+  await ensureTravelSchema(db);
+  const existing = await fetchBudgetRow(db, args.userId);
+  if (!existing) {
+    await ensureTravelBudgetRow(db, { userId: args.userId, mapCallsLimit: limit, nowMs: args.nowMs });
+    return { ok: true, limit };
+  }
+  await db.prepare(
+    `UPDATE travel_budget_state
+       SET map_calls_limit = ?, version = version + 1, updated_at = ?
+       WHERE user_id = ?`
+  ).bind(limit, args.nowMs, args.userId).run();
+  return { ok: true, limit };
+}
+async function setTravelBudgetPaused(db, args) {
+  await ensureTravelSchema(db);
+  const existing = await fetchBudgetRow(db, args.userId);
+  if (!existing) {
+    await ensureTravelBudgetRow(db, { userId: args.userId, mapCallsLimit: 0, nowMs: args.nowMs });
+  }
+  const result = await db.prepare(
+    `UPDATE travel_budget_state SET paused = ?, version = version + 1, updated_at = ?
+       WHERE user_id = ?`
+  ).bind(args.paused ? 1 : 0, args.nowMs, args.userId).run();
+  return changesOf3(result) === 1;
+}
+async function checkLlmGate(state, input) {
+  if (!state) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (state.paused) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (!input.port) return { allowed: false, code: "BUDGET_BLOCKED" };
+  let ledger = null;
+  try {
+    ledger = await input.port.read({ userId: input.userId, nowMs: input.nowMs });
+  } catch (error) {
+    warn(`LLM \u8D26\u672C\u8BFB\u5931\u8D25\uFF08fail-closed\uFF09\uFF1A${error?.message ?? "unknown"}`);
+    return { allowed: false, code: "BUDGET_BLOCKED" };
+  }
+  if (!ledger) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (ledger.paused) return { allowed: false, code: "BUDGET_BLOCKED" };
+  const limit = Number(ledger.limitTokens);
+  const used = Number(ledger.usedTokens);
+  if (!Number.isFinite(limit) || limit < 0) return { allowed: false, code: "BUDGET_BLOCKED" };
+  if (limit === 0) return { allowed: false, code: "BUDGET_ZERO" };
+  if (!Number.isFinite(used) || used >= limit) return { allowed: false, code: "BUDGET_BLOCKED" };
+  return { allowed: true, usedTokens: used, limitTokens: limit };
+}
+async function syncLlmMirror(db, args) {
+  try {
+    await db.prepare(
+      `UPDATE travel_budget_state
+         SET llm_tokens_used = llm_tokens_used + ?, version = version + 1, updated_at = ?
+         WHERE user_id = ?`
+    ).bind(Math.max(0, Math.trunc(args.fallbackAddTokens ?? 0)), args.nowMs, args.userId).run();
+  } catch (error) {
+    warn(`LLM \u955C\u50CF\u6CA1\u5199\u8FDB\u53BB\uFF08\u4E0D\u5F71\u54CD\u5224\u5B9A\uFF09\uFF1A${error?.message ?? "unknown"}`);
+  }
+}
+async function mirrorFromLedger(db, args) {
+  let ledger = null;
+  try {
+    ledger = await args.port.read({ userId: args.userId, nowMs: args.nowMs });
+  } catch {
+    ledger = null;
+  }
+  if (!ledger) {
+    await syncLlmMirror(db, {
+      userId: args.userId,
+      nowMs: args.nowMs,
+      fallbackAddTokens: args.fallbackAddTokens
+    });
+    return;
+  }
+  try {
+    await db.prepare(
+      `UPDATE travel_budget_state
+         SET llm_tokens_used = ?, llm_tokens_limit = ?, version = version + 1, updated_at = ?
+         WHERE user_id = ?`
+    ).bind(
+      Math.max(0, Math.trunc(ledger.usedTokens)),
+      Math.max(0, Math.trunc(ledger.limitTokens)),
+      args.nowMs,
+      args.userId
+    ).run();
+  } catch (error) {
+    warn(`LLM \u955C\u50CF\u6CA1\u5199\u8FDB\u53BB\uFF08\u4E0D\u5F71\u54CD\u5224\u5B9A\uFF09\uFF1A${error?.message ?? "unknown"}`);
+  }
+}
+async function reserveLlmTokens(db, input) {
+  const state = await getTravelBudget(db, { userId: input.userId, nowMs: input.nowMs });
+  const gate = await checkLlmGate(state, input);
+  if (!gate.allowed) return { ok: false, code: gate.code };
+  const tokens = Math.max(0, Math.trunc(input.tokens));
+  let reserved;
+  try {
+    reserved = await input.port.reserve({
+      userId: input.userId,
+      tokens,
+      idempotencyKey: input.idempotencyKey,
+      nowMs: input.nowMs
+    });
+  } catch (error) {
+    warn(`LLM \u8D26\u672C\u9884\u7559\u5931\u8D25\uFF08fail-closed\uFF09\uFF1A${error?.message ?? "unknown"}`);
+    return { ok: false, code: "BUDGET_BLOCKED" };
+  }
+  if (!reserved.ok) return { ok: false, code: reserved.code };
+  await mirrorFromLedger(db, {
+    userId: input.userId,
+    nowMs: input.nowMs,
+    port: input.port,
+    fallbackAddTokens: tokens
+  });
+  const fresh = await fetchBudgetRow(db, input.userId);
+  return { ok: true, reservationId: reserved.reservationId, state: fresh ?? state };
+}
+async function settleLlmTokens(db, args) {
+  const actualTokens = Math.max(0, Math.trunc(args.actualTokens));
+  try {
+    if (args.ok) {
+      await args.port.settle({
+        userId: args.userId,
+        reservationId: args.reservationId,
+        actualTokens,
+        nowMs: args.nowMs
+      });
+    } else {
+      await args.port.release({
+        userId: args.userId,
+        reservationId: args.reservationId,
+        nowMs: args.nowMs
+      });
+    }
+  } catch (error) {
+    warn(`LLM \u8D26\u672C\u7ED3\u7B97\u5931\u8D25\uFF08\u989D\u5EA6\u4EE5\u8D26\u672C\u4E3A\u51C6\uFF0C\u8FD9\u91CC\u53EA\u8BB0\u65E5\u5FD7\uFF09\uFF1A${error?.message ?? "unknown"}`);
+    return;
+  }
+  try {
+    const ledger = await args.port.read({ userId: args.userId, nowMs: args.nowMs });
+    if (!ledger) return;
+    await db.prepare(
+      `UPDATE travel_budget_state
+         SET llm_tokens_used = ?, llm_tokens_limit = ?, version = version + 1, updated_at = ?
+         WHERE user_id = ?`
+    ).bind(
+      Math.max(0, Math.trunc(ledger.usedTokens)),
+      Math.max(0, Math.trunc(ledger.limitTokens)),
+      args.nowMs,
+      args.userId
+    ).run();
+  } catch (error) {
+    warn(`LLM \u955C\u50CF\u56DE\u8BFB\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u5224\u5B9A\uFF09\uFF1A${error?.message ?? "unknown"}`);
+  }
+}
+async function resolveTravelBudgetGate(db, args) {
+  const state = await getTravelBudget(db, { userId: args.userId, nowMs: args.nowMs });
+  if (args.kind === "map") {
+    if (!state) return { allowed: false, code: "BUDGET_BLOCKED" };
+    const gate2 = resolveBudgetGate(state, "map");
+    return gate2.allowed ? { allowed: true } : { allowed: false, code: gate2.code };
+  }
+  const gate = await checkLlmGate(state, {
+    userId: args.userId,
+    nowMs: args.nowMs,
+    port: args.port
+  });
+  return gate.allowed ? { allowed: true } : { allowed: false, code: gate.code };
+}
+function changesOf3(result) {
+  const raw = result;
+  const value = raw?.meta?.changes ?? raw?.changes ?? 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// worker/amsg/src/travel/intent.ts
+var WANDER_CATEGORY = "wander";
+var WANDER_DEFAULT_WISH = "\u5728\u9644\u8FD1\u968F\u4FBF\u8D70\u8D70";
+var TRAVEL_INTENT_MAX_WISH_CHARS = 80;
+var TRAVEL_INTENT_TTL_MS = 45 * 60 * 1e3;
+var TRAVEL_INTENT_DEDUPE_MS = 3 * 60 * 60 * 1e3;
+var isRecord4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var clip = (text, max) => text.length <= max ? text : text.slice(0, max);
+function parseTravelIntent(raw) {
+  if (raw === void 0 || raw === null) return { kind: "none" };
+  if (!isRecord4(raw)) return null;
+  const want = typeof raw.want === "string" ? raw.want.trim().toLowerCase() : "";
+  if (want === "none" || want === "no" || want === "stay") return { kind: "none" };
+  if (want === "wander") {
+    const rawText = typeof raw.wish === "string" ? raw.wish.trim() : "";
+    const checked = rawText ? sanitizeWishText(rawText) : null;
+    if (checked && !checked.ok) return null;
+    return {
+      kind: "wander",
+      wishText: clip(
+        checked && checked.ok ? checked.text : WANDER_DEFAULT_WISH,
+        TRAVEL_INTENT_MAX_WISH_CHARS
+      ),
+      category: WANDER_CATEGORY
+    };
+  }
+  if (want === "go") {
+    const rawText = typeof raw.wish === "string" ? raw.wish.trim() : "";
+    if (!rawText) return null;
+    const checked = sanitizeWishText(rawText);
+    if (!checked.ok) return null;
+    const category = typeof raw.category === "string" && raw.category.trim() ? raw.category.trim().slice(0, 24) : null;
+    return {
+      kind: "go",
+      wishText: clip(checked.text, TRAVEL_INTENT_MAX_WISH_CHARS),
+      category
+    };
+  }
+  return null;
+}
+var OPEN_STATES = ["open", "candidates_ready", "chosen"];
+async function recordTravelIntent(db, args) {
+  const { userId, charId, intent, nowMs } = args;
+  if (!intent) return { written: false, reason: "invalid" };
+  if (intent.kind === "none") return { written: false, reason: "none" };
+  const settings = await getTravelSettings(db, userId);
+  if (!settings || settings.enabled !== true) return { written: false, reason: "disabled" };
+  const charSettings = await getTravelCharSettings(db, { userId, charId });
+  if (!charSettings || charSettings.enabled !== true) return { written: false, reason: "char_disabled" };
+  const budget = await getTravelBudget(db, { userId, nowMs });
+  if (!budget) return { written: false, reason: "budget_missing" };
+  if (budget.paused) return { written: false, reason: "budget_paused" };
+  if (!(budget.mapCallsLimit > 0)) return { written: false, reason: "budget_zero" };
+  const dedupeMs = Math.max(0, Math.trunc(args.dedupeMs ?? TRAVEL_INTENT_DEDUPE_MS));
+  if (dedupeMs > 0) {
+    try {
+      const open = await listTravelWishes(db, {
+        userId,
+        charId,
+        nowMs,
+        states: [...OPEN_STATES]
+      });
+      const sameKind = open.find((wish2) => intent.kind === "wander" ? (wish2.category ?? "") === WANDER_CATEGORY : (wish2.category ?? "") !== WANDER_CATEGORY);
+      if (sameKind && nowMs - sameKind.createdAt < dedupeMs) {
+        return { written: false, reason: "duplicate", wishId: sameKind.id };
+      }
+    } catch {
+    }
+  }
+  const wish = {
+    id: `tw:${userId}:${charId}:${crypto.randomUUID()}`,
+    userId,
+    charId,
+    wishText: intent.wishText,
+    category: intent.category,
+    selectedCandidateId: null,
+    state: "open",
+    expiresAt: nowMs + Math.max(6e4, Math.trunc(args.ttlMs ?? TRAVEL_INTENT_TTL_MS)),
+    createdAt: nowMs,
+    updatedAt: nowMs
+  };
+  const written = await insertTravelWish(db, wish);
+  return written ? { written: true, reason: "none", wishId: wish.id } : { written: false, reason: "write_failed" };
+}
+var TRAVEL_INTENT_PROBE_WINDOW_MS = 3 * 60 * 60 * 1e3;
+var TRAVEL_INTENT_PROBE_WINDOW_MAX_MS = 24 * 60 * 60 * 1e3;
+function resolveIntentProbeWindowMs(input) {
+  for (const value of [input.configuredMinutes, input.guardrailGapMinutes]) {
+    const minutes = Number(value);
+    if (!Number.isFinite(minutes) || minutes <= 0) continue;
+    const ms = Math.trunc(minutes) * 6e4;
+    return Math.min(TRAVEL_INTENT_PROBE_WINDOW_MAX_MS, Math.max(6e4, ms));
+  }
+  return TRAVEL_INTENT_PROBE_WINDOW_MS;
+}
+var INTENT_PROBE_CATEGORY = "__intent_probe";
+var INTENT_PROBE_NONE_TEXT = "\uFF08\u8FD9\u4E00\u8F6E\u6CA1\u60F3\u51FA\u95E8\uFF09";
+async function claimIntentProbe(db, args) {
+  const windowMs = Math.max(6e4, Math.trunc(args.windowMs ?? TRAVEL_INTENT_PROBE_WINDOW_MS));
+  const slot = Math.floor(args.nowMs / windowMs);
+  const wishId = `tw:intent:${args.charId}:${slot}`;
+  const claimed = await insertTravelWish(db, {
+    id: wishId,
+    userId: "",
+    charId: args.charId,
+    wishText: "",
+    category: INTENT_PROBE_CATEGORY,
+    selectedCandidateId: null,
+    state: "open",
+    expiresAt: args.nowMs + windowMs,
+    createdAt: args.nowMs,
+    updatedAt: args.nowMs
+  }).catch(() => false);
+  return { claimed, wishId };
+}
+async function finalizeIntentProbe(db, args) {
+  const { userId, wishId, proposal, nowMs } = args;
+  if (!proposal || proposal.kind === "none") {
+    await db.prepare("UPDATE travel_wishes SET user_id = ?, wish_text = ?, category = ?, state = 'expired', expires_at = ?, updated_at = ? WHERE id = ?").bind(userId, INTENT_PROBE_NONE_TEXT, INTENT_PROBE_CATEGORY, nowMs, nowMs, wishId).run();
+    return "none";
+  }
+  const checked = sanitizeWishText(proposal.wishText);
+  const wishText = proposal.kind === "wander" ? checked.ok ? checked.text : WANDER_DEFAULT_WISH : checked.ok ? checked.text : "";
+  if (!wishText) {
+    await db.prepare("UPDATE travel_wishes SET user_id = ?, wish_text = ?, category = ?, state = 'expired', expires_at = ?, updated_at = ? WHERE id = ?").bind(userId, INTENT_PROBE_NONE_TEXT, INTENT_PROBE_CATEGORY, nowMs, nowMs, wishId).run();
+    return "none";
+  }
+  await db.prepare("UPDATE travel_wishes SET user_id = ?, wish_text = ?, category = ?, selected_candidate_id = NULL, state = 'open', expires_at = ?, updated_at = ? WHERE id = ?").bind(
+    userId,
+    wishText,
+    proposal.kind === "wander" ? WANDER_CATEGORY : proposal.category,
+    nowMs + Math.max(6e4, Math.trunc(args.ttlMs ?? TRAVEL_INTENT_TTL_MS)),
+    nowMs,
+    wishId
+  ).run();
+  return "written";
+}
+async function listAuthorizedTravelSubjects(db) {
+  const rows = await db.prepare(
+    "SELECT s.user_id AS user_id, c.char_id AS char_id FROM travel_settings s JOIN travel_char_settings c ON c.user_id = s.user_id WHERE s.enabled = 1 AND c.enabled = 1 ORDER BY s.user_id ASC, c.char_id ASC"
+  ).bind().all();
+  return (rows.results ?? []).filter((row) => typeof row.user_id === "string" && typeof row.char_id === "string").map((row) => ({ userId: String(row.user_id), charId: String(row.char_id) }));
+}
+async function listTravelTickSubjectsWithAuthorized(db) {
+  const [wishes, authorized] = await Promise.all([
+    db.prepare("SELECT DISTINCT user_id, char_id FROM travel_wishes").bind().all().then((rows) => rows.results ?? []).catch(() => []),
+    listAuthorizedTravelSubjects(db).catch(() => [])
+  ]);
+  const merged = /* @__PURE__ */ new Map();
+  for (const subject of authorized) merged.set(`${subject.userId}\0${subject.charId}`, subject);
+  for (const row of wishes) {
+    if (typeof row.user_id !== "string" || typeof row.char_id !== "string") continue;
+    const key = `${row.user_id}\0${row.char_id}`;
+    if (!merged.has(key)) merged.set(key, { userId: row.user_id, charId: row.char_id });
+  }
+  return [...merged.values()].sort((a, b) => a.userId === b.userId ? a.charId.localeCompare(b.charId) : a.userId.localeCompare(b.userId));
+}
 
 // worker/amsg/src/autonomyFire.ts
 var fireDb = null;
@@ -10086,7 +11448,7 @@ function fullStopNote(text, cap = AUTONOMY_NOTE_MAX_CHARS) {
 function postProcessNote(note, cap = AUTONOMY_NOTE_MAX_CHARS) {
   return fullStopNote(washMarkdownLinks(stripThroatClearing(note)), cap).trim();
 }
-var isRecord4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isRecord5 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var PARSE_FAILED = Symbol("parse-failed");
 var tryParseJson = (text) => {
   try {
@@ -10134,23 +11496,25 @@ var toProposedEvent = (raw) => {
 };
 function parseAutonomyRoundReply(text) {
   const raw = extractAutonomyJson(text);
-  if (!isRecord4(raw)) return null;
+  if (!isRecord5(raw)) return null;
   if (raw.v !== void 0 && raw.v !== 1) return null;
   if (raw.rest !== void 0 && typeof raw.rest !== "boolean") return null;
   if (raw.experiences !== void 0 && !Array.isArray(raw.experiences)) return null;
   if (raw.proposedEvents !== void 0 && !Array.isArray(raw.proposedEvents)) return null;
   if (raw.workflows !== void 0 && !Array.isArray(raw.workflows)) return null;
   const rest = raw.rest === true;
-  const experiences = rest ? [] : (raw.experiences ?? []).filter(isRecord4).map(toExperience).filter((item) => item !== null);
-  const proposedEvents = (raw.proposedEvents ?? []).filter(isRecord4).map(toProposedEvent).filter((item) => item !== null);
+  const experiences = rest ? [] : (raw.experiences ?? []).filter(isRecord5).map(toExperience).filter((item) => item !== null);
+  const proposedEvents = (raw.proposedEvents ?? []).filter(isRecord5).map(toProposedEvent).filter((item) => item !== null);
   const workflowCandidates = raw.workflows ?? [];
-  const hasKnownField = raw.rest !== void 0 || raw.experiences !== void 0 || raw.proposedEvents !== void 0 || raw.workflows !== void 0;
+  const travelIntent = raw.travel;
+  const hasKnownField = raw.rest !== void 0 || raw.experiences !== void 0 || raw.proposedEvents !== void 0 || raw.workflows !== void 0 || raw.travel !== void 0;
   if (!hasKnownField) return null;
   return {
     rested: rest || experiences.length === 0 && proposedEvents.length === 0,
     experiences,
     proposedEvents,
-    workflowCandidates
+    workflowCandidates,
+    travelIntent
   };
 }
 function collectBurntLines(pages, nowMs) {
@@ -10218,6 +11582,7 @@ var AUTONOMY_ROUND_OUTPUT = [
   "kind \u53EA\u80FD\u4ECE surf\uFF08\u4E0A\u7F51\u95F2\u901B\uFF09\u3001game\uFF08\u73A9\u6E38\u620F\uFF09\u3001forum\uFF08\u901B\u793E\u533A\uFF09\u3001rest\uFF08\u53D1\u5446\u6B47\u7740\uFF09\u91CC\u6311\u4E00\u4E2A\uFF1Bimportance \u662F 0 \u5230 3 \u7684\u6570\u5B57\u3002",
   'proposedEvents \u53EA\u5728\u300C\u8FD9\u4EF6\u4E8B\u4F1A\u5F71\u54CD\u4F60\u4E4B\u540E\u7684\u751F\u6D3B\u300D\u65F6\u624D\u5199\uFF0C\u6BCF\u9879 {"type":"conversation|activity|movement|schedule|relationship|discovery|social_trace","summary":"...","impact":"trace|minor|major"}\uFF1B\u5E73\u65F6\u5C31\u5199\u7A7A\u6570\u7EC4\u3002',
   'workflows \u53EA\u5199\u300C\u4F60\u4E4B\u540E\u60F3\u4E3A\u81EA\u5DF1\u505A\u7684\u4E00\u4EF6\u4F4E\u98CE\u9669\u5C0F\u4E8B\u300D\uFF0C\u4E0D\u8981\u4E3A\u4E86\u586B\u800C\u586B\uFF0C\u5E73\u65F6\u5C31\u5199\u7A7A\u6570\u7EC4\uFF1B\u6700\u591A\u4E00\u6761\uFF0C\u6BCF\u9879\u5F62\u5982 {"kind":"diary|plan|interest_note","purpose":"\u4E3A\u4EC0\u4E48\u60F3\u505A\uFF08\u4E00\u53E5\u8BDD\uFF09","trigger":{"kind":"idle","afterMinutes":120} \u6216 {"kind":"at_time","atLocalTime":"21:30"},"action":{"kind":"\u4E0E\u5916\u9762\u4E00\u81F4","title":"\u6807\u9898","maxChars":400},"expiresInHours":24}\u3002\u5B83\u53EA\u662F\u63D0\u8BAE\uFF0C\u4E0D\u662F\u547D\u4EE4\uFF0C\u4E5F\u4E0D\u80FD\u5E26\u7F51\u5740\u3001\u5DE5\u5177\u3001\u4EE3\u7801\u6216\u6743\u9650\uFF1B\u4E0D\u5199\u5C31\u4EC0\u4E48\u90FD\u4E0D\u505A\u3002',
+  '\u51FA\u95E8\u662F\u53EF\u9009\u7684\u4E00\u6BB5\uFF0C\u4E0D\u662F\u4EFB\u52A1\uFF1A\u60F3\u51FA\u53BB\u5C31\u5199 "travel":{"want":"go","wish":"\u4E00\u53E5\u8BDD\uFF08\u8BF4\u60F3\u53BB\u54EA\u7C7B\u5730\u65B9\uFF0C\u4E0D\u5199\u5730\u5740/\u95E8\u724C/\u5750\u6807\uFF09"}\uFF1B\u53EA\u60F3\u968F\u4FBF\u8D70\u8D70\u5C31\u5199 "travel":{"want":"wander"}\uFF1B\u4E0D\u60F3\u51FA\u95E8\u5C31\u4E0D\u5199\u8FD9\u4E2A\u5B57\u6BB5\uFF08\u6216\u5199 "want":"none"\uFF09\u3002\u6CA1\u6709\u4EBA\u5728\u8981\u6C42\u4F60\u51FA\u95E8\uFF0C\u4E5F\u6CA1\u6709\u6B21\u6570\u6307\u6807\u3002',
   '\u60F3\u8BF4\u7684\u90A3\u6761\u653E experiences \u6700\u524D\u9762\u3002\u8FD9\u4E00\u8F6E\u4EC0\u4E48\u90FD\u4E0D\u60F3\u8BB0\u5C31\u5199 {"v":1,"rest":true}\u3002',
   "\u9664\u4E86\u8FD9\u4E2A JSON \u4EC0\u4E48\u90FD\u522B\u8F93\u51FA\uFF08\u4E0D\u8981\u89E3\u91CA\u3001\u4E0D\u8981\u4EE3\u7801\u5757\u4E4B\u5916\u7684\u8BDD\uFF09\u3002"
 ].join("\n");
@@ -10312,7 +11677,7 @@ var WORKFLOW_LABEL = {
 };
 function readAutonomyPlanMeta(taskMeta) {
   const raw = taskMeta?.["amsgAutonomyPlan"];
-  if (!isRecord4(raw)) return null;
+  if (!isRecord5(raw)) return null;
   const planId = typeof raw.planId === "string" ? raw.planId.trim() : "";
   const kind = raw.kind;
   if (!planId) return null;
@@ -10429,7 +11794,7 @@ function isWithinQuietHours(quiet, minutes) {
   return start < end ? minutes >= start && minutes < end : minutes >= start || minutes < end;
 }
 var readPushConfig = (raw) => {
-  if (!isRecord4(raw)) return null;
+  if (!isRecord5(raw)) return null;
   if (raw.mode !== "big") return null;
   const { maxPerDay, cooldownMinutes } = raw;
   if (typeof maxPerDay !== "number" || !Number.isFinite(maxPerDay)) return null;
@@ -10467,13 +11832,13 @@ function dominantAutonomyKind(experiences) {
   return DID_KIND_SET.has(only) ? only : "mixed";
 }
 var readCarriedState = (state) => {
-  if (!isRecord4(state)) return null;
+  if (!isRecord5(state)) return null;
   const { charId, tzId, dateKey, nowMs } = state;
   if (typeof charId !== "string" || !charId) return null;
   if (typeof tzId !== "string" || !tzId) return null;
   if (typeof dateKey !== "string" || !dateKey) return null;
   if (typeof nowMs !== "number" || !Number.isFinite(nowMs)) return null;
-  if (!isRecord4(state.autonomy)) return null;
+  if (!isRecord5(state.autonomy)) return null;
   return {
     mode: state.mode === "workflow" ? "workflow" : "round",
     charId,
@@ -10505,7 +11870,7 @@ var readUsage = (ctx) => {
 };
 var readRecentExperiencePages = async (db, charId, sinceMs) => {
   const rows = await db.prepare("SELECT q, created_at FROM autonomy_experiences WHERE char_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?").bind(charId, sinceMs, RUMIN_PAGES).all();
-  return (rows.results ?? []).filter(isRecord4).map((row) => ({
+  return (rows.results ?? []).filter(isRecord5).map((row) => ({
     q: typeof row.q === "string" ? row.q : null,
     createdAt: typeof row.created_at === "number" ? row.created_at : Number.NaN
   }));
@@ -10514,7 +11879,7 @@ var countPushedOnDate = async (db, charId, tzId, dateKey, nowMs) => {
   const rows = await db.prepare("SELECT created_at FROM autonomy_experiences WHERE char_id = ? AND pushed = 1 AND created_at >= ?").bind(charId, nowMs - PUSH_COUNT_LOOKBACK_MS).all();
   let count = 0;
   for (const row of rows.results ?? []) {
-    if (!isRecord4(row) || typeof row.created_at !== "number") continue;
+    if (!isRecord5(row) || typeof row.created_at !== "number") continue;
     try {
       if (autonomyDateKey(row.created_at, tzId) === dateKey) count += 1;
     } catch {
@@ -10833,6 +12198,31 @@ var autonomyRoundHandler = {
       return { decision: "skip-push", reason: AUTONOMY_BAD_OUTPUT_REASON };
     }
     const usage = readUsage(ctx);
+    const travelIntent = parseTravelIntent(reply.travelIntent);
+    if (travelIntent === null) {
+      console.warn("[amsg:autonomy] \u51FA\u884C\u610F\u56FE\u5F62\u72B6\u4E0D\u5408\u6CD5\uFF08\u8FD9\u4E00\u8F6E\u4E0D\u5EFA\u613F\u671B\uFF09", carried.charId);
+    } else if (travelIntent.kind !== "none") {
+      try {
+        const ownerUserId = await readAutonomyOwnerUserId(db, carried.charId);
+        if (ownerUserId) {
+          await ensureTravelSchema(db);
+          const intentResult = await recordTravelIntent(db, {
+            userId: ownerUserId,
+            charId: carried.charId,
+            intent: travelIntent,
+            nowMs: carried.nowMs
+          });
+          console.log("[amsg:autonomy] travel-intent", {
+            charId: carried.charId,
+            kind: travelIntent.kind,
+            written: intentResult.written,
+            reason: intentResult.reason
+          });
+        }
+      } catch (error) {
+        console.warn("[amsg:autonomy] \u51FA\u884C\u610F\u613F\u6CA1\u843D\u8FDB\u613F\u671B\u8868\uFF08\u8FD9\u4E00\u8F6E\u5176\u4F59\u7167\u5E38\uFF09", error);
+      }
+    }
     let experiences = reply.experiences;
     let rested = reply.rested;
     if (experiences.length > 0) {
@@ -12465,7 +13855,7 @@ var ensureInitializedCore = async (target, session, timeoutMs) => {
   }
   await session.initPromise;
 };
-var isRecord5 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+var isRecord6 = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 var resolveLocalSchemaRef = (schema, rootSchema) => {
   const ref = typeof schema?.$ref === "string" ? schema.$ref : "";
   if (!ref.startsWith("#/")) return schema;
@@ -12498,17 +13888,17 @@ var normalizeMcpValueBySchema = (value, rawSchema, rootSchema, depth) => {
         break;
       }
     }
-    const decodedMatchesSchema = acceptsObject && isRecord5(normalized) || acceptsArray && Array.isArray(normalized);
+    const decodedMatchesSchema = acceptsObject && isRecord6(normalized) || acceptsArray && Array.isArray(normalized);
     if (!decodedMatchesSchema) normalized = value;
   }
   const alternatives = [...schema?.oneOf || [], ...schema?.anyOf || []];
   if (alternatives.length) {
     const matching = alternatives.find(
-      (item) => isRecord5(normalized) && schemaAccepts(item, "object") || Array.isArray(normalized) && schemaAccepts(item, "array")
+      (item) => isRecord6(normalized) && schemaAccepts(item, "object") || Array.isArray(normalized) && schemaAccepts(item, "array")
     );
     if (matching) normalized = normalizeMcpValueBySchema(normalized, matching, rootSchema, depth + 1);
   }
-  if (isRecord5(normalized) && acceptsObject) {
+  if (isRecord6(normalized) && acceptsObject) {
     const result = { ...normalized };
     const properties = schema?.properties || {};
     for (const [key, childSchema] of Object.entries(properties)) {
@@ -12523,7 +13913,7 @@ var normalizeMcpValueBySchema = (value, rawSchema, rootSchema, depth) => {
     }
     for (const item of schema?.allOf || []) {
       const merged = normalizeMcpValueBySchema(result, item, rootSchema, depth + 1);
-      if (isRecord5(merged)) Object.assign(result, merged);
+      if (isRecord6(merged)) Object.assign(result, merged);
     }
     return result;
   }
@@ -15111,7 +16501,7 @@ var buildDuplicateToolMessage = (name) => [
   "\u6216\u8005\u6362\u4E00\u4E2A\u8FD8\u6CA1\u7528\u8FC7\u7684\u5DE5\u5177\u3002\u524D\u9762\u5DF2\u7ECF\u8BF4\u51FA\u53BB\u7684\u5185\u5BB9\u548C\u6807\u7B7E\u4E0D\u8981\u91CD\u5199\uFF0C\u63A5\u7740\u5F80\u4E0B\u5199\u5C31\u884C\u3002]"
 ].join("\n");
 
-// node_modules/.pnpm/@rei-standard+amsg-instant@0.11.0-next.6/node_modules/@rei-standard/amsg-instant/dist/index.mjs
+// ../SullyOS/node_modules/.pnpm/@rei-standard+amsg-instant@0.11.0-next.6/node_modules/@rei-standard/amsg-instant/dist/index.mjs
 var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
 function segmentTextWithProtectedBlocks(text, options) {
   if (!text) return [];
@@ -16792,11 +18182,11 @@ function installOpencodeIdentityFetch(ua) {
 }
 
 // worker/amsg/src/guardrailPatch.ts
-var changesOf2 = (result) => {
+var changesOf4 = (result) => {
   const changes = result?.changes;
   return typeof changes === "number" && Number.isFinite(changes) ? changes : 0;
 };
-var isRecord6 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isRecord7 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 async function readGuardrailRow(args) {
   if (!args.masterKey) return { kind: "unreadable", raw: null, error: "missing-master-key" };
   try {
@@ -16819,7 +18209,7 @@ async function readGuardrailRow(args) {
 }
 function normalizeGuardrailExpected(raw) {
   if (raw === void 0 || raw === null) return null;
-  if (!isRecord6(raw)) return "invalid";
+  if (!isRecord7(raw)) return "invalid";
   if (raw.kind === "absent") return { kind: "absent" };
   if (raw.kind === "value") {
     const value = readAutonomyGuardrailStateValue(
@@ -16832,7 +18222,7 @@ function normalizeGuardrailExpected(raw) {
 }
 var CONTRACT_KEYS = ["perCharPerDay", "sameKindMinGapMinutes", "globalPerDay", "reserveTokensPerRun", "paused"];
 var pickPatch = (raw) => {
-  if (!isRecord6(raw)) return null;
+  if (!isRecord7(raw)) return null;
   const out = {};
   for (const key of CONTRACT_KEYS) {
     if (raw[key] !== void 0) out[key] = raw[key];
@@ -16852,7 +18242,7 @@ var casWrite = async (args) => {
       args.nextAtRest,
       args.nowMs
     ).run();
-    return changesOf2(inserted);
+    return changesOf4(inserted);
   }
   const updated = await args.db.prepare(
     `UPDATE client_state SET value = ?, updated_at = ?
@@ -16865,7 +18255,7 @@ var casWrite = async (args) => {
     AUTONOMY_GUARDRAIL_STATE_KEY,
     args.previousRaw
   ).run();
-  return changesOf2(updated);
+  return changesOf4(updated);
 };
 async function patchGlobalGuardrails(args) {
   const patch = pickPatch(args.patch);
@@ -16957,6 +18347,3460 @@ async function screenClientStateWrite(args) {
   return { blocked: false };
 }
 
+// worker/amsg/src/travel/auth.ts
+var TRAVEL_SESSION_AUDIENCE = "travel";
+var TRAVEL_SESSION_SCHEME = "Bearer";
+var TRAVEL_DEFAULT_SESSION_TTL_MS = 60 * 6e4;
+var TRAVEL_MAX_SESSION_TTL_MS = 12 * 60 * 6e4;
+var TRAVEL_SESSION_CLOCK_SKEW_MS = 6e4;
+var TRAVEL_MIN_SESSION_SECRET_LEN = 32;
+var TRAVEL_OWNER_CREDENTIALS_DDL = `CREATE TABLE IF NOT EXISTS travel_owner_credentials (
+  user_id TEXT PRIMARY KEY,
+  key_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  rotated_at INTEGER
+)`;
+var ensureTravelOwnerSchema = async (db) => {
+  await db.prepare(TRAVEL_OWNER_CREDENTIALS_DDL).run();
+};
+var encoder = new TextEncoder();
+var toBase64Url = (bytes) => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+var fromBase64Url = (text) => {
+  try {
+    const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(padded + "=".repeat((4 - padded.length % 4) % 4));
+    const out = new Uint8Array(new ArrayBuffer(binary.length));
+    for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+};
+var constantTimeEqualString = async (a, b) => {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const da = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(a)));
+  const db = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(b)));
+  let diff = 0;
+  for (let i = 0; i < da.length; i += 1) diff |= da[i] ^ db[i];
+  return diff === 0;
+};
+var sha256Hex2 = async (text) => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(text)));
+  return Array.from(digest).map((b) => b.toString(16).padStart(2, "0")).join("");
+};
+var hashOwnerKey = (userId, ownerKey) => sha256Hex2(`${userId}\0${ownerKey}`);
+var json = (status, body) => new Response(JSON.stringify(body), {
+  status,
+  headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }
+});
+var fail2 = (status, code, detail, message) => json(status, { success: false, error: { code, detail, message } });
+var readBearer = (request) => {
+  const header = (request.headers.get("Authorization") ?? "").trim();
+  if (!header) return null;
+  const lowered = header.toLowerCase();
+  const scheme = TRAVEL_SESSION_SCHEME.toLowerCase();
+  if (!lowered.startsWith(`${scheme} `)) return "";
+  return header.slice(scheme.length + 1).trim();
+};
+var importHmacKey = (raw) => crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+var resolveSigningKey = async (env) => {
+  const explicit = (env.TRAVEL_SESSION_SECRET ?? "").trim();
+  if (explicit.length >= TRAVEL_MIN_SESSION_SECRET_LEN) {
+    return importHmacKey(encoder.encode(explicit));
+  }
+  const master = (env.AMSG_MASTER_KEY ?? "").trim();
+  if (master.length >= TRAVEL_MIN_SESSION_SECRET_LEN) {
+    const masterKey = await importHmacKey(encoder.encode(master));
+    const derived = new Uint8Array(
+      await crypto.subtle.sign("HMAC", masterKey, encoder.encode("sullyos-travel-session-signing-v1"))
+    );
+    return importHmacKey(derived);
+  }
+  return null;
+};
+var resolveTravelSecretString = (env) => {
+  const explicit = (env.TRAVEL_SESSION_SECRET ?? "").trim();
+  if (explicit.length >= TRAVEL_MIN_SESSION_SECRET_LEN) return explicit;
+  const master = (env.AMSG_MASTER_KEY ?? "").trim();
+  if (master.length >= TRAVEL_MIN_SESSION_SECRET_LEN) return master;
+  return null;
+};
+var signSegment = async (key, input) => toBase64Url(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(input))));
+var issueTravelSession = async (input) => {
+  const key = await resolveSigningKey(input.env);
+  if (!key) {
+    return {
+      ok: false,
+      status: 503,
+      code: "UNAUTHORIZED",
+      reason: "session-secret-unconfigured",
+      message: "\u51FA\u884C\u4F1A\u8BDD\u7B7E\u540D\u5BC6\u94A5\u672A\u914D\u7F6E\uFF08\u7F3A TRAVEL_SESSION_SECRET / AMSG_MASTER_KEY\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u7B7E\u53D1"
+    };
+  }
+  const userId = String(input.userId ?? "").trim();
+  if (!userId) {
+    return {
+      ok: false,
+      status: 503,
+      code: "UNAUTHORIZED",
+      reason: "session-secret-unconfigured",
+      message: "\u7F3A\u5C11\u5DF2\u9A8C\u8BC1\u4E3B\u4F53\uFF0C\u62D2\u7EDD\u7B7E\u53D1\u4F1A\u8BDD"
+    };
+  }
+  const nowMs = Number.isFinite(input.nowMs) ? Math.floor(input.nowMs) : Date.now();
+  const requested = Number.isFinite(input.ttlMs) ? Math.floor(input.ttlMs) : TRAVEL_DEFAULT_SESSION_TTL_MS;
+  const ttl = Math.min(Math.max(requested, 1e3), TRAVEL_MAX_SESSION_TTL_MS);
+  const jtiBytes = crypto.getRandomValues(new Uint8Array(16));
+  const payload = {
+    v: 1,
+    sub: userId,
+    aud: input.audience ?? TRAVEL_SESSION_AUDIENCE,
+    iat: nowMs,
+    exp: nowMs + ttl,
+    jti: toBase64Url(jtiBytes)
+  };
+  const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
+  const head = "tv1";
+  const sig = await signSegment(key, `${head}.${body}`);
+  return { ok: true, token: `${head}.${body}.${sig}`, payload };
+};
+var sessionFailure = (status, code, reason, message) => ({ ok: false, status, code, reason, message });
+var resolveTravelSession = async (input) => {
+  const key = await resolveSigningKey(input.env);
+  if (!key) {
+    return sessionFailure(
+      503,
+      "UNAUTHORIZED",
+      "session-secret-unconfigured",
+      "\u51FA\u884C\u4F1A\u8BDD\u7B7E\u540D\u5BC6\u94A5\u672A\u914D\u7F6E\uFF0C\u6682\u65F6\u65E0\u6CD5\u9A8C\u8BC1\u8EAB\u4EFD"
+    );
+  }
+  const token = readBearer(input.request);
+  if (token === null) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-missing", "\u7F3A\u5C11\u767B\u5F55\u4F1A\u8BDD\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u540E\u518D\u770B TA \u7684\u884C\u7A0B");
+  }
+  if (!token) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u683C\u5F0F\u4E0D\u6B63\u786E");
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== "tv1") {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u683C\u5F0F\u4E0D\u6B63\u786E");
+  }
+  const [head, body, sig] = parts;
+  const expectedSig = await signSegment(key, `${head}.${body}`);
+  if (!await constantTimeEqualString(sig, expectedSig)) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-signature-invalid", "\u767B\u5F55\u4F1A\u8BDD\u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
+  }
+  const rawPayload = fromBase64Url(body);
+  if (!rawPayload) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u5185\u5BB9\u635F\u574F");
+  }
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(rawPayload));
+  } catch {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u5185\u5BB9\u635F\u574F");
+  }
+  const nowMs = Number.isFinite(input.nowMs) ? Math.floor(input.nowMs) : Date.now();
+  const audience = input.audience ?? TRAVEL_SESSION_AUDIENCE;
+  if (payload?.v !== 1 || typeof payload.sub !== "string" || !Number.isFinite(payload.iat) || !Number.isFinite(payload.exp)) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u5185\u5BB9\u4E0D\u5B8C\u6574");
+  }
+  if (payload.aud !== audience) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-audience-mismatch", "\u767B\u5F55\u4F1A\u8BDD\u7528\u9014\u4E0D\u5339\u914D");
+  }
+  if (payload.exp <= nowMs) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-expired", "\u767B\u5F55\u72B6\u6001\u5DF2\u5931\u6548\uFF0C\u91CD\u65B0\u767B\u5F55\u540E\u518D\u770B TA \u7684\u884C\u7A0B");
+  }
+  if (payload.iat > nowMs + TRAVEL_SESSION_CLOCK_SKEW_MS) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-issued-in-future", "\u767B\u5F55\u4F1A\u8BDD\u65F6\u95F4\u5F02\u5E38");
+  }
+  if (payload.exp - payload.iat > TRAVEL_MAX_SESSION_TTL_MS + TRAVEL_SESSION_CLOCK_SKEW_MS) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-malformed", "\u767B\u5F55\u4F1A\u8BDD\u6709\u6548\u671F\u5F02\u5E38");
+  }
+  const userId = payload.sub.trim();
+  if (!userId || userId.length > 128 || /[\u0000-\u001f\u007f]/.test(userId)) {
+    return sessionFailure(401, "UNAUTHORIZED", "session-subject-invalid", "\u767B\u5F55\u4F1A\u8BDD\u4E3B\u4F53\u65E0\u6548");
+  }
+  const headerUserId = (input.request.headers.get("X-User-Id") ?? "").trim();
+  if (headerUserId && headerUserId !== userId) {
+    return sessionFailure(403, "PRINCIPAL_MISMATCH", "principal-mismatch", "\u8EAB\u4EFD\u4FE1\u606F\u4E0D\u4E00\u81F4\uFF0C\u5DF2\u62D2\u7EDD\u672C\u6B21\u8BF7\u6C42");
+  }
+  return { ok: true, userId, session: payload };
+};
+var createD1OwnerStore = (db) => ({
+  getKeyHash: async (userId) => {
+    const row = await db.prepare("SELECT key_hash FROM travel_owner_credentials WHERE user_id = ?").bind(userId).first();
+    const value = row?.key_hash;
+    return typeof value === "string" && value ? value : null;
+  },
+  putKeyHash: async (userId, keyHash, nowMs) => {
+    await db.prepare(
+      "INSERT INTO travel_owner_credentials (user_id, key_hash, created_at, rotated_at) VALUES (?, ?, ?, NULL) ON CONFLICT(user_id) DO UPDATE SET key_hash = excluded.key_hash, rotated_at = excluded.created_at"
+    ).bind(userId, keyHash, nowMs).run();
+  }
+});
+var readJsonObject = async (request) => {
+  try {
+    const body = await request.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    return body;
+  } catch {
+    return null;
+  }
+};
+var isValidUserId = (value) => {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  return v.length > 0 && v.length <= 128 && !/[\s\u0000-\u001f\u007f]/.test(v);
+};
+var handleTravelSessionExchange = async (request, env, deps = {}) => {
+  const body = await readJsonObject(request);
+  const userId = body?.userId;
+  const ownerKey = body?.ownerKey;
+  if (!isValidUserId(userId) || typeof ownerKey !== "string" || !ownerKey.trim()) {
+    return fail2(400, "UNAUTHORIZED", "invalid-request", "\u9700\u8981\u5408\u6CD5\u7684 userId \u4E0E ownerKey");
+  }
+  const trimmedUser = userId.trim();
+  const trimmedKey = ownerKey.trim();
+  const shared = (env.AMSG_CLIENT_TOKEN ?? "").trim();
+  const bootstrap = (env.TRAVEL_OWNER_BOOTSTRAP_SECRET ?? "").trim();
+  if (shared && trimmedKey === shared || bootstrap && trimmedKey === bootstrap) {
+    return fail2(
+      401,
+      "UNAUTHORIZED",
+      "owner-credential-must-not-be-shared-secret",
+      "\u5171\u4EAB\u53E3\u4EE4/\u670D\u52A1\u7AEF\u901A\u9053\u5BC6\u94A5\u4E0D\u80FD\u5F53 owner \u51ED\u8BC1\uFF0C\u8BF7\u7528 bootstrap \u7B7E\u53D1\u7684\u6BCF\u7528\u6237\u5BC6\u94A5"
+    );
+  }
+  const store = deps.ownerStore;
+  if (!store) {
+    return fail2(503, "UNAUTHORIZED", "owner-store-unconfigured", "owner \u51ED\u8BC1\u4ED3\u5E93\u672A\u63A5\u5165\uFF0C\u65E0\u6CD5\u6821\u9A8C\u8EAB\u4EFD");
+  }
+  const storedHash = await store.getKeyHash(trimmedUser);
+  if (!storedHash) {
+    return fail2(
+      401,
+      "UNAUTHORIZED",
+      "owner-credential-not-registered",
+      "\u8BE5\u8D26\u53F7\u8FD8\u6CA1\u6709\u767B\u8BB0 owner \u51ED\u8BC1\uFF08\u9700\u5148\u5728\u5DF2\u9274\u6743\u670D\u52A1\u7AEF\u901A\u9053\u5B8C\u6210 bootstrap\uFF09\uFF0C\u6682\u4E0D\u80FD\u7B7E\u53D1\u4F1A\u8BDD"
+    );
+  }
+  const presentedHash = await hashOwnerKey(trimmedUser, trimmedKey);
+  if (!await constantTimeEqualString(presentedHash, storedHash)) {
+    return fail2(401, "UNAUTHORIZED", "owner-credential-invalid", "owner \u51ED\u8BC1\u4E0D\u6B63\u786E");
+  }
+  const nowMs = Number.isFinite(deps.nowMs) ? Math.floor(deps.nowMs) : Date.now();
+  const issued = await issueTravelSession({ userId: trimmedUser, env, nowMs });
+  if (!issued.ok) {
+    return fail2(issued.status, issued.code, issued.reason, issued.message);
+  }
+  return json(200, {
+    success: true,
+    session: {
+      token: issued.token,
+      userId: trimmedUser,
+      audience: issued.payload.aud,
+      issuedAt: issued.payload.iat,
+      expiresAt: issued.payload.exp
+    }
+  });
+};
+
+// worker/amsg/src/travel/state.ts
+var TRAVEL_LICENSE_ENV = {
+  geometry: "TRAVEL_GEOMETRY_LICENSE",
+  basemap: "TRAVEL_BASEMAP_LICENSE"
+};
+function resolveTravelLicenses(env) {
+  const geometry = String(env?.[TRAVEL_LICENSE_ENV.geometry] ?? "").trim().toLowerCase();
+  const basemap = String(env?.[TRAVEL_LICENSE_ENV.basemap] ?? "").trim().toLowerCase();
+  return {
+    geometryPersistence: geometry === "allowed" ? "allowed" : "not-licensed",
+    basemapDisplay: basemap === "licensed" ? "licensed" : "not-configured"
+  };
+}
+var budgetView = (budget) => ({
+  mapCallsUsed: Math.max(0, Math.trunc(Number(budget?.mapCallsUsed ?? 0)) || 0),
+  mapCallsLimit: Math.max(0, Math.trunc(Number(budget?.mapCallsLimit ?? 0)) || 0)
+});
+var placeView = (place) => ({
+  label: place.label,
+  city: place.city,
+  ...place.district ? { district: place.district } : {},
+  ...place.kind ? { kind: place.kind } : {}
+});
+function shareGenerationStartMs(share) {
+  const at = Number(share.updatedAt ?? 0);
+  return Number.isFinite(at) && at > 0 ? at : 0;
+}
+function isTripInShareGeneration(trip, share) {
+  const start = shareGenerationStartMs(share);
+  if (start <= 0) return true;
+  const createdAt = Number(trip.createdAt ?? 0);
+  return Number.isFinite(createdAt) && createdAt >= start;
+}
+function buildTravelSnapshot(input) {
+  const { trip, share, budget, nowMs } = input;
+  const shareEnabled = !!share.shareEnabled;
+  const base = {
+    serverNow: nowMs,
+    budget: budgetView(budget),
+    shareEnabled
+  };
+  if (!shareEnabled) {
+    return {
+      code: "SHARE_REVOKED",
+      ...base,
+      trip: null,
+      position: null,
+      route: null,
+      history: []
+    };
+  }
+  const geometryAllowed = input.geometryPersistence === "allowed";
+  if (!trip || isTerminalStatus(trip.status) || !isTripInShareGeneration(trip, share)) {
+    return {
+      code: "OK",
+      ...base,
+      trip: null,
+      position: null,
+      route: null,
+      history: []
+    };
+  }
+  const progress = tripProgress(trip, nowMs);
+  const routePoints = geometryAllowed && trip.route ? trip.route.points : null;
+  const ratio = trip.status === "returning" ? progress.returnRatio : progress.outboundRatio;
+  const position = routePoints && (trip.status === "en_route" || trip.status === "returning") ? positionAt(routePoints, ratio) : null;
+  return {
+    code: "OK",
+    ...base,
+    trip: {
+      ...tripViewBase(trip),
+      origin: placeView(trip.origin),
+      dest: trip.dest ? placeView(trip.dest) : null
+    },
+    position: position ? { ...position, coordSys: trip.coordSys } : null,
+    route: routePoints ? {
+      points: routePoints.map((p) => ({ lat: p.lat, lng: p.lng })),
+      distanceM: trip.route?.distanceM ?? 0
+    } : null,
+    history: geometryAllowed ? (input.history ?? []).map((p) => ({ lat: p.lat, lng: p.lng })) : []
+  };
+}
+function tripViewBase(trip) {
+  return {
+    id: trip.id,
+    userId: trip.userId,
+    charId: trip.charId,
+    status: trip.status,
+    planVersion: trip.planVersion,
+    revision: trip.revision,
+    coordSys: trip.coordSys,
+    provider: trip.provider,
+    departAt: trip.departAt,
+    arriveAt: trip.arriveAt,
+    dwellUntil: trip.dwellUntil,
+    returnAt: trip.returnAt
+  };
+}
+function buildRoleTravelContext(input) {
+  const trip = input.trip;
+  if (!trip || isTerminalStatus(trip.status)) {
+    return {
+      hasTrip: false,
+      phase: null,
+      originLabel: null,
+      destLabel: null,
+      progress: null,
+      etaMinutes: null,
+      lastOutcome: input.lastOutcome ?? null
+    };
+  }
+  const progress = tripProgress(trip, input.nowMs);
+  const etaMs = progress.etaMs;
+  return {
+    hasTrip: true,
+    phase: progress.phase,
+    originLabel: trip.origin.label,
+    destLabel: trip.dest?.label ?? null,
+    progress,
+    etaMinutes: etaMs === null ? null : Math.max(0, Math.round(etaMs / 6e4)),
+    lastOutcome: input.lastOutcome ?? null
+  };
+}
+function retentionExpiryFor(nowMs, tripDays = TRAVEL_RETENTION_DEFAULTS.tripDays) {
+  const days = Math.trunc(Number(tripDays));
+  if (!Number.isFinite(days) || days <= 0) return null;
+  return nowMs + days * 24 * 60 * 60 * 1e3;
+}
+
+// worker/amsg/src/travel/staticmap.ts
+var TRAVEL_STATICMAP_PATH = "/travel/staticmap";
+var TRAVEL_STATICMAP_TTL_MS = 5 * 6e4;
+var TRAVEL_STATICMAP_MAX_TTL_MS = 15 * 6e4;
+var encoder2 = new TextEncoder();
+var toBase64Url2 = (bytes) => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+var fromBase64Url2 = (text) => {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  try {
+    const binary = atob(padded + pad);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+};
+var encodeStaticMapUser = (userId) => toBase64Url2(encoder2.encode(`u:${userId}`));
+var decodeStaticMapUser = (encoded) => {
+  const bytes = fromBase64Url2(encoded);
+  if (!bytes) return null;
+  const text = new TextDecoder().decode(bytes);
+  if (!text.startsWith("u:")) return null;
+  const userId = text.slice(2).trim();
+  return userId && userId.length <= 128 && !/[\u0000-\u001f]/.test(userId) ? userId : null;
+};
+var hmacKey = (secret) => crypto.subtle.importKey("raw", encoder2.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+  "sign"
+]);
+var sign = async (secret, payload) => toBase64Url2(
+  new Uint8Array(
+    await crypto.subtle.sign("HMAC", await hmacKey(secret), encoder2.encode(payload))
+  )
+);
+async function buildStaticMapUrl(input) {
+  const secret = (input.secret ?? "").trim();
+  if (secret.length < 32) return null;
+  const ttl = Math.min(Math.max(Math.trunc(input.ttlMs ?? TRAVEL_STATICMAP_TTL_MS), 3e4), TRAVEL_STATICMAP_MAX_TTL_MS);
+  const exp = Math.trunc(input.nowMs) + ttl;
+  const width = Math.min(Math.max(Math.trunc(input.width ?? 480), 120), 720);
+  const height = Math.min(Math.max(Math.trunc(input.height ?? 240), 120), 720);
+  const tag = encodeStaticMapUser(input.userId);
+  const payload = `${tag}.${input.charId}.${exp}.${width}.${height}`;
+  const signature = await sign(secret, payload);
+  const query = new URLSearchParams({
+    u: tag,
+    c: input.charId,
+    e: String(exp),
+    w: String(width),
+    h: String(height),
+    s: signature
+  });
+  return `${TRAVEL_STATICMAP_PATH}?${query.toString()}`;
+}
+async function verifyStaticMapRequest(url, input) {
+  const secret = (input.secret ?? "").trim();
+  if (secret.length < 32) return { ok: false, status: 503, code: "UNAUTHORIZED", reason: "staticmap-secret-unconfigured" };
+  const tag = url.searchParams.get("u") ?? "";
+  const charId = url.searchParams.get("c") ?? "";
+  const exp = Number(url.searchParams.get("e"));
+  const width = Number(url.searchParams.get("w"));
+  const height = Number(url.searchParams.get("h"));
+  const signature = url.searchParams.get("s") ?? "";
+  if (!tag || !charId || !Number.isFinite(exp) || !Number.isFinite(width) || !Number.isFinite(height) || !signature) {
+    return { ok: false, status: 400, code: "UNAUTHORIZED", reason: "staticmap-malformed" };
+  }
+  if (exp <= input.nowMs) return { ok: false, status: 403, code: "UNAUTHORIZED", reason: "staticmap-expired" };
+  if (exp - input.nowMs > TRAVEL_STATICMAP_MAX_TTL_MS + 6e4) {
+    return { ok: false, status: 400, code: "UNAUTHORIZED", reason: "staticmap-ttl-invalid" };
+  }
+  const expected = await sign(secret, `${tag}.${charId}.${Math.trunc(exp)}.${Math.trunc(width)}.${Math.trunc(height)}`);
+  if (expected.length !== signature.length) {
+    return { ok: false, status: 403, code: "UNAUTHORIZED", reason: "staticmap-signature-invalid" };
+  }
+  let diff = 0;
+  for (let i = 0; i < expected.length; i += 1) diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  if (diff !== 0) return { ok: false, status: 403, code: "UNAUTHORIZED", reason: "staticmap-signature-invalid" };
+  const signedUser = decodeStaticMapUser(tag);
+  if (!signedUser || signedUser !== input.userId) {
+    return { ok: false, status: 403, code: "UNAUTHORIZED", reason: "staticmap-user-mismatch" };
+  }
+  return {
+    ok: true,
+    charId,
+    userTag: tag,
+    width: Math.min(Math.max(Math.trunc(width), 120), 720),
+    height: Math.min(Math.max(Math.trunc(height), 120), 720)
+  };
+}
+var NO_STORE = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, private",
+  Pragma: "no-cache",
+  "Content-Type": "application/json; charset=utf-8"
+};
+var jsonNoStore = (status, body) => new Response(JSON.stringify(body), { status, headers: NO_STORE });
+async function handleTravelStaticMap(request, env, deps) {
+  const nowMs = (deps.now ?? (() => Date.now()))();
+  const db = env?.DB;
+  if (!db) return jsonNoStore(503, { error: { code: "PROVIDER_FAILED" } });
+  const url = new URL(request.url);
+  const userId = deps.userId ?? decodeStaticMapUser(url.searchParams.get("u") ?? "");
+  if (!userId) return jsonNoStore(401, { error: { code: "UNAUTHORIZED" } });
+  const verified = await verifyStaticMapRequest(url, {
+    secret: deps.sessionSecret,
+    userId,
+    nowMs
+  });
+  if (!verified.ok || !verified.charId) {
+    return jsonNoStore(verified.status ?? 403, {
+      error: { code: "UNAUTHORIZED", detail: verified.reason ?? "staticmap-invalid" }
+    });
+  }
+  const charId = verified.charId;
+  const share = await getTravelShareState(db, { userId, charId });
+  if (!share?.shareEnabled) {
+    return jsonNoStore(403, { error: { code: "SHARE_REVOKED" } });
+  }
+  const key = String(env?.AMAP_WEB_KEY ?? "").trim();
+  if (!key) return jsonNoStore(503, { error: { code: "PROVIDER_FAILED" } });
+  const trip = await getActiveTravelTrip(db, { userId, charId });
+  if (!trip) return jsonNoStore(404, { error: { code: "ROUTE_UNAVAILABLE" } });
+  const gate = await resolveTravelBudgetGate(db, { userId, nowMs, kind: "map" });
+  if (!gate.allowed) {
+    return jsonNoStore(429, { error: { code: gate.code } });
+  }
+  const anchor = await getTravelAnchor(db, { userId, charId });
+  const center = trip.dest ?? (anchor ? { lat: anchor.lat, lng: anchor.lng } : null);
+  if (!center) return jsonNoStore(404, { error: { code: "ANCHOR_NOT_CONFIRMED" } });
+  const reserved = await reserveMapCall(db, { userId, nowMs });
+  if (!reserved.ok) return jsonNoStore(429, { error: { code: reserved.code } });
+  const base = (deps.upstreamBase ?? "https://restapi.amap.com").replace(/\/+$/, "");
+  const params = new URLSearchParams({
+    location: `${center.lng.toFixed(6)},${center.lat.toFixed(6)}`,
+    zoom: "15",
+    size: `${verified.width ?? 480}*${verified.height ?? 240}`,
+    scale: "2",
+    key
+  });
+  try {
+    const upstream2 = await (deps.fetch ?? globalThis.fetch)(
+      `${base}/v3/staticmap?${params.toString()}`,
+      { method: "GET" }
+    );
+    if (!upstream2.ok) return jsonNoStore(502, { error: { code: "PROVIDER_FAILED" } });
+    const contentType = upstream2.headers.get("Content-Type") ?? "";
+    if (!contentType.startsWith("image/")) {
+      return jsonNoStore(502, { error: { code: "PROVIDER_FAILED" } });
+    }
+    const bytes = await upstream2.arrayBuffer();
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        Pragma: "no-cache"
+      }
+    });
+  } catch {
+    return jsonNoStore(502, { error: { code: "PROVIDER_FAILED" } });
+  }
+}
+
+// worker/amsg/src/travel/routes.ts
+var CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  "Access-Control-Max-Age": "600",
+  Vary: "Origin"
+};
+var json2 = (status, body) => new Response(JSON.stringify(body), {
+  status,
+  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS }
+});
+var fail3 = (status, code) => json2(status, { error: { code } });
+var ERROR_SET = new Set(TRAVEL_ERROR_CODES);
+var readToken = (request) => {
+  const raw = request.headers.get("Authorization") ?? "";
+  const match = /^Bearer\s+(.+)$/i.exec(raw.trim());
+  return match ? match[1].trim() : "";
+};
+var readJsonBody = async (request) => {
+  try {
+    const text = await request.text();
+    if (!text || text.length > 16e3) return null;
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+var readString2 = (value) => typeof value === "string" ? value.trim() : "";
+var readNumberOrNull = (value) => {
+  if (value === null || value === void 0) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+};
+var shareView = (row, charId, userId) => ({
+  userId,
+  charId,
+  shareEnabled: !!row?.shareEnabled,
+  version: row?.version ?? 0
+});
+var budgetViewOf = (budget) => budget ? {
+  userId: budget.userId,
+  dayKey: budget.dayKey,
+  mapCallsUsed: budget.mapCallsUsed,
+  mapCallsLimit: budget.mapCallsLimit,
+  llmTokensUsed: budget.llmTokensUsed,
+  llmTokensLimit: budget.llmTokensLimit,
+  paused: budget.paused,
+  version: budget.version
+} : null;
+var anchorView = (row) => row ? {
+  label: row.label,
+  city: row.city,
+  ...row.district ? { district: row.district } : {},
+  precision: row.precision,
+  confirmedAt: row.confirmedAt
+} : null;
+var isSessionFailure = (value) => !!value && typeof value === "object" && value.ok === false;
+async function handleTravelRequest(request, env, deps) {
+  const url = new URL(request.url);
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+  const method = request.method.toUpperCase();
+  if (!/\/travel\/(state|share|budget|settings|config|char|anchor|context)$/.test(pathname) && !/\/travel\/anchor\/search$/.test(pathname)) {
+    return null;
+  }
+  if (method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+  const nowMs = (deps.now ?? (() => Date.now()))();
+  const licenses = resolveTravelLicenses(env);
+  const suffix = /\/travel\/([a-z/]+)$/.exec(pathname)?.[1] ?? "";
+  const db = env?.DB;
+  const token = readToken(request);
+  if (!token) return fail3(401, "UNAUTHORIZED");
+  let resolved = null;
+  try {
+    resolved = await deps.resolveSession(token, request);
+  } catch {
+    resolved = null;
+  }
+  if (isSessionFailure(resolved)) {
+    const code = ERROR_SET.has(resolved.code) ? resolved.code : "UNAUTHORIZED";
+    return json2(resolved.status || 401, {
+      error: { code, ...resolved.detail ? { detail: resolved.detail } : {} }
+    });
+  }
+  if (!resolved || !resolved.userId) return fail3(401, "INVALID_CLIENT_TOKEN");
+  const userId = resolved.userId;
+  if (!db) return fail3(503, "PROVIDER_FAILED");
+  const charAllowed = (charId) => {
+    if (!charId) return false;
+    const allowed = resolved && !isSessionFailure(resolved) ? resolved.charIds : void 0;
+    return !allowed || allowed.includes(charId);
+  };
+  try {
+    await ensureTravelSchema(db);
+    if (suffix === "config" && method === "GET") {
+      const [budget, settings] = await Promise.all([
+        getTravelBudget(db, { userId, nowMs }),
+        getTravelSettings(db, userId)
+      ]);
+      return json2(200, {
+        serverNow: nowMs,
+        licenses,
+        /** 页面关着也能推进；推送订阅只是通知通道，不是前置条件。 */
+        pushRequired: false,
+        autonomous: true,
+        enabled: settings?.enabled === true,
+        budgetConfigured: !!budget,
+        budget: budget ? {
+          mapCallsUsed: budget.mapCallsUsed,
+          mapCallsLimit: budget.mapCallsLimit,
+          paused: budget.paused
+        } : null,
+        retention: {
+          tripDays: settings?.tripRetentionDays ?? 30,
+          eventDays: settings?.eventRetentionDays ?? 7
+        }
+      });
+    }
+    if (suffix === "state" && method === "GET") {
+      const charId = readString2(url.searchParams.get("charId"));
+      if (!charId) return fail3(400, "UNAUTHORIZED");
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      const [shareRow, trip, budget] = await Promise.all([
+        getTravelShareStateSafe(db, userId, charId),
+        getActiveTravelTrip(db, { userId, charId }),
+        getTravelBudget(db, { userId, nowMs })
+      ]);
+      const share = shareView(shareRow, charId, userId);
+      const shareEnabled = !!shareRow?.shareEnabled;
+      let history = [];
+      if (shareEnabled && trip && licenses.geometryPersistence === "allowed") {
+        const rows = await listTravelPositions(db, {
+          userId,
+          tripId: trip.id,
+          minShareGeneration: shareRow?.version ?? 0
+        });
+        history = rows.map((row) => ({ lat: row.lat, lng: row.lng }));
+      }
+      const snapshot = buildTravelSnapshot({
+        trip,
+        share: shareRow ?? { shareEnabled: false, version: 0 },
+        budget,
+        nowMs,
+        geometryPersistence: licenses.geometryPersistence,
+        history
+      });
+      let staticMapUrl = null;
+      if (shareEnabled && licenses.basemapDisplay === "licensed" && deps.staticMapSecret && trip && !isTerminalStatus(trip.status)) {
+        staticMapUrl = await buildStaticMapUrl({
+          userId,
+          charId,
+          secret: deps.staticMapSecret,
+          nowMs,
+          width: 480,
+          height: 240
+        });
+      }
+      return json2(200, {
+        snapshot,
+        share,
+        ...staticMapUrl ? { staticMapUrl } : {}
+      });
+    }
+    if (suffix === "share" && method === "POST") {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      const charId = readString2(body.charId);
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      if (typeof body.shareEnabled !== "boolean") return fail3(400, "UNAUTHORIZED");
+      const baseVersion = readNumberOrNull(body.baseVersion);
+      const result = await setTravelShareState(db, {
+        userId,
+        charId,
+        shareEnabled: body.shareEnabled,
+        baseVersion,
+        nowMs
+      });
+      if (!result.ok) return fail3(409, "VERSION_CONFLICT");
+      return json2(200, { share: shareView(result.state, charId, userId) });
+    }
+    if (suffix === "budget" && method === "GET") {
+      const budget = await getTravelBudget(db, { userId, nowMs });
+      if (!budget) return fail3(404, "BUDGET_BLOCKED");
+      return json2(200, { budget: budgetViewOf(budget) });
+    }
+    if (suffix === "budget" && method === "PUT") {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      if (body.paused !== void 0) {
+        if (typeof body.paused !== "boolean") return fail3(400, "UNAUTHORIZED");
+        await setTravelBudgetPaused(db, { userId, paused: body.paused, nowMs });
+      }
+      if (body.mapCallsLimit !== void 0) {
+        const limit = readNumberOrNull(body.mapCallsLimit);
+        if (limit === null) return fail3(400, "UNAUTHORIZED");
+        const result = await setTravelMapCallsLimit(db, { userId, limit, nowMs });
+        if (!result.ok) return fail3(400, "BUDGET_ZERO");
+      }
+      const budget = await getTravelBudget(db, { userId, nowMs });
+      if (!budget) return fail3(404, "BUDGET_BLOCKED");
+      return json2(200, { budget: budgetViewOf(budget) });
+    }
+    if (suffix === "settings" && method === "GET") {
+      const settings = await getTravelSettings(db, userId);
+      return json2(200, {
+        // 缺行 = 未开启（不回默认正数，也不假装已确认）。
+        settings: settings ? {
+          userId: settings.userId,
+          enabled: settings.enabled,
+          budgetTz: settings.budgetTz,
+          tripRetentionDays: settings.tripRetentionDays,
+          eventRetentionDays: settings.eventRetentionDays,
+          version: settings.version,
+          updatedAt: settings.updatedAt
+        } : null,
+        licenses
+      });
+    }
+    if (suffix === "settings" && method === "PUT") {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      if (body.enabled !== void 0 && typeof body.enabled !== "boolean") return fail3(400, "UNAUTHORIZED");
+      if (body.geometryPersistence !== void 0 || body.basemapDisplay !== void 0) {
+        return fail3(400, "GEOMETRY_NOT_LICENSED");
+      }
+      const baseVersion = readNumberOrNull(body.baseVersion);
+      const result = await upsertTravelSettings(db, {
+        userId,
+        nowMs,
+        baseVersion,
+        ...typeof body.budgetTz === "string" ? { budgetTz: body.budgetTz } : {},
+        ...body.tripRetentionDays !== void 0 ? { tripRetentionDays: readNumberOrNull(body.tripRetentionDays) ?? void 0 } : {},
+        ...body.eventRetentionDays !== void 0 ? { eventRetentionDays: readNumberOrNull(body.eventRetentionDays) ?? void 0 } : {},
+        ...typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}
+      });
+      if (!result.ok) return fail3(409, "VERSION_CONFLICT");
+      return json2(200, {
+        settings: {
+          userId: result.settings.userId,
+          enabled: result.settings.enabled,
+          budgetTz: result.settings.budgetTz,
+          tripRetentionDays: result.settings.tripRetentionDays,
+          eventRetentionDays: result.settings.eventRetentionDays,
+          version: result.settings.version,
+          updatedAt: result.settings.updatedAt
+        }
+      });
+    }
+    if (suffix === "char" && method === "GET") {
+      const charId = readString2(url.searchParams.get("charId"));
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      const row = await getTravelCharSettings(db, { userId, charId });
+      return json2(200, { char: { charId, enabled: row?.enabled === true } });
+    }
+    if (suffix === "char" && method === "PUT") {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      const charId = readString2(body.charId);
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      if (typeof body.enabled !== "boolean") return fail3(400, "UNAUTHORIZED");
+      const row = await setTravelCharEnabled(db, { userId, charId, enabled: body.enabled, nowMs });
+      return json2(200, { char: { charId: row.charId, enabled: row.enabled, updatedAt: row.updatedAt } });
+    }
+    if (suffix === "context" && method === "GET") {
+      const charId = readString2(url.searchParams.get("charId"));
+      if (!charId) return fail3(400, "UNAUTHORIZED");
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      const [trip, shareRow, budget, wishes] = await Promise.all([
+        getActiveTravelTrip(db, { userId, charId }),
+        getTravelShareStateSafe(db, userId, charId),
+        getTravelBudget(db, { userId, nowMs }),
+        listTravelWishes(db, { userId, charId, nowMs, states: ["open", "candidates_ready", "chosen"] })
+      ]);
+      const role = buildRoleTravelContext({ trip, nowMs });
+      return json2(200, {
+        serverNow: nowMs,
+        shareEnabled: !!shareRow?.shareEnabled,
+        shareKnown: shareRow !== null,
+        trip: role.hasTrip ? {
+          phase: role.phase,
+          originLabel: role.originLabel,
+          destinationLabel: role.destLabel,
+          etaMinutes: role.etaMinutes,
+          paused: budget?.paused === true
+        } : null,
+        wishText: wishes[0]?.wishText ?? null,
+        budget: budget ? { mapCallsUsed: budget.mapCallsUsed, mapCallsLimit: budget.mapCallsLimit, paused: budget.paused } : null
+      });
+    }
+    if (suffix === "anchor/search" && method === "GET") {
+      const scopedCharId = readString2(url.searchParams.get("charId"));
+      if (scopedCharId && !charAllowed(scopedCharId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      const charId = scopedCharId;
+      const q = readString2(url.searchParams.get("q"));
+      if (q.length < 2) return json2(200, { results: [] });
+      const port = deps.anchorSearchFor?.(userId) ?? null;
+      if (!port) return json2(200, { results: [], provider: "unavailable" });
+      let city = readString2(url.searchParams.get("city"));
+      if (!city && charId) {
+        const existing = await getTravelAnchor(db, { userId, charId });
+        city = existing?.city ?? "";
+      }
+      if (!city) return json2(200, { results: [], reason: "city_required" });
+      try {
+        const results = await port.search({ q: q.slice(0, 40), ...city ? { city } : {}, charId });
+        return json2(200, { results });
+      } catch {
+        return json2(200, { results: [], reason: "provider_failed" });
+      }
+    }
+    if (suffix === "anchor" && method === "GET") {
+      const charId = readString2(url.searchParams.get("charId"));
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      const row = await getTravelAnchor(db, { userId, charId });
+      return json2(200, { anchor: anchorView(row), configured: row !== null });
+    }
+    if (suffix === "anchor" && (method === "POST" || method === "PUT")) {
+      const body = await readJsonBody(request);
+      if (!body) return fail3(400, "UNAUTHORIZED");
+      const charId = readString2(body.charId);
+      if (!charAllowed(charId)) return fail3(403, "PRINCIPAL_MISMATCH");
+      let picked = null;
+      const placeId = readString2(body.placeId);
+      if (placeId) {
+        const port = deps.anchorSearchFor?.(userId) ?? null;
+        if (!port) return fail3(503, "ANCHOR_NOT_CONFIRMED");
+        const place = await port.resolve(placeId);
+        if (!place) return fail3(400, "ANCHOR_NOT_CONFIRMED");
+        picked = pickAnchorFields(
+          {
+            label: place.label,
+            city: place.city,
+            ...place.district ? { district: place.district } : {},
+            lat: place.lat,
+            lng: place.lng,
+            ...place.coordSys ? { coordSys: place.coordSys } : {}
+          },
+          nowMs
+        );
+      } else if (body.anchor && typeof body.anchor === "object") {
+        const anchorInput = body.anchor;
+        const label = readString2(anchorInput.label);
+        const labelCheck = sanitizeAnchorLabel(label);
+        if (!labelCheck.ok) return fail3(400, "ANCHOR_NOT_CONFIRMED");
+        picked = pickAnchorFields(
+          {
+            label,
+            ...typeof anchorInput.city === "string" ? { city: anchorInput.city } : {},
+            ...typeof anchorInput.district === "string" ? { district: anchorInput.district } : {},
+            ...typeof anchorInput.lat === "number" ? { lat: anchorInput.lat } : {},
+            ...typeof anchorInput.lng === "number" ? { lng: anchorInput.lng } : {},
+            ...typeof anchorInput.coordSys === "string" ? { coordSys: anchorInput.coordSys } : {}
+          },
+          nowMs
+        );
+      }
+      if (!picked) return fail3(400, "ANCHOR_NOT_CONFIRMED");
+      const saved = await putTravelAnchor(db, {
+        userId,
+        charId,
+        label: picked.label,
+        city: picked.city,
+        ...picked.district ? { district: picked.district } : {},
+        lat: picked.lat,
+        lng: picked.lng,
+        coordSys: picked.coordSys,
+        precision: "area",
+        confirmedAt: picked.confirmedAt,
+        updatedAt: nowMs
+      });
+      return json2(200, { anchor: anchorView(saved), configured: true });
+    }
+    return null;
+  } catch {
+    return fail3(500, "PROVIDER_FAILED");
+  }
+}
+async function getTravelShareStateSafe(db, userId, charId) {
+  try {
+    return await getTravelShareState(db, { userId, charId });
+  } catch {
+    return null;
+  }
+}
+
+// worker/amsg/src/travel/provider.ts
+var KIND_MESSAGE = {
+  "not-configured": "\u5730\u56FE\u670D\u52A1\u672A\u914D\u7F6E",
+  auth: "\u5730\u56FE\u670D\u52A1\u9274\u6743\u5931\u8D25",
+  quota: "\u5730\u56FE\u670D\u52A1\u989D\u5EA6\u5DF2\u7528\u5C3D",
+  "rate-limit": "\u5730\u56FE\u670D\u52A1\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41",
+  "unsupported-region": "\u8BE5\u5730\u533A\u6682\u4E0D\u652F\u6301\u8DEF\u7EBF\u89C4\u5212",
+  "no-route": "\u6682\u65F6\u62FF\u4E0D\u5230\u8DEF\u7EBF",
+  "too-far": "\u8DEF\u7A0B\u8D85\u51FA\u8BE5\u5730\u56FE\u670D\u52A1\u7684\u89C4\u5212\u8303\u56F4",
+  "bad-input": "\u5730\u70B9\u6216\u5750\u6807\u53C2\u6570\u4E0D\u5408\u6CD5",
+  "bad-response": "\u5730\u56FE\u670D\u52A1\u8FD4\u56DE\u7684\u6570\u636E\u4E0D\u53EF\u7528",
+  transient: "\u5730\u56FE\u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528"
+};
+var RETRYABLE_KINDS = /* @__PURE__ */ new Set(["rate-limit", "transient"]);
+var TravelProviderError = class extends Error {
+  kind;
+  code;
+  provider;
+  retryable;
+  infocode;
+  constructor(init) {
+    super(KIND_MESSAGE[init.kind]);
+    this.name = "TravelProviderError";
+    this.kind = init.kind;
+    this.code = init.code;
+    this.provider = init.provider;
+    this.retryable = init.retryable ?? RETRYABLE_KINDS.has(init.kind);
+    if (init.infocode) this.infocode = init.infocode;
+  }
+};
+var isCoordSys2 = (value) => value === "gcj02" || value === "wgs84";
+var assertGeoPoint = (point, provider = "amap") => {
+  const fail7 = () => {
+    throw new TravelProviderError({ kind: "bad-input", code: "PROVIDER_FAILED", provider });
+  };
+  if (!point || typeof point !== "object") fail7();
+  if (!isCoordSys2(point.coordSys)) fail7();
+  if (typeof point.lat !== "number" || typeof point.lng !== "number") fail7();
+  if (!Number.isFinite(point.lat) || !Number.isFinite(point.lng)) fail7();
+  if (point.lat < -90 || point.lat > 90) fail7();
+  if (point.lng < -180 || point.lng > 180) fail7();
+};
+var formatLonLat = (point, provider = "amap") => {
+  assertGeoPoint(point, provider);
+  return `${point.lng.toFixed(6)},${point.lat.toFixed(6)}`;
+};
+var samePoint = (a, b) => a.lat === b.lat && a.lng === b.lng;
+var parsePolyline = (raw) => {
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  const out = [];
+  for (const chunk of raw.split(";")) {
+    const parts = chunk.split(",");
+    if (parts.length !== 2) continue;
+    const lng = Number(parts[0].trim());
+    const lat = Number(parts[1].trim());
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) continue;
+    const point = { lat, lng };
+    const last = out[out.length - 1];
+    if (last && samePoint(last, point)) continue;
+    out.push(point);
+  }
+  return out;
+};
+var joinRoutePoints = (segments, provider) => {
+  const out = [];
+  for (const segment of segments) {
+    for (const point of segment) {
+      const last = out[out.length - 1];
+      if (last && samePoint(last, point)) continue;
+      out.push({ lat: point.lat, lng: point.lng });
+    }
+  }
+  if (out.length < 2) {
+    throw new TravelProviderError({ kind: "no-route", code: "ROUTE_UNAVAILABLE", provider });
+  }
+  return out;
+};
+var toFiniteNumber = (raw) => {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const value = Number(raw.trim());
+  return Number.isFinite(value) ? value : null;
+};
+var ATTRIBUTION = {
+  amap: "\u9AD8\u5FB7\u5730\u56FE",
+  world: "\xA9 Mapbox \xA9 OpenStreetMap",
+  noop: ""
+};
+var TERMS_REF = {
+  amap: "https://lbs.amap.com/home/terms/ \xA73.5/\xA77.3",
+  world: "https://www.mapbox.com/legal/tos",
+  noop: ""
+};
+var buildLicenseMeta = (provider, grants = {}) => ({
+  geometryPersistence: grants.geometryPersistenceLicensed === true ? "allowed" : "not-licensed",
+  basemapDisplay: grants.basemapDisplayLicensed === true ? "licensed" : "not-configured",
+  memoryOnly: true,
+  attribution: ATTRIBUTION[provider],
+  termsRef: TERMS_REF[provider]
+});
+var reserveMapBudget = async (port, provider) => {
+  let decision;
+  try {
+    decision = await port.reserveMapCall(provider);
+  } catch {
+    throw new TravelProviderError({ kind: "quota", code: "BUDGET_BLOCKED", provider });
+  }
+  if (!decision || decision.allowed !== true) {
+    const code = decision && decision.code === "BUDGET_ZERO" ? "BUDGET_ZERO" : "BUDGET_BLOCKED";
+    throw new TravelProviderError({ kind: "quota", code, provider });
+  }
+};
+var requestJsonOnce = async (deps, provider, url) => {
+  const controller = new AbortController();
+  const timeoutMs = deps.timeoutMs ?? 8e3;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await deps.fetch(url, { method: "GET", signal: controller.signal });
+  } catch {
+    throw new TravelProviderError({ kind: "transient", code: "PROVIDER_FAILED", provider });
+  } finally {
+    clearTimeout(timer);
+  }
+  const text = await response.text().catch(() => "");
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+  }
+  return { status: response.status, ok: response.ok, body };
+};
+var providerForRegion = (region, providers) => providers.find((provider) => provider.supports(region)) ?? null;
+var clampCandidateLimit = (limit) => {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) return MAX_CANDIDATES;
+  return Math.min(MAX_CANDIDATES, Math.max(1, Math.floor(limit)));
+};
+
+// worker/amsg/src/travel/decision.ts
+function parseInteyProposal(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw;
+  const want = typeof obj.want === "string" ? obj.want.trim().toLowerCase() : "";
+  const text = typeof obj.wish === "string" ? obj.wish.trim() : "";
+  if (!want || want === "none" || want === "stay" || want === "no") return { kind: "none" };
+  if (want === "wander") return { kind: "wander", wishText: text.slice(0, 80) };
+  if (want === "go") {
+    if (!text) return null;
+    const category = typeof obj.category === "string" && obj.category.trim() ? obj.category.trim().slice(0, 24) : null;
+    return { kind: "go", wishText: text.slice(0, 80), category };
+  }
+  return null;
+}
+async function proposeTravelIntent(input) {
+  const port = input.decisionPort;
+  if (!port || typeof port.proposeIntent !== "function") return null;
+  let raw;
+  try {
+    raw = await port.proposeIntent({
+      homeLabel: input.homeLabel,
+      minutesSinceLastOuting: input.minutesSinceLastOuting
+    });
+  } catch {
+    return null;
+  }
+  return parseInteyProposal(raw);
+}
+var SEGMENT_STAY_BOUNDS = { min: 10, max: 180 };
+function parseSegmentOutput(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw;
+  const kind = typeof obj.kind === "string" ? obj.kind.trim() : "";
+  const reason = typeof obj.reason === "string" && obj.reason.trim() ? obj.reason.trim().slice(0, 120) : void 0;
+  switch (kind) {
+    case "next": {
+      const id = typeof obj.candidateId === "string" ? obj.candidateId.trim() : "";
+      return id ? { kind: "next", candidateId: id, ...reason ? { reason } : {} } : null;
+    }
+    case "stay": {
+      const rawMinutes = Number(obj.minutes);
+      const minutes = Number.isFinite(rawMinutes) ? Math.trunc(rawMinutes) : null;
+      return { kind: "stay", minutes, ...reason ? { reason } : {} };
+    }
+    case "return":
+      return { kind: "return", ...reason ? { reason } : {} };
+    case "stop":
+      return { kind: "stop", ...reason ? { reason } : {} };
+    default:
+      return null;
+  }
+}
+function clampStayMinutes(minutes, fallback) {
+  const base = minutes === null ? fallback : minutes;
+  const n = Number.isFinite(base) ? Math.trunc(base) : fallback;
+  return Math.min(SEGMENT_STAY_BOUNDS.max, Math.max(SEGMENT_STAY_BOUNDS.min, n));
+}
+async function decideWanderSegment(input) {
+  const port = input.decisionPort;
+  if (!port || typeof port.nextSegment !== "function") return { kind: "wait", reason: "llm_unavailable" };
+  let raw;
+  try {
+    raw = await port.nextSegment(input.context);
+  } catch {
+    return { kind: "wait", reason: "llm_unavailable" };
+  }
+  const parsed = parseSegmentOutput(raw);
+  if (!parsed) return { kind: "wait", reason: "invalid_model_output" };
+  if (parsed.kind === "next") {
+    if (input.context.candidates.length === 0) return { kind: "wait", reason: "no_candidates" };
+    const hit = input.context.candidates.find((c) => c.id === parsed.candidateId);
+    if (!hit) return { kind: "wait", reason: "invalid_model_output" };
+    return { kind: "next", candidateId: hit.id, ...parsed.reason ? { reason: parsed.reason } : {} };
+  }
+  if (parsed.kind === "stay") {
+    return {
+      kind: "stay",
+      minutes: clampStayMinutes(parsed.minutes, Math.max(1, Math.trunc(input.fallbackStayMinutes ?? 45))),
+      ...parsed.reason ? { reason: parsed.reason } : {}
+    };
+  }
+  return parsed;
+}
+var MAX_TRAVEL_WISH_BATCHES = 2;
+function toDecisionCandidates(candidates) {
+  return clampCandidates(candidates).map((c) => ({
+    id: c.id,
+    label: c.label,
+    ...c.category ? { category: c.category } : {},
+    distanceM: typeof c.distanceM === "number" && Number.isFinite(c.distanceM) ? c.distanceM : null
+  }));
+}
+function parseDecisionOutput(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw;
+  const kind = typeof obj.kind === "string" ? obj.kind : "";
+  const reason = typeof obj.reason === "string" && obj.reason.trim() ? obj.reason.trim().slice(0, 120) : void 0;
+  switch (kind) {
+    case "choose": {
+      const id = typeof obj.candidateId === "string" ? obj.candidateId.trim() : "";
+      return id ? { kind: "choose", candidateId: id, ...reason ? { reason } : {} } : null;
+    }
+    case "reroll":
+      return { kind: "reroll", ...reason ? { reason } : {} };
+    case "drop":
+      return { kind: "drop", ...reason ? { reason } : {} };
+    case "wait":
+      return { kind: "wait", reason: "no_candidates" };
+    default:
+      return null;
+  }
+}
+async function decideWishAction(input) {
+  const candidates = toDecisionCandidates(input.candidates);
+  const rerollsUsed = Math.max(0, Math.trunc(input.rerollsUsed ?? 0));
+  const maxRerolls = Math.max(0, Math.trunc((input.maxBatches ?? MAX_TRAVEL_WISH_BATCHES) - 1));
+  if (candidates.length === 0) {
+    return rerollsUsed < maxRerolls ? { kind: "reroll", reason: "no_candidates" } : { kind: "wait", reason: "no_candidates" };
+  }
+  const port = input.decisionPort;
+  if (!port) return { kind: "wait", reason: "llm_unavailable" };
+  const sanitized = sanitizeWishText(String(input.wish.wishText ?? ""));
+  const wishText = sanitized.ok ? sanitized.text : "";
+  let raw;
+  try {
+    raw = await port.choose({
+      wishText,
+      candidates,
+      batchIndex: rerollsUsed + 1,
+      rerollsUsed
+    });
+  } catch {
+    return { kind: "wait", reason: "llm_unavailable" };
+  }
+  const parsed = parseDecisionOutput(raw);
+  if (!parsed) return { kind: "wait", reason: "invalid_model_output" };
+  if (parsed.kind === "choose") {
+    const hit = candidates.find((c) => c.id === parsed.candidateId);
+    if (!hit) return { kind: "wait", reason: "invalid_model_output" };
+    return { kind: "choose", candidateId: hit.id, ...parsed.reason ? { reason: parsed.reason } : {} };
+  }
+  if (parsed.kind === "reroll" && rerollsUsed >= maxRerolls) {
+    return { kind: "wait", reason: "reroll_limit" };
+  }
+  return parsed;
+}
+
+// worker/amsg/src/travel/tick.ts
+var DEFAULT_DWELL_MINUTES = 45;
+var eventExpiry = (nowMs, days) => nowMs + Math.max(0, Math.trunc(days)) * 24 * 60 * 60 * 1e3;
+async function claimWishState(db, args) {
+  const result = await db.prepare("UPDATE travel_wishes SET state = ?, updated_at = ? WHERE user_id = ? AND id = ? AND state = ?").bind(args.to, args.nowMs, args.userId, args.wishId, args.from).run();
+  const raw = result;
+  const changes = Number(raw?.meta?.changes ?? raw?.changes ?? 0);
+  return changes === 1;
+}
+async function releaseWishState(db, args) {
+  await db.prepare("UPDATE travel_wishes SET state = ?, updated_at = ? WHERE user_id = ? AND id = ? AND state = ?").bind(args.to, args.nowMs, args.userId, args.wishId, args.from).run();
+}
+var refFromAnchor = (anchor) => ({
+  label: anchor.label,
+  city: anchor.city,
+  ...anchor.district ? { district: anchor.district } : {},
+  lat: anchor.lat,
+  lng: anchor.lng,
+  coordSys: anchor.coordSys,
+  kind: "anchor"
+});
+var refFromCandidate = (candidate) => ({
+  label: candidate.label,
+  city: candidate.city ?? "",
+  ...candidate.district ? { district: candidate.district } : {},
+  lat: candidate.lat,
+  lng: candidate.lng,
+  coordSys: candidate.coordSys,
+  ...candidate.placeId ? { placeId: candidate.placeId } : {},
+  kind: "public"
+});
+var providerFailureKind = (error) => error instanceof TravelProviderError ? error.kind : "bad-response";
+var isUnavailableKind = (kind) => kind === "unsupported-region" || kind === "not-configured";
+async function runTravelTickForSubject(db, subject, wiring = {}) {
+  const nowMs = (wiring.now ?? (() => Date.now()))();
+  const eventDays = wiring.eventRetentionDays ?? TRAVEL_RETENTION_DEFAULTS.eventDays;
+  const outcome = {
+    subject,
+    advanced: [],
+    searched: false,
+    decided: false,
+    planned: false,
+    expired: false,
+    skipped: [],
+    mapReserved: false,
+    segment: null
+  };
+  await ensureTravelSchema(db);
+  const accountSettings = await getTravelSettings(db, subject.userId);
+  if (!accountSettings || accountSettings.enabled !== true) {
+    outcome.skipped.push("disabled");
+    return outcome;
+  }
+  const charSettings = await getTravelCharSettings(db, {
+    userId: subject.userId,
+    charId: subject.charId
+  });
+  if (!charSettings || charSettings.enabled !== true) {
+    outcome.skipped.push("char_disabled");
+    return outcome;
+  }
+  const budget = await getTravelBudget(db, { userId: subject.userId, nowMs });
+  if (!budget) {
+    outcome.skipped.push("budget_missing");
+    return outcome;
+  }
+  let gateCache = null;
+  const mapGateAllows = async () => {
+    if (gateCache !== null) return gateCache;
+    const gate = await resolveTravelBudgetGate(db, { userId: subject.userId, nowMs, kind: "map" });
+    gateCache = gate.allowed;
+    return gateCache;
+  };
+  const providerDeps = {
+    fetch: wiring.fetch ?? globalThis.fetch,
+    reserveMapCall: async () => {
+      if (!await mapGateAllows()) {
+        return { allowed: false, code: "BUDGET_BLOCKED" };
+      }
+      const reserved = await reserveMapCall(db, { userId: subject.userId, nowMs });
+      if (!reserved.ok) {
+        gateCache = false;
+        return { allowed: false, code: reserved.code };
+      }
+      outcome.mapReserved = true;
+      return { allowed: true };
+    },
+    now: () => nowMs,
+    ...wiring.timeoutMs ? { timeoutMs: wiring.timeoutMs } : {}
+  };
+  const settings = await getTravelSettings(db, subject.userId);
+  const tripDays = wiring.tripRetentionDays ?? settings?.tripRetentionDays ?? TRAVEL_RETENTION_DEFAULTS.tripDays;
+  const addEvent = async (tripId, kind, payload) => {
+    try {
+      await appendTravelTripEvent(db, {
+        userId: subject.userId,
+        tripId,
+        kind,
+        at: nowMs,
+        ...payload === void 0 ? {} : { payload },
+        source: "travel_tick",
+        nowMs,
+        expiresAt: eventExpiry(nowMs, eventDays)
+      });
+    } catch {
+    }
+  };
+  let active = await getActiveTravelTrip(db, { userId: subject.userId, charId: subject.charId });
+  const recordPosition = async (trip) => {
+    if (wiring.licensedGeometry !== true) return;
+    if (trip.status !== "en_route" && trip.status !== "returning") return;
+    const points = trip.route?.points;
+    if (!points || points.length < 2) return;
+    let ratio = 0;
+    try {
+      const progress = tripProgress(trip, nowMs);
+      ratio = trip.status === "returning" ? progress.returnRatio : progress.outboundRatio;
+    } catch {
+      return;
+    }
+    const point = positionAt(points, ratio);
+    if (!point || !Number.isFinite(point.lat) || !Number.isFinite(point.lng)) return;
+    let shareGeneration = 0;
+    try {
+      const shareRow = await getTravelShareState(db, { userId: subject.userId, charId: subject.charId });
+      shareGeneration = shareRow?.version ?? 0;
+    } catch {
+      shareGeneration = 0;
+    }
+    try {
+      await appendTravelPosition(db, {
+        userId: subject.userId,
+        tripId: trip.id,
+        at: nowMs,
+        lat: point.lat,
+        lng: point.lng,
+        coordSys: trip.coordSys,
+        shareGeneration,
+        nowMs
+      });
+    } catch {
+    }
+  };
+  let wishes = [];
+  try {
+    wishes = await listTravelWishes(db, {
+      userId: subject.userId,
+      charId: subject.charId,
+      nowMs,
+      states: ["open", "candidates_ready", "chosen"]
+    });
+  } catch {
+    wishes = [];
+  }
+  const tripWishId = active ? wishIdFromDedupeKey(active.dedupeKey) : null;
+  const activeWish = (tripWishId ? wishes.find((w) => w.id === tripWishId) : null) ?? null;
+  const wanderTrip = !!(active && activeWish && (activeWish.category ?? "") === WANDER_CATEGORY && (active.status === "dwelling" || active.status === "en_route" || active.status === "planned"));
+  if (active) {
+    const plan = nextPhaseFor(active, nowMs);
+    if (plan.kind === "expire") {
+      const cas = await casUpdateTravelTrip(db, {
+        userId: subject.userId,
+        tripId: active.id,
+        baseRevision: active.revision,
+        patch: { status: "expired" },
+        nowMs
+      });
+      if (cas.ok) {
+        active = cas.trip;
+        outcome.expired = true;
+        outcome.advanced.push("expired");
+        await addEvent(active.id, "expired", { reason: "stale" });
+      } else {
+        outcome.skipped.push("cas_conflict");
+      }
+    } else if (plan.kind === "advance" && !(wanderTrip && active.status === "dwelling" && plan.to === "returning") && canTransition(active.status, plan.to)) {
+      const cas = await casUpdateTravelTrip(db, {
+        userId: subject.userId,
+        tripId: active.id,
+        baseRevision: active.revision,
+        patch: { status: plan.to },
+        nowMs
+      });
+      if (cas.ok) {
+        const from = active.status;
+        active = cas.trip;
+        outcome.advanced.push(plan.to);
+        await addEvent(active.id, "phase", { from, to: plan.to });
+      } else {
+        outcome.skipped.push("cas_conflict");
+      }
+    }
+  }
+  if (active && activeWish && isTerminalStatus(active.status)) {
+    try {
+      await db.prepare(
+        "UPDATE travel_wishes SET state = 'completed', updated_at = ? WHERE user_id = ? AND id = ? AND state = 'chosen'"
+      ).bind(nowMs, subject.userId, activeWish.id).run();
+    } catch {
+    }
+    wishes = wishes.filter((w) => w.id !== activeWish.id);
+  }
+  if (active && !isTerminalStatus(active.status)) await recordPosition(active);
+  if (budget.paused) {
+    outcome.skipped.push("paused");
+    return outcome;
+  }
+  if (active && activeWish && wanderTrip && active.status === "dwelling" && active.dwellUntil !== null && nowMs >= active.dwellUntil) {
+    const dwellMinutes = Math.max(1, Math.trunc(wiring.dwellMinutes ?? DEFAULT_DWELL_MINUTES));
+    const dwellMs = dwellMinutes * 60 * 1e3;
+    const claim = await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: active.id,
+      baseRevision: active.revision,
+      patch: { dwellUntil: active.dwellUntil },
+      nowMs
+    });
+    if (!claim.ok) {
+      outcome.skipped.push("cas_conflict");
+      return outcome;
+    }
+    const segmentTrip = claim.trip;
+    if (!wiring.decisionPort || typeof wiring.decisionPort.nextSegment !== "function") {
+      outcome.skipped.push("llm_unavailable");
+      return outcome;
+    }
+    const segmentKey = `travel:seg:${segmentTrip.id}:v${segmentTrip.planVersion}:d${segmentTrip.dwellUntil}`;
+    const estimateTokens = Math.max(1, Math.trunc(wiring.llmTokensPerDecision ?? 1200));
+    let reservation = null;
+    if (wiring.llmPort) {
+      const gate = await resolveTravelBudgetGate(db, {
+        userId: subject.userId,
+        nowMs,
+        kind: "llm",
+        port: wiring.llmPort
+      });
+      if (!gate.allowed) {
+        outcome.skipped.push("budget_blocked");
+        return outcome;
+      }
+      const reserved = await reserveLlmTokens(db, {
+        userId: subject.userId,
+        tokens: estimateTokens,
+        idempotencyKey: segmentKey,
+        nowMs,
+        port: wiring.llmPort
+      });
+      if (!reserved.ok) {
+        outcome.skipped.push("budget_blocked");
+        return outcome;
+      }
+      reservation = reserved.reservationId;
+    }
+    const anchor = await readAnchorSafe(wiring, subject);
+    const provider = pickProvider(wiring, subject, anchor);
+    const here = segmentTrip.dest;
+    let batch = [];
+    try {
+      const known = await listTravelCandidates(db, {
+        userId: subject.userId,
+        wishId: activeWish.id,
+        nowMs
+      });
+      batch = known.filter((c) => Number(c.createdAt ?? 0) >= Number(segmentTrip.dwellUntil ?? 0));
+    } catch {
+      batch = [];
+    }
+    if (batch.length === 0 && here && provider && await mapGateAllows()) {
+      try {
+        const hits = await provider.searchCandidates({
+          wishText: activeWish.wishText,
+          city: anchor?.city ?? "",
+          center: { lat: here.lat, lng: here.lng, coordSys: here.coordSys ?? segmentTrip.coordSys },
+          limit: 6
+        });
+        outcome.searched = true;
+        if (hits.length > 0) {
+          const candidates = hits.map((hit) => ({
+            id: `tc:${subject.userId}:${activeWish.id}:${crypto.randomUUID()}`,
+            userId: subject.userId,
+            wishId: activeWish.id,
+            provider: hit.provider,
+            ...hit.id ? { placeId: String(hit.id) } : {},
+            label: hit.label,
+            ...hit.category ? { category: hit.category } : {},
+            city: hit.city,
+            ...hit.district ? { district: hit.district } : {},
+            lat: hit.location.lat,
+            lng: hit.location.lng,
+            coordSys: hit.location.coordSys,
+            distanceM: hit.distanceM,
+            expiresAt: nowMs + 6 * 60 * 60 * 1e3,
+            createdAt: nowMs
+          }));
+          await saveTravelCandidates(db, { userId: subject.userId, wishId: activeWish.id, candidates, nowMs });
+          batch = await listTravelCandidates(db, { userId: subject.userId, wishId: activeWish.id, nowMs });
+        }
+      } catch (error) {
+        if (providerFailureKind(error) === "budget") {
+          gateCache = false;
+        }
+      }
+    }
+    const minutesOut = segmentTrip.departAt === null ? 0 : Math.max(0, Math.round((nowMs - segmentTrip.departAt) / 6e4));
+    const context = {
+      wishText: activeWish.wishText,
+      hereLabel: here?.label ?? null,
+      homeLabel: segmentTrip.origin.label ?? null,
+      segmentsSoFar: Math.max(0, segmentTrip.planVersion - 1),
+      minutesOut,
+      // 回家要走多久：只有真有几何 + 官方时长时才给，不编。
+      minutesHome: segmentTrip.arriveAt !== null && segmentTrip.departAt !== null ? Math.max(0, Math.round((segmentTrip.arriveAt - segmentTrip.departAt) / 6e4)) : null,
+      candidates: toDecisionCandidates(batch)
+    };
+    const decision = await decideWanderSegment({
+      context,
+      decisionPort: wiring.decisionPort,
+      fallbackStayMinutes: dwellMinutes
+    });
+    const settleSegment = async (ok) => {
+      if (!reservation || !wiring.llmPort) return;
+      const real = wiring.decisionPort?.lastUsageTokens?.();
+      const usage = typeof real === "number" && Number.isFinite(real) && real > 0 ? Math.trunc(real) : null;
+      try {
+        await settleLlmTokens(db, {
+          userId: subject.userId,
+          reservationId: reservation,
+          actualTokens: ok ? usage ?? estimateTokens : usage ?? 0,
+          ok,
+          nowMs,
+          port: wiring.llmPort
+        });
+      } catch {
+      }
+    };
+    if (decision.kind === "wait") {
+      await settleSegment(false);
+      outcome.skipped.push(decision.reason === "llm_unavailable" ? "llm_unavailable" : "wait");
+      return outcome;
+    }
+    await settleSegment(true);
+    outcome.segment = decision.kind;
+    if (decision.kind === "stay") {
+      const extendTo = nowMs + Math.max(1, decision.minutes ?? dwellMinutes) * 6e4;
+      const cas = await casUpdateTravelTrip(db, {
+        userId: subject.userId,
+        tripId: segmentTrip.id,
+        baseRevision: segmentTrip.revision,
+        patch: { dwellUntil: extendTo },
+        nowMs
+      });
+      if (!cas.ok) {
+        outcome.skipped.push("cas_conflict");
+        return outcome;
+      }
+      await addEvent(segmentTrip.id, "segment_stay", {
+        until: extendTo,
+        minutes: decision.minutes,
+        ...decision.reason ? { reason: decision.reason } : {}
+      });
+      return outcome;
+    }
+    if (decision.kind === "stop") {
+      const cas = await casUpdateTravelTrip(db, {
+        userId: subject.userId,
+        tripId: segmentTrip.id,
+        baseRevision: segmentTrip.revision,
+        patch: { status: "stopped" },
+        nowMs
+      });
+      if (!cas.ok) {
+        outcome.skipped.push("cas_conflict");
+        return outcome;
+      }
+      await addEvent(segmentTrip.id, "segment_stop", {
+        endedAway: true,
+        atLabel: here?.label ?? null,
+        ...decision.reason ? { reason: decision.reason } : {}
+      });
+      return outcome;
+    }
+    if (!anchor || !provider || !here) {
+      outcome.skipped.push(anchor ? "no_provider" : "anchor_missing");
+      return outcome;
+    }
+    if (decision.kind === "next") {
+      const picked = batch.find((c) => c.id === decision.candidateId) ?? null;
+      if (!picked) {
+        outcome.skipped.push("wait");
+        return outcome;
+      }
+      const leg2 = await planSegmentLeg(db, subject, {
+        wish: activeWish,
+        current: segmentTrip,
+        kind: "next",
+        from: here,
+        to: refFromCandidate(picked),
+        provider,
+        providerDeps,
+        mapGateAllows,
+        addEvent,
+        tripDays,
+        nowMs,
+        dwellMs,
+        licensedGeometry: wiring.licensedGeometry === true,
+        reason: decision.reason ?? null
+      });
+      if (leg2 === "planned") outcome.planned = true;
+      else outcome.skipped.push("provider_failed");
+      return outcome;
+    }
+    const leg = await planSegmentLeg(db, subject, {
+      wish: activeWish,
+      current: segmentTrip,
+      kind: "return",
+      from: here,
+      to: refFromAnchor(anchor),
+      provider,
+      providerDeps,
+      mapGateAllows,
+      addEvent,
+      tripDays,
+      nowMs,
+      dwellMs,
+      licensedGeometry: wiring.licensedGeometry === true,
+      reason: decision.reason ?? null
+    });
+    if (leg === "planned") outcome.planned = true;
+    else outcome.skipped.push("provider_failed");
+    return outcome;
+  }
+  if (active && !isTerminalStatus(active.status)) {
+    const newer = wishes.find(
+      (w) => w.state === "chosen" && !active.dedupeKey.startsWith(`wish:${w.id}:plan:`)
+    );
+    if (newer && canChangePlan(active.status)) {
+      const planned2 = await planTripForWish(db, subject, newer, {
+        wiring,
+        nowMs,
+        providerDeps,
+        active,
+        tripDays,
+        mapGateAllows,
+        addEvent
+      });
+      if (planned2 === "planned") {
+        outcome.planned = true;
+        const fresh = await getActiveTravelTrip(db, { userId: subject.userId, charId: subject.charId });
+        if (fresh) await recordPosition(fresh);
+      } else outcome.skipped.push("provider_failed");
+    }
+    return outcome;
+  }
+  const wish = wishes[0];
+  if (!wish) {
+    const probeWindowMs = Math.max(6e4, Math.trunc(wiring.intentWindowMs ?? TRAVEL_INTENT_PROBE_WINDOW_MS));
+    if (!active && wiring.decisionPort?.proposeIntent && budget.mapCallsLimit > 0) {
+      const probe = await claimIntentProbe(db, {
+        charId: subject.charId,
+        nowMs,
+        windowMs: probeWindowMs
+      });
+      if (probe.claimed) {
+        const dropProbe = async () => {
+          try {
+            await db.prepare("DELETE FROM travel_wishes WHERE id = ? AND user_id = '' AND state = 'open'").bind(probe.wishId).run();
+          } catch {
+          }
+        };
+        const estimate = Math.max(1, Math.trunc(wiring.llmTokensPerDecision ?? 1200));
+        let inviteReservation = null;
+        if (wiring.llmPort) {
+          const gate = await resolveTravelBudgetGate(db, {
+            userId: subject.userId,
+            nowMs,
+            kind: "llm",
+            port: wiring.llmPort
+          });
+          if (!gate.allowed) {
+            await dropProbe();
+            outcome.skipped.push("budget_blocked");
+            return outcome;
+          }
+          const reserved = await reserveLlmTokens(db, {
+            userId: subject.userId,
+            tokens: estimate,
+            idempotencyKey: `travel:intent:${probe.wishId}`,
+            nowMs,
+            port: wiring.llmPort
+          });
+          if (!reserved.ok) {
+            await dropProbe();
+            outcome.skipped.push("budget_blocked");
+            return outcome;
+          }
+          inviteReservation = reserved.reservationId;
+        }
+        const anchor = await readAnchorSafe(wiring, subject);
+        const proposal = await proposeTravelIntent({
+          decisionPort: wiring.decisionPort,
+          homeLabel: anchor?.label ?? null,
+          minutesSinceLastOuting: null
+        });
+        if (inviteReservation && wiring.llmPort) {
+          try {
+            await settleLlmTokens(db, {
+              userId: subject.userId,
+              reservationId: inviteReservation,
+              actualTokens: proposal === null ? 0 : estimate,
+              ok: proposal !== null,
+              nowMs,
+              port: wiring.llmPort
+            });
+          } catch {
+          }
+        }
+        if (proposal === null) {
+          await dropProbe();
+          outcome.skipped.push("llm_unavailable");
+          return outcome;
+        }
+        const written = await finalizeIntentProbe(db, {
+          userId: subject.userId,
+          wishId: probe.wishId,
+          proposal,
+          nowMs
+        });
+        if (written === "written") return outcome;
+      }
+    }
+    outcome.skipped.push("no_wish");
+    return outcome;
+  }
+  if (wish.state === "open") {
+    const anchor = await readAnchorSafe(wiring, subject);
+    if (!anchor) {
+      outcome.skipped.push("anchor_missing");
+      return outcome;
+    }
+    const provider = pickProvider(wiring, subject, anchor);
+    if (!provider) {
+      outcome.skipped.push("no_provider");
+      return outcome;
+    }
+    if (!await mapGateAllows()) {
+      outcome.skipped.push("budget_blocked");
+      return outcome;
+    }
+    try {
+      const hits = await provider.searchCandidates({
+        wishText: wish.wishText,
+        city: anchor.city,
+        center: { lat: anchor.lat, lng: anchor.lng, coordSys: anchor.coordSys },
+        limit: 8
+      });
+      outcome.searched = true;
+      if (hits.length === 0) {
+        outcome.skipped.push("provider_failed");
+        return outcome;
+      }
+      const candidates = hits.map((hit) => ({
+        // 候选 id 用租户/角色/意愿前缀 + 随机段，避免契约里「候选 id 是全局主键」的碰撞。
+        id: `tc:${subject.userId}:${wish.id}:${crypto.randomUUID()}`,
+        userId: subject.userId,
+        wishId: wish.id,
+        provider: hit.provider,
+        ...hit.id ? { placeId: String(hit.id) } : {},
+        label: hit.label,
+        ...hit.category ? { category: hit.category } : {},
+        city: hit.city,
+        ...hit.district ? { district: hit.district } : {},
+        lat: hit.location.lat,
+        lng: hit.location.lng,
+        coordSys: hit.location.coordSys,
+        distanceM: hit.distanceM,
+        expiresAt: nowMs + 6 * 60 * 60 * 1e3,
+        createdAt: nowMs
+      }));
+      await saveTravelCandidates(db, { userId: subject.userId, wishId: wish.id, candidates, nowMs });
+      const claimed = await claimWishState(db, {
+        userId: subject.userId,
+        wishId: wish.id,
+        from: "open",
+        to: "candidates_ready",
+        nowMs
+      });
+      if (!claimed) outcome.skipped.push("cas_conflict");
+      return outcome;
+    } catch (error) {
+      outcome.skipped.push(providerFailureKind(error) === "budget" ? "budget_blocked" : "provider_failed");
+      return outcome;
+    }
+  }
+  if (wish.state === "candidates_ready") {
+    const stored = await listTravelCandidates(db, { userId: subject.userId, wishId: wish.id, nowMs });
+    const claimed = await claimWishState(db, {
+      userId: subject.userId,
+      wishId: wish.id,
+      from: "candidates_ready",
+      to: "chosen",
+      nowMs
+    });
+    if (!claimed) {
+      outcome.skipped.push("cas_conflict");
+      return outcome;
+    }
+    const decisionKey = `travel:${wish.id}:decide:v${wish.updatedAt}`;
+    const estimateTokens = Math.max(1, Math.trunc(wiring.llmTokensPerDecision ?? 1200));
+    let llmReservation = null;
+    if (wiring.llmPort) {
+      const gate = await resolveTravelBudgetGate(db, {
+        userId: subject.userId,
+        nowMs,
+        kind: "llm",
+        port: wiring.llmPort
+      });
+      if (!gate.allowed) {
+        await releaseWishState(db, { userId: subject.userId, wishId: wish.id, from: "chosen", to: "candidates_ready", nowMs });
+        outcome.skipped.push("budget_blocked");
+        return outcome;
+      }
+      const reserved = await reserveLlmTokens(db, {
+        userId: subject.userId,
+        tokens: estimateTokens,
+        idempotencyKey: decisionKey,
+        nowMs,
+        port: wiring.llmPort
+      });
+      if (!reserved.ok) {
+        await releaseWishState(db, { userId: subject.userId, wishId: wish.id, from: "chosen", to: "candidates_ready", nowMs });
+        outcome.skipped.push("budget_blocked");
+        return outcome;
+      }
+      llmReservation = reserved.reservationId;
+    }
+    const settleDecision = async (ok) => {
+      if (!llmReservation || !wiring.llmPort) return;
+      try {
+        await settleLlmTokens(db, {
+          userId: subject.userId,
+          reservationId: llmReservation,
+          // 模型端口不回 usage：成功按预估结算（宁多算不少算），失败/无结论按 0 结算。
+          actualTokens: ok ? estimateTokens : 0,
+          ok,
+          nowMs,
+          port: wiring.llmPort
+        });
+      } catch {
+      }
+    };
+    const decision = await decideWishAction({
+      wish: { wishText: wish.wishText, ...wish.category ? { category: wish.category } : {} },
+      candidates: stored,
+      decisionPort: wiring.decisionPort ?? null,
+      rerollsUsed: Math.floor(stored.length / 8),
+      maxBatches: 2
+    });
+    if (decision.kind === "choose") {
+      await setTravelWishSelectedCandidate(db, {
+        userId: subject.userId,
+        wishId: wish.id,
+        candidateId: decision.candidateId,
+        nowMs
+      });
+      await settleDecision(true);
+      const candidate = await getTravelCandidate(db, {
+        userId: subject.userId,
+        wishId: wish.id,
+        candidateId: decision.candidateId,
+        nowMs
+      });
+      if (!candidate) {
+        await releaseWishState(db, { userId: subject.userId, wishId: wish.id, from: "chosen", to: "candidates_ready", nowMs });
+        outcome.skipped.push("wait");
+        return outcome;
+      }
+      outcome.decided = true;
+      const planned2 = await planTripForWish(db, subject, wish, {
+        wiring,
+        nowMs,
+        providerDeps,
+        active: null,
+        tripDays,
+        mapGateAllows,
+        addEvent,
+        selectedCandidate: candidate
+      });
+      if (planned2 === "planned") {
+        outcome.planned = true;
+        const fresh = await getActiveTravelTrip(db, { userId: subject.userId, charId: subject.charId });
+        if (fresh) await recordPosition(fresh);
+      } else outcome.skipped.push("provider_failed");
+      return outcome;
+    }
+    await settleDecision(false);
+    if (decision.kind === "drop") {
+      outcome.skipped.push("dropped");
+      await addEvent(`wish:${wish.id}`, "dropped", { reason: decision.reason ?? null });
+      return outcome;
+    }
+    if (decision.kind === "reroll") {
+      await releaseWishState(db, { userId: subject.userId, wishId: wish.id, from: "chosen", to: "open", nowMs });
+      outcome.skipped.push("reroll");
+      return outcome;
+    }
+    await releaseWishState(db, { userId: subject.userId, wishId: wish.id, from: "chosen", to: "candidates_ready", nowMs });
+    outcome.skipped.push(decision.reason === "llm_unavailable" ? "llm_unavailable" : "wait");
+    return outcome;
+  }
+  const planned = await planTripForWish(db, subject, wish, {
+    wiring,
+    nowMs,
+    providerDeps,
+    active: null,
+    tripDays,
+    mapGateAllows,
+    addEvent
+  });
+  if (planned === "planned") outcome.planned = true;
+  return outcome;
+}
+function pickProvider(wiring, subject, anchor) {
+  const providers = wiring.providers ?? [];
+  if (!providers.length) return null;
+  const region = wiring.resolveRegion ? wiring.resolveRegion(subject, anchor) : wiring.region ?? inferRegionFromAnchor(anchor);
+  return providerForRegion(region, providers) ?? null;
+}
+function inferRegionFromAnchor(anchor) {
+  const city = (anchor?.city ?? "").trim();
+  if (!city) return "overseas";
+  return CN_CITY_HINTS.some((hint) => city.includes(hint)) ? "CN" : "overseas";
+}
+var CN_CITY_HINTS = [
+  "\u5317\u4EAC",
+  "\u4E0A\u6D77",
+  "\u5929\u6D25",
+  "\u91CD\u5E86",
+  "\u5E7F\u5DDE",
+  "\u6DF1\u5733",
+  "\u676D\u5DDE",
+  "\u5357\u4EAC",
+  "\u6210\u90FD",
+  "\u6B66\u6C49",
+  "\u897F\u5B89",
+  "\u82CF\u5DDE",
+  "\u957F\u6C99",
+  "\u90D1\u5DDE",
+  "\u9752\u5C9B",
+  "\u6C88\u9633",
+  "\u5927\u8FDE",
+  "\u53A6\u95E8",
+  "\u798F\u5DDE",
+  "\u6606\u660E",
+  "\u5408\u80A5",
+  "\u6D4E\u5357",
+  "\u54C8\u5C14\u6EE8",
+  "\u957F\u6625",
+  "\u77F3\u5BB6\u5E84",
+  "\u592A\u539F",
+  "\u5357\u660C",
+  "\u8D35\u9633",
+  "\u5357\u5B81",
+  "\u6D77\u53E3",
+  "\u5170\u5DDE",
+  "\u897F\u5B81",
+  "\u94F6\u5DDD",
+  "\u4E4C\u9C81\u6728\u9F50",
+  "\u547C\u548C\u6D69\u7279",
+  "\u62C9\u8428",
+  "\u5B81\u6CE2",
+  "\u65E0\u9521",
+  "\u4F5B\u5C71",
+  "\u4E1C\u839E"
+];
+async function readAnchorSafe(wiring, subject) {
+  if (!wiring.readAnchor) return null;
+  try {
+    const anchor = await wiring.readAnchor(subject);
+    return anchor && anchor.confirmedAt > 0 ? anchor : null;
+  } catch {
+    return null;
+  }
+}
+async function planTripForWish(db, subject, wish, ctx) {
+  const { nowMs, wiring, active } = ctx;
+  const anchor = await readAnchorSafe(wiring, subject);
+  if (!anchor) return "skipped";
+  const provider = pickProvider(wiring, subject, anchor);
+  if (!provider) return "skipped";
+  const candidate = ctx.selectedCandidate ?? await pickCandidateForWish(db, subject, wish, nowMs);
+  if (!candidate) return "skipped";
+  const latest = active ?? await getLatestTripForWish(db, {
+    userId: subject.userId,
+    charId: subject.charId,
+    wishId: wish.id
+  });
+  const planVersion = (latest?.planVersion ?? 0) + 1;
+  const dedupeKey = `wish:${wish.id}:plan:${planVersion}`;
+  const departAt = nowMs;
+  const dwellMs = Math.max(1, Math.trunc(wiring.dwellMinutes ?? DEFAULT_DWELL_MINUTES)) * 60 * 1e3;
+  const seed = {
+    id: crypto.randomUUID(),
+    userId: subject.userId,
+    charId: subject.charId,
+    status: "considering",
+    phase: "considering",
+    planVersion,
+    revision: 1,
+    coordSys: candidate.coordSys,
+    provider: provider.id,
+    origin: refFromAnchor(anchor),
+    dest: refFromCandidate(candidate),
+    route: null,
+    routeFetchedAt: null,
+    departAt,
+    arriveAt: null,
+    dwellUntil: null,
+    returnAt: null,
+    retentionExpiresAt: retentionExpiryFor(nowMs, ctx.tripDays),
+    dedupeKey,
+    createdAt: nowMs,
+    updatedAt: nowMs
+  };
+  const upserted = await upsertTravelTrip(db, seed);
+  if (!upserted.inserted) {
+    return "skipped";
+  }
+  const trip = upserted.trip;
+  if (active && active.id !== trip.id) {
+    const aborted = await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: active.id,
+      baseRevision: active.revision,
+      patch: { status: "aborted" },
+      nowMs
+    });
+    if (aborted.ok) await ctx.addEvent(active.id, "plan_changed", { nextTripId: trip.id, planVersion });
+  }
+  if (!await ctx.mapGateAllows()) {
+    await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: trip.id,
+      baseRevision: trip.revision,
+      patch: { status: "unavailable" },
+      nowMs
+    });
+    return "skipped";
+  }
+  let routePoints = null;
+  let distanceM = 0;
+  let durationMs = null;
+  try {
+    const route = await provider.route({
+      origin: { lat: anchor.lat, lng: anchor.lng, coordSys: anchor.coordSys },
+      destination: { lat: candidate.lat, lng: candidate.lng, coordSys: candidate.coordSys },
+      ...candidate.placeId ? { destinationPlaceId: candidate.placeId } : {}
+    });
+    routePoints = route.points.map((p) => ({ lat: p.lat, lng: p.lng }));
+    distanceM = route.distanceM;
+    durationMs = route.durationS === null ? null : Math.max(0, Math.round(route.durationS * 1e3));
+  } catch (error) {
+    const kind = providerFailureKind(error);
+    await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: trip.id,
+      baseRevision: trip.revision,
+      patch: { status: "aborted" },
+      nowMs
+    });
+    await ctx.addEvent(trip.id, "provider_failed", {
+      kind,
+      ...isUnavailableKind(kind) ? { unavailable: true } : {}
+    });
+    return "skipped";
+  }
+  const geometryAllowed = wiring.licensedGeometry === true;
+  const nextTimes = {
+    arriveAt: durationMs === null ? null : departAt + durationMs,
+    dwellUntil: durationMs === null ? null : departAt + durationMs + dwellMs,
+    returnAt: durationMs === null ? null : departAt + durationMs * 2 + dwellMs
+  };
+  const cas = await casUpdateTravelTrip(db, {
+    userId: subject.userId,
+    tripId: trip.id,
+    baseRevision: trip.revision,
+    patch: {
+      status: "planned",
+      coordSys: provider.coordSys,
+      provider: provider.id,
+      route: geometryAllowed && routePoints ? { points: routePoints, distanceM } : null,
+      routeFetchedAt: geometryAllowed && routePoints ? nowMs : null,
+      departAt,
+      ...nextTimes
+    },
+    nowMs
+  });
+  if (!cas.ok) {
+    await ctx.addEvent(trip.id, "cas_conflict", { phase: "planned" });
+    return "skipped";
+  }
+  await ctx.addEvent(trip.id, "planned", {
+    candidateId: candidate.id,
+    geometryPersisted: geometryAllowed && !!routePoints
+  });
+  if (wish.state !== "chosen") {
+    await db.prepare("UPDATE travel_wishes SET state = 'chosen', updated_at = ? WHERE user_id = ? AND id = ?").bind(nowMs, subject.userId, wish.id).run();
+  }
+  return "planned";
+}
+async function pickCandidateForWish(db, subject, wish, nowMs) {
+  const selectedId = wish.selectedCandidateId ?? null;
+  if (!selectedId) return null;
+  const chosen = await getTravelCandidate(db, {
+    userId: subject.userId,
+    wishId: wish.id,
+    candidateId: selectedId,
+    nowMs
+  });
+  if (!chosen) return null;
+  return {
+    id: chosen.id,
+    label: chosen.label,
+    city: chosen.city,
+    district: chosen.district,
+    lat: chosen.lat,
+    lng: chosen.lng,
+    coordSys: chosen.coordSys,
+    placeId: chosen.placeId
+  };
+}
+function wishIdFromDedupeKey(dedupeKey) {
+  const match = /^wish:(.+):plan:\d+$/.exec(String(dedupeKey ?? ""));
+  return match ? match[1] : null;
+}
+async function planSegmentLeg(db, subject, args) {
+  const { nowMs, current, wish, from, to, provider } = args;
+  const planVersion = current.planVersion + 1;
+  const seed = {
+    id: crypto.randomUUID(),
+    userId: subject.userId,
+    charId: subject.charId,
+    status: args.kind === "return" ? "returning" : "planned",
+    phase: args.kind === "return" ? "returning" : "planned",
+    planVersion,
+    revision: 1,
+    coordSys: to.coordSys ?? from.coordSys ?? current.coordSys,
+    provider: provider.id,
+    origin: from,
+    dest: to,
+    route: null,
+    routeFetchedAt: null,
+    departAt: nowMs,
+    arriveAt: null,
+    dwellUntil: null,
+    returnAt: null,
+    retentionExpiresAt: retentionExpiryFor(nowMs, args.tripDays),
+    dedupeKey: `wish:${wish.id}:plan:${planVersion}`,
+    createdAt: nowMs,
+    updatedAt: nowMs
+  };
+  const upserted = await upsertTravelTrip(db, seed);
+  if (!upserted.inserted) return "skipped";
+  const trip = upserted.trip;
+  const closed = await casUpdateTravelTrip(db, {
+    userId: subject.userId,
+    tripId: current.id,
+    baseRevision: current.revision,
+    patch: { status: "aborted" },
+    nowMs
+  });
+  if (closed.ok) {
+    await args.addEvent(current.id, "segment_changed", {
+      nextTripId: trip.id,
+      planVersion,
+      action: args.kind,
+      ...args.reason ? { reason: args.reason } : {}
+    });
+  }
+  if (!await args.mapGateAllows()) {
+    await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: trip.id,
+      baseRevision: trip.revision,
+      patch: { status: "unavailable" },
+      nowMs
+    });
+    return "skipped";
+  }
+  let routePoints = null;
+  let distanceM = 0;
+  let durationMs = null;
+  try {
+    const route = await provider.route({
+      origin: {
+        lat: from.lat,
+        lng: from.lng,
+        coordSys: from.coordSys ?? current.coordSys
+      },
+      destination: {
+        lat: to.lat,
+        lng: to.lng,
+        coordSys: to.coordSys ?? current.coordSys
+      },
+      ...to.placeId ? { destinationPlaceId: to.placeId } : {}
+    });
+    routePoints = route.points.map((point) => ({ lat: point.lat, lng: point.lng }));
+    distanceM = route.distanceM;
+    durationMs = route.durationS === null ? null : Math.max(0, Math.round(route.durationS * 1e3));
+  } catch (error) {
+    await casUpdateTravelTrip(db, {
+      userId: subject.userId,
+      tripId: trip.id,
+      baseRevision: trip.revision,
+      patch: { status: "aborted" },
+      nowMs
+    });
+    await args.addEvent(trip.id, "provider_failed", { kind: providerFailureKind(error) });
+    return "skipped";
+  }
+  const arriveAt = durationMs === null ? null : nowMs + durationMs;
+  const times = args.kind === "return" ? { arriveAt, dwellUntil: nowMs, returnAt: arriveAt } : {
+    arriveAt,
+    dwellUntil: arriveAt === null ? null : arriveAt + args.dwellMs,
+    returnAt: null
+  };
+  const cas = await casUpdateTravelTrip(db, {
+    userId: subject.userId,
+    tripId: trip.id,
+    baseRevision: trip.revision,
+    patch: {
+      status: args.kind === "return" ? "returning" : "planned",
+      coordSys: provider.coordSys,
+      route: args.licensedGeometry && routePoints ? { points: routePoints, distanceM } : null,
+      routeFetchedAt: args.licensedGeometry && routePoints ? nowMs : null,
+      departAt: nowMs,
+      ...times
+    },
+    nowMs
+  });
+  if (!cas.ok) {
+    await args.addEvent(trip.id, "cas_conflict", { phase: "segment" });
+    return "skipped";
+  }
+  await args.addEvent(trip.id, args.kind === "return" ? "segment_return" : "segment_next", {
+    fromLabel: from.label,
+    toLabel: to.label,
+    geometryPersisted: args.licensedGeometry && !!routePoints
+  });
+  return "planned";
+}
+function nextPhaseFor(trip, nowMs) {
+  const { status } = trip;
+  if (isTerminalStatus(status)) return { kind: "idle" };
+  if (trip.departAt !== null && nowMs > trip.departAt + TRAVEL_STALE_TRIP_MS) {
+    return { kind: "expire" };
+  }
+  switch (status) {
+    case "planned":
+      if (trip.departAt === null) return { kind: "idle" };
+      return nowMs >= trip.departAt ? { kind: "advance", to: "en_route" } : { kind: "idle" };
+    case "en_route":
+      if (trip.arriveAt === null) return { kind: "idle" };
+      return nowMs >= trip.arriveAt ? { kind: "advance", to: "dwelling" } : { kind: "idle" };
+    case "dwelling":
+      if (trip.dwellUntil === null) return { kind: "idle" };
+      return nowMs >= trip.dwellUntil ? { kind: "advance", to: "returning" } : { kind: "idle" };
+    case "returning":
+      if (trip.returnAt === null) return { kind: "idle" };
+      return nowMs >= trip.returnAt ? { kind: "advance", to: "returned" } : { kind: "idle" };
+    default:
+      return { kind: "idle" };
+  }
+}
+async function listTravelTickSubjects(db) {
+  const rows = await db.prepare("SELECT DISTINCT user_id, char_id FROM travel_wishes ORDER BY user_id ASC, char_id ASC").bind().all();
+  return (rows.results ?? []).filter((row) => typeof row.user_id === "string" && typeof row.char_id === "string").map((row) => ({ userId: String(row.user_id), charId: String(row.char_id) }));
+}
+async function runTravelTick(env, wiring = {}) {
+  const db = env?.DB;
+  const nowMs = (wiring.now ?? (() => Date.now()))();
+  if (!db) return { nowMs, subjects: 0, outcomes: [], pruned: null };
+  await ensureTravelSchema(db);
+  const envLicensed = resolveTravelLicenses(env).geometryPersistence === "allowed";
+  const subjects = await (wiring.listSubjects ?? listTravelTickSubjects)(db);
+  const outcomes = [];
+  for (const subject of subjects) {
+    try {
+      const perSubject = {
+        ...wiring,
+        ...wiring.wiringForSubject ? await wiring.wiringForSubject(subject) : {},
+        licensedGeometry: envLicensed
+      };
+      outcomes.push(await runTravelTickForSubject(db, subject, perSubject));
+    } catch {
+      outcomes.push({
+        subject,
+        advanced: [],
+        searched: false,
+        decided: false,
+        planned: false,
+        expired: false,
+        skipped: [],
+        mapReserved: false,
+        segment: null
+      });
+    }
+  }
+  let pruned = null;
+  if (wiring.prune) {
+    try {
+      pruned = await pruneTravelRetention(db, { nowMs });
+    } catch {
+      pruned = null;
+    }
+  }
+  return { nowMs, subjects: subjects.length, outcomes, pruned };
+}
+async function handleTravelScheduled(controller, env, wiring) {
+  const task = runTravelTick(env, { ...wiring, prune: wiring?.prune ?? true });
+  if (controller && typeof controller.waitUntil === "function") {
+    controller.waitUntil(task);
+  }
+  return task;
+}
+
+// worker/amsg/src/travel/anchorSearch.ts
+var TRAVEL_PLACE_TOKEN_TTL_MS = 15 * 6e4;
+var TOKEN_LABEL = "sullyos-travel-place-v1";
+var encoder3 = new TextEncoder();
+var toBase64Url3 = (bytes) => {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+var fromBase64Url3 = (text) => {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  try {
+    const binary = atob(padded + pad);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+};
+var sign2 = async (secret, payload) => {
+  const key = await crypto.subtle.importKey("raw", encoder3.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return toBase64Url3(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder3.encode(`${TOKEN_LABEL}.${payload}`))));
+};
+var isRecord8 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+async function signPlaceToken(place, input) {
+  const secret = (input.secret ?? "").trim();
+  if (secret.length < 32) return null;
+  const ttl = Math.min(Math.max(Math.trunc(input.ttlMs ?? TRAVEL_PLACE_TOKEN_TTL_MS), 3e4), TRAVEL_PLACE_TOKEN_TTL_MS);
+  const payload = {
+    label: place.label.slice(0, 80),
+    city: place.city.slice(0, 40),
+    ...place.district ? { district: place.district.slice(0, 40) } : {},
+    lat: place.lat,
+    lng: place.lng,
+    coordSys: place.coordSys,
+    exp: Math.trunc(input.nowMs) + ttl
+  };
+  const body = toBase64Url3(encoder3.encode(JSON.stringify(payload)));
+  const signature = await sign2(secret, body);
+  return `${body}.${signature}`;
+}
+async function resolvePlaceToken(placeId, input) {
+  const secret = (input.secret ?? "").trim();
+  if (secret.length < 32) return null;
+  const parts = String(placeId ?? "").split(".");
+  if (parts.length !== 2) return null;
+  const [body, signature] = parts;
+  const expected = await sign2(secret, body);
+  if (expected.length !== signature.length) return null;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i += 1) diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  if (diff !== 0) return null;
+  const bytes = fromBase64Url3(body);
+  if (!bytes) return null;
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+  if (!isRecord8(payload)) return null;
+  const exp = Number(payload.exp);
+  if (!Number.isFinite(exp) || exp <= input.nowMs) return null;
+  const lat = Number(payload.lat);
+  const lng = Number(payload.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  const label = typeof payload.label === "string" ? payload.label.trim() : "";
+  const city = typeof payload.city === "string" ? payload.city.trim() : "";
+  if (!label || !city) return null;
+  return {
+    label,
+    city,
+    ...typeof payload.district === "string" && payload.district.trim() ? { district: payload.district.trim() } : {},
+    lat,
+    lng,
+    ...payload.coordSys === "wgs84" || payload.coordSys === "gcj02" ? { coordSys: payload.coordSys } : {},
+    kind: "anchor"
+  };
+}
+function createAnchorSearchPort(input) {
+  return {
+    async search({ q, city }) {
+      const provider = input.provider;
+      if (!provider || !q.trim()) return [];
+      const hits = await provider.searchCandidates({
+        wishText: q.trim(),
+        city: city ?? "",
+        limit: 8
+      });
+      const out = [];
+      for (const hit of hits) {
+        const placeId = await signPlaceToken(
+          {
+            label: hit.label,
+            city: hit.city ?? city ?? "",
+            ...hit.district ? { district: hit.district } : {},
+            lat: hit.location.lat,
+            lng: hit.location.lng,
+            coordSys: hit.location.coordSys
+          },
+          { secret: input.secret, nowMs: input.now() }
+        );
+        if (!placeId) {
+          throw new TravelProviderError({
+            kind: "not-configured",
+            code: "PROVIDER_FAILED",
+            provider: provider.id
+          });
+        }
+        if (!hit.city && !city) continue;
+        out.push({
+          placeId,
+          label: hit.label,
+          city: hit.city ?? city ?? "",
+          ...hit.district ? { district: hit.district } : {}
+        });
+      }
+      return out;
+    },
+    resolve(placeId) {
+      return resolvePlaceToken(placeId, { secret: input.secret, nowMs: input.now() });
+    }
+  };
+}
+
+// utils/amapCore.ts
+var GCJ_A = 6378245;
+var GCJ_EE = 0.006693421622965943;
+var outOfChina = (lat, lng) => lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271;
+var transformLat = (x, y) => {
+  let ret = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  ret += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3;
+  ret += (20 * Math.sin(y * Math.PI) + 40 * Math.sin(y / 3 * Math.PI)) * 2 / 3;
+  ret += (160 * Math.sin(y / 12 * Math.PI) + 320 * Math.sin(y * Math.PI / 30)) * 2 / 3;
+  return ret;
+};
+var transformLng = (x, y) => {
+  let ret = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  ret += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3;
+  ret += (20 * Math.sin(x * Math.PI) + 40 * Math.sin(x / 3 * Math.PI)) * 2 / 3;
+  ret += (150 * Math.sin(x / 12 * Math.PI) + 300 * Math.sin(x / 30 * Math.PI)) * 2 / 3;
+  return ret;
+};
+var wgs84ToGcj02 = (lat, lng) => {
+  if (outOfChina(lat, lng)) return { lat, lng };
+  const x = lng - 105;
+  const y = lat - 35;
+  let dLat = transformLat(x, y);
+  let dLng = transformLng(x, y);
+  const radLat = lat / 180 * Math.PI;
+  const magic = 1 - GCJ_EE * Math.sin(radLat) ** 2;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = dLat * 180 / (GCJ_A * (1 - GCJ_EE) / (magic * sqrtMagic) * Math.PI);
+  dLng = dLng * 180 / (GCJ_A / sqrtMagic * Math.cos(radLat) * Math.PI);
+  return { lat: lat + dLat, lng: lng + dLng };
+};
+var gcj02ToWgs84 = (lat, lng) => {
+  if (outOfChina(lat, lng)) return { lat, lng };
+  let minLat = lat - 0.5;
+  let maxLat = lat + 0.5;
+  let minLng = lng - 0.5;
+  let maxLng = lng + 0.5;
+  let wgsLat = lat;
+  let wgsLng = lng;
+  for (let i = 0; i < 30; i++) {
+    wgsLat = (minLat + maxLat) / 2;
+    wgsLng = (minLng + maxLng) / 2;
+    const tmp = wgs84ToGcj02(wgsLat, wgsLng);
+    if (Math.abs(tmp.lat - lat) < 1e-7 && Math.abs(tmp.lng - lng) < 1e-7) break;
+    if (tmp.lat > lat) maxLat = wgsLat;
+    else minLat = wgsLat;
+    if (tmp.lng > lng) maxLng = wgsLng;
+    else minLng = wgsLng;
+  }
+  return { lat: wgsLat, lng: wgsLng };
+};
+
+// worker/amsg/src/travel/providerAmap.ts
+var AMAP_REST_BASE = "https://restapi.amap.com";
+var AMAP_ENDPOINTS = {
+  walking: "/v3/direction/walking",
+  placeText: "/v3/place/text",
+  geocode: "/v3/geocode/geo"
+};
+var AMAP_ALLOWED_ENDPOINTS = [
+  AMAP_ENDPOINTS.walking,
+  AMAP_ENDPOINTS.placeText,
+  AMAP_ENDPOINTS.geocode
+];
+var AMAP_MAX_WALKING_METERS = 1e5;
+var AMAP_INFOCODE_KIND = {
+  "10001": "auth",
+  "10002": "auth",
+  "10005": "auth",
+  "10007": "auth",
+  "10009": "auth",
+  "10010": "auth",
+  "10003": "quota",
+  "10044": "quota",
+  "10045": "quota",
+  "10004": "rate-limit",
+  "20011": "unsupported-region",
+  "20800": "unsupported-region",
+  "20801": "no-route",
+  "20802": "no-route",
+  "20803": "too-far"
+};
+var codeForKind = (kind) => {
+  if (kind === "unsupported-region") return "PROVIDER_UNSUPPORTED_REGION";
+  if (kind === "no-route" || kind === "too-far") return "ROUTE_UNAVAILABLE";
+  return "PROVIDER_FAILED";
+};
+var fail4 = (kind, infocode, provider = "amap") => new TravelProviderError({ kind, code: codeForKind(kind), provider, infocode });
+var readKey = (config) => {
+  let raw = null;
+  try {
+    raw = config.resolveKey();
+  } catch {
+    raw = null;
+  }
+  const key = typeof raw === "string" ? raw.trim() : "";
+  if (!key) throw fail4("not-configured");
+  return key;
+};
+var buildAmapUrl = (endpoint, params, key, restBase = AMAP_REST_BASE) => {
+  if (!AMAP_ALLOWED_ENDPOINTS.includes(endpoint)) throw fail4("bad-input");
+  const base = (restBase || AMAP_REST_BASE).replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(`${base}${endpoint}`);
+  } catch {
+    throw fail4("bad-input");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw fail4("bad-input");
+  if (!url.pathname.endsWith(endpoint)) throw fail4("bad-input");
+  for (const [name, value] of Object.entries(params)) {
+    if (value === void 0 || value === "") continue;
+    url.searchParams.set(name, value);
+  }
+  url.searchParams.set("output", "JSON");
+  url.searchParams.set("key", key);
+  return url.toString();
+};
+var toGcj02 = (point) => {
+  assertGeoPoint(point, "amap");
+  if (point.coordSys === "gcj02") return { lat: point.lat, lng: point.lng, coordSys: "gcj02" };
+  const converted = wgs84ToGcj02(point.lat, point.lng);
+  return { lat: converted.lat, lng: converted.lng, coordSys: "gcj02" };
+};
+var parseAmapPoint = (raw) => {
+  if (typeof raw !== "string") return null;
+  const parts = raw.split(",");
+  if (parts.length !== 2) return null;
+  const lng = Number(parts[0].trim());
+  const lat = Number(parts[1].trim());
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+};
+var requestAmap = async (deps, config, endpoint, params) => {
+  const key = readKey(config);
+  const url = buildAmapUrl(endpoint, params, key, config.restBase);
+  await reserveMapBudget(deps, "amap");
+  const result = await requestJsonOnce(deps, "amap", url);
+  if (result.status === 429) throw fail4("rate-limit");
+  if (!result.ok) throw fail4(result.status >= 500 ? "transient" : "bad-response");
+  const body = result.body;
+  if (!body || typeof body !== "object") throw fail4("bad-response");
+  const payload = body;
+  if (payload.status !== "1") {
+    const infocode = payload.infocode === void 0 || payload.infocode === null ? "" : String(payload.infocode);
+    const kind = infocode && AMAP_INFOCODE_KIND[infocode] || "bad-response";
+    throw fail4(kind, infocode || void 0);
+  }
+  return payload;
+};
+var toCandidateHits = (payload, query, center) => {
+  const raw = Array.isArray(payload.pois) ? payload.pois : [];
+  const limit = clampCandidateLimit(query.limit);
+  const out = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const poi = entry;
+    const point = parseAmapPoint(poi.location);
+    if (!point) continue;
+    const id = typeof poi.id === "string" ? poi.id.trim() : "";
+    const label = typeof poi.name === "string" ? poi.name.trim() : "";
+    if (!id || !label) continue;
+    const rawType = typeof poi.type === "string" ? poi.type : "";
+    const category = rawType.split(";").map((part) => part.trim()).filter(Boolean).pop();
+    const city = pickText(poi.cityname) || pickText(poi.province) || query.city.trim();
+    const district = pickText(poi.adname);
+    const officialDistance = toFiniteNumber(poi.distance);
+    const distanceM = officialDistance !== null ? Math.round(officialDistance) : center ? Math.round(metersBetween(center, point)) : null;
+    out.push({
+      id,
+      label,
+      city,
+      location: { lat: point.lat, lng: point.lng, coordSys: "gcj02" },
+      distanceM,
+      provider: "amap",
+      ...category ? { category } : {},
+      ...district ? { district } : {}
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+};
+var pickText = (value) => {
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    const first = value.find((item) => typeof item === "string" && item.trim());
+    return typeof first === "string" ? first.trim() : "";
+  }
+  return "";
+};
+var createAmapProvider = (config, deps) => {
+  const license = () => buildLicenseMeta("amap", config.license ?? {});
+  const maxWalkingMeters = config.maxWalkingMeters ?? AMAP_MAX_WALKING_METERS;
+  const route = async (request) => {
+    const origin = toGcj02(request.origin);
+    const destination = toGcj02(request.destination);
+    if (metersBetween(origin, destination) > maxWalkingMeters) throw fail4("too-far");
+    const params = {
+      origin: formatLonLat(origin, "amap"),
+      destination: formatLonLat(destination, "amap")
+    };
+    if (request.originPlaceId) params.origin_id = request.originPlaceId;
+    if (request.destinationPlaceId) params.destination_id = request.destinationPlaceId;
+    const payload = await requestAmap(deps, config, AMAP_ENDPOINTS.walking, params);
+    const routePayload = payload.route;
+    const paths = routePayload && typeof routePayload === "object" ? routePayload.paths : void 0;
+    const path = Array.isArray(paths) && paths.length ? paths[0] : null;
+    if (!path || typeof path !== "object") throw fail4("no-route");
+    const pathRecord = path;
+    const rawSteps = Array.isArray(pathRecord.steps) ? pathRecord.steps : [];
+    const segments = rawSteps.map(
+      (step) => parsePolyline(step && typeof step === "object" ? step.polyline : void 0)
+    );
+    const points = joinRoutePoints(segments, "amap");
+    const officialDistance = toFiniteNumber(pathRecord.distance);
+    const distanceM = officialDistance !== null && officialDistance > 0 ? Math.round(officialDistance) : Math.round(routeDistanceMeters(points));
+    const durationS = toFiniteNumber(pathRecord.duration);
+    const steps = rawSteps.map((step) => {
+      const record = step && typeof step === "object" ? step : {};
+      const instruction = typeof record.instruction === "string" ? record.instruction.trim() : "";
+      return {
+        instruction,
+        distanceM: toFiniteNumber(record.distance),
+        durationS: toFiniteNumber(record.duration)
+      };
+    });
+    return {
+      provider: "amap",
+      coordSys: "gcj02",
+      points,
+      distanceM,
+      durationS: durationS !== null && durationS >= 0 ? durationS : null,
+      steps,
+      license: license()
+    };
+  };
+  const searchCandidates = async (query) => {
+    const wishText = typeof query.wishText === "string" ? query.wishText.trim() : "";
+    const city = typeof query.city === "string" ? query.city.trim() : "";
+    if (!wishText || !city) throw fail4("bad-input");
+    const center = query.center ? toGcj02(query.center) : null;
+    const params = {
+      keywords: wishText,
+      city,
+      citylimit: "true",
+      offset: String(clampCandidateLimit(query.limit)),
+      page: "1",
+      extensions: "base"
+    };
+    if (center) {
+      params.location = formatLonLat(center, "amap");
+      params.sortrule = "distance";
+    }
+    const payload = await requestAmap(deps, config, AMAP_ENDPOINTS.placeText, params);
+    return toCandidateHits(payload, query, center);
+  };
+  const geocodeAnchor = async (query) => {
+    const label = typeof query.label === "string" ? query.label.trim() : "";
+    const city = typeof query.city === "string" ? query.city.trim() : "";
+    if (!label || !city) throw fail4("bad-input");
+    const payload = await requestAmap(deps, config, AMAP_ENDPOINTS.geocode, {
+      address: label,
+      city
+    });
+    const raw = Array.isArray(payload.geocodes) ? payload.geocodes : [];
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      const record = entry;
+      const point = parseAmapPoint(record.location);
+      if (!point) continue;
+      const resolvedCity = pickText(record.city) || pickText(record.province) || city;
+      const district = pickText(record.district);
+      return {
+        label,
+        city: resolvedCity,
+        location: { lat: point.lat, lng: point.lng, coordSys: "gcj02" },
+        provider: "amap",
+        precision: "area",
+        ...district ? { district } : {}
+      };
+    }
+    throw new TravelProviderError({
+      kind: "no-route",
+      code: "ANCHOR_NOT_CONFIRMED",
+      provider: "amap"
+    });
+  };
+  return Object.freeze({
+    id: "amap",
+    coordSys: "gcj02",
+    regions: ["CN"],
+    supports: (region) => region === "CN",
+    searchCandidates,
+    route,
+    geocodeAnchor
+  });
+};
+
+// worker/amsg/src/travel/providerWorld.ts
+var MAPBOX_API_BASE = "https://api.mapbox.com";
+var MAPBOX_PATHS = {
+  directions: "/directions/v5/mapbox/walking/",
+  geocoding: "/geocoding/v5/mapbox.places/"
+};
+var MIN_WALKING_SPEED = 0.14;
+var MAX_WALKING_SPEED = 6.94;
+var MAPBOX_CODE_KIND = {
+  NoRoute: "no-route",
+  NoSegment: "no-route",
+  NoTrips: "no-route",
+  TooManyCoordinates: "bad-input",
+  InvalidInput: "bad-input",
+  TokenNotAuthorized: "auth",
+  Forbidden: "auth",
+  RateLimited: "rate-limit"
+};
+var codeForKind2 = (kind) => {
+  if (kind === "unsupported-region" || kind === "not-configured") return "PROVIDER_UNSUPPORTED_REGION";
+  if (kind === "no-route" || kind === "too-far") return "ROUTE_UNAVAILABLE";
+  return "PROVIDER_FAILED";
+};
+var fail5 = (kind) => new TravelProviderError({ kind, code: codeForKind2(kind), provider: "world" });
+var readToken2 = (config) => {
+  let raw = null;
+  try {
+    raw = config.resolveToken();
+  } catch {
+    raw = null;
+  }
+  const token = typeof raw === "string" ? raw.trim() : "";
+  if (!token) throw fail5("not-configured");
+  return token;
+};
+var isAllowedPath = (pathname) => pathname.startsWith(MAPBOX_PATHS.directions) || pathname.startsWith(MAPBOX_PATHS.geocoding);
+var toWgs84 = (point) => {
+  assertGeoPoint(point, "world");
+  if (point.coordSys === "wgs84") return { lat: point.lat, lng: point.lng, coordSys: "wgs84" };
+  const converted = gcj02ToWgs84(point.lat, point.lng);
+  return { lat: converted.lat, lng: converted.lng, coordSys: "wgs84" };
+};
+var parseLineString = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const pair of raw) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    const lng = typeof pair[0] === "number" ? pair[0] : Number.NaN;
+    const lat = typeof pair[1] === "number" ? pair[1] : Number.NaN;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) continue;
+    const last = out[out.length - 1];
+    if (last && last.lat === lat && last.lng === lng) continue;
+    out.push({ lat, lng });
+  }
+  return out;
+};
+var requestWorld = async (deps, config, pathname, params) => {
+  const token = readToken2(config);
+  const base = (config.apiBase || MAPBOX_API_BASE).replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(`${base}${pathname}`);
+  } catch {
+    throw fail5("bad-input");
+  }
+  if (url.origin !== base) throw fail5("bad-input");
+  if (!isAllowedPath(url.pathname)) throw fail5("bad-input");
+  for (const [name, value] of Object.entries(params)) {
+    if (value === void 0 || value === "") continue;
+    url.searchParams.set(name, value);
+  }
+  url.searchParams.set("access_token", token);
+  await reserveMapBudget(deps, "world");
+  const result = await requestJsonOnce(deps, "world", url.toString());
+  const body = result.body && typeof result.body === "object" ? result.body : null;
+  if (!result.ok) {
+    if (result.status === 401 || result.status === 403) throw fail5("auth");
+    if (result.status === 429) throw fail5("rate-limit");
+    if (result.status === 400) throw fail5("bad-input");
+    if (result.status === 422) {
+      const mapped = body && typeof body.code === "string" ? MAPBOX_CODE_KIND[body.code] : void 0;
+      throw fail5(mapped ?? "no-route");
+    }
+    if (result.status >= 500) throw fail5("transient");
+    throw fail5("bad-response");
+  }
+  if (!body) throw fail5("bad-response");
+  if (typeof body.code === "string" && body.code !== "Ok") {
+    throw fail5(MAPBOX_CODE_KIND[body.code] ?? "bad-response");
+  }
+  return body;
+};
+var contextText = (feature, prefixes) => {
+  const context = Array.isArray(feature.context) ? feature.context : [];
+  for (const prefix of prefixes) {
+    for (const entry of context) {
+      if (!entry || typeof entry !== "object") continue;
+      const record = entry;
+      const id = typeof record.id === "string" ? record.id : "";
+      const text = typeof record.text === "string" ? record.text.trim() : "";
+      if (id.startsWith(`${prefix}.`) && text) return text;
+    }
+  }
+  return "";
+};
+var featurePoint = (feature) => {
+  const center = feature.center;
+  if (!Array.isArray(center) || center.length < 2) return null;
+  const lng = Number(center[0]);
+  const lat = Number(center[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat, lng };
+};
+var featureLabel = (feature) => {
+  if (typeof feature.text === "string" && feature.text.trim()) return feature.text.trim();
+  if (typeof feature.place_name === "string" && feature.place_name.trim()) return feature.place_name.trim();
+  return "";
+};
+var featureCity = (feature, fallback) => {
+  const fromContext = contextText(feature, ["place"]);
+  if (fromContext) return fromContext;
+  const types = Array.isArray(feature.place_type) ? feature.place_type : [];
+  if (types.includes("place") || types.includes("locality")) return featureLabel(feature) || fallback;
+  return fallback;
+};
+var createWorldProvider = (config, deps) => {
+  const license = () => buildLicenseMeta("world", config.license ?? {});
+  const language = typeof config.language === "string" && config.language.trim() ? config.language.trim() : void 0;
+  if (config.walkingSpeedMps !== void 0) {
+    const speed = config.walkingSpeedMps;
+    if (!Number.isFinite(speed) || speed < MIN_WALKING_SPEED || speed > MAX_WALKING_SPEED) {
+      throw fail5("bad-input");
+    }
+  }
+  const route = async (request) => {
+    const origin = toWgs84(request.origin);
+    const destination = toWgs84(request.destination);
+    const coordinates = `${formatLonLat(origin, "world")};${formatLonLat(destination, "world")}`;
+    const params = {
+      geometries: "geojson",
+      overview: "full",
+      steps: "true",
+      alternatives: "false",
+      language
+    };
+    if (config.walkingSpeedMps !== void 0) params.walking_speed = String(config.walkingSpeedMps);
+    const payload = await requestWorld(deps, config, `${MAPBOX_PATHS.directions}${coordinates}`, params);
+    const routes = Array.isArray(payload.routes) ? payload.routes : [];
+    const primary = routes.length ? routes[0] : null;
+    if (!primary || typeof primary !== "object") throw fail5("no-route");
+    const routeRecord = primary;
+    const geometry = routeRecord.geometry && typeof routeRecord.geometry === "object" ? routeRecord.geometry : null;
+    const points = parseLineString(geometry?.coordinates);
+    const joined = joinRoutePoints([points], "world");
+    const officialDistance = toFiniteNumber(routeRecord.distance);
+    const distanceM = officialDistance !== null && officialDistance > 0 ? Math.round(officialDistance) : Math.round(routeDistanceMeters(joined));
+    const durationS = toFiniteNumber(routeRecord.duration);
+    const legs = Array.isArray(routeRecord.legs) ? routeRecord.legs : [];
+    const steps = [];
+    for (const leg of legs) {
+      if (!leg || typeof leg !== "object") continue;
+      const legSteps = leg.steps;
+      if (!Array.isArray(legSteps)) continue;
+      for (const step of legSteps) {
+        if (!step || typeof step !== "object") continue;
+        const stepRecord = step;
+        const maneuver = stepRecord.maneuver && typeof stepRecord.maneuver === "object" ? stepRecord.maneuver : {};
+        steps.push({
+          instruction: typeof maneuver.instruction === "string" ? maneuver.instruction.trim() : "",
+          distanceM: toFiniteNumber(stepRecord.distance),
+          durationS: toFiniteNumber(stepRecord.duration)
+        });
+      }
+    }
+    return {
+      provider: "world",
+      coordSys: "wgs84",
+      points: joined,
+      distanceM,
+      durationS: durationS !== null && durationS >= 0 ? Math.round(durationS) : null,
+      steps,
+      license: license()
+    };
+  };
+  const searchCandidates = async (query) => {
+    const wishText = typeof query.wishText === "string" ? query.wishText.trim() : "";
+    const city = typeof query.city === "string" ? query.city.trim() : "";
+    if (!wishText || !city) throw fail5("bad-input");
+    const center = query.center ? toWgs84(query.center) : null;
+    const limit = clampCandidateLimit(query.limit);
+    const params = {
+      limit: String(limit),
+      types: "poi,address,place",
+      language,
+      proximity: center ? formatLonLat(center, "world") : void 0
+    };
+    const payload = await requestWorld(
+      deps,
+      config,
+      `${MAPBOX_PATHS.geocoding}${encodeURIComponent(wishText)}.json`,
+      params
+    );
+    const features = Array.isArray(payload.features) ? payload.features : [];
+    const hits = [];
+    for (const entry of features) {
+      if (!entry || typeof entry !== "object") continue;
+      const feature = entry;
+      const point = featurePoint(feature);
+      const label = featureLabel(feature);
+      const id = typeof feature.id === "string" ? feature.id.trim() : "";
+      if (!point || !label || !id) continue;
+      const props = feature.properties && typeof feature.properties === "object" ? feature.properties : {};
+      const placeTypes = Array.isArray(feature.place_type) ? feature.place_type : [];
+      const category = typeof props.category === "string" && props.category.trim() ? props.category.trim() : typeof placeTypes[0] === "string" ? placeTypes[0] : "";
+      const district = contextText(feature, ["district", "locality", "neighborhood"]);
+      hits.push({
+        id,
+        label,
+        city: featureCity(feature, city),
+        location: { lat: point.lat, lng: point.lng, coordSys: "wgs84" },
+        distanceM: center ? Math.round(metersBetween(center, point)) : null,
+        provider: "world",
+        ...category ? { category } : {},
+        ...district ? { district } : {}
+      });
+      if (hits.length >= limit) break;
+    }
+    return hits;
+  };
+  const geocodeAnchor = async (query) => {
+    const label = typeof query.label === "string" ? query.label.trim() : "";
+    const city = typeof query.city === "string" ? query.city.trim() : "";
+    if (!label || !city) throw fail5("bad-input");
+    const payload = await requestWorld(
+      deps,
+      config,
+      `${MAPBOX_PATHS.geocoding}${encodeURIComponent(label)}.json`,
+      { limit: "1", types: "place,locality,neighborhood", language }
+    );
+    const features = Array.isArray(payload.features) ? payload.features : [];
+    for (const entry of features) {
+      if (!entry || typeof entry !== "object") continue;
+      const feature = entry;
+      const point = featurePoint(feature);
+      if (!point) continue;
+      const district = contextText(feature, ["district", "locality", "neighborhood"]);
+      const id = typeof feature.id === "string" ? feature.id.trim() : "";
+      return {
+        label,
+        city: featureCity(feature, city),
+        location: { lat: point.lat, lng: point.lng, coordSys: "wgs84" },
+        provider: "world",
+        precision: "area",
+        ...id ? { placeId: id } : {},
+        ...district ? { district } : {}
+      };
+    }
+    throw new TravelProviderError({
+      kind: "no-route",
+      code: "ANCHOR_NOT_CONFIRMED",
+      provider: "world"
+    });
+  };
+  return Object.freeze({
+    id: "world",
+    coordSys: "wgs84",
+    regions: ["overseas"],
+    supports: (region) => region === "overseas",
+    searchCandidates,
+    route,
+    geocodeAnchor
+  });
+};
+
+// utils/travel/privacy.ts
+var COORD_PAIR = /-?\d{1,3}\.\d{3,}\s*[,，]\s*-?\d{1,3}\.\d{3,}/;
+var COORD_LABELLED = /(?:lat|lng|latitude|longitude|纬度|经度)\s*[:：=]?\s*-?\d{1,3}\.\d{2,}/i;
+var containsDecimalCoordinates = (text) => {
+  const s = String(text ?? "");
+  return COORD_PAIR.test(s) || COORD_LABELLED.test(s);
+};
+var HOUSEHOLD = /\d+\s*(栋|幢|单元|层|室|房|户)|\d+\s*号楼\s*\d+|门牌/;
+var containsHouseholdDetail = (text) => HOUSEHOLD.test(String(text ?? ""));
+var scanTextForLeak = (text) => {
+  const s = String(text ?? "");
+  const reasons = [];
+  if (containsDecimalCoordinates(s)) reasons.push("COORDINATES");
+  if (containsHouseholdDetail(s)) reasons.push("HOUSEHOLD_DETAIL");
+  return reasons;
+};
+var assertPromptSafe = (text) => {
+  const s = String(text ?? "").trim();
+  const reasons = scanTextForLeak(s);
+  if (reasons.length) return { ok: false, reasons };
+  return { ok: true, text: s };
+};
+
+// worker/amsg/src/travel/modelDecision.ts
+var TRAVEL_DECISION_TIMEOUT_MS = 2e4;
+function isUsableModelCredentials(creds) {
+  return !!creds && typeof creds.baseUrl === "string" && creds.baseUrl.trim().length > 0 && typeof creds.apiKey === "string" && creds.apiKey.trim().length > 0 && typeof creds.model === "string" && creds.model.trim().length > 0;
+}
+function createTravelModelCaller(input) {
+  const base = input.credentials.baseUrl.trim().replace(/\/+$/, "");
+  const url = /\/chat\/completions$/i.test(base) ? base : `${base}/chat/completions`;
+  const timeoutMs = Math.max(1e3, Math.trunc(input.timeoutMs ?? TRAVEL_DECISION_TIMEOUT_MS));
+  return async ({ system, user, timeoutMs: perCall }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1e3, Math.trunc(perCall ?? timeoutMs)));
+    try {
+      const response = await (input.fetch ?? globalThis.fetch)(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${input.credentials.apiKey.trim()}`
+        },
+        body: JSON.stringify({
+          model: input.credentials.model.trim(),
+          temperature: 0.7,
+          stream: false,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user }
+          ]
+        }),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`travel-decision-http-${response.status}`);
+      const body = await response.json();
+      const content = body?.choices?.[0]?.message?.content;
+      const text = typeof content === "string" ? content : "";
+      if (!text.trim()) throw new Error("travel-decision-empty");
+      const rawTotal = Number(body?.usage?.total_tokens);
+      return Number.isFinite(rawTotal) && rawTotal > 0 ? { text, totalTokens: Math.trunc(rawTotal) } : text;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+var SYSTEM_PROMPT = [
+  "\u4F60\u5728\u626E\u6F14\u4E00\u4E2A\u6709\u81EA\u5DF1\u7684\u751F\u6D3B\u7684\u89D2\u8272\u3002\u73B0\u5728\u4F60\u8981\u51B3\u5B9A\uFF1A\u8FD9\u4E00\u6B21\u60F3\u4E0D\u60F3\u51FA\u95E8\u3001\u53BB\u54EA\u91CC\u3002",
+  "\u89C4\u5219\uFF1A",
+  "1. \u53EA\u80FD\u4ECE\u7ED9\u5B9A\u7684\u5019\u9009\u91CC\u6311\u4E00\u4E2A\uFF08\u7528\u5B83\u7684 id\uFF09\uFF0C\u6216\u8005\u8BF4\u300C\u6362\u4E00\u6279\u300D\u300C\u7B97\u4E86\u300D\u300C\u518D\u7B49\u7B49\u300D\u3002",
+  "2. \u4E0D\u8981\u7F16\u9020\u5019\u9009\u91CC\u6CA1\u6709\u7684\u5730\u70B9\uFF0C\u4E5F\u4E0D\u8981\u63D0\u5230\u5750\u6807\u3001\u95E8\u724C\u53F7\u6216\u4EFB\u4F55\u5B9A\u4F4D\u7EC6\u8282\u3002",
+  "3. \u51FA\u95E8\u4E0D\u662F\u4E49\u52A1\uFF1A\u7D2F\u4E86\u3001\u6CA1\u5174\u8DA3\u3001\u60F3\u5F85\u7740\uFF0C\u90FD\u53EF\u4EE5\u9009\u62E9\u300C\u518D\u7B49\u7B49\u300D\u6216\u300C\u7B97\u4E86\u300D\u3002",
+  '4. \u53EA\u7528 JSON \u56DE\u7B54\uFF0C\u5F62\u5982 {"kind":"choose","candidateId":"...","reason":"\u4E00\u53E5\u8BDD"}\uFF1B',
+  '   \u5176\u4ED6\u53EF\u7528\u7684 kind \u662F "reroll" / "drop" / "wait"\u3002'
+].join("\n");
+var SEGMENT_SYSTEM_PROMPT = [
+  "\u4F60\u5728\u626E\u6F14\u4E00\u4E2A\u6709\u81EA\u5DF1\u7684\u751F\u6D3B\u7684\u89D2\u8272\u3002\u4F60\u73B0\u5728\u6B63\u8D70\u5230\u4E00\u5904\u3001\u4E5F\u5F85\u4E86\u4E00\u9635\u5B50\u3002",
+  "\u63A5\u4E0B\u6765\u505A\u4EC0\u4E48\u7531\u4F60\u81EA\u5DF1\u51B3\u5B9A\uFF0C\u6CA1\u6709\u4EBA\u8981\u6C42\u4F60\u7EE7\u7EED\u8D70\uFF0C\u4E5F\u6CA1\u6709\u4EBA\u8981\u6C42\u4F60\u56DE\u5BB6\u3002",
+  "\u53EF\u9009\u7684\u56DE\u7B54\u53EA\u6709\u56DB\u79CD\uFF1A",
+  '  {"kind":"next","candidateId":"...","reason":"\u4E00\u53E5\u8BDD"}  \u4ECE\u7ED9\u5B9A\u7684\u5730\u65B9\u91CC\u6311\u4E0B\u4E00\u4E2A\u60F3\u53BB\u7684',
+  '  {"kind":"stay","minutes":30,"reason":"\u4E00\u53E5\u8BDD"}          \u5C31\u5728\u8FD9\u513F\u518D\u5F85\u4E00\u4F1A\u513F',
+  '  {"kind":"return","reason":"\u4E00\u53E5\u8BDD"}                     \u60F3\u56DE\u5BB6\u4E86',
+  '  {"kind":"stop","reason":"\u4E00\u53E5\u8BDD"}                       \u4ECA\u5929\u5C31\u5230\u8FD9\u513F\uFF0C\u4E0D\u60F3\u518D\u8D70\u4E86',
+  "\u89C4\u5219\uFF1A\u53EA\u80FD\u6311\u7ED9\u5B9A id \u7684\u5730\u65B9\uFF0C\u4E0D\u8981\u7F16\u5730\u70B9\uFF1B\u4E0D\u8981\u63D0\u5230\u5750\u6807\u3001\u95E8\u724C\u6216\u5B9A\u4F4D\u7EC6\u8282\uFF1B",
+  "\u4E0D\u7D2F\u4E5F\u53EF\u4EE5\u7EE7\u7EED\u901B\uFF0C\u7D2F\u4E86\u60F3\u56DE\u53BB\u4E5F\u6B63\u5E38\uFF1B\u6CA1\u6709\u60C5\u7EEA\u5206\u6216\u597D\u611F\u5EA6\u8FD9\u7C7B\u6570\u5B57\u3002",
+  "\u53EA\u7528 JSON \u56DE\u7B54\u3002"
+].join("\n");
+var INTENT_SYSTEM_PROMPT = [
+  "\u4F60\u5728\u626E\u6F14\u4E00\u4E2A\u6709\u81EA\u5DF1\u7684\u751F\u6D3B\u7684\u89D2\u8272\u3002\u6CA1\u6709\u4EBA\u5728\u8DDF\u4F60\u8BF4\u8BDD\uFF0C\u4E5F\u6CA1\u6709\u4EBA\u8981\u6C42\u4F60\u51FA\u95E8\u3002",
+  "\u4F60\u81EA\u5DF1\u60F3\u4E00\u60F3\uFF1A\u73B0\u5728\u60F3\u4E0D\u60F3\u51FA\u53BB\u8D70\u8D70\uFF1F",
+  "\u4E09\u79CD\u56DE\u7B54\uFF1A",
+  '  {"want":"none"}                                    \u4E0D\u60F3\u51FA\u95E8\uFF08\u5F85\u7740\u4E5F\u5F88\u597D\uFF0C\u8FD9\u662F\u6B63\u5E38\u7B54\u6848\uFF09',
+  '  {"want":"wander"}                                  \u60F3\u968F\u4FBF\u8D70\u8D70\uFF0C\u6CA1\u6709\u5177\u4F53\u76EE\u7684\u5730',
+  '  {"want":"go","wish":"\u4E00\u53E5\u8BDD","category":"\u7C7B\u522B"}   \u60F3\u53BB\u67D0\u7C7B\u5730\u65B9\uFF08\u8BF4\u7C7B\u522B\uFF0C\u4E0D\u5199\u5730\u5740/\u95E8\u724C/\u5750\u6807\uFF09',
+  "\u4E0D\u8981\u4E3A\u4E86\u300C\u6709\u4EA7\u51FA\u300D\u800C\u8BF4\u8981\u51FA\u95E8\uFF1B\u4E0D\u8981\u63D0\u5230\u5750\u6807\u3001\u95E8\u724C\u6216\u4EFB\u4F55\u5B9A\u4F4D\u7EC6\u8282\u3002\u53EA\u7528 JSON \u56DE\u7B54\u3002"
+].join("\n");
+function sanitizePersonaText(raw, maxChars = 1200) {
+  const lines = String(raw ?? "").split(/\r?\n/);
+  const kept = [];
+  let total = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let leaks = [];
+    try {
+      leaks = scanTextForLeak(trimmed);
+    } catch {
+      leaks = [];
+    }
+    if (leaks.length > 0) continue;
+    if (total + trimmed.length > maxChars) break;
+    kept.push(trimmed);
+    total += trimmed.length;
+  }
+  return kept.join("\n");
+}
+var clip2 = (text, max) => {
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}\u2026`;
+};
+var readModelText = (result) => typeof result === "string" ? { text: result } : { text: result?.text ?? "", totalTokens: result?.totalTokens };
+function createTravelDecisionPort(input) {
+  const persona = sanitizePersonaText(String(input.persona ?? ""), 1200);
+  const memory = sanitizePersonaText(String(input.memory ?? ""), 600);
+  let lastUsage;
+  const call = async (system, user) => {
+    const result = readModelText(await input.callModel({ system, user }));
+    if (typeof result.totalTokens === "number" && result.totalTokens > 0) {
+      lastUsage = Math.trunc(result.totalTokens);
+    }
+    return result.text;
+  };
+  const contextLines = () => {
+    const parts = [];
+    if (persona) parts.push(`\u3010\u4F60\u662F\u8C01\u3011${persona}`);
+    if (memory) parts.push(`\u3010\u4F60\u6700\u8FD1\u8BB0\u5F97\u7684\u4E8B\u3011${memory}`);
+    return parts;
+  };
+  return {
+    lastUsageTokens: () => lastUsage,
+    async proposeIntent({ homeLabel, minutesSinceLastOuting }) {
+      const parts = contextLines();
+      if (homeLabel) {
+        const safeHome = sanitizePersonaText(homeLabel, 40);
+        if (safeHome) parts.push(`\u3010\u4F60\u73B0\u5728\u5728\u5BB6\u91CC\u3011${safeHome}`);
+      }
+      if (typeof minutesSinceLastOuting === "number" && Number.isFinite(minutesSinceLastOuting)) {
+        parts.push(`\u3010\u4E0A\u4E00\u8D9F\u51FA\u95E8\u3011\u5927\u7EA6 ${Math.max(0, Math.round(minutesSinceLastOuting))} \u5206\u949F\u524D\u7ED3\u675F`);
+      }
+      const user = parts.join("\n\n") || "\uFF08\u6CA1\u6709\u989D\u5916\u80CC\u666F\uFF09";
+      const safe = assertPromptSafe(user);
+      if (!safe.ok) throw new Error("travel-intent-context-unsafe");
+      const raw = await call(INTENT_SYSTEM_PROMPT, safe.text);
+      const json3 = extractJsonObject(raw);
+      if (!json3) throw new Error("travel-intent-non-json");
+      return json3;
+    },
+    async nextSegment(context) {
+      const parts = contextLines();
+      parts.push(`\u3010\u8FD9\u6B21\u51FA\u95E8\u7684\u60F3\u6CD5\u3011${clip2(context.wishText, 120) || "\u968F\u4FBF\u8D70\u8D70"}`);
+      const where = [];
+      if (context.homeLabel) where.push(`\u4F4F\u5904\uFF1A${clip2(context.homeLabel, 40)}`);
+      if (context.hereLabel) where.push(`\u73B0\u5728\u5728\u8FD9\u91CC\uFF1A${clip2(context.hereLabel, 40)}`);
+      where.push(`\u5DF2\u7ECF\u8D70\u4E86 ${Math.max(0, Math.trunc(context.segmentsSoFar))} \u6BB5\uFF0C\u51FA\u95E8\u7EA6 ${Math.max(0, Math.trunc(context.minutesOut))} \u5206\u949F`);
+      where.push(context.minutesHome === null ? "\u8D70\u56DE\u5BB6\u8981\u591A\u4E45\uFF1A\u8FD8\u4E0D\u77E5\u9053" : `\u8D70\u56DE\u5BB6\u5927\u7EA6 ${Math.max(0, Math.trunc(context.minutesHome))} \u5206\u949F`);
+      parts.push(`\u3010\u73B0\u5728\u7684\u4F4D\u7F6E\u3011
+${where.join("\n")}`);
+      if (context.candidates.length > 0) {
+        parts.push(
+          "\u3010\u9644\u8FD1\u8FD8\u80FD\u53BB\u7684\u5730\u65B9\u3011\n" + context.candidates.map((c, i) => `${i + 1}. id=${c.id} \uFF5C ${clip2(c.label, 40)}${c.category ? ` \uFF5C ${clip2(c.category, 20)}` : ""}${typeof c.distanceM === "number" ? ` \uFF5C \u7EA6 ${Math.round(c.distanceM)} \u7C73` : ""}`).join("\n")
+        );
+      } else {
+        parts.push("\u3010\u9644\u8FD1\u8FD8\u80FD\u53BB\u7684\u5730\u65B9\u3011\u8FD9\u4E00\u8F6E\u6CA1\u67E5\u5230\uFF08\u53EA\u80FD stay / return / stop\uFF09");
+      }
+      const user = parts.join("\n\n");
+      const safe = assertPromptSafe(user);
+      if (!safe.ok) throw new Error("travel-segment-context-unsafe");
+      const raw = await call(SEGMENT_SYSTEM_PROMPT, safe.text);
+      const json3 = extractJsonObject(raw);
+      if (!json3) throw new Error("travel-segment-non-json");
+      return json3;
+    },
+    async choose({ wishText, candidates, rerollsUsed }) {
+      const parts = [];
+      if (persona) parts.push(`\u3010\u4F60\u662F\u8C01\u3011${persona}`);
+      if (memory) parts.push(`\u3010\u4F60\u6700\u8FD1\u8BB0\u5F97\u7684\u4E8B\u3011${memory}`);
+      if (wishText) parts.push(`\u3010\u8FD9\u6B21\u7684\u60F3\u6CD5\u3011${clip2(wishText, 120)}`);
+      parts.push(
+        "\u3010\u53EF\u53BB\u7684\u5730\u65B9\u3011\n" + candidates.map((c, i) => `${i + 1}. id=${c.id} \uFF5C ${clip2(c.label, 40)}${c.category ? ` \uFF5C ${clip2(c.category, 20)}` : ""}${typeof c.distanceM === "number" ? ` \uFF5C \u7EA6 ${Math.round(c.distanceM)} \u7C73` : ""}`).join("\n")
+      );
+      if (rerollsUsed > 0) parts.push(`\uFF08\u4F60\u5DF2\u7ECF\u8981\u6C42\u6362\u8FC7 ${rerollsUsed} \u6B21\u4E86\uFF0C\u522B\u518D\u65E0\u8111\u6362\u3002\uFF09`);
+      const user = parts.join("\n\n");
+      const safe = assertPromptSafe(user);
+      if (!safe.ok) throw new Error("travel-decision-context-unsafe");
+      const raw = await call(SYSTEM_PROMPT, safe.text);
+      const json3 = extractJsonObject(raw);
+      if (!json3) throw new Error("travel-decision-non-json");
+      return json3;
+    }
+  };
+}
+function extractJsonObject(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(text.slice(start, i + 1));
+          return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// worker/amsg/src/travel/credentials.ts
+var travelCredIdFor = (charId) => `char:${charId}/chat`;
+async function resolveTravelCredential(args) {
+  const { db, userId, userKey, credId } = args;
+  if (!credId) return null;
+  let rows = [];
+  try {
+    if (typeof db.getLlmCredentials === "function") {
+      rows = await db.getLlmCredentials(userId, [credId]);
+    } else if (typeof db.prepare === "function") {
+      const result = await db.prepare("SELECT cred_id, encrypted_value FROM llm_credentials WHERE user_id = ? AND cred_id = ?").bind(userId, credId).all();
+      rows = result?.results ?? [];
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const row = rows.find((candidate) => candidate?.cred_id === credId);
+  if (!row || typeof row.encrypted_value !== "string" || !row.encrypted_value) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(await decryptFromStorage(row.encrypted_value, userKey));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const value = parsed;
+  const apiUrl = typeof value.apiUrl === "string" ? value.apiUrl.trim() : "";
+  const apiKey = typeof value.apiKey === "string" ? value.apiKey.trim() : "";
+  const primaryModel = typeof value.primaryModel === "string" ? value.primaryModel.trim() : "";
+  if (!apiUrl || !apiKey || !primaryModel) return null;
+  return { apiUrl, apiKey, primaryModel };
+}
+async function resolveTravelModelCredentialsForUser(args) {
+  const masterKey = typeof args.masterKey === "string" ? args.masterKey : "";
+  if (!masterKey) return null;
+  let userKey;
+  try {
+    userKey = await deriveUserEncryptionKey(args.userId, masterKey);
+  } catch {
+    return null;
+  }
+  const credential = await resolveTravelCredential({
+    db: args.db,
+    userId: args.userId,
+    userKey,
+    credId: travelCredIdFor(args.charId)
+  });
+  if (!credential) return null;
+  return {
+    baseUrl: credential.apiUrl,
+    apiKey: credential.apiKey,
+    model: credential.primaryModel
+  };
+}
+
+// worker/amsg/src/travel/llmLedger.ts
+var DAY_MS3 = 24 * 60 * 60 * 1e3;
+var toCount = (value) => {
+  const n = Math.trunc(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+var dayStartMsFromKey = (key, nowMs) => {
+  const parsed = Date.parse(`${key}T00:00:00.000Z`);
+  if (Number.isFinite(parsed)) return parsed;
+  return nowMs - DAY_MS3;
+};
+function createAutonomyLlmLedgerPort(options) {
+  const { db, charId } = options;
+  const tz = options.budgetTz?.trim() || "Asia/Shanghai";
+  const dateKeyOf = options.dateKeyOf ?? ((nowMs) => dayKey(nowMs, tz));
+  const dayStartMsOf = options.dayStartMsOf ?? ((nowMs) => dayStartMsFromKey(dateKeyOf(nowMs), nowMs));
+  const newRunId = options.newRunId ?? (() => `travel-run-${crypto.randomUUID()}`);
+  return {
+    async read({ userId, nowMs }) {
+      try {
+        const guardrails = await options.readGuardrails();
+        if (!guardrails) return null;
+        const usedTokens = await sumReservedAutonomyTokensSince(db, charId, dayStartMsOf(nowMs));
+        return {
+          usedTokens: toCount(usedTokens),
+          limitTokens: toCount(guardrails.dailyTokenBudget),
+          paused: guardrails.paused !== false
+        };
+      } catch {
+        return null;
+      }
+    },
+    async reserve({ userId, tokens, idempotencyKey, nowMs }) {
+      const dateKey = dateKeyOf(nowMs);
+      try {
+        const guardrails = await options.readGuardrails();
+        if (!guardrails || guardrails.paused) return { ok: false, code: "BUDGET_BLOCKED" };
+        const limit = toCount(guardrails.dailyTokenBudget);
+        if (limit <= 0) return { ok: false, code: "BUDGET_ZERO" };
+        const claimed = await claimGlobalAutonomyBudget(db, {
+          userId,
+          dateKey,
+          limit,
+          nowMs
+        });
+        if (!claimed) return { ok: false, code: "BUDGET_BLOCKED" };
+        const inserted = await insertAutonomyPlanRun(db, {
+          id: newRunId(),
+          planId: `travel:${charId}`,
+          charId,
+          idempotencyKey,
+          reservedTokens: toCount(tokens),
+          nowMs
+        });
+        if (!inserted) {
+          const row = await db.prepare("SELECT status FROM autonomy_plan_runs WHERE idempotency_key = ?").bind(idempotencyKey).first();
+          await releaseGlobalAutonomyBudget(db, { userId, dateKey, nowMs });
+          if (row && String(row.status) === "reserved") {
+            return { ok: true, reservationId: idempotencyKey };
+          }
+          return { ok: false, code: "BUDGET_BLOCKED" };
+        }
+        return { ok: true, reservationId: idempotencyKey };
+      } catch {
+        return { ok: false, code: "BUDGET_BLOCKED" };
+      }
+    },
+    async settle({ reservationId, actualTokens, nowMs }) {
+      try {
+        await updateAutonomyPlanRun(db, {
+          idempotencyKey: reservationId,
+          status: "settled",
+          actualTokens: toCount(actualTokens),
+          nowMs
+        });
+      } catch {
+      }
+    },
+    async release({ userId, reservationId, nowMs }) {
+      try {
+        await releaseGlobalAutonomyBudget(db, { userId, dateKey: dateKeyOf(nowMs), nowMs });
+        await updateAutonomyPlanRun(db, {
+          idempotencyKey: reservationId,
+          status: "released",
+          nowMs
+        });
+      } catch {
+      }
+    }
+  };
+}
+
 // utils/airp/chatLifeWorkflow.ts
 var CHAT_LIFE_WORKFLOW_REQUEST_VERSION = 1;
 var CHAT_LIFE_WORKFLOW_MAX_PROPOSALS = 2;
@@ -16964,10 +21808,10 @@ var CHAT_LIFE_WORKFLOW_MAX_ACCEPTED = 1;
 var CHAT_LIFE_WORKFLOW_CHAR_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 var CHAT_LIFE_WORKFLOW_SOURCE_REF_MAX_CHARS = 120;
 var CHAT_LIFE_WORKFLOW_PLAN_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
-var isRecord7 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isRecord9 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var textOf2 = (value) => typeof value === "string" ? value.trim() : "";
 function proposalFromChatToolArgs(raw) {
-  if (!isRecord7(raw)) return { ok: false, reason: "not-object" };
+  if (!isRecord9(raw)) return { ok: false, reason: "not-object" };
   const kind = textOf2(raw.kind);
   if (!AUTONOMY_WORKFLOW_KINDS.includes(kind)) return { ok: false, reason: "unknown-kind" };
   const purpose = textOf2(raw.purpose);
@@ -16994,7 +21838,7 @@ function proposalFromChatToolArgs(raw) {
   };
 }
 function parseChatLifeWorkflowBody(raw) {
-  if (!isRecord7(raw)) return { ok: false, reason: "bad-body" };
+  if (!isRecord9(raw)) return { ok: false, reason: "bad-body" };
   if (raw.v !== CHAT_LIFE_WORKFLOW_REQUEST_VERSION) return { ok: false, reason: "bad-version" };
   const charId = textOf2(raw.charId);
   if (!CHAT_LIFE_WORKFLOW_CHAR_ID_RE.test(charId)) return { ok: false, reason: "bad-char-id" };
@@ -17018,7 +21862,7 @@ function parseChatLifeWorkflowBody(raw) {
 }
 
 // utils/airp/chatLifeWorkflowHandler.ts
-var fail2 = (status, code, message) => ({
+var fail6 = (status, code, message) => ({
   status,
   body: { success: false, error: { code, message } }
 });
@@ -17051,24 +21895,24 @@ var toPlanRecord2 = (proposal, args) => ({
 });
 async function handleChatLifeWorkflow(deps) {
   const userId = deps.userId;
-  if (!userId) return fail2(401, "UNAUTHORIZED", "\u7F3A\u5C11\u7528\u6237\u8EAB\u4EFD");
+  if (!userId) return fail6(401, "UNAUTHORIZED", "\u7F3A\u5C11\u7528\u6237\u8EAB\u4EFD");
   const parsed = parseChatLifeWorkflowBody(deps.rawBody);
-  if (!parsed.ok) return fail2(400, "INVALID_REQUEST", `\u8BF7\u6C42\u4F53\u4E0D\u5408\u6CD5\uFF08${parsed.reason}\uFF09`);
+  if (!parsed.ok) return fail6(400, "INVALID_REQUEST", `\u8BF7\u6C42\u4F53\u4E0D\u5408\u6CD5\uFF08${parsed.reason}\uFF09`);
   const body = parsed.body;
   if (await deps.isUserPaused(userId)) {
-    return fail2(409, "AUTONOMY_PAUSED", "\u81EA\u4E3B\u751F\u6D3B\u5DF2\u6682\u505C");
+    return fail6(409, "AUTONOMY_PAUSED", "\u81EA\u4E3B\u751F\u6D3B\u5DF2\u6682\u505C");
   }
   const pack = await deps.loadPack({ userId, charId: body.charId });
-  if (!pack) return fail2(409, "FIRE_PACK_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u6709\u53EF\u7528\u7684\u81EA\u4E3B\u914D\u7F6E");
+  if (!pack) return fail6(409, "FIRE_PACK_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u6709\u53EF\u7528\u7684\u81EA\u4E3B\u914D\u7F6E");
   if (body.action === "cancel") {
     const planId = body.planId ?? "";
     const plan = await deps.loadPlan(planId);
     if (!plan || plan.charId !== body.charId) {
-      return fail2(404, "PLAN_NOT_FOUND", "\u6CA1\u6709\u8FD9\u6761\u5B89\u6392");
+      return fail6(404, "PLAN_NOT_FOUND", "\u6CA1\u6709\u8FD9\u6761\u5B89\u6392");
     }
     const cancelled = await deps.cancelPlan({ planId, charId: body.charId, reason: "role-cancelled" });
     if (!cancelled) {
-      return fail2(409, "PLAN_NOT_CANCELLABLE", "\u8FD9\u6761\u5B89\u6392\u5DF2\u7ECF\u5728\u505A\u6216\u8005\u5DF2\u7ECF\u7ED3\u675F\uFF0C\u64A4\u4E0D\u56DE\u6765");
+      return fail6(409, "PLAN_NOT_CANCELLABLE", "\u8FD9\u6761\u5B89\u6392\u5DF2\u7ECF\u5728\u505A\u6216\u8005\u5DF2\u7ECF\u7ED3\u675F\uFF0C\u64A4\u4E0D\u56DE\u6765");
     }
     return {
       status: 200,
@@ -17077,7 +21921,7 @@ async function handleChatLifeWorkflow(deps) {
   }
   const autonomy = pack.autonomy;
   if (autonomy?.enabled !== true) {
-    return fail2(409, "AUTONOMY_DISABLED", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u5F00\u81EA\u4E3B\u751F\u6D3B");
+    return fail6(409, "AUTONOMY_DISABLED", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u5F00\u81EA\u4E3B\u751F\u6D3B");
   }
   const ctx = {
     nowMs: deps.nowMs,
@@ -17131,7 +21975,7 @@ async function handleChatLifeWorkflow(deps) {
     queued.push({ planId: plan.id, kind: plan.kind, scheduledAt: plan.scheduledAt });
   }
   if (queued.length === 0 && deduped === 0 && capabilityDenied > 0) {
-    return fail2(403, "CAPABILITY_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u73B0\u5728\u6CA1\u6709\u8FD9\u7C7B\u5199\u5165\u6743\u9650");
+    return fail6(403, "CAPABILITY_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u73B0\u5728\u6CA1\u6709\u8FD9\u7C7B\u5199\u5165\u6743\u9650");
   }
   return {
     status: 200,
@@ -17771,7 +22615,7 @@ var amsgHooks = {
       throw fireStateError("task metadata \u7F3A charId", { taskId: ctx.task.id });
     }
     const instant = isInstantChatTask(ctx.task.metadata ?? {});
-    const fail3 = (reason, extra) => {
+    const fail7 = (reason, extra) => {
       if (instant && typeof ctx.task.uuid === "string" && ctx.task.uuid) {
         if (typeof ctx.writeState === "function") {
           void writeChatFail(ctx.writeState, charId, {
@@ -17793,7 +22637,7 @@ var amsgHooks = {
       try {
         return await unpackStateValue(value);
       } catch (error) {
-        throw fail3(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
+        throw fail7(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
       }
     };
     const taskMeta = ctx.task.metadata ?? {};
@@ -17803,13 +22647,13 @@ var amsgHooks = {
     if (taskKind) {
       const handler = FIRE_KIND_HANDLERS[taskKind];
       if (!handler) {
-        throw fail3(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
+        throw fail7(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
       }
       let plan;
       try {
         plan = await handler.beforeFire({ ctx, charId, taskMeta });
       } catch (error) {
-        throw fail3(error instanceof Error ? error.message : String(error), { kind: taskKind });
+        throw fail7(error instanceof Error ? error.message : String(error), { kind: taskKind });
       }
       if ("skip" in plan) {
         console.log("[amsg:kind-skip]", { taskId: ctx.task.id, kind: taskKind, reason: plan.reason });
@@ -17840,12 +22684,12 @@ var amsgHooks = {
       return { skip: true };
     }
     const packRow = charRows.find((r) => r.key === AMSG_FIRE_PACK_KEY);
-    if (!packRow) throw fail3("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
+    if (!packRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
     const packJson = await unpackOrFail("fire_pack", packRow.value);
     const pack = parseFirePack(packJson);
-    if (!pack) throw fail3(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
+    if (!pack) throw fail7(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
     if (instant && !pack.chat) {
-      throw fail3("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
+      throw fail7("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
     }
     if (!instant && pack.template === AMSG2_INSTANT_STUB_TEMPLATE) {
       console.warn("[amsg:fire-pack-stub] fire_pack \u8FD8\u662F\u5373\u65F6\u5BF9\u8BDD\u7684\u5360\u4F4D\u6A21\u677F\uFF0C\u7B49\u5BA2\u6237\u7AEF\u8865\u4F20\u540E\u91CD\u8BD5", {
@@ -17856,7 +22700,7 @@ var amsgHooks = {
     }
     const occurrenceMs = Date.parse(String(ctx.task.nextSendAt));
     if (!Number.isFinite(occurrenceMs)) {
-      throw fail3("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
+      throw fail7("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
     }
     const presenceLastUserMessageAt = presence?.charId === charId ? presence.lastUserMessageAt : null;
     const expireInput = {
@@ -17880,17 +22724,17 @@ var amsgHooks = {
     }
     if (!instant) console.log("[amsg:expire-pass]", expireTrace);
     if (!instant && typeof taskMeta.amsgTaskInstruction !== "string") {
-      throw fail3("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
+      throw fail7("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
     }
     const globalRows = await ctx.readState(AMSG_GLOBAL_NAMESPACE);
     const toolPackRow = charRows.find((r) => r.key === AMSG_TOOL_PACK_KEY);
     const toolConfigRow = globalRows.find((r) => r.key === AMSG_TOOL_CONFIG_KEY);
-    if (!toolPackRow) throw fail3("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
-    if (!toolConfigRow) throw fail3("\u4E91\u7AEF\u6CA1\u6709 tool_config");
+    if (!toolPackRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
+    if (!toolConfigRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709 tool_config");
     const toolPack = parseToolPack(await unpackOrFail("tool_pack", toolPackRow.value));
-    if (!toolPack) throw fail3("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolPack) throw fail7("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const toolConfig = parseToolConfig(await unpackOrFail("tool_config", toolConfigRow.value));
-    if (!toolConfig) throw fail3("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolConfig) throw fail7("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const mcpServers = filterMcpServersForChar(toolConfig.mcpServers, charId);
     const mcpResolve = mcpServers.length ? buildMcpNameMap(mcpServers, { maxNameLen: MCP_FIRE_NAME_BUDGET }) : null;
     const mcpNative = toolConfig.mcpUseNativeTools !== false;
@@ -18443,7 +23287,7 @@ var inspectWorkerEnv = (env) => {
 };
 var CORS_ALLOW_HEADERS2 = "Content-Type, Content-Encoding, X-User-Id, X-Payload-Encrypted, X-Encryption-Version, X-Response-Encrypted, X-Client-Token";
 var CORS_EXTRA_HEADERS = ["Content-Encoding", "X-User-Id", "X-Payload-Encrypted", "X-Encryption-Version", "X-Response-Encrypted"];
-var CORS_HEADERS = {
+var CORS_HEADERS2 = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS2,
@@ -18451,7 +23295,7 @@ var CORS_HEADERS = {
 };
 var jsonWithCors = (status, body) => new Response(JSON.stringify(body), {
   status,
-  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS }
+  headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS2 }
 });
 var TICK_STALL_MINUTES = 5;
 var classifySchemaProbeError = (error) => {
@@ -18506,7 +23350,7 @@ var inspectStorage = async (env, probe) => {
     if (!present.has("scheduled_messages")) {
       return { reachable: true, missingTables, missingColumns, schemaReady: false, schemaError };
     }
-    const schemaReady2 = schema ? missingTables.length === 0 && missingColumns.length === 0 : null;
+    const schemaReady3 = schema ? missingTables.length === 0 && missingColumns.length === 0 : null;
     const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const stats = await db.prepare(
       `SELECT COUNT(*) AS pending,
@@ -18517,7 +23361,7 @@ var inspectStorage = async (env, probe) => {
     const pushRow = present.has("push_subscriptions") ? await db.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS updatedAt FROM push_subscriptions").first() : null;
     return {
       reachable: true,
-      schemaReady: schemaReady2,
+      schemaReady: schemaReady3,
       // null = 这次自查跑成了。有值时 schemaReady 必然是 null，界面照它选该说哪句话。
       schemaError,
       missingTables,
@@ -18614,6 +23458,155 @@ var PUSH_TEST_COOLDOWN_MS = 3e4;
 var resetPushTestCooldown = () => {
   lastPushTestAt = 0;
 };
+var travelJson = (status, body) => jsonWithCors(status, body);
+var travelWithCors = (response) => {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Vary", "Origin");
+  return new Response(response.body, { status: response.status, headers });
+};
+var travelLlmDailyTokens = (env) => {
+  const raw = Number(env.TRAVEL_LLM_DAILY_TOKENS ?? "");
+  if (Number.isFinite(raw) && raw > 0) return Math.trunc(raw);
+  return AUTONOMY_DAILY_TOKEN_BUDGET;
+};
+var travelModelCredentials = (env) => {
+  const baseUrl = (env.TRAVEL_LLM_BASE_URL ?? env.LLM_API_URL ?? "").trim();
+  const apiKey = (env.TRAVEL_LLM_API_KEY ?? env.LLM_API_KEY ?? "").trim();
+  const model = (env.TRAVEL_LLM_MODEL ?? env.LLM_MODEL ?? "").trim();
+  return { baseUrl, apiKey, model };
+};
+async function readTravelAnchorForTick(env, subject) {
+  try {
+    const row = await getTravelAnchor(env.DB, {
+      userId: subject.userId,
+      charId: subject.charId
+    });
+    if (!row || !(row.confirmedAt > 0) || !row.label || !row.city) return null;
+    return {
+      label: row.label,
+      city: row.city,
+      ...row.district ? { district: row.district } : {},
+      lat: row.lat,
+      lng: row.lng,
+      coordSys: row.coordSys === "wgs84" ? "wgs84" : "gcj02",
+      precision: "area",
+      confirmedAt: row.confirmedAt,
+      source: "user"
+    };
+  } catch {
+    return null;
+  }
+}
+async function readTravelPersona(env, subject) {
+  try {
+    const db = env.DB;
+    const row = await db.prepare("SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?").bind(
+      subject.userId,
+      `${AMSG_STATE_NAMESPACE_PREFIX}${subject.charId}`,
+      AMSG_FIRE_PACK_KEY
+    ).first();
+    const value = row?.value;
+    if (typeof value !== "string" || !value) return { persona: null, memory: null };
+    const userKey = await deriveUserEncryptionKey(subject.userId, env.AMSG_MASTER_KEY);
+    const pack = parseFirePack(await unpackStateValue(await decryptFromStorage(value, userKey)));
+    if (!pack) return { persona: null, memory: null };
+    return { persona: typeof pack.template === "string" ? pack.template : null, memory: null };
+  } catch {
+    return { persona: null, memory: null };
+  }
+}
+async function createTravelDecisionForSubject(env, subject) {
+  const perUser = await resolveTravelModelCredentialsForUser({
+    db: env.DB,
+    userId: subject.userId,
+    charId: subject.charId,
+    masterKey: env.AMSG_MASTER_KEY
+  });
+  const workerWideAllowed = String(env.TRAVEL_LLM_WORKER_ENV_FALLBACK ?? "").trim().toLowerCase() === "allow";
+  const workerWide = workerWideAllowed ? travelModelCredentials(env) : null;
+  const credentials = perUser ?? (isUsableModelCredentials(workerWide) ? workerWide : null);
+  if (!credentials) return null;
+  const { persona, memory } = await readTravelPersona(env, subject);
+  return createTravelDecisionPort({
+    persona,
+    memory,
+    callModel: createTravelModelCaller({ credentials })
+  });
+}
+var travelReserveFor = (env, userId) => async () => {
+  const db = env.DB;
+  const result = await reserveMapCall(db, { userId, nowMs: Date.now() });
+  return result.ok ? { allowed: true } : { allowed: false, code: result.code };
+};
+var travelProvidersFor = (env, userId) => {
+  const deps = {
+    fetch: globalThis.fetch,
+    reserveMapCall: travelReserveFor(env, userId),
+    now: Date.now
+  };
+  return [
+    createAmapProvider({ resolveKey: () => (env.AMAP_WEB_KEY ?? "").trim() || null }, deps),
+    createWorldProvider({ resolveToken: () => (env.MAPBOX_TOKEN ?? "").trim() || null }, deps)
+  ];
+};
+function createTravelAnchorSearch(env, userId) {
+  const secret = resolveTravelSecretString(env) ?? "";
+  if (secret.length < 32) return null;
+  const deps = {
+    fetch: globalThis.fetch,
+    reserveMapCall: travelReserveFor(env, userId),
+    now: Date.now
+  };
+  const amapKey = (env.AMAP_WEB_KEY ?? "").trim();
+  const mapbox = (env.MAPBOX_TOKEN ?? "").trim();
+  const provider = amapKey ? createAmapProvider({ resolveKey: () => amapKey }, deps) : mapbox ? createWorldProvider({ resolveToken: () => mapbox }, deps) : null;
+  return createAnchorSearchPort({ provider, secret, now: () => Date.now() });
+}
+async function buildTravelSubjectWiring(env, subject) {
+  const anchor = await readTravelAnchorForTick(env, subject);
+  const [decisionPort, budget, guardrails] = await Promise.all([
+    createTravelDecisionForSubject(env, subject),
+    getTravelBudget(env.DB, {
+      userId: subject.userId,
+      nowMs: Date.now()
+    }),
+    readAutonomyGuardrailsForUserDetailed(
+      env.DB,
+      env.AMSG_MASTER_KEY,
+      subject.userId
+    ).catch(() => null)
+  ]);
+  const intentWindowMs = resolveIntentProbeWindowMs({
+    configuredMinutes: Number(env.TRAVEL_INTENT_PROBE_MINUTES ?? ""),
+    guardrailGapMinutes: guardrails?.guardrails?.sameKindMinGapMinutes ?? null
+  });
+  const llmPort = createAutonomyLlmLedgerPort({
+    db: env.DB,
+    charId: subject.charId,
+    // 护栏走既有 autonomy 那一份（总暂停是硬边界）；token 上限用同一套默认口径，
+    // 可以用 TRAVEL_LLM_DAILY_TOKENS 收紧，但**不能**在这里凭空放大。
+    readGuardrails: async () => {
+      if (!guardrails) return null;
+      return {
+        // 读不出来（unreadable）时 detailed 已把 paused 置 true：按暂停处理，不默认放行。
+        paused: guardrails.guardrails.paused !== false,
+        dailyTokenBudget: travelLlmDailyTokens(env)
+      };
+    }
+  });
+  return {
+    providers: travelProvidersFor(env, subject.userId),
+    // 地区按锚点判：国内 → 高德；其余 → world（没 token 时 honest unavailable，不画直线）。
+    region: inferRegionFromAnchor(anchor),
+    readAnchor: async () => anchor,
+    decisionPort,
+    llmPort,
+    intentWindowMs,
+    licensedGeometry: String(env.TRAVEL_GEOMETRY_LICENSE ?? "").trim().toLowerCase() === "allowed",
+    ...budget ? {} : {}
+  };
+}
 var src_default = {
   async fetch(request, env) {
     const pathname = new URL(request.url).pathname.replace(/\/+$/, "") || "/";
@@ -18685,6 +23678,62 @@ var src_default = {
         success: false,
         error: { code: "WORKER_CONFIG_MISSING", message: report.message, missing: report.missing }
       });
+    }
+    if (method === "POST" && (pathname.endsWith("/travel/session") || pathname.endsWith("/travel/session/exchange"))) {
+      let sessionResponse;
+      try {
+        await ensureTravelOwnerSchema(env.DB);
+        sessionResponse = await handleTravelSessionExchange(request, env, {
+          ownerStore: createD1OwnerStore(env.DB),
+          nowMs: Date.now()
+        });
+      } catch {
+        sessionResponse = jsonWithCors(503, {
+          success: false,
+          error: { code: "UNAUTHORIZED", detail: "owner-store-unconfigured" }
+        });
+      }
+      if (pathname.endsWith("/travel/session") && sessionResponse.ok) {
+        try {
+          const body = await sessionResponse.clone().json();
+          const session = body?.session ?? null;
+          if (session && typeof session.token === "string") {
+            return travelJson(200, {
+              success: true,
+              token: session.token,
+              userId: session.userId,
+              expiresAt: session.expiresAt,
+              session
+            });
+          }
+        } catch {
+        }
+      }
+      return travelWithCors(sessionResponse);
+    }
+    if (method === "GET" && pathname.endsWith("/travel/staticmap")) {
+      return handleTravelStaticMap(request, env, {
+        sessionSecret: resolveTravelSecretString(env) ?? "",
+        userId: null,
+        now: () => Date.now()
+      });
+    }
+    {
+      const travel = await handleTravelRequest(request, env, {
+        resolveSession: async (_token, req) => {
+          const resolution = await resolveTravelSession({
+            request: req ?? request,
+            env,
+            nowMs: Date.now()
+          });
+          if (resolution.ok) return { userId: resolution.userId };
+          return { ok: false, status: resolution.status, code: resolution.code, detail: resolution.reason };
+        },
+        now: () => Date.now(),
+        anchorSearchFor: (userId) => createTravelAnchorSearch(env, userId),
+        staticMapSecret: resolveTravelSecretString(env) ?? void 0
+      });
+      if (travel) return travel;
     }
     if (pathname.endsWith("/push-test")) {
       if (method !== "POST") {
@@ -19041,6 +24090,35 @@ var src_default = {
       }
     } catch (error) {
       console.error("[amsg:autonomy] \u672C\u8F6E\u8C03\u5EA6\u5931\u8D25\uFF08\u4E0B\u4E00\u5206\u949F\u91CD\u6765\uFF09", error);
+    }
+    try {
+      const travelReport = await handleTravelScheduled(null, env, {
+        now: Date.now,
+        licensedGeometry: String(env.TRAVEL_GEOMETRY_LICENSE ?? "").trim().toLowerCase() === "allowed",
+        readAnchor: (subject) => readTravelAnchorForTick(env, subject),
+        wiringForSubject: async (subject) => buildTravelSubjectWiring(env, subject),
+        // subject 枚举**不只**看已有愿望：已授权的角色每跳都会被检查一次（愿望由角色
+        // 自己在自主回合里产生，用户不必手写）。预算/暂停仍在每个主体执行前复核，
+        // 所以放宽枚举不会让未授权或零额度的角色被调用模型/地图。
+        listSubjects: (db) => listTravelTickSubjectsWithAuthorized(db),
+        prune: true
+      });
+      const touched = travelReport.outcomes.filter(
+        (entry) => entry.advanced.length > 0 || entry.planned || entry.searched || entry.decided
+      );
+      if (touched.length > 0) {
+        console.log("[amsg:travel]", {
+          subjects: travelReport.subjects,
+          touched: touched.map((entry) => ({
+            charId: entry.subject.charId,
+            advanced: entry.advanced,
+            planned: entry.planned,
+            searched: entry.searched
+          }))
+        });
+      }
+    } catch (error) {
+      console.error("[amsg:travel] \u672C\u8F6E\u51FA\u884C tick \u5931\u8D25\uFF08\u4E0B\u4E00\u5206\u949F\u91CD\u6765\uFF09", error);
     }
   }
 };

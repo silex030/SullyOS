@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { DB } from './db';
-import { MIRRORED_KEYS, healLocalStorageMirror, snapshotLocalStorageMirror } from './lsMirror';
+import { MIRRORED_KEYS, MIRROR_ASSET_ID, healLocalStorageMirror, snapshotLocalStorageMirror } from './lsMirror';
+import { LS_MIRROR_ASSET_ID } from './backupSecrets';
 
 // localStorage 镜像：模拟"浏览器清了 localStorage 但 IndexedDB 幸存"的用户现场
 // （主题回初始 / 盲盒收藏册清空 / API 配置丢失导致「更新这一天」无反应）。
@@ -8,6 +9,11 @@ describe('localStorage IndexedDB 镜像 (lsMirror)', () => {
     beforeEach(async () => {
         localStorage.clear();
         await DB.saveAssetRaw('ls_mirror_v1', null as any).catch(() => {});
+    });
+
+    it('镜像资产 id 与备份脱敏用的是同一个常量（防两边各写一份漂掉）', () => {
+        expect(MIRROR_ASSET_ID).toBe('ls_mirror_v1');
+        expect(MIRROR_ASSET_ID).toBe(LS_MIRROR_ASSET_ID);
     });
 
     it('快照 → localStorage 被清 → 回填恢复', async () => {

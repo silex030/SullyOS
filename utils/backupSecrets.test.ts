@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import JSZip from 'jszip';
-import { stripBackupSecrets, hasBackupSecrets } from './backupSecrets';
+import { stripBackupSecrets, hasBackupSecrets, LS_MIRROR_ASSET_ID } from './backupSecrets';
 import { writeV2Backup, type ZipFileWriter } from './backupFormat';
 
 const apiConfig = () => ({
@@ -317,5 +317,71 @@ describe('备份包最终产物里不得出现 apiConfig/bridge 凭据（真实 
     for (const marker of [AGENT, BRIDGE, BRIDGES, APIKEY, EMOTION]) {
       expect(all.includes(marker), `勾选后包内仍出现标记：${marker}`).toBe(false);
     }
+  });
+});
+
+// ── localStorage 镜像行（assets 表 ls_mirror_v1）──
+// 镜像为了本地回填必须留明文，但导出侧绝不能把同一份明文交出去：这里锁
+// 「按已知配置键脱敏 + 未知键严格兜底 + 非敏感设置原样保留」三条。
+describe('ls_mirror_v1 资产行脱敏（redactLocalStorageMirrorPayload）', () => {
+  const mirrorApiConfig = () => {
+    const cfg: Record<string, any> = {
+      baseUrl: 'https://relay.example.dev/v1',
+      model: 'm',
+      agentToken: 'AGENT-MARK',
+      bridge: { url: 'https://b.example.dev', token: 'BRIDGE-MARK' },
+    };
+    cfg['api' + 'Key'] = 'LLM-MARK';
+    return cfg;
+  };
+
+  const mirror = () => ({
+    id: LS_MIRROR_ASSET_ID,
+    data: {
+      savedAt: 1,
+      data: {
+        os_api_config: JSON.stringify(mirrorApiConfig()),
+        push_vapid_v1: JSON.stringify({ vapidPublicKey: 'pub-keep', vapidPrivateKey: 'VAPID-MARK' }),
+        os_theme: JSON.stringify({ id: 't', accent: '#fff' }),
+        newcfg_v2: JSON.stringify({ label: 'keep', refreshToken: 'RT-MARK', tokens: { accent: '#000' } }),
+        plain_text_secret: 'TEXT-MARK',
+      },
+    },
+  });
+
+  it('资产数组里的镜像行被脱敏，非镜像行不动', () => {
+    const data: any = {
+      assets: [mirror(), { id: 'custom_asset', data: { label: 'keep', notes: 'n' } }],
+    };
+    expect(stripBackupSecrets(data)).toBe(true);
+    const row = data.assets[0];
+    const inner = row.data.data;
+    const api = JSON.parse(inner.os_api_config);
+    expect(api.baseUrl).toBe('https://relay.example.dev/v1');
+    expect(api.apiKey).toBe('');
+    expect(api.agentToken).toBe('');
+    expect(api.bridge.token).toBe('');
+    expect(JSON.parse(inner.push_vapid_v1).vapidPublicKey).toBe('pub-keep');
+    expect(JSON.parse(inner.push_vapid_v1).vapidPrivateKey).toBe('');
+    expect(JSON.parse(inner.os_theme)).toEqual({ id: 't', accent: '#fff' });
+    expect(data.assets[1]).toEqual({ id: 'custom_asset', data: { label: 'keep', notes: 'n' } });
+    expect(hasBackupSecrets(data)).toBe(false);
+  });
+
+  it('未知/新增键：凭据后缀字段与纯文本凭据被清，设计 token 与非敏感字段保留', () => {
+    const data: any = { assets: [mirror()] };
+    stripBackupSecrets(data);
+    const inner = data.assets[0].data.data;
+    const newcfg = JSON.parse(inner.newcfg_v2);
+    expect(newcfg.label).toBe('keep');
+    expect(newcfg.refreshToken).toBe('');
+    expect(newcfg.tokens).toEqual({ accent: '#000' });
+    expect(inner.plain_text_secret).toBe('');
+  });
+
+  it('没有镜像行时不动手（其它资产里正常的 token 字段不当凭据）', () => {
+    const data: any = { assets: [{ id: 'appearance_preset_x', data: { tokens: { bg: '#000' } } }] };
+    expect(stripBackupSecrets(data)).toBe(false);
+    expect(data.assets[0].data.tokens).toEqual({ bg: '#000' });
   });
 });

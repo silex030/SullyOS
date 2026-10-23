@@ -42,6 +42,7 @@ import ChatHeader from '../components/chat/ChatHeaderShell';
 import CharacterEntryTransition from '../components/chat/CharacterEntryTransition';
 import ChromeCssEditor from '../components/chat/ChromeCssEditor';
 import ChatInputArea from '../components/chat/ChatInputArea';
+import { TravelChatEntry } from '../components/travel/TravelOverlay';
 import InstantChatRouteNotice from '../components/chat/InstantChatRouteNotice';
 import MemoryRepairPortal from '../components/chat/MemoryRepairPortal';
 import FavoritesPortal from '../components/chat/VoiceFavoritesPortal';
@@ -4478,6 +4479,14 @@ const Chat: React.FC = () => {
 
                 {/* 开关写着「已开启」、这一轮却在本地生成时，把原因说给用户听 */}
                 <InstantChatRouteNotice charId={activeCharacterId} />
+
+                {/* 出行：当前角色在共享中且有行程时给一个紧凑入口；共享关闭 → 不渲染。
+                    只显示相位，点开由全局悬浮层的面板负责，不在聊天里伪造路线。 */}
+                {char && (
+                    <div className="flex justify-center pb-1">
+                        <TravelChatEntry charId={char.id} charName={char.name} />
+                    </div>
+                )}
 
                 <ChatInputArea
                     input={input} setInput={handleInputChange}

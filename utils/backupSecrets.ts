@@ -23,6 +23,119 @@ const blankField = (hit: { hit: boolean }, obj: any, field: string): void => {
   }
 };
 
+/**
+ * `utils/lsMirror.ts` 把 localStorage 配置镜像进 IndexedDB 的 assets 行
+ * `ls_mirror_v1`，而该行**会随 full/media 备份一起出包**（导出端只把
+ * `wallpaper` / `widget_*` 这类冗余行过滤掉，镜像行不在排除名单里）。镜像里存的
+ * 正是 `os_api_config` / `os_realtime_config` / `os_cloud_backup_config` /
+ * `push_vapid_v1` / `instant_push_config_v1` 的**明文 JSON**，所以只脱敏
+ * metadata 不够——分片里照样把 LLM Key、地图 Key、主代理桥 token、WebDAV 密码
+ * 一起交出去。常量放这里，让「哪一行要脱敏」和「怎么脱敏」不会各写一份而漂掉；
+ * `lsMirror.ts` 也从这里取，不再自己留一个字面量。
+ */
+export const LS_MIRROR_ASSET_ID = 'ls_mirror_v1';
+
+/** 镜像里每个键存的都是 localStorage 字符串（JSON 文本）。 */
+type MirrorMap = Record<string, unknown>;
+
+const MIRROR_KNOWN_REDACTORS: Record<string, (hit: { hit: boolean }, cfg: any) => void> = {
+  os_api_config: stripApiConfig,
+  study_api_config: stripApiConfig,
+  world_home_api: stripApiConfig,
+  os_realtime_config: stripRealtimeConfig,
+  os_cloud_backup_config: (hit, cfg) => {
+    blankField(hit, cfg, 'password');
+    blankField(hit, cfg, 'githubToken');
+  },
+  push_vapid_v1: (hit, cfg) => blankField(hit, cfg, 'vapidPrivateKey'),
+  instant_push_config_v1: (hit, cfg) => blankField(hit, cfg, 'clientToken'),
+  os_remote_vector_config: (hit, cfg) => blankField(hit, cfg, 'supabaseAnonKey'),
+  os_memory_palace_config: (hit, cfg) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    blankField(hit, cfg.embedding, 'apiKey');
+    blankField(hit, cfg.lightLLM, 'apiKey');
+    blankField(hit, cfg.rerank, 'apiKey');
+  },
+};
+
+/**
+ * 未知/新增键的兜底：只抹「值是非空字符串、字段名以凭据词结尾」的字段。
+ * 刻意不抹对象/数组、也不抹 `tokens`（设计 token）、`authMode` 这类正常配置，
+ * 避免为了安全把非敏感设置一起清空。
+ */
+const MIRROR_GENERIC_SECRET_FIELD = /(api_?key|apikey|token|secret|password|passphrase|cookie)$/i;
+
+function deepRedactMirrorValue(hit: { hit: boolean }, value: any, depth = 0): void {
+  if (depth > 6 || !value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) deepRedactMirrorValue(hit, item, depth + 1);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    const v = value[key];
+    if (typeof v === 'string') {
+      if (v !== '' && MIRROR_GENERIC_SECRET_FIELD.test(key)) {
+        value[key] = '';
+        hit.hit = true;
+      }
+      continue;
+    }
+    if (v && typeof v === 'object') deepRedactMirrorValue(hit, v, depth + 1);
+  }
+}
+
+/**
+ * 就地脱敏一条镜像载荷（`{savedAt, data:{key: jsonString}}`，也容忍直接传 map）。
+ * 按已知键走「与 metadata 同一套」脱敏器，再对剩余字段做严格兜底；非敏感字段与
+ * 无法解析成 JSON 但键名不像凭据的值原样保留（镜像仍要能回填本地配置）。
+ */
+export function redactLocalStorageMirrorPayload(hit: { hit: boolean }, payload: any): void {
+  if (!payload || typeof payload !== 'object') return;
+  const map: MirrorMap | null =
+    payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+      ? (payload.data as MirrorMap)
+      : null;
+  if (!map) return;
+
+  for (const key of Object.keys(map)) {
+    const raw = map[key];
+    if (typeof raw !== 'string' || raw === '') continue;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // 不是 JSON：键名本身像凭据才整值清空，否则保留（可能是纯文本设置）。
+      if (SECRET_KEY_PATTERN.test(key)) {
+        map[key] = '';
+        hit.hit = true;
+      }
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+
+    const known = MIRROR_KNOWN_REDACTORS[key];
+    if (known) {
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) known(hit, item?.config ?? item);
+      } else {
+        known(hit, parsed);
+      }
+    }
+    deepRedactMirrorValue(hit, parsed);
+    map[key] = JSON.stringify(parsed);
+  }
+}
+
+/** 备份里的 assets 行数组：只处理镜像行，其它 asset 行原样不动。 */
+function stripAssetsSecrets(hit: { hit: boolean }, assets: any): void {
+  if (!Array.isArray(assets)) return;
+  for (const row of assets) {
+    if (!row || typeof row !== 'object') continue;
+    if (row.id !== LS_MIRROR_ASSET_ID) continue;
+    redactLocalStorageMirrorPayload(hit, row.data);
+  }
+}
+
 /** APIConfig 形态（含各家 TTS/生图 Key + 视觉副 API + 主代理/桥接凭据）。Partial 亦可。 */
 function stripApiConfig(hit: { hit: boolean }, cfg: any): void {
   if (!cfg || typeof cfg !== 'object') return;
@@ -128,6 +241,9 @@ export function stripBackupSecrets(data: any, opts: { keepBackendConnection?: bo
   stripOpaqueMap(hit, data.worldHomeLocal);
   // Google 桥 token（localStorage aetheros.google.*）：随包带出即失守，键名命中 token 启发式即清空。
   stripOpaqueMap(hit, data.googleLocal);
+  // localStorage 镜像行（assets 表里的 ls_mirror_v1）：里面有同一批配置的明文，
+  // 只脱敏 metadata 会把钥匙留在 stores/assets.*.json 里。
+  stripAssetsSecrets(hit, data.assets);
 
   return hit.hit;
 }

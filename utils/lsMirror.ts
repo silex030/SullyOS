@@ -17,6 +17,7 @@
  */
 
 import { DB } from './db';
+import { LS_MIRROR_ASSET_ID } from './backupSecrets';
 
 /**
  * 参与镜像的键。收录标准：用户手动配置或长期积累、丢了没法凭空再生、体积是小段
@@ -45,7 +46,9 @@ export const MIRRORED_KEYS: readonly string[] = [
     'os_last_active_char_id',
 ];
 
-const MIRROR_ASSET_ID = 'ls_mirror_v1';
+// 资产 id 与「备份脱敏」共用同一份常量（utils/backupSecrets.ts）：导出时正是靠它
+// 认出这行镜像并清掉里面的明文密钥，两边各写一个字面量就会悄悄漂掉。
+export const MIRROR_ASSET_ID = LS_MIRROR_ASSET_ID;
 const SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 
 type MirrorPayload = { savedAt: number; data: Record<string, string> };

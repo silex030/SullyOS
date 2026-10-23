@@ -248,3 +248,34 @@
 - 2026-10-23：**本地记忆候选（v3.20，未提交/未部署）**——本地 EmbeddingGemma2 主代理路由三路径挂载 + `sullyos.service` 载入受限 env 文件（未重启）+ 向量空间指纹（检索/去重严格分区，legacy 不当新模型）+ 记忆宫殿本地模型卡（重建可取消/可续）+ Supabase 1024 不兼容显式告警（不静默假同步、无 DDL）+ 设置页本地语音改标「未启用」+ 版本号 `v3.20 (Local Memory)`。门禁：全量 566 文件 / 6853 用例全绿、`tsc` 0 新增（55 条，基线实测 56）、`build:workers` 两次同哈希、`vite build` 通过；`check:workers` 因未提交必红。详见 `/srv/model-tests/next-phase/INTEGRATION-CANDIDATE.md`。
 - 2026-10-23：**本地记忆（v3.20 Local Memory）发布**——本地 EmbeddingGemma2 主代理三路径 + 受限 env + 向量空间指纹严格分区 + 记忆宫殿本地模型卡 + Supabase 不兼容显式告警（无 DDL）+ 设置页本地语音改标「未启用」；发布轮只做 3 项有限修正（删坏自启脚本、`/health` 去内网地址回显、语音项标题准确化）并补守卫用例。SoVITS 仍停用、CF Google secret 仍未同步、前端备份 ZIP 仍未加密、索引需用户自选重建。门禁与线上读回见 `/srv/model-tests/next-phase/RELEASE-RESULT.md`。
 - 2026-10-22：**发布候选收尾（三路阻断修复后的最终打通）**——①记忆协商开关前后台统一走 `getMemoryNegotiationGate()`（正式 config 的 false 压过旧 localkey，config 读坏按关且不回落）；②导入备份后清空旧协商账本（OSContext 收尾 + `db.importFullData` 两条入口，幂等，清不掉如实提示）；③角色面板改用权威快照显示全局护栏（读不到云端显示「后台未确认」，不再拿默认 6 次的兜底值冒充）；④补上「角色自己排着的事」提示段（服务端 id + 标题 + 能不能撤），聊天工具登记/撤销后同步本地 `airp_workflow_plans`，取消不再被同一条用户消息误判；⑤人工重试保留旧 run 审计（released 行改名让位而非删除），旧 task payload 只认自己那一代计划；⑥全局护栏新增受鉴权专用 CAS 写路由（`POST /autonomy-guardrails/patch`），并在泛写入口拦「把远端暂停改回未暂停」的普通保存，带真 SQL 并发回归。未提交/未部署；门禁与产物哈希见 `/srv/model-tests/implementation/RELEASE-CANDIDATE.md`。
+- 2026-10-23：**角色自主出行（v3.21 Travel，未提交/未部署）**——B0 契约 + B1 存储预算 + B2 高德/Mapbox provider + B3 tick/路由 + B4 前端数据层 + B5 悬浮球真地图面板 + B6 设置/聊天卡 + 安全 lane（会话 + 镜像脱敏）合并进同一工作树并做集成：`index.ts` 在配置门后、未知 fallback 前挂 `/travel/*`（session/exchange、state、share、budget、settings、char、anchor、anchor/search、context、config、staticmap），`scheduled()` 内接 `handleTravelScheduled`。集成期**改语义**的四处：①预算从「每 tick 预留一次」改为**每个真实地图请求在 provider 出口扣一格**（tick 只做只读闸门，避免双扣）；②`settleMapCall` 默认**不退款**，只有「一个字节都没发出去」才显式 `refund:true`（否则失败重试免费）；③`/travel/anchor` 单数 + `placeId` 短期签名令牌（前端不传坐标，服务端解析），搜索走城市内检索；④会话统一：`POST /travel/session` = exchange 摊平别名，前端用一次性配对码自动续期，不再要求用户每次输 token。契约从 7 表扩到 10 表（`travel_anchors` / `travel_char_settings` / `travel_trip_positions`），设置加 `enabled`、角色级启用位、历史按共享代际过滤。新增端到端回归 `worker/amsg/src/travel/integration.test.ts`（真 SQLite + 真 provider + 注入 fetch）与挂载回归 `mount.test.ts`。未接通项（高德 Key 权限、`/_AMapService` 反代、Mapbox、per-user LLM 凭据解密、真机视觉）见 `docs/travel-contract.md` §11.5。
+- 2026-10-23（补齐批，仍未提交/未部署）：**角色自己产生出行愿望 + 用用户自己的模型凭据**。
+  ① 自主回合 JSON 增加**可选** `travel:{want:"go|wander|none",wish?,category?}`（提示词 + 解析 + 落库 +
+  tick 枚举一条链），愿望由角色在既有自主回合里自然说出，用户不必手写；缺省/`none` 就是不出门，
+  不按次数强制。解析走 `travel/intent.ts`（`sanitizeWishText` 拒坐标/门牌），落库前复核总开关、
+  角色位、预算行、暂停与地图额度，3 小时内同类去重，**不额外调模型**。
+  ② tick 的 subject 枚举改为「愿望 ∪ 已授权角色」（`listTravelTickSubjectsWithAuthorized`），
+  没愿望的角色也会被检查但不会花模型/地图（执行前复核仍在）。
+  ③ 决策模型凭据改为 **per-user `llm_credentials`**（`char:<charId>/chat`，与自主生活同口径），
+  用上游同一份信封解密（`deriveUserEncryptionKey` + `decryptFromStorage`）；解不开即端口缺席，
+  worker 级 `LLM_*` 只在 `TRAVEL_LLM_WORKER_ENV_FALLBACK=allow` 时兜底（线上那份已失效）。
+  ④ 语义纠正：`placeId` 是 **HMAC 完整性签名、不是加密**（base64url 可解出坐标），只回本人配置界面，
+  禁止进模型/日志/推送/备份；不称「隐私加密」。
+  ⑤ 修掉一个真实烧额度的缺陷：tick §3 原把在途代自己的 `chosen` 愿望当「更新一代」，导致每跳重排路线；
+  现在比对 `dedupeKey` 只认**另一条**愿望。回归 `worker/amsg/src/travel/intent.test.ts`（14 例，真 SQLite）。
+
+  - 2026-10-23（同日补）：**闲逛分段 / 停留 / 在外结束 / 返程**接上。到点停留后由角色自己选
+  `next`（换站，真候选 + 真道路折线）/ `stay`（延长停留）/ `return`（沿真实路线回确认锚点，
+  `returnAt` 才变 `returned`）/ `stop`（终态 `stopped`：在外结束，不假装到家）。没有模型或额度
+  就留在原地、愿望保留。愿望走完闭环成 `completed`（否则 `chosen` 会每跳重排）。另补一条
+  **不依赖推送订阅**的自主意愿探针（窗口可配：`TRAVEL_INTENT_PROBE_MINUTES` → 用户自己配的
+  autonomy 同类最小间隔 → 3h 兜底，复用 autonomy 账本），因为上游自主回合
+  缺订阅会整跳跳过（上游 409）。回归 `worker/amsg/src/travel/wander.test.ts`（10 例，真 SQLite
+  + 注入 fetch）。
+  **终态与文案一致性（收尾轮补）**：`stopped`（在外结束）/`completed`（愿望闭环）加进契约后，
+  `TRAVEL_PHASE_COPY`、提示词相位文案、`resolvePanelStatus`（静音终态、不给 ETA）、
+  `getActiveTravelTrip` / 静态图判定（改用 `isTerminalStatus`）、保留期清理（`completed` 也按
+  过期删）逐项对齐；`dwelling → stopped` 补进 `TRAVEL_TRANSITIONS`（此前 tick 真写该边、
+  契约表却没有）。
+  **未完成**：高德/Mapbox 真实账号权限与配额、`/_AMapService` 反代、真机视觉验收（见
+  `docs/travel-contract.md` §11.5）。

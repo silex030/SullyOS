@@ -43,6 +43,7 @@ import { mergeSystemMessages } from './systemMessageMerge';
 import { injectWorldbookDepthEntries, injectDepthEntries, resolveWorldbookEntries } from './worldbook';
 import { normalizeTranslationLangLabel } from './translationLang';
 import { cleanApiMessages, flattenImageContentParts } from './promptMessageCleanup';
+import { getTravelRuntime } from './travel/runtime';
 import { materializeVisionDescriptions } from './visionApi';
 import type { RecallEntryPoint, RecallTrace } from './memoryPalace/trace';
 import { loadCollaborationFileCabinetBlock } from '../features/collaboration/chatLibrary';
@@ -591,6 +592,15 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     // 永远最后一句的约定。空串 / undefined 一律不拼，保证 AIRP 关闭时输出与历史逐字一致。
     if (typeof input.airpInstruction === 'string' && input.airpInstruction.length > 0) {
         volatileTail += '\n\n' + input.airpInstruction;
+    }
+
+    // 出行：角色的「自知」块（地名语义 + 阶段 + 有依据的 ETA），来自鉴权后的
+    // `/travel/context` 并已过 buildTravelPromptBlock 脱敏。共享关闭也照样注入
+    // （角色当然知道自己要去哪），但**不**拿公开共享快照当唯一来源；
+    // 没读到就整段不注入，不发请求、不新增 LLM 调用。
+    const travelBlock = getTravelRuntime().promptBlock(char.id);
+    if (travelBlock) {
+        volatileTail += '\n\n' + travelBlock;
     }
 
     // 「关于对方的表达」+「回到你自己」必须是易变尾段的最后内容：修复旧版把双语/HTML/

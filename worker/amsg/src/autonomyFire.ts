@@ -93,6 +93,8 @@ import type {
   KindSessionCtx,
 } from './fireKinds';
 import { buildWantToSharePush } from './instantChat';
+import { parseTravelIntent, recordTravelIntent } from './travel/intent';
+import { ensureTravelSchema } from './travel/store';
 import type { ResolvedAirpAutonomy } from '../../../utils/airp/autonomySettings';
 import { resolveScheduleSlots } from '../../../utils/scheduleInjection';
 
@@ -246,6 +248,11 @@ export interface AutonomyRoundReply {
    * 真正落计划前必须过 lifeWorkflow 的白名单校验器；这里只负责「掏出来」。
    */
   workflowCandidates: unknown[];
+  /**
+   * B7：可选的一次「想不想出门」。原样透传，由 `travel/intent.ts` 做严格解析
+   * （缺省 = 这一轮没提，等于不出门；写坏了只丢这一段，不判整轮失败）。
+   */
+  travelIntent: unknown;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -343,15 +350,20 @@ export function parseAutonomyRoundReply(text: string): AutonomyRoundReply | null
     .map(toProposedEvent)
     .filter((item): item is AutonomyProposedEvent => item !== null);
   const workflowCandidates: unknown[] = raw.workflows ?? [];
+  // 出行是**可选**产出：形状在这里不校验（各段由 travel/intent.ts 的严格解析器负责），
+  // 坏值也绝不能让整轮自主回合失败——那等于用一次手滑吞掉角色这一轮的全部生活。
+  const travelIntent = raw.travel;
 
   const hasKnownField = raw.rest !== undefined || raw.experiences !== undefined
-    || raw.proposedEvents !== undefined || raw.workflows !== undefined;
+    || raw.proposedEvents !== undefined || raw.workflows !== undefined
+    || raw.travel !== undefined;
   if (!hasKnownField) return null;
   return {
     rested: rest || (experiences.length === 0 && proposedEvents.length === 0),
     experiences,
     proposedEvents,
     workflowCandidates,
+    travelIntent,
   };
 }
 
@@ -476,6 +488,9 @@ export const AUTONOMY_ROUND_OUTPUT = [
     + '"trigger":{"kind":"idle","afterMinutes":120} 或 {"kind":"at_time","atLocalTime":"21:30"},'
     + '"action":{"kind":"与外面一致","title":"标题","maxChars":400},"expiresInHours":24}。'
     + '它只是提议，不是命令，也不能带网址、工具、代码或权限；不写就什么都不做。',
+  '出门是可选的一段，不是任务：想出去就写 "travel":{"want":"go","wish":"一句话（说想去哪类地方，不写地址/门牌/坐标）"}；'
+    + '只想随便走走就写 "travel":{"want":"wander"}；'
+    + '不想出门就不写这个字段（或写 "want":"none"）。没有人在要求你出门，也没有次数指标。',
   '想说的那条放 experiences 最前面。这一轮什么都不想记就写 {"v":1,"rest":true}。',
   '除了这个 JSON 什么都别输出（不要解释、不要代码块之外的话）。',
 ].join('\n');
@@ -1403,6 +1418,34 @@ export const autonomyRoundHandler: FireKindHandler = {
     }
 
     const usage = readUsage(ctx);
+
+    // B7：这一轮角色有没有顺口说「想出去」。**不额外发模型请求**（就长在上面这份 JSON 里），
+    // 落库前先过授权/预算复核；任何一步失败只记日志，绝不把整轮自主回合判失败。
+    const travelIntent = parseTravelIntent(reply.travelIntent);
+    if (travelIntent === null) {
+      console.warn('[amsg:autonomy] 出行意图形状不合法（这一轮不建愿望）', carried.charId);
+    } else if (travelIntent.kind !== 'none') {
+      try {
+        const ownerUserId = await readAutonomyOwnerUserId(db, carried.charId);
+        if (ownerUserId) {
+          await ensureTravelSchema(db as never);
+          const intentResult = await recordTravelIntent(db as never, {
+            userId: ownerUserId,
+            charId: carried.charId,
+            intent: travelIntent,
+            nowMs: carried.nowMs,
+          });
+          console.log('[amsg:autonomy] travel-intent', {
+            charId: carried.charId,
+            kind: travelIntent.kind,
+            written: intentResult.written,
+            reason: intentResult.reason,
+          });
+        }
+      } catch (error) {
+        console.warn('[amsg:autonomy] 出行意愿没落进愿望表（这一轮其余照常）', error);
+      }
+    }
 
     // 反刍闸：模型报上来的选题逐条比近 96h / 12 页。全撞 = 这一轮收成 rest；
     // 只撞一部分就只丢撞的那些（模型可以在同一份输出里换个题）。

@@ -178,6 +178,7 @@ import {
   AUTONOMY_SKIP_REASONS,
   createAutonomyPostTask,
   readAutonomyGuardrailsForUser,
+  readAutonomyGuardrailsForUserDetailed,
   runAutonomyTick,
   scanAutonomyPacks,
 } from './autonomyScheduler';
@@ -196,6 +197,29 @@ import {
   insertAutonomyPlan,
   type AutonomyDb,
 } from './autonomyStore';
+import {
+  createD1OwnerStore,
+  ensureTravelOwnerSchema,
+  handleTravelSessionExchange,
+  resolveTravelSecretString,
+  resolveTravelSession,
+} from './travel/auth';
+import { createTravelSessionResolver } from './travel/auth';
+import { handleTravelRequest } from './travel/routes';
+import { handleTravelScheduled, inferRegionFromAnchor } from './travel/tick';
+import { handleTravelStaticMap } from './travel/staticmap';
+import { createAnchorSearchPort } from './travel/anchorSearch';
+import { createAmapProvider } from './travel/providerAmap';
+import { createWorldProvider } from './travel/providerWorld';
+import { createTravelDecisionPort, createTravelModelCaller, isUsableModelCredentials } from './travel/modelDecision';
+import { resolveTravelModelCredentialsForUser } from './travel/credentials';
+import { listTravelTickSubjectsWithAuthorized, resolveIntentProbeWindowMs } from './travel/intent';
+import { createAutonomyLlmLedgerPort } from './travel/llmLedger';
+import { reserveMapCall as reserveTravelMapCall, getTravelBudget as getTravelBudgetRow } from './travel/budget';
+import { getTravelAnchor, type TravelDb as TravelStoreDb } from './travel/store';
+import type { TravelPlaceAnchor, TravelCoordSys } from '../../../contracts/travel';
+import type { TravelTickSubject } from './travel/tick';
+import { AUTONOMY_DAILY_TOKEN_BUDGET } from '../../../utils/airp/autonomySettings';
 import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
 import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
 import { configureAutonomyFireDb, configureAutonomyFireMasterKey, configureAutonomyHomeEnv } from './autonomyFire';
@@ -239,6 +263,42 @@ interface Env extends NativeFcmEnv {
    * 那种情况由 /instant-chat 明确报「需要更新 Worker」，见 instantChat.kickInstantTick。
    */
   INSTANT_TICK?: InstantTickNamespace;
+  /* ── 角色自主出行（travel）：全部可选，缺一项就 fail-closed，不做默认放行 ── */
+  /** 会话签名钥（≥32 字符）。缺 → 用 AMSG_MASTER_KEY 派生；两者都缺 = 出行不可用。 */
+  TRAVEL_SESSION_SECRET?: string;
+  /**
+   * owner 凭证 bootstrap 通道密钥（≥32 字符且 ≠ 共享口令）。
+   * **不挂 HTTP 路由**：只给服务端运维脚本用（见 docs/travel-contract.md 的运维段）。
+   */
+  TRAVEL_OWNER_BOOTSTRAP_SECRET?: string;
+  /** 几何持久化许可：只有 'allowed' 才把路线/位置落库。用户请求体不能解锁。 */
+  TRAVEL_GEOMETRY_LICENSE?: string;
+  /** 底图展示许可：只有 'licensed' 才给静态图缩略图。与几何是两条线。 */
+  TRAVEL_BASEMAP_LICENSE?: string;
+  /** 高德 Web 服务 Key（服务端专用；绝不能与 JS API Key 混用）。 */
+  AMAP_WEB_KEY?: string;
+  /** 国外地图 token（`pk.` 前缀）；没有 → 国外标未授权，不是「已支持」。 */
+  MAPBOX_TOKEN?: string;
+  /** 出行决策用的模型凭据（缺就用 LLM_*；再缺 → 决策端口缺席，tick 停在 wait）。 */
+  TRAVEL_LLM_BASE_URL?: string;
+  TRAVEL_LLM_API_KEY?: string;
+  TRAVEL_LLM_MODEL?: string;
+  /** 收紧出行模型每日 token（缺省沿用自主生活默认值；调大不生效，不能借此提额）。 */
+  TRAVEL_LLM_DAILY_TOKENS?: string;
+  /**
+   * 只有显式设 `allow` 才允许出行决策回落到 worker 级 `LLM_*`。
+   * 默认不看：线上那把 `LLM_API_KEY` 实测已失效，把「字段非空」当可用等于每跳白扣预算。
+   */
+  TRAVEL_LLM_WORKER_ENV_FALLBACK?: string;
+  /**
+   * 出行意图探针窗口（分钟）：同一角色这个窗口内最多问一次「想不想出去」。
+   * 不设就沿用用户自己配置的「同类动作最小间隔」（autonomy 护栏，
+   * `sameKindMinGapMinutes`，同一份授权）；两者都拿不到才用 3h 兜底。
+   */
+  TRAVEL_INTENT_PROBE_MINUTES?: string;
+  LLM_API_URL?: string;
+  LLM_API_KEY?: string;
+  LLM_MODEL?: string;
 }
 
 // ─── 满血 fire-time hooks（amsg-server 2.6.0-next.4+：含 ctx.scratch / 存储层大值分块） ───
@@ -3162,6 +3222,216 @@ export const resetPushTestCooldown = (): void => { lastPushTestAt = 0; };
 
 // /instant-chat 回完 202 之后的那一跳跑在 InstantTickDO 的 alarm 里，不占这个请求的
 // 生命周期（waitUntil 只有 30 秒，见 InstantTickDO 的注释）。
+/* ──────────────────────────────────────────────────────────────────────── *
+ * 角色自主出行（travel）接线辅助
+ *
+ * 这些都在 `index.ts` 里而不再另开一层抽象，是为了让「谁在什么时候花谁的钱」
+ * 一眼能追到：每个主体一份 provider 回调（扣这个账号的地图额度）、一份模型端口
+ * （缺凭据就整个缺席）、一份账本端口（走既有 autonomy 账本，不另立额度表）。
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** 出行响应统一带 CORS（前端走 externalFetch 的 worker 通道）。 */
+const travelJson = (status: number, body: unknown): Response => jsonWithCors(status, body);
+
+const travelWithCors = (response: Response): Response => {
+  const headers = new Headers(response.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Vary', 'Origin');
+  return new Response(response.body, { status: response.status, headers });
+};
+
+/** 出行模型每日 token 上限：可用 env 收紧，缺省沿用既有自主生活的同一默认值。 */
+const travelLlmDailyTokens = (env: Env): number => {
+  const raw = Number(env.TRAVEL_LLM_DAILY_TOKENS ?? '');
+  if (Number.isFinite(raw) && raw > 0) return Math.trunc(raw);
+  return AUTONOMY_DAILY_TOKEN_BUDGET;
+};
+
+/** 出行的模型凭据：先看 travel 专用，再回落既有 LLM_*（同一份账户配置，不新建体系）。 */
+const travelModelCredentials = (env: Env) => {
+  const baseUrl = (env.TRAVEL_LLM_BASE_URL ?? env.LLM_API_URL ?? '').trim();
+  const apiKey = (env.TRAVEL_LLM_API_KEY ?? env.LLM_API_KEY ?? '').trim();
+  const model = (env.TRAVEL_LLM_MODEL ?? env.LLM_MODEL ?? '').trim();
+  return { baseUrl, apiKey, model };
+};
+
+/** 角色住处锚点（DB 权威；`confirmedAt > 0` 才算用户确认过）。 */
+async function readTravelAnchorForTick(
+  env: Env,
+  subject: TravelTickSubject,
+): Promise<TravelPlaceAnchor | null> {
+  try {
+    const row = await getTravelAnchor(env.DB as unknown as TravelStoreDb, {
+      userId: subject.userId,
+      charId: subject.charId,
+    });
+    if (!row || !(row.confirmedAt > 0) || !row.label || !row.city) return null;
+    return {
+      label: row.label,
+      city: row.city,
+      ...(row.district ? { district: row.district } : {}),
+      lat: row.lat,
+      lng: row.lng,
+      coordSys: (row.coordSys === 'wgs84' ? 'wgs84' : 'gcj02') as TravelCoordSys,
+      precision: 'area',
+      confirmedAt: row.confirmedAt,
+      source: 'user',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 人格/记忆来源：既有 `client_state` 里的 fire_pack 模板（角色设定 + 世界 + 最近对话）。
+ * **不解出坐标**：模型端还会逐行脱敏（`sanitizePersonaText`）。读不到就是空 —— 不编人设。
+ */
+async function readTravelPersona(
+  env: Env,
+  subject: TravelTickSubject,
+): Promise<{ persona: string | null; memory: string | null }> {
+  try {
+    const db = env.DB as unknown as { prepare(sql: string): { bind(...a: unknown[]): { first(): Promise<unknown> } } };
+    const row = await db
+      .prepare('SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?')
+      .bind(
+        subject.userId,
+        `${AMSG_STATE_NAMESPACE_PREFIX}${subject.charId}`,
+        AMSG_FIRE_PACK_KEY,
+      )
+      .first();
+    const value = (row as { value?: unknown } | null)?.value;
+    if (typeof value !== 'string' || !value) return { persona: null, memory: null };
+    const userKey = await deriveUserEncryptionKey(subject.userId, env.AMSG_MASTER_KEY);
+    const pack = parseFirePack(await unpackStateValue(await decryptFromStorage(value, userKey)));
+    if (!pack) return { persona: null, memory: null };
+    return { persona: typeof pack.template === 'string' ? pack.template : null, memory: null };
+  } catch {
+    return { persona: null, memory: null };
+  }
+}
+
+/**
+ * 真的模型出口；没有凭据就返回 null（tick 落在 wait，不造结论）。
+ *
+ * 凭据顺序（B8）：
+ * 1. **用户自己的** `llm_credentials` 行（`char:<charId>/chat`），按与既有 invoke 相同的
+ *    信封解密（`travel/credentials.ts`，`resolveLlmCredential` 同一条 crypto 路径）；
+ * 2. 只有运维显式设了 `TRAVEL_LLM_WORKER_ENV_FALLBACK=allow` 才看 worker 级 env。
+ *    默认**不看**：那份 `LLM_API_KEY` 在线上实测已失效，把「字段非空」当可用等于每一跳
+ *    都白扣一次预算再失败。
+ */
+async function createTravelDecisionForSubject(env: Env, subject: TravelTickSubject) {
+  const perUser = await resolveTravelModelCredentialsForUser({
+    db: env.DB as never,
+    userId: subject.userId,
+    charId: subject.charId,
+    masterKey: (env as { AMSG_MASTER_KEY?: string }).AMSG_MASTER_KEY,
+  });
+  const workerWideAllowed =
+    String(env.TRAVEL_LLM_WORKER_ENV_FALLBACK ?? '').trim().toLowerCase() === 'allow';
+  const workerWide = workerWideAllowed ? travelModelCredentials(env) : null;
+  const credentials = perUser
+    ?? (isUsableModelCredentials(workerWide) ? workerWide : null);
+  if (!credentials) return null;
+  const { persona, memory } = await readTravelPersona(env, subject);
+  return createTravelDecisionPort({
+    persona,
+    memory,
+    callModel: createTravelModelCaller({ credentials }),
+  });
+}
+
+/** 某个账号的地图预算回调（provider 每次真实出口调用一次）。 */
+const travelReserveFor = (env: Env, userId: string) => async () => {
+  const db = env.DB as unknown as TravelStoreDb;
+  const result = await reserveTravelMapCall(db, { userId, nowMs: Date.now() });
+  return result.ok
+    ? { allowed: true as const }
+    : { allowed: false as const, code: result.code };
+};
+
+/** 国内高德 + 国外 Mapbox 两套实现都挂上，地区由 tick 按锚点判。 */
+const travelProvidersFor = (env: Env, userId: string) => {
+  const deps = {
+    fetch: globalThis.fetch,
+    reserveMapCall: travelReserveFor(env, userId),
+    now: Date.now,
+  };
+  return [
+    createAmapProvider({ resolveKey: () => (env.AMAP_WEB_KEY ?? '').trim() || null }, deps),
+    createWorldProvider({ resolveToken: () => (env.MAPBOX_TOKEN ?? '').trim() || null }, deps),
+  ];
+};
+
+/** 锚点检索端口（前端只拿签名 placeId；坐标留在服务端）。 */
+function createTravelAnchorSearch(env: Env, userId: string) {
+  const secret = resolveTravelSecretString(env as never) ?? '';
+  if (secret.length < 32) return null;
+  const deps = {
+    fetch: globalThis.fetch,
+    reserveMapCall: travelReserveFor(env, userId),
+    now: Date.now,
+  };
+  const amapKey = (env.AMAP_WEB_KEY ?? '').trim();
+  const mapbox = (env.MAPBOX_TOKEN ?? '').trim();
+  // 锚点检索默认国内；只有没配高德 Web 服务 Key 时才用国外 provider。
+  const provider = amapKey
+    ? createAmapProvider({ resolveKey: () => amapKey }, deps)
+    : mapbox
+      ? createWorldProvider({ resolveToken: () => mapbox }, deps)
+      : null;
+  return createAnchorSearchPort({ provider, secret, now: () => Date.now() });
+}
+
+/** 每个主体的完整 tick 接线。 */
+async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
+  const anchor = await readTravelAnchorForTick(env, subject);
+  const [decisionPort, budget, guardrails] = await Promise.all([
+    createTravelDecisionForSubject(env, subject),
+    getTravelBudgetRow(env.DB as unknown as TravelStoreDb, {
+      userId: subject.userId,
+      nowMs: Date.now(),
+    }),
+    readAutonomyGuardrailsForUserDetailed(
+      env.DB as unknown as AutonomyDb,
+      env.AMSG_MASTER_KEY,
+      subject.userId,
+    ).catch(() => null),
+  ]);
+  // 意图探针窗口：运维可配的分钟数 → 用户自己配的同类动作最小间隔 → 3h 兜底。
+  // 复用同一份 autonomy 护栏（同一份授权），不新造一套设置，也不硬编码 3h。
+  const intentWindowMs = resolveIntentProbeWindowMs({
+    configuredMinutes: Number(env.TRAVEL_INTENT_PROBE_MINUTES ?? ''),
+    guardrailGapMinutes: guardrails?.guardrails?.sameKindMinGapMinutes ?? null,
+  });
+  const llmPort = createAutonomyLlmLedgerPort({
+    db: env.DB as never,
+    charId: subject.charId,
+    // 护栏走既有 autonomy 那一份（总暂停是硬边界）；token 上限用同一套默认口径，
+    // 可以用 TRAVEL_LLM_DAILY_TOKENS 收紧，但**不能**在这里凭空放大。
+    readGuardrails: async () => {
+      if (!guardrails) return null;
+      return {
+        // 读不出来（unreadable）时 detailed 已把 paused 置 true：按暂停处理，不默认放行。
+        paused: guardrails.guardrails.paused !== false,
+        dailyTokenBudget: travelLlmDailyTokens(env),
+      };
+    },
+  });
+  return {
+    providers: travelProvidersFor(env, subject.userId),
+    // 地区按锚点判：国内 → 高德；其余 → world（没 token 时 honest unavailable，不画直线）。
+    region: inferRegionFromAnchor(anchor),
+    readAnchor: async () => anchor,
+    decisionPort,
+    llmPort,
+    intentWindowMs,
+    licensedGeometry: String(env.TRAVEL_GEOMETRY_LICENSE ?? '').trim().toLowerCase() === 'allowed',
+    ...(budget ? {} : {}),
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const pathname = new URL(request.url).pathname.replace(/\/+$/, '') || '/';
@@ -3267,6 +3537,76 @@ export default {
         success: false,
         error: { code: 'WORKER_CONFIG_MISSING', message: report.message, missing: report.missing },
       });
+    }
+
+    // ── 角色自主出行（travel）────────────────────────────────────────────
+    // 全部排在配置门之后、未知 fallback 之前，所以既不会在缺配置时误报「能用」，
+    // 也不会被 upstream 的 404 兜底吃掉。
+    //
+    // 1) 会话交换：owner 密钥 → 短期 Bearer。**owner bootstrap 不挂 HTTP**
+    //    （公开挂出去等于给任意人签发身份）；它只由运维在服务端跑见 docs/travel-contract.md。
+    if (method === 'POST'
+      && (pathname.endsWith('/travel/session') || pathname.endsWith('/travel/session/exchange'))) {
+      let sessionResponse: Response;
+      try {
+        await ensureTravelOwnerSchema(env.DB as unknown as Parameters<typeof ensureTravelOwnerSchema>[0]);
+        sessionResponse = await handleTravelSessionExchange(request, env as never, {
+          ownerStore: createD1OwnerStore(env.DB as never),
+          nowMs: Date.now(),
+        });
+      } catch {
+        sessionResponse = jsonWithCors(503, {
+          success: false,
+          error: { code: 'UNAUTHORIZED', detail: 'owner-store-unconfigured' },
+        });
+      }
+      // `/travel/session` 是前端会话层的兼容别名：额外摊平 token/userId/expiresAt。
+      if (pathname.endsWith('/travel/session') && sessionResponse.ok) {
+        try {
+          const body = await sessionResponse.clone().json() as { session?: Record<string, unknown> };
+          const session = body?.session ?? null;
+          if (session && typeof session.token === 'string') {
+            return travelJson(200, {
+              success: true,
+              token: session.token,
+              userId: session.userId,
+              expiresAt: session.expiresAt,
+              session,
+            });
+          }
+        } catch {
+          /* 形状不对就按原响应返回 */
+        }
+      }
+      return travelWithCors(sessionResponse);
+    }
+
+    // 2) 静态图（同源短签 URL）：URL 里没有 Bearer，验签 + 回查共享后才出图。
+    if (method === 'GET' && pathname.endsWith('/travel/staticmap')) {
+      return handleTravelStaticMap(request, env as never, {
+        sessionSecret: resolveTravelSecretString(env as never) ?? '',
+        userId: null,
+        now: () => Date.now(),
+      });
+    }
+
+    // 3) 出行业务路由（state/share/budget/settings/char/anchor/context/config）。
+    {
+      const travel = await handleTravelRequest(request, env as never, {
+        resolveSession: async (_token, req) => {
+          const resolution = await resolveTravelSession({
+            request: req ?? request,
+            env: env as never,
+            nowMs: Date.now(),
+          });
+          if (resolution.ok) return { userId: resolution.userId };
+          return { ok: false, status: resolution.status, code: resolution.code, detail: resolution.reason };
+        },
+        now: () => Date.now(),
+        anchorSearchFor: (userId) => createTravelAnchorSearch(env, userId),
+        staticMapSecret: resolveTravelSecretString(env as never) ?? undefined,
+      });
+      if (travel) return travel;
     }
 
     // 即时对话：一个请求把「传云端状态 + 建任务」串完，回 202 之后立刻起一跳。
@@ -3675,6 +4015,38 @@ export default {
       }
     } catch (error) {
       console.error('[amsg:autonomy] 本轮调度失败（下一分钟重来）', error);
+    }
+
+    // 角色自主出行：与推送订阅、页面开关**没有**依赖关系，靠时钟 + DB 推进。
+    // 每个主体单独构造接线（地图预算/模型/账本都是 per-user 的）。
+    try {
+      const travelReport = await handleTravelScheduled(null, env as never, {
+        now: Date.now,
+        licensedGeometry: String(env.TRAVEL_GEOMETRY_LICENSE ?? '').trim().toLowerCase() === 'allowed',
+        readAnchor: (subject) => readTravelAnchorForTick(env, subject),
+        wiringForSubject: async (subject) => buildTravelSubjectWiring(env, subject),
+        // subject 枚举**不只**看已有愿望：已授权的角色每跳都会被检查一次（愿望由角色
+        // 自己在自主回合里产生，用户不必手写）。预算/暂停仍在每个主体执行前复核，
+        // 所以放宽枚举不会让未授权或零额度的角色被调用模型/地图。
+        listSubjects: (db) => listTravelTickSubjectsWithAuthorized(db),
+        prune: true,
+      });
+      const touched = travelReport.outcomes.filter(
+        (entry) => entry.advanced.length > 0 || entry.planned || entry.searched || entry.decided,
+      );
+      if (touched.length > 0) {
+        console.log('[amsg:travel]', {
+          subjects: travelReport.subjects,
+          touched: touched.map((entry) => ({
+            charId: entry.subject.charId,
+            advanced: entry.advanced,
+            planned: entry.planned,
+            searched: entry.searched,
+          })),
+        });
+      }
+    } catch (error) {
+      console.error('[amsg:travel] 本轮出行 tick 失败（下一分钟重来）', error);
     }
   },
 };

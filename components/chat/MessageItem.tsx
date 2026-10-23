@@ -20,6 +20,7 @@ import { parseShoppingOrderTag } from '../../utils/shoppingFormat';
 import LuckinCard from './LuckinCard';
 import LuckinCheckoutCard from './LuckinCheckoutCard';
 import QixiEventCardView from './QixiEventCard';
+import { TravelCardMessage } from '../travel/TravelOverlay';
 
 // 思考链卡片支持的 12 种风格预设 — 同时被 MessageItem 与 ThinkingChainSettingsModal 复用
 export type ThinkingChainStyleId = 'echo' | 'whisper' | 'minimal' | 'ink' | 'neon' | 'terminal' | 'stellar' | 'tama' | 'pixel' | 'muji' | 'ins' | 'custom';
@@ -2265,6 +2266,19 @@ const MessageItem = React.memo(({
                     </div>
                 </div>
             </div>
+        );
+    }
+
+    // --- Travel Card (角色出行：共享中才显示；点击打开全局行程面板) ---
+    if (m.type === 'travel_card' && m.metadata?.travel) {
+        const travel = m.metadata.travel as any;
+        return commonLayout(
+            <TravelCardMessage
+                charId={String(travel.charId || '')}
+                charName={String(travel.charName || '')}
+                avatarUrl={travel.avatarUrl ?? null}
+                travel={travel}
+            />,
         );
     }
 
