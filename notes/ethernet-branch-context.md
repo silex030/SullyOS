@@ -202,3 +202,10 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - **音色元数据别塞进代码**：`NANO_VOICE_META`（JSON `[{id,label,origin}]`）只提供展示名与来源，授权仍只由 `NANO_VOICE_IDS` 决定；meta 里出现白名单外的 ID 必须忽略。`preview`/`registered` 来自 relay `/health` 的真实注册表与文件，不能由前端猜。
   - **许可分层**：仓库/权重 Apache-2.0 ≠ 音频可分发。本轮只加 `public-zh-01`（AISHELL-3 `SSB01220090.wav`，语料级 Apache-2.0）；官方 demo 里 10 个 B 级发言人未知的样本按「不用未知真人声」不加，`zh_11`/`en_7` 含真实艺人名永久排除。UI 不写性别/年龄。
   - 门禁与线上读回见 `/srv/model-tests/moss-nano/voice-selector/RELEASE-RESULT.md`。
+- 🚀 **2026-10-24 出行 + 地图密钥设置上线**：`origin/ethernet` = `6f5d52e5`（TTS 合进 travel 分支）。要点：
+  - **bundle 不能靠文本合并**：合并后必须 `pnpm build:workers` 重建，再用 `check:workers` 锁。
+  - **Caddy 两条新路由都用 `handle`**：`/travel/*` 与 `/_AMapService/*` → 8832，剥前缀就是 404（同 `/home/*`）。
+  - **bootstrap 不公开**：`/travel/owner/bootstrap` 在 Caddy 里 `respond 404`；登记 owner 走本机 ops 脚本（库只存 sha256 哈希）。
+  - 线上验收口径：`/travel/session` 空体要 400 JSON、凭据端点无 session 要 401 JSON，出现 HTML 就说明被 SPA 回退吃了。
+  - 真实账号当前还填不了 Key：缺 owner 配对（0 行），输入框 `disabled={!credKnown}`，而 `credKnown` 依赖需要 session 的 GET。
+  - 文案 bug（待修）：全 clear 后 `configured` 仍 true → UI 仍显示「已加密保存」。
