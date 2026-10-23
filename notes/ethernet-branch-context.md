@@ -209,3 +209,14 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - 线上验收口径：`/travel/session` 空体要 400 JSON、凭据端点无 session 要 401 JSON，出现 HTML 就说明被 SPA 回退吃了。
   - 真实账号当前还填不了 Key：缺 owner 配对（0 行），输入框 `disabled={!credKnown}`，而 `credKnown` 依赖需要 session 的 GET。
   - 文案 bug（待修）：全 clear 后 `configured` 仍 true → UI 仍显示「已加密保存」。
+
+## 2026-10-24 出行收尾（`499457c5`）
+
+- 多角色实时感知：`createTravelMultiStateStore`（每角色独立 store + 取消句柄）。**别退回单 store**：
+  旧写法切角色会 `stop` 上一个人的轮询，顶部只剩一条。
+- 空视图必须是同一个冻结对象（`EMPTY_VIEW`），否则 `useSyncExternalStore` 会因每次返回新字面量无限重渲染。
+- 地图 Key 分两条通道：`_AMapService`（JS Key + jscode，浏览器 SDK）、`/travel/map/rest`（Web 服务 Key，
+  本站 Bearer + allowlist + 共用限流）。**不要拿 JS Key 去打地理编码/POI**，类型不同。
+- 浏览器侧不再读 `realtimeConfig.amapApiKey`（只剩设置页迁移输入）；新代码一律 `resolveAmapAuth()`，
+  可用性判断用 `isAmapAuthReady`，不要看 `auth.key`。
+- Caddy `handle /travel/*`（不剥前缀）已覆盖 REST 中转，无需新增路由。

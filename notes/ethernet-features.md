@@ -318,3 +318,17 @@
   验收：首页/`agent`/`amsg`/`home`/`heartbeat` health 全 200；`POST /travel/session` 空体 400 JSON、`GET /travel/map/credentials` 无 session 401 JSON、错 token 403（都不是 SPA HTML）；线上 `Settings-juf_63I3.js` 与本地 dist sha256 一致。合成 test-owner 走完 HTTPS 保存 → `has` 四项 true → DB 密文 450B 无明文 → 几何许可仍 400 → 非白名单/篡改 token 403 → clear → owner 行与凭据行、临时文件全部清零；未发真实高德/Mapbox 请求。
   **仍未完成**：`travel_owner_credentials` 0 行 ⇒ 设置页凭据输入框处于禁用态，真实账号还填不进去。差用户给一次自己的用户 ID，我在本机登记 owner 并把配对码写进 root-only `/opt/sullyos/secrets/travel-owner-<userId>.json`，用户自行读取后粘一次。**不要**用 `client_state` 最近更新时间猜身份，也不要把配对码贴进 chat。
   已知目标修复：四个字段全 `clear` 后 `GET` 仍 `configured:true`（=有行），UI 因此仍显示「已加密保存」，与 `has` 全 false 矛盾，另行修 `mapCredentialView`。
+- 2026-10-24：**出行重组收尾 · 多角色顶部状态 + 地图凭据单源上线（`499457c5`）**——
+  - 多角色：`utils/travel/state.ts` 增 `createTravelMultiStateStore`（每角色独立 store/取消句柄），
+    切角色不停别人轮询、撤销只清该角色、共享读失败只影响该角色；`TravelOverlay` 按 `byChar` 合并 N 条，
+    挂载时每角色各读一次共享位，未共享者不进轮询。
+  - 地图凭据：新增鉴权 REST 中转 `/travel/map/rest/v3/...`（`worker/amsg/src/travel/mapRest.ts`），
+    按会话 userId 读 **Web 服务 Key**、allowlist、与 `_AMapService`（JS Key+jscode）共用按用户限流；
+    浏览器 `readAmapAuth` 删除，改 `resolveAmapAuth()`，全部原消费者（cityPlaces/日程/MOVE_TO/约会/世界演绎/
+    AIRP/Settings 测试与地点库/Character 地点卡/UserCityCard）已切换，本机旧 Key 只作迁移输入。
+    迁移改为严格读回 `has.amapWebKey` 成功才清本地值。
+  - 门禁：全量 vitest 614 文件 / 7420 用例 EXIT=0；tsc 与基线集合相同（新增 0）；check:workers EXIT=0；
+    vite build EXIT=0。线上 `Settings-5br0rOuE.js` 等三个懒加载 chunk 与本地 sha256 一致；
+    `/travel/map/rest` 无会话 401、`/travel/pair/approve` 404；合成主体走完 申请→拒绝未批准→本机批准→
+    一次 claim→session→凭据 all-false→中转 503→重放 409，数据已清（owner/pair/map 均 0 行）。
+  - 仍缺：真实用户的公开短码 + userId（设置页「申请连接」自带），未拿到前不宣称本人已连接。
