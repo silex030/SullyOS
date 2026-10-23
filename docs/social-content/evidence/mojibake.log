@@ -1,0 +1,13 @@
+
+ RUN  v2.1.9 /root/SullyOS
+
+ ✓ utils/mojibakeGuard.test.ts (1 test) 475ms
+   ✓ utf-8 截断护栏（U+FFFD 禁入源码） > 全仓文本源码里没有 U+FFFD 替换符 472ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  23:29:30
+   Duration  1.66s (transform 236ms, setup 142ms, collect 175ms, tests 475ms, environment 0ms, prepare 209ms)
+
+
+EXIT=0

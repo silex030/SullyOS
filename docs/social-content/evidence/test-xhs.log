@@ -1,0 +1,69 @@
+
+ RUN  v2.1.9 /root/SullyOS
+
+ ✓ utils/xhsMcpClient.test.ts (15 tests) 49ms
+stdout | utils/agenticTools.xhs.test.ts > runXhsDetail > exposes Lite interactions/comments to the role and enriches the share card with one request
+📕 [XHS] AI要查看笔记详情: note-1 (有xsecToken)
+📕 [XHS] 缓存了 2 条评论的 userId, 2 条 authorName
+
+stdout | utils/agenticTools.xhs.test.ts > runXhsDetail > 详情拿不回来时算这次没跑成，不再包成"成功但正文是一句报错"
+📕 [XHS] AI要查看笔记详情: note-404 (无xsecToken)
+
+stderr | utils/agenticTools.xhs.test.ts > runXhsDetail > 详情拿不回来时算这次没跑成，不再包成"成功但正文是一句报错"
+📕 [XHS] 详情失败且无缓存标题，无法重试
+
+stdout | utils/agenticTools.xhs.test.ts > runXhsDetail > 回了 200 但正文是一句报错 → 同样算没跑成
+📕 [XHS] AI要查看笔记详情: note-500 (无xsecToken)
+
+ ✓ utils/agenticTools.xhs.test.ts (3 tests) 20ms
+stdout | utils/xhsMcpClient.concurrency.test.ts > XHS MCP 握手的并发安全 > 两个调用并发进来，只握一次手（回归：重复 initialize）
+[MCP] 发现工具: search
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+
+stdout | utils/xhsMcpClient.concurrency.test.ts > XHS MCP 握手的并发安全 > 两个并发调用带的是同一个 session（回归：后握手的把先前的 session 覆盖掉）
+[MCP] 发现工具: search
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+
+stdout | utils/xhsMcpClient.concurrency.test.ts > XHS MCP 握手的并发安全 > 握手完成后的调用直接复用，不再重复握手
+[MCP] 发现工具: search
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+
+stdout | utils/xhsMcpClient.concurrency.test.ts > XHS MCP 握手的并发安全 > 握手失败不留下「正在握手」的残留，下一次调用能重新握手
+[MCP] 发现工具: search
+[MCP] 工具 search 返回 JSON, 顶层 keys: notes
+
+ ✓ utils/xhsMcpClient.concurrency.test.ts (4 tests) 317ms
+ ✓ utils/xhsFreeRoamOwnership.test.ts (5 tests) 15ms
+ ✓ utils/xhsSession.test.ts (11 tests) 12ms
+ ✓ utils/xhsOwnedPosts.test.ts (2 tests) 50ms
+ ✓ utils/xhsMcpConfig.test.ts (6 tests) 9ms
+stdout | utils/applyAssistantPostProcessing.xhsOwnership.test.ts > 普通聊天与角色小红书主页的闭环 > 首轮聊天发帖成功后保存精确 note_id
+📕 [XHS] AI要发小红书: 晚安碎碎念
+
+stdout | utils/applyAssistantPostProcessing.xhsOwnership.test.ts > 普通聊天与角色小红书主页的闭环 > 首轮聊天发帖成功后保存精确 note_id
+📕 [XHS] 发布成功: note-1792768375166-0.8018272792697183
+
+stdout | utils/applyAssistantPostProcessing.xhsOwnership.test.ts > 普通聊天与角色小红书主页的闭环 > 隔几轮说“刚才那个帖子”时，只从当前角色主页选候选并用精确 ID 查详情
+📕 [XHS] AI要查看自己的主页
+⏱ [API timing] headers=0ms total=1ms
+⏱ [API timing] headers=1ms total=1ms
+
+stdout | utils/applyAssistantPostProcessing.xhsOwnership.test.ts > 普通聊天与角色小红书主页的闭环 > 查看主页后二轮发帖也会写入角色主页
+📕 [XHS] AI要查看自己的主页
+⏱ [API timing] headers=0ms total=0ms
+📕 [XHS] AI要发小红书(profile后): 新帖子
+
+stdout | utils/applyAssistantPostProcessing.xhsOwnership.test.ts > 普通聊天与角色小红书主页的闭环 > 查看主页后二轮发帖也会写入角色主页
+📕 [XHS] 发布成功(profile后): second-round-1792768375378-0.9130457326104566
+
+ ✓ utils/applyAssistantPostProcessing.xhsOwnership.test.ts (3 tests) 231ms
+ ✓ utils/xhsOwnedPostReference.test.ts (3 tests) 18ms
+
+ Test Files  9 passed (9)
+      Tests  52 passed (52)
+   Start at  23:12:46
+   Duration  9.49s (transform 5.63s, setup 669ms, collect 8.44s, tests 720ms, environment 5ms, prepare 1.26s)
+
