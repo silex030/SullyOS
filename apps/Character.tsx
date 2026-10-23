@@ -24,6 +24,8 @@ import { generateRelationshipProfiles, REL_PERSONA_MAX_CHARS } from '../utils/re
 import { ensureRelationLink, listJoinableHomes } from '../utils/relationshipHomeLink';
 import type { WorldProfile } from '../types';
 import { normalizeElevenLabsVoiceId, synthesizeSpeechElevenLabsDetailed } from '../utils/elevenLabsTts';
+import MossVoicePicker from '../components/voice/MossVoicePicker';
+import { useMossVoiceCatalog } from '../utils/useMossVoiceCatalog';
 import { normalizeUserImpression } from '../utils/impression';
 import { extractAppearanceFromPersona, extractAppearanceFromReferenceImage } from '../utils/imageGenFlow';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
@@ -98,6 +100,11 @@ const CharacterCard: React.FC<{
 
 const Character: React.FC = () => {
   const { closeApp, openApp, characters, activeCharacterId, setActiveCharacterId, addCharacter, updateCharacter, deleteCharacter, characterGroups, createCharacterGroup, renameCharacterGroup, deleteCharacterGroup, apiConfig, addToast, userProfile, worldbooks, addWorldbook, realtimeConfig } = useOS();
+
+  // 只有当前语音服务商是「本地语音（MOSS-TTS-Nano）」时，才去读音色目录并展示选择器。
+  // 其他 provider 下不探测、不渲染，原来的 MiniMax / Fish / ElevenLabs 配置一律不动。
+  const isMossProvider = apiConfig.genieVoiceEnabled === true;
+  const mossCatalog = useMossVoiceCatalog(isMossProvider);
   const launchIntent = characterLaunch.peek();
   const [view, setView] = useState<'list' | 'detail'>(() => launchIntent ? 'detail' : 'list');
   const [charPage, setCharPage] = useState(0); // 角色列表分页（每页 6 个，仅未建分组时）
@@ -2022,6 +2029,32 @@ ${isInitialGeneration ? `
                                    />
                                    <p className="text-[10px] text-slate-400">从 ElevenLabs Voices / Voice Library 复制 Voice ID；也可直接粘贴含 voiceId 的页面链接。设置里语音选 ElevenLabs 后使用，与 MiniMax、鱼声音色分别保存。</p>
                                </div>
+
+                               {/* 本机 MOSS-TTS-Nano 音色：只在当前语音服务商是「本地语音」时出现。
+                                   不选 = 继承设置页的全局音色；选了就存 voiceProfile.mossVoiceId，
+                                   合成时真的按这个 ID 上行（不是只存字段）。试听为该音色约 2 秒参考副本。 */}
+                               {isMossProvider && (
+                                   <div className="rounded-2xl border border-emerald-200/60 bg-emerald-50/40 p-2.5 space-y-1.5">
+                                       <div className="text-[10px] font-bold text-emerald-700 uppercase tracking-widest">本机语音音色（MOSS-TTS-Nano）</div>
+                                       <MossVoicePicker
+                                           value={formData.voiceProfile?.mossVoiceId || ''}
+                                           onChange={(id) => {
+                                               const next = { ...(formData.voiceProfile || {}) };
+                                               if (id) next.mossVoiceId = id; else delete next.mossVoiceId;
+                                               handleChange('voiceProfile', next);
+                                           }}
+                                           status={mossCatalog.status}
+                                           globalVoiceId={apiConfig.mossVoiceId || ''}
+                                           showInherit
+                                           onRefresh={() => { void mossCatalog.refresh(); }}
+                                           refreshing={mossCatalog.refreshing}
+                                       />
+                                       <p className="text-[10px] text-slate-500">
+                                           只影响本机语音；MiniMax / 鱼声 / ElevenLabs 的音色各自保存，不受影响。
+                                           选好会自动保存到该角色。
+                                       </p>
+                                   </div>
+                               )}
 
                                {/* 语速：三家 TTS 共用 voiceProfile.speed */}
                                <div className="space-y-1 pt-1">

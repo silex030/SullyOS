@@ -1,0 +1,53 @@
+
+ RUN  v2.1.9 /root/SullyOS
+
+ ✓ utils/airp/lifeWorkflow.test.ts (25 tests) 120ms
+ ✓ utils/airp/autonomyGuardrails.test.ts (19 tests) 34ms
+stderr | worker/amsg/src/autonomyScheduler.test.ts > 自动化轮次 —— 闸的判定 > claim-first：postTask 抛错也不回滚，账已经扣掉
+[amsg:autonomy] 建任务失败（不回滚，下一次到窗再试） char-lumen Error: schedule-message 拒绝（HTTP 500）
+    at postTask (/root/SullyOS/worker/amsg/src/autonomyScheduler.test.ts:329:15)
+    at Module.runAutonomyTick (/root/SullyOS/worker/amsg/src/autonomyScheduler.ts:931:13)
+    at processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at /root/SullyOS/worker/amsg/src/autonomyScheduler.test.ts:326:20
+    at file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1205:15)
+    at runSuite (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1205:15)
+    at runFiles (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1262:5)
+    at startTests (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1271:3)
+
+stderr | worker/amsg/src/autonomyScheduler.test.ts > scanAutonomyPacks > 读不出来的行记 pack-unreadable 并跳过（不拖垮整轮）
+[amsg:autonomy] 共享护栏解密/解析失败，本跳暂停这个用户 00000000-0000-4000-8000-000000000001 Cannot read properties of undefined (reading 'length')
+
+stderr | worker/amsg/src/autonomyScheduler.test.ts > 每分钟认领闸（双 cron 防护） > 认领与建任务是两套独立机制：post 失败不影响下一分钟再认领
+[amsg:autonomy] 建任务失败（不回滚，下一次到窗再试） char-lumen Error: schedule-message 拒绝（HTTP 500）
+    at postTask (/root/SullyOS/worker/amsg/src/autonomyScheduler.test.ts:695:37)
+    at Module.runAutonomyTick (/root/SullyOS/worker/amsg/src/autonomyScheduler.ts:931:13)
+    at /root/SullyOS/worker/amsg/src/autonomyScheduler.test.ts:694:20
+    at file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1205:15)
+    at runSuite (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1205:15)
+    at runFiles (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1262:5)
+    at startTests (file:///root/SullyOS/node_modules/.pnpm/@vitest+runner@2.1.9/node_modules/@vitest/runner/dist/index.js:1271:3)
+    at file:///root/SullyOS/node_modules/.pnpm/vitest@2.1.9_@types+node@25.9.0_jsdom@30.0.1/node_modules/vitest/dist/chunks/runBaseTests.3qpJUEJM.js:126:11
+
+stderr | worker/amsg/src/autonomyScheduler.test.ts > 共享护栏（用户级全局配置） > 读云端加密行 → 归一后的护栏；缺行回落默认
+[amsg:autonomy] 共享护栏读不出来，本轮按暂停处理 00000000-0000-4000-8000-000000000001 missing-master-key
+
+stderr | worker/amsg/src/autonomyScheduler.test.ts > 护栏 fail-closed（发布阻断项 1） > 缺 master key → unreadable + 保守暂停（不再回落 paused:false）
+[amsg:autonomy] 共享护栏读不出来，本轮按暂停处理 00000000-0000-4000-8000-000000000001 missing-master-key
+
+stderr | worker/amsg/src/autonomyScheduler.test.ts > 护栏 fail-closed（发布阻断项 1） > 密文坏 → unreadable + 暂停；不把用户的总暂停吞掉
+[amsg:autonomy] 共享护栏读不出来，本轮按暂停处理 00000000-0000-4000-8000-000000000001 Cannot read properties of undefined (reading 'length')
+
+ ✓ worker/amsg/src/autonomyScheduler.test.ts (61 tests) 418ms
+ ✓ utils/airp/chatLifeWorkflow.test.ts (12 tests) 98ms
+ ✓ utils/momentsFeed.test.ts (11 tests) 70ms
+ ✓ utils/socialFeedMerge.test.ts (4 tests) 10ms
+
+ Test Files  6 passed (6)
+      Tests  132 passed (132)
+   Start at  23:13:01
+   Duration  4.53s (transform 2.39s, setup 545ms, collect 3.12s, tests 750ms, environment 4ms, prepare 1.19s)
+

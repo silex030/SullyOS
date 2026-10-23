@@ -1175,9 +1175,104 @@ function wavDurationSeconds(wav) {
     return null;
   }
 }
+// ─────────────────────── MOSS-TTS-Nano（本机 runtime 127.0.0.1:19890）───────────────────────
+// 只做鉴权后的薄转发。三条硬约束：
+//   1. 上游地址**只来自 env**（NANO_TTS_URL / NANO_HEALTH_URL），请求体里的 url/voice/路径一律
+//      不读——否则浏览器能借这个端点打任意主机（SSRF），也能拿别人的音色 id。
+//   2. 上行只有 {text} 和显式的 demo_id；demo_id 是服务端 env 的公开演示条目，
+//      「用户/角色参考音频」不走这条路由（没有身份体系前不开放参考注册，见
+//      /srv/model-tests/moss-nano/SULLYOS-ADAPTER.md）。
+//   3. 缺参考音频的 422 必须翻成 no_ref_voice 409，绝不能回一段假音频充成功。
+const NANO_DEFAULT_URL = 'http://127.0.0.1:19890/api/generate';
+const NANO_DEFAULT_DEMO_ID = 'public-demo';
+// 音色 ID 的形状和 relay 侧 VOICE_ID_RE 一致：只允许短的安全标识符。
+// 任何带斜杠、点、空格或超长的值都不可能是合法 ID —— 直接判「没有这个音色」，
+// 不转发给上游，也就不存在借音色字段做路径穿越/任意文件读的可能。
+const NANO_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** env 里的音色白名单（`NANO_VOICE_IDS=a,b`）。只保留形状合法的 ID，去重保序。 */
+function nanoVoiceList(env) {
+  const out = [];
+  for (const part of String(env?.NANO_VOICE_IDS || '').split(',')) {
+    const id = part.trim();
+    if (id && NANO_VOICE_ID_RE.test(id) && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * 音色的展示元数据（`NANO_VOICE_META` JSON 数组：[{id,label,origin}]）。
+ * 只做展示名/来源，**不参与授权**：可选 ID 永远由 NANO_VOICE_IDS 白名单决定；
+ * meta 里出现白名单外的 ID 一律忽略，避免 env 写错就多出一个音色。
+ */
+function nanoVoiceMeta(env, voices) {
+  const map = new Map();
+  const raw = getJsonEnv(env, 'NANO_VOICE_META', []);
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      if (!voices.includes(id) || map.has(id)) continue;
+      const label = typeof item.label === 'string' ? item.label.replace(/[\u0000-\u001f\u007f]/g, ' ').trim() : '';
+      const origin = typeof item.origin === 'string' ? item.origin.replace(/[\u0000-\u001f\u007f]/g, ' ').trim() : '';
+      map.set(id, { label: label.slice(0, 40), origin: origin.slice(0, 60) });
+    }
+  }
+  return map;
+}
+
+/** 端点派生：base 只从 env 取，health 优先用显式 env，否则从 NANO_TTS_URL 推同主机 /health。 */
+function nanoEndpoints(env) {
+  const url = (env?.NANO_TTS_URL || '').trim() || NANO_DEFAULT_URL;
+  let health = (env?.NANO_HEALTH_URL || '').trim();
+  if (!health) {
+    const m = /^(https?:\/\/[^/]+)/i.exec(url);
+    health = m ? `${m[1]}/health` : 'http://127.0.0.1:19890/health';
+  }
+  // 试听预览与生成同一个 relay：显式 env 优先，否则从生成端点推同主机的 /api/preview。
+  let preview = (env?.NANO_PREVIEW_URL || '').trim();
+  if (!preview) {
+    const m = /^(https?:\/\/[^/]+)/i.exec(url);
+    preview = m ? `${m[1]}/api/preview` : 'http://127.0.0.1:19890/api/preview';
+  }
+  const voices = nanoVoiceList(env);
+  const configured = (env?.NANO_VOICE_ID || '').trim();
+  // 默认音色只有在白名单里才算数（fail-closed）：运营把某个 ID 从白名单拿掉后，
+  // 不能因为它还写在 NANO_VOICE_ID 里就继续被用。
+  const defaultVoice = configured && voices.includes(configured) ? configured : '';
+  return {
+    url,
+    health,
+    preview,
+    demoId: (env?.NANO_DEMO_ID || '').trim() || NANO_DEFAULT_DEMO_ID,
+    voices,
+    defaultVoice,
+    key: (env?.NANO_RELAY_KEY || '').trim(),
+  };
+}
+
+/** 上游错误码白名单：只透传这几个人话码，其余按状态码收敛（不把上游原文回给浏览器）。 */
+const NANO_ERROR_CODES = new Set([
+  'no_ref_voice', 'reference_invalid', 'payload_too_large', 'unsupported_media',
+  'busy', 'model_loading', 'timeout', 'bad_request', 'text_too_long',
+]);
+
+function nanoErrorFor(status, upstreamCode) {
+  const code = NANO_ERROR_CODES.has(upstreamCode) ? upstreamCode : '';
+  if (code === 'no_ref_voice' || status === 422) return { code: 'no_ref_voice', status: 409 };
+  // 文本超长是「文字太长」，不能折成「参考音频超过 10MB」——那是两回事。
+  if (code === 'text_too_long') return { code: 'text_too_long', status: 413 };
+  if (code === 'timeout' || status === 504) return { code: 'timeout', status: 504 };
+  if (code === 'payload_too_large' || status === 413) return { code: 'payload_too_large', status: 413 };
+  if (code === 'busy' || status === 429) return { code: 'busy', status: 429 };
+  if (code === 'model_loading') return { code: 'model_loading', status: 503 };
+  if (code) return { code, status: status >= 500 ? 503 : 400 };
+  if (status === 400 || status === 415) return { code: 'bad_request', status: 400 };
+  return { code: 'nano_unavailable', status: 503 };
+}
+
 async function ttsProxy(request, env) {
-  const nanoUrl = (env?.NANO_TTS_URL || '').trim() || 'http://127.0.0.1:18083/api/generate';
-  const demoId = (env?.NANO_DEMO_ID || '').trim() || 'demo-30';
+  const { url: nanoUrl, demoId, voices, defaultVoice, key } = nanoEndpoints(env);
   let payload;
   try {
     payload = await request.json();
@@ -1186,28 +1281,62 @@ async function ttsProxy(request, env) {
   }
   const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
   if (!text) return json({ error: 'empty' }, 400);
-  // Nano 无情绪参数：调用方仍可传 emotion，本代理直接忽略（不校验、不转发）。
+  // 只认 text、显式 demo:true 和 voice（白名单内的 ID）。emotion / voice_id / url / demo_id /
+  // 任何路径字段一律忽略（不转发）。
+  const body = { text };
+  const headers = { 'content-type': 'application/json' };
+  if (key) headers['x-relay-key'] = key; // 共享密钥：relay 只认它，不经浏览器
+  if (payload?.demo === true) {
+    // 试听公开演示：绝不带角色音色，避免「试听一下」变成拿用户音色。
+    body.demo_id = demoId;
+  } else {
+    const requested = typeof payload?.voice === 'string' ? payload.voice.trim() : '';
+    const voice = requested || defaultVoice;
+    // 缺音色 / 音色不在白名单 → 明确 no_ref_voice，不回落 demo，也不偷偷换成默认音色。
+    if (!voice || !voices.includes(voice)) return json({ error: 'no_ref_voice' }, 409);
+    headers['x-voice-id'] = voice;
+  }
   try {
-    const form = new FormData();
-    form.append('text', text);
-    form.append('demo_id', demoId);
-    form.append('seed', '7');
-    form.append('max_new_frames', '200');
     const upstream = await fetch(nanoUrl, {
       method: 'POST',
-      body: form,
-      signal: AbortSignal.timeout(150000),
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Number(env?.NANO_TIMEOUT_MS || 120000)),
     });
-    let data;
-    try {
-      data = await upstream.json();
-    } catch {
+    if (!upstream.ok) {
+      let upstreamCode = '';
+      try {
+        const parsed = await upstream.json();
+        upstreamCode = typeof parsed?.error === 'string' ? parsed.error : '';
+      } catch { upstreamCode = ''; }
+      const mapped = nanoErrorFor(upstream.status, upstreamCode);
+      console.warn(`[tts] upstream ${upstream.status} ${upstreamCode || '-'} → ${mapped.code}`);
+      return json({ error: mapped.code }, mapped.status);
+    }
+    // 兼容两种下行实现：JSON {audio_base64} 或裸 audio/wav（runtime 契约未定稿时都别断）。
+    // 判据不只看 content-type：上游漏设头时按首字节嗅探（'{' 当 JSON，'RIFF' 当音频）。
+    const ctype = String(upstream.headers.get('content-type') || '').toLowerCase();
+    const raw = new Uint8Array(await upstream.arrayBuffer());
+    let wav;
+    if (!ctype.includes('audio/') && raw[0] === 0x7b) {
+      let data;
+      try {
+        data = JSON.parse(new TextDecoder().decode(raw));
+      } catch {
+        return json({ error: 'synth_failed' }, 502);
+      }
+      if (typeof data?.audio_base64 !== 'string' || !data.audio_base64) {
+        return json({ error: 'synth_failed' }, 502);
+      }
+      wav = Uint8Array.from(atob(data.audio_base64), (c) => c.charCodeAt(0));
+    } else {
+      wav = raw;
+    }
+    // WAV 门：不是 RIFF 头就不是音频，宁可报失败也不能把坏字节当声音发出去。
+    if (wav.length < 44 || wavDurationSeconds(wav) === null) {
+      console.warn(`[tts] reject non-wav payload: bytes=${wav.length} type=${ctype || '-'}`);
       return json({ error: 'synth_failed' }, 502);
     }
-    if (!upstream.ok || typeof data?.audio_base64 !== 'string' || !data.audio_base64) {
-      return json({ error: 'synth_failed' }, 502);
-    }
-    const wav = Uint8Array.from(atob(data.audio_base64), (c) => c.charCodeAt(0));
     // 时长守卫：复读循环的音频远长于文本应有长度，直接拒收（seed 抽风已实测）。
     const seconds = wavDurationSeconds(wav);
     if (seconds !== null && seconds > text.length * 0.6 + 4) {
@@ -1219,7 +1348,112 @@ async function ttsProxy(request, env) {
     out.set('access-control-allow-origin', '*');
     return new Response(wav, { status: 200, headers: out });
   } catch {
-    return json({ error: 'nano_unavailable' }, 502);
+    return json({ error: 'nano_unavailable' }, 503);
+  }
+}
+
+/**
+ * 本机语音健康：把 runtime `/health` 收敛成 UI 需要的四个字段。
+ * 只回 ready/model/referenceConfigured/demoAvailable —— 本机路径、模型目录、参考音频文件名
+ * 一律不出主代理。探不通就 503，让界面说「未连接」而不是猜「已成功」。
+ */
+async function ttsHealth(request, env) {
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const { health, voices } = nanoEndpoints(env);
+  try {
+    const upstream = await fetch(health, { signal: AbortSignal.timeout(4000) });
+    if (!upstream.ok) return json({ error: 'nano_unavailable' }, 503);
+    let data = null;
+    try {
+      data = await upstream.json();
+    } catch {
+      data = null;
+    }
+    const ready = !!data && typeof data === 'object' && data.ready === true;
+    const referenceConfigured = !!data && typeof data === 'object' && data.referenceConfigured === true;
+    // relay 若报告已注册音色 / 已有预览片段的 ID，就用它给出权威的 registered/preview；
+    // 老 relay 没有这两个数组时，registered 按 referenceConfigured 推断，preview 一律 false（不假装能听）。
+    const registeredList = data && typeof data === 'object' && Array.isArray(data.voices)
+      ? data.voices.filter((id) => typeof id === 'string' && voices.includes(id))
+      : null;
+    const previewList = data && typeof data === 'object' && Array.isArray(data.previews)
+      ? data.previews.filter((id) => typeof id === 'string' && voices.includes(id))
+      : [];
+    const meta = nanoVoiceMeta(env, voices);
+    const voiceOptions = voices.map((id) => {
+      const m = meta.get(id);
+      return {
+        id,
+        label: m?.label || id,
+        origin: m?.origin || '',
+        preview: previewList.includes(id),
+        registered: registeredList ? registeredList.includes(id) : referenceConfigured,
+      };
+    });
+    const body = {
+      ready,
+      referenceConfigured,
+      // 契约里没有独立的 demo 字段：只有模型 ready 才谈得上试听演示。
+      demoAvailable: ready,
+      // 可选音色只回服务端白名单里的 ID（是「可选清单」，不代表每个都已注册；
+      // 真缺参考时合成会明确 409）。绝不回参考文件路径或本机目录。
+      voices,
+      // 结构化目录：展示名 / 来源 / 是否有约 2 秒试听 / 是否已注册参考音频。
+      voiceOptions,
+    };
+    const model = data && typeof data === 'object' && typeof data.model === 'string' ? data.model.trim() : '';
+    if (model) body.model = model;
+    return json(body);
+  } catch {
+    return json({ error: 'nano_unavailable' }, 503);
+  }
+}
+
+/**
+ * 音色试听：`GET /v1/tts/preview?voice=<id>` → 该音色约 2 秒参考副本（audio/wav）。
+ *
+ * 与合成同一套授权：先鉴权（路由层），再按 NANO_VOICE_IDS 白名单校验 ID，
+ * 只把 ID 交给 relay；**不接受任何路径/URL 参数**，所以不存在任意文件读。
+ * 下游 relay 也只回已注册音色的私有预览文件，找不到就是 404 no_preview，
+ * 绝不回落到 public-demo 或别的角色音色。
+ */
+async function ttsPreview(request, env, url) {
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const { preview, voices, key } = nanoEndpoints(env);
+  const requested = (url.searchParams.get('voice') || '').trim();
+  if (!requested || !NANO_VOICE_ID_RE.test(requested)) return json({ error: 'invalid_voice' }, 400);
+  if (!voices.includes(requested)) return json({ error: 'no_ref_voice' }, 409);
+  const headers = {};
+  headers['x-voice-id'] = requested;
+  if (key) headers['x-relay-key'] = key;
+  try {
+    const upstream = await fetch(preview, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (upstream.status === 404) return json({ error: 'no_preview' }, 404);
+    if (!upstream.ok) {
+      console.warn(`[tts] preview upstream ${upstream.status} → preview_failed`);
+      return json({ error: 'preview_failed' }, 502);
+    }
+    const raw = new Uint8Array(await upstream.arrayBuffer());
+    // 私有预览只应是 2 秒左右的 WAV：不是 RIFF / 时长不在 1–3 秒 / 体积过大都拒绝，
+    // 避免 relay 配错时把别的文件（或超长音频）当试听发出去。
+    const seconds = raw.length >= 44 ? wavDurationSeconds(raw) : null;
+    if (seconds === null || seconds < 1 || seconds > 3 || raw.length > 2 * 1024 * 1024) {
+      console.warn(`[tts] reject preview bytes=${raw.length} seconds=${seconds === null ? '-' : seconds.toFixed(2)}`);
+      return json({ error: 'preview_invalid' }, 502);
+    }
+    const out = new Headers();
+    out.set('content-type', 'audio/wav');
+    // 私有资产：禁止中间层/CDN 缓存，浏览器每次带 token 现取。
+    out.set('cache-control', 'private, no-store, max-age=0');
+    out.set('x-content-type-options', 'nosniff');
+    out.set('access-control-allow-origin', '*');
+    return new Response(raw, { status: 200, headers: out });
+  } catch {
+    return json({ error: 'nano_unavailable' }, 503);
   }
 }
 
@@ -1586,8 +1820,12 @@ export default {
     if (plain === '/v1/mcp-relay') return mcpRelayProxy(request, env, url);
     if (plain === '/v1/models') return llmModelsProxy(request, env, url);
 
-    // Genie-TTS（VPS 自建中文克隆）。适配层已处理情绪表、队列、分块与 WAV 包裹，
-    // 本层只做鉴权后的无状态转发——不记情绪、不缓存参考音频，避免跨进程失效。
+    // 本机 MOSS-TTS-Nano（CPU，中文）。适配只在 runtime 内；本层做鉴权后的无状态转发，
+    // 不缓存参考音频、不接受任何上游地址或音色 id。
+    // GET /v1/tts/health 是 UI 判断「就绪 / 待配置 / 未连接」的唯一来源，同样要 token。
+    if (plain === '/v1/tts/health') return ttsHealth(request, env);
+    // GET /v1/tts/preview?voice=<id> 试听某个已授权音色的约 2 秒参考副本（同样要 token）。
+    if (plain === '/v1/tts/preview') return ttsPreview(request, env, url);
     if (plain === '/v1/tts') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       return ttsProxy(request, env);

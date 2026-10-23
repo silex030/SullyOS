@@ -66,6 +66,7 @@ import {
     synthesizeSpeechDetailed,
 } from '../utils/ttsRouter';
 import { shouldAutoGenerateVoice, shouldAutoPlayGeneratedVoice } from '../utils/voicePlayback';
+import { isGenieVoiceEnabled, isMossVoiceUsableSync, refreshMossVoiceStatus } from '../utils/genieTts';
 import { voiceLanguagePromptLabel } from '../utils/voiceLanguage';
 import { fetchBlobForShare, shareOrDownloadBlob } from '../utils/shareExport';
 import { suggestImageTags, generateImageBlobOnly } from '../utils/imageGenFlow';
@@ -821,6 +822,13 @@ const Chat: React.FC = () => {
         // 空语音条照常出现，用户点了才合成、合成完直接播。
         if (!shouldAutoGenerateVoice({ autoPlayEnabled: char.chatVoiceAutoPlay })) return;
         if (!characterHasVoice(char, apiConfig)) return;
+        // 本机语音额外要求「模型 ready 且已有参考音频」才自动合成：
+        // 缺参考/未连接时静默跳过并顺手刷新一次状态，而不是每条消息都失败弹错。
+        // 用户手点的合成不受这道门限制（真错误由服务端码呈现）。
+        if (isGenieVoiceEnabled(apiConfig) && !isMossVoiceUsableSync()) {
+            void refreshMossVoiceStatus();
+            return;
+        }
         // Scan recent assistant messages for unprocessed <语音> tags
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];

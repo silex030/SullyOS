@@ -13,6 +13,9 @@ import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled a
 import { getLuckinToken, setLuckinToken as saveLuckinToken, isLuckinEnabled, setLuckinEnabled as saveLuckinEnabled, testLuckinConnection, resetLuckinSession } from '../utils/luckinMcpClient';
 import { consumeProxyWorkerSettingsFocus, getProxyWorkerUrl, setProxyWorkerUrl, DEFAULT_PROXY_WORKER } from '../utils/proxyWorker';
 import { geocodeCity, isAuthErrorCode, isQuotaErrorCode } from '../utils/amapCore';
+import { probeMossVoiceStatus } from '../utils/genieTts';
+import { describeMossVoiceStatus, type MossVoiceStatus } from '../utils/mossTtsStatus';
+import MossVoicePicker from '../components/voice/MossVoicePicker';
 import { deleteCachedLibrary, getCityLibrary, listCachedLibraries } from '../utils/cityPlaces';
 import { VOICE_ACTING_GUIDE } from '../utils/minimaxTts';
 import { FISH_VOICE_ACTING_GUIDE } from '../utils/fishAudioTts';
@@ -67,6 +70,16 @@ import {
     setFirecrawlApiKey,
     type FirecrawlCreditUsage,
 } from '../utils/firecrawl';
+
+/** 还没探到真实状态时的保守占位：不预置 ready，也不假装有可选音色。 */
+const MOSS_STATUS_UNKNOWN: MossVoiceStatus = {
+    state: 'unknown',
+    ready: false,
+    referenceConfigured: false,
+    demoAvailable: false,
+    voices: [],
+    voiceOptions: [],
+};
 
 // hot_news（news.orz.ai）可选热榜平台。key 必须与 API 的 ?platform= 完全一致。
 const HOTNEWS_PLATFORM_OPTIONS: { key: string; label: string }[] = [
@@ -676,6 +689,11 @@ const Settings: React.FC = () => {
   );
   const [localFishKey, setLocalFishKey] = useState(apiConfig.fishAudioApiKey || '');
   const [localGenieEnabled, setLocalGenieEnabled] = useState(apiConfig.genieVoiceEnabled === true);
+  // 本机语音用哪个已授权音色（服务端白名单内的 ID）；空串 = 用服务端默认。
+  const [localMossVoiceId, setLocalMossVoiceId] = useState(apiConfig.mossVoiceId || '');
+  // 本机 MOSS-TTS-Nano 的真实状态：null = 还没探到（显示检测中），不预置「可用」。
+  const [localMossStatus, setLocalMossStatus] = useState<MossVoiceStatus | null>(null);
+  const [localMossProbing, setLocalMossProbing] = useState(false);
   const [localFishModel, setLocalFishModel] = useState(apiConfig.fishAudioModel || 's2.1-pro');
   const [localElevenLabsKey, setLocalElevenLabsKey] = useState(apiConfig.elevenLabsApiKey || '');
   const [localElevenLabsModel, setLocalElevenLabsModel] = useState(apiConfig.elevenLabsModel || DEFAULT_ELEVENLABS_MODEL);
@@ -691,6 +709,20 @@ const Settings: React.FC = () => {
   const [showVoicePrompts, setShowVoicePrompts] = useState(false);
   const [showAceStepGuide, setShowAceStepGuide] = useState(false);
   const [otherStatusMsg, setOtherStatusMsg] = useState('');
+
+  // 本机语音状态探活：只打主代理 /agent/v1/tts/health（免费、不触发生成、不调收费接口）。
+  // 拿不到就显示「未连接」，绝不预置「可用」；模型就绪也不自动替用户开启本地语音。
+  const refreshLocalMossStatus = useCallback(async () => {
+    setLocalMossProbing(true);
+    try {
+      const probe = await probeMossVoiceStatus();
+      setLocalMossStatus(probe.status);
+    } finally {
+      setLocalMossProbing(false);
+    }
+  }, []);
+
+  useEffect(() => { void refreshLocalMossStatus(); }, [refreshLocalMossStatus]);
   // 高级设置（流式/温度）默认折叠 — 大多数用户不需要碰
   const [showApiAdvanced, setShowApiAdvanced] = useState(false);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
@@ -1344,6 +1376,7 @@ const Settings: React.FC = () => {
       fishAudioApiKey: localFishKey,
       fishAudioModel: localFishModel,
       genieVoiceEnabled: localGenieEnabled,
+      mossVoiceId: localMossVoiceId.trim() || undefined,
       elevenLabsApiKey: localElevenLabsKey,
       elevenLabsModel: localElevenLabsModel,
       elevenLabsStability: localElevenLabsStability,
@@ -3265,13 +3298,16 @@ const Settings: React.FC = () => {
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
                     <div className="space-y-2">
                         {([
-                            // 本机 GPT-SoVITS 已实测不达标（41 字 65.3s、常驻 >4GB、宿主可用内存压到 1.95GB），
-                            // 服务保持 disabled + inactive，**没有**接通。这里如实标「未启用」，
-                            // 不再写成可用的「中文克隆」；保留这一项是为了让老配置能改回来。
-                            [true, '本地语音（GPT-SoVITS，未启用）', '本机 SoVITS 试验未达标：慢且吃内存，服务保持停用'],
-                            [false, '语音合成 API', 'MiniMax / 鱼声 / ElevenLabs 三家（当前唯一可用）'],
+                            // 本机 MOSS-TTS-Nano（CPU，仅中文）。**不写死状态**：option 徽标由
+                            // /agent/v1/tts/health 的真实 ready + referenceConfigured 决定，
+                            // 模型就绪不等于该替用户全局开启，所以这里仍是一个 opt-in 选项。
+                            [true, '本地语音（MOSS-TTS-Nano）', '本机 CPU 跑的中文语音；音色需在本机配置参考音频'],
+                            [false, '语音合成 API', 'MiniMax / 鱼声 / ElevenLabs 三家（云端，随时可用）'],
                         ] as const).map(([isGenie, name, desc]) => {
                             const active = localGenieEnabled === isGenie;
+                            const mossBadge = localMossStatus
+                                ? describeMossVoiceStatus(localMossStatus).badge
+                                : '已选 · 检测中';
                             return (
                                 <button
                                     key={name}
@@ -3287,8 +3323,8 @@ const Settings: React.FC = () => {
                                         <span className="block text-[11px] text-slate-400 mt-0.5">{desc}</span>
                                     </span>
                                     {active && (
-                                        <span className={`text-[10px] font-bold shrink-0 ${isGenie ? 'text-amber-600' : 'text-primary'}`}>
-                                            {isGenie ? '已选 · 不可用' : '使用中'}
+                                        <span className={`text-[10px] font-bold shrink-0 ${isGenie && localMossStatus?.state !== 'ready' ? 'text-amber-600' : 'text-primary'}`}>
+                                            {isGenie ? mossBadge : '使用中'}
                                         </span>
                                     )}
                                 </button>
@@ -3298,10 +3334,33 @@ const Settings: React.FC = () => {
                 </div>
 
                 {localGenieEnabled && (
-                    <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200/70 rounded-xl px-3 py-2 leading-relaxed">
-                        本机语音（GPT-SoVITS）已实测不达标并保持停用：合成 41 字需要 65 秒、常驻内存超过 4GB。
-                        选它合成会直接失败——请改回「语音合成 API」，云端三家不受影响。
-                    </p>
+                    <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl px-3 py-2 leading-relaxed space-y-2">
+                        <p>
+                            本机语音走 MOSS-TTS-Nano（CPU，仅中文）。状态由主代理实时检测：
+                            模型就绪 <span className="font-semibold">并且</span> 已配置角色参考音频才显示「使用中」，
+                            否则会显示「待配置」或「未就绪」——不会因为模型装上就宣称能用。
+                        </p>
+                        <p>{describeMossVoiceStatus(localMossStatus ?? MOSS_STATUS_UNKNOWN).detail}</p>
+                        {/* 音色选择：选项只来自主代理白名单（服务端 env），前端不能自造 ID，
+                            也不会替你挑别的角色音色。没选 = 用服务端默认音色。
+                            试听是「选中音色的约 2 秒参考副本」，不是统一 demo，也不跑模型。 */}
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-amber-800">本机音色（全局默认）</div>
+                        <MossVoicePicker
+                            value={localMossVoiceId}
+                            onChange={setLocalMossVoiceId}
+                            status={localMossStatus}
+                            onRefresh={() => { void refreshLocalMossStatus(); }}
+                            refreshing={localMossProbing}
+                            showLabel={false}
+                        />
+                        <p className="text-amber-700">
+                            这些音色是本机已授权并注册的参考音频（3-15 秒干净中文、单声道 WAV、≤10MB），
+                            网页端只负责<span className="font-semibold">选择</span>，不上传、不显示文件路径。
+                            没注册过的音色不会偷偷用别的音色顶替，只会明确报「待配置」。
+                            所有角色默认共用这里的全局音色；角色编辑里可以单独选，没单独选就跟着这里。
+                            选完记得保存。
+                        </p>
+                    </div>
                 )}
 
                 {!localGenieEnabled ? (<>
@@ -3464,7 +3523,7 @@ const Settings: React.FC = () => {
                     </div>
                 </div>
                 </>) : (
-                    <p className="text-[11px] text-amber-700 pl-1 leading-relaxed">当前选的是本地语音（GPT-SoVITS），但它实测未达标、服务保持停用，合成会失败；切回「语音合成 API」可继续使用三家云引擎</p>
+                    <p className="text-[11px] text-amber-700 pl-1 leading-relaxed">当前选的是本地语音（MOSS-TTS-Nano）：合成只走本机 CPU、仅中文，且需要本机已配置参考音频；没配好会明确报「待配置」。云端三家不受影响，随时可切回「语音合成 API」</p>
                 )}
 
                 {/* 语音提示词（高级）—— 自定义注入角色 system prompt 的「语音表演指南」，按服务商分别保存 */}

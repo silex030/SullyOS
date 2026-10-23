@@ -314,6 +314,27 @@ describe('v2 真实链路：分片 → 组装 → importFullData', () => {
         expect(profile.perCharAvatars).toEqual(userProfile.perCharAvatars);
     });
 
+    it('角色独立本机音色随备份往返不丢（voiceProfile.mossVoiceId）', async () => {
+        // 用户要求：备份往返后每角色选的音色仍然在，不能悄悄退回全局。
+        const char = {
+            id: 'moss-voice-1', name: '音色角色', avatar: '',
+            voiceProfile: {
+                mossVoiceId: 'public-zh-01',
+                voiceId: 'mm-1',
+                fishReferenceId: 'fish-ref',
+                elevenLabsVoiceId: 'el-1',
+            },
+        };
+        const zip = new FakeZip();
+        const manifest = await writeV2Backup(zip, { characters: [char] } as any, {});
+        const data: any = await assembleV2Backup(zip, manifest);
+
+        await DB.importFullData(data);
+
+        const restored = (await DB.getRawStoreData('characters')).find((c: any) => c.id === 'moss-voice-1');
+        expect(restored.voiceProfile).toEqual(char.voiceProfile);
+    });
+
     it('AI 原文范围设置随角色备份完整往返', async () => {
         const char = {
             id: 'ctx1',

@@ -220,6 +220,27 @@
 - 版本名 `v3.20 (Local Memory)`。
 - **明确未完成（别当已完成）**：SoVITS 本机 CPU 推理不达标，服务保持 `disabled`+`inactive`，未接主代理；云端 BGE 无同题实测，仅保留为可选；前端备份 ZIP 仍未加密；Cloudflare `worker/amsg` 的 Google secret 未同步（本机无 wrangler/无 CF 凭据）；Supabase 零 DDL（768 迁移仍是文本方案，需用户自己执行）；索引重建需用户自选触发，不自动全量重建；「架构一键向导」不是本轮内容。**上线回滚资产只有旧前端静态产物 + 旧代码 SHA，不做数据库备份/恢复。**
 
+## 十九、本地语音 MOSS-TTS-Nano（v3.21 Local Voice，2026-10-23 已发布）
+
+- **真实可用链路**：浏览器 `utils/genieTts.ts` → 主代理 `/agent/v1/tts`（`AMSG_CLIENT_TOKEN` 鉴权）→ 本机 loopback `127.0.0.1:19890` relay（`x-relay-key` 共享密钥）→ MOSS-TTS-Nano **FP32 + 真实参考特征缓存**（16 条 / 64 MiB、scope `relay-single-user`；无结果音频缓存、无 KV 缓存）。设置页「语音 → 本地语音（MOSS-TTS-Nano）」选它才走本机，云端三家完全不受影响。
+- **音色选择**：唯一授权音色 ID `ether`（用户授权音频，8.789 s / 48 kHz / mono；经 relay `POST /api/reference` 正规注册，落 `refs/ether.wav` 600、目录 700，原件与 `refs/user-ether/` 未改未剪）。设置页「本机音色」下拉只列**主代理 env 白名单**（`NANO_VOICE_IDS`）里的 ID，选完保存写 `apiConfig.mossVoiceId`。
+- **安全边界**：上行只认 `text` / `voice` / `demo`；`url`、`demo_id`、`voice_id`、任何路径字段一律忽略（无 SSRF、无任意文件读）；`voice` 必须命中白名单，否则 **409 `no_ref_voice` 且不触上游**；`demo` 只走服务端 env 的公开演示条目；`/tts/health` 只回布尔 + 白名单 ID + model，不回本机路径/参考文件名/密钥。
+- **缺参考不串音色**：没注册参考音频 → 409 `no_ref_voice` → 界面「待配置」，绝不回落公开 demo，也绝不换成别的音色。
+- **性能定位是「后台语音」**：FP32+cache 短句 cold 13.38 s / warm 9.12 s，relay 端 14.50 → 10.89 s，warm 音频与 FP32 基线逐字节相同（RTF ≈3.5，非实时）。所以文字先出、语音后台，不阻塞回复。
+- **资源与排队**：`moss.service` = CPUQuota 400% / 4 线程（ORT intra=4、inter=1）/ MemoryMax 4G / `MemorySwapMax=0` / Nice 10；relay 单并发、队列上限 3、单请求超时 90 s，主代理 80 s，前端 75 s；`/health` 只读计数器、不跑推理（实测 3–7 ms）。
+- **取消语义（如实）**：前端 abort 只停止等待，**不中断已进入 ONNX 的计算**；排队位靠单并发 + 超时回收，不宣称「已取消」。
+- **可直接关闭**：`systemctl stop moss.service` → 主代理回 `nano_unavailable`，文字与云端 TTS 不受影响；`MOSS_REF_CACHE_ENABLED=0` 单独回滚缓存。
+
+## 二十、角色独立本机音色 + 每音色 2 秒试听（v3.22 Voice Picker，2026-10-23）
+
+- **真实入口（不是只加字段）**：设置 → 其他 API →「本地语音（MOSS-TTS-Nano）」下有全局「本机音色（全局默认）」；角色编辑（`apps/Character.tsx`）在 `apiConfig.genieVoiceEnabled === true` 时才有「本机语音音色（MOSS-TTS-Nano）」卡片，选 `voiceProfile.mossVoiceId`（空 = 继承全局），随该角色自动保存。其他 provider 下不渲染、不探测，MiniMax / 鱼声 / ElevenLabs 字段原样保留。
+- **上行真的按选择**：`utils/genieTts.ts` 的 `resolveMossVoiceId()` 角色 > 全局 > 空，`/agent/v1/tts` 带 `voice`；主代理仍按 `NANO_VOICE_IDS` 白名单校验，未知 ID 409 `no_ref_voice` 不触上游。两角色各选各的，互不串。
+- **权威目录**：`GET /agent/v1/tts/health` 新增 `voiceOptions: [{id,label,origin,preview,registered}]`，ID 来自白名单、label/origin 来自 `NANO_VOICE_META`、`preview`/`registered` 来自 relay `/health` 的真实文件与注册表；旧版只有 `voices[]` 时前端降级显示 ID 且 `preview=false`。前端不硬编码任何音色。
+- **试听 = 参考副本**：新增 `GET /agent/v1/tts/preview?voice=<id>`（同一 `X-Client-Token` 鉴权）→ 主代理只把 ID 交给 relay → relay `GET /api/preview` 读 `refs/previews/<id>.wav`（700/600，不进 refs 顶层、不注册、不进静态站），2.000 s、48k/16k 单声道 PCM16、30ms 淡入淡出；`cache-control: private, no-store` + `nosniff`。原参考音频只读，不剪不改。
+- **音色集合**：`ether`（用户授权）+ `public-zh-01`（AISHELL-3 公开语料 `SSB01220090.wav` 副本，Apache-2.0，来源标注在 UI）。官方 repo 的 10 个 B 级 demo（zh_*/en_*）**未加入**：仓库 Apache-2.0 只覆盖代码/权重，音频无单独授权且发言人未知，按「不用未知真人声」排除；`zh_11`/`en_7` 含真实艺人名，永久排除。
+- **失败文案**：无音色/未连接 → 空态「还没有可选音色」；无预览片段 → 该行标「无试听」且按钮禁用；鉴权 403 / 404 无片段 / 409 越界 / 非音频 / 超 2MB 各有独立中文提示；同一时刻只播一段，换音色或卸载即 pause + revoke。
+- **边界**：不新增多用户隔离承诺；预览与合成共用同一白名单与现有单用户 token；不改模型/量化/缓存策略、不动其他角色数据、不为试听跑推理。
+
 ## 开发备注（自用）
 
 - ethernet 是唯一主力开发线，同步上游按提交等价移植，不整分支合并。
@@ -291,3 +312,5 @@
   - 设置页新增四个 password 输入 + 保存/清除/测试按钮，`autocomplete=new-password`，成功清空并读回存在性，失败不覆盖草稿。
   - 回归 17（mapCredentials/mapProxy/mapProviders）+ routes 5 + 设置 UI 3 + 前端 runtime 5 + loader 3；全部合成 Key，未发真实收费请求。
   - 未验证：VPS Caddy `handle /_AMapService/*` 路由（样板在 `docs/travel-map-credentials.md`，未应用）；用户真实 Key 的权限与出图。
+- 2026-10-23：**本地语音 MOSS-TTS-Nano 上线（v3.21 Local Voice）**——既有 `/agent/v1/tts` 路由补音色白名单 + relay 共享密钥 + health `voices`，用户授权参考以 `ether` 正规注册（原件未改），设置页「本机音色」可选并保存 `mossVoiceId`；缺参考 409 `no_ref_voice`、不回落 demo 不串音色；FP32 + 真实参考特征缓存（16/64MiB、single-user），定位后台语音（warm 短句 ≈9.1 s）。门禁与线上读回见 `/srv/model-tests/moss-nano/integration/RELEASE-RESULT.md`。
+- 2026-10-23：**角色独立音色 + 每音色 2 秒试听（v3.22 Voice Picker）**——角色编辑真实入口（仅本地语音 provider）、`voiceProfile.mossVoiceId` 持久化并实际上行；health 新增 `voiceOptions` 权威目录；新增鉴权 `/agent/v1/tts/preview?voice=<id>` 与 relay `/api/preview`，播放从授权参考裁出的 2.000 s 私有副本（不跑模型）；新增 `public-zh-01`（AISHELL-3 / Apache-2.0），10 个发言人未知的官方 demo 未加入。门禁与线上读回见 `/srv/model-tests/moss-nano/voice-selector/RELEASE-RESULT.md`。
