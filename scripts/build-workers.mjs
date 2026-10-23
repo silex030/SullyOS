@@ -82,6 +82,17 @@ const sharedOpts = {
   external: ['cloudflare:*'],
 };
 
+// esbuild 给内联模块打的 `// <相对路径>` 头注释是按 cwd 解析的。本仓 node_modules 在
+// 多 worktree 下是指向主检出的符号链接（/root/SullyOS-travel/node_modules →
+// /root/SullyOS/node_modules），同一份源码会产出 `../SullyOS/node_modules/…` 与
+// `node_modules/…` 两种头注释 —— 产物哈希随检出目录变化，check:workers 换 worktree 就假红。
+// 统一裁到 `node_modules/` 起，产物与检出位置无关。
+function normalizeModuleBannerComments(file) {
+  const text = readFileSync(file, 'utf8');
+  const normalized = text.replace(/^\/\/ .*?(node_modules\/)/gm, '// $1');
+  if (normalized !== text) writeFileSync(file, normalized);
+}
+
 console.log(`Building ${WORKERS.length} worker bundle(s)...`);
 
 for (const w of WORKERS) {
@@ -111,6 +122,7 @@ for (const w of WORKERS) {
 
   for (const out of outputs) {
     await build({ ...sharedOpts, entryPoints: [entry], outfile: out, banner });
+    normalizeModuleBannerComments(out);
   }
 
   const sizeRef = outWorker || outPublic;
