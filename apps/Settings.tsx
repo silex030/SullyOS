@@ -13,8 +13,9 @@ import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled a
 import { getLuckinToken, setLuckinToken as saveLuckinToken, isLuckinEnabled, setLuckinEnabled as saveLuckinEnabled, testLuckinConnection, resetLuckinSession } from '../utils/luckinMcpClient';
 import { consumeProxyWorkerSettingsFocus, getProxyWorkerUrl, setProxyWorkerUrl, DEFAULT_PROXY_WORKER } from '../utils/proxyWorker';
 import { geocodeCity, isAuthErrorCode, isQuotaErrorCode } from '../utils/amapCore';
-import { probeMossVoiceStatus, synthesizeMossDemoPreview } from '../utils/genieTts';
+import { probeMossVoiceStatus } from '../utils/genieTts';
 import { describeMossVoiceStatus, type MossVoiceStatus } from '../utils/mossTtsStatus';
+import MossVoicePicker from '../components/voice/MossVoicePicker';
 import { deleteCachedLibrary, getCityLibrary, listCachedLibraries } from '../utils/cityPlaces';
 import { VOICE_ACTING_GUIDE } from '../utils/minimaxTts';
 import { FISH_VOICE_ACTING_GUIDE } from '../utils/fishAudioTts';
@@ -76,6 +77,7 @@ const MOSS_STATUS_UNKNOWN: MossVoiceStatus = {
     referenceConfigured: false,
     demoAvailable: false,
     voices: [],
+    voiceOptions: [],
 };
 
 // hot_news（news.orz.ai）可选热榜平台。key 必须与 API 的 ?platform= 完全一致。
@@ -691,8 +693,6 @@ const Settings: React.FC = () => {
   // 本机 MOSS-TTS-Nano 的真实状态：null = 还没探到（显示检测中），不预置「可用」。
   const [localMossStatus, setLocalMossStatus] = useState<MossVoiceStatus | null>(null);
   const [localMossProbing, setLocalMossProbing] = useState(false);
-  const [mossPreviewState, setMossPreviewState] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
-  const mossPreviewUrlRef = useRef<string | null>(null);
   const [localFishModel, setLocalFishModel] = useState(apiConfig.fishAudioModel || 's2.1-pro');
   const [localElevenLabsKey, setLocalElevenLabsKey] = useState(apiConfig.elevenLabsApiKey || '');
   const [localElevenLabsModel, setLocalElevenLabsModel] = useState(apiConfig.elevenLabsModel || DEFAULT_ELEVENLABS_MODEL);
@@ -722,29 +722,6 @@ const Settings: React.FC = () => {
   }, []);
 
   useEffect(() => { void refreshLocalMossStatus(); }, [refreshLocalMossStatus]);
-
-  useEffect(() => () => {
-    if (mossPreviewUrlRef.current) URL.revokeObjectURL(mossPreviewUrlRef.current);
-    mossPreviewUrlRef.current = null;
-  }, []);
-
-  /** 试听公开演示音色：只是听个响，不写角色音色、不落库。 */
-  const playMossDemoPreview = useCallback(async () => {
-    if (mossPreviewState === 'loading' || mossPreviewState === 'playing') return;
-    setMossPreviewState('loading');
-    try {
-      const { url } = await synthesizeMossDemoPreview('你好，这是本机语音的公开演示音色。');
-      if (mossPreviewUrlRef.current) URL.revokeObjectURL(mossPreviewUrlRef.current);
-      mossPreviewUrlRef.current = url;
-      const audio = new Audio(url);
-      audio.onended = () => setMossPreviewState('idle');
-      audio.onerror = () => setMossPreviewState('error');
-      setMossPreviewState('playing');
-      await audio.play();
-    } catch {
-      setMossPreviewState('error');
-    }
-  }, [mossPreviewState]);
   // 高级设置（流式/温度）默认折叠 — 大多数用户不需要碰
   const [showApiAdvanced, setShowApiAdvanced] = useState(false);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
@@ -3364,55 +3341,23 @@ const Settings: React.FC = () => {
                         </p>
                         <p>{describeMossVoiceStatus(localMossStatus ?? MOSS_STATUS_UNKNOWN).detail}</p>
                         {/* 音色选择：选项只来自主代理白名单（服务端 env），前端不能自造 ID，
-                            也不会替你挑别的角色音色。没选 = 用服务端默认音色。 */}
-                        <div className="flex items-center gap-2 flex-wrap">
-                            <label className="font-semibold text-amber-800" htmlFor="moss-voice-select">本机音色</label>
-                            {(localMossStatus?.voices.length ?? 0) > 0 ? (
-                                <select
-                                    id="moss-voice-select"
-                                    value={localMossVoiceId}
-                                    onChange={(e) => setLocalMossVoiceId(e.target.value)}
-                                    className="px-2 py-1 rounded-lg bg-white border border-amber-300/70 text-amber-900 font-mono"
-                                >
-                                    <option value="">默认（服务端设定）</option>
-                                    {localMossStatus!.voices.map((id) => (
-                                        <option key={id} value={id}>{id}</option>
-                                    ))}
-                                </select>
-                            ) : (
-                                <span className="text-amber-700">服务端还没给出可选音色（未连接或未配置）</span>
-                            )}
-                            <span className="text-[10px] text-amber-600">选完记得保存</span>
-                        </div>
+                            也不会替你挑别的角色音色。没选 = 用服务端默认音色。
+                            试听是「选中音色的约 2 秒参考副本」，不是统一 demo，也不跑模型。 */}
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-amber-800">本机音色（全局默认）</div>
+                        <MossVoicePicker
+                            value={localMossVoiceId}
+                            onChange={setLocalMossVoiceId}
+                            status={localMossStatus}
+                            onRefresh={() => { void refreshLocalMossStatus(); }}
+                            refreshing={localMossProbing}
+                            showLabel={false}
+                        />
                         <p className="text-amber-700">
                             这些音色是本机已授权并注册的参考音频（3-15 秒干净中文、单声道 WAV、≤10MB），
                             网页端只负责<span className="font-semibold">选择</span>，不上传、不显示文件路径。
                             没注册过的音色不会偷偷用别的音色顶替，只会明确报「待配置」。
-                            所有角色默认共用这里的全局音色；角色自己指定了本机音色的，优先用角色那份。
-                        </p>
-                        <div className="flex items-center gap-2 flex-wrap pt-0.5">
-                            <button
-                                type="button"
-                                disabled={localMossProbing || mossPreviewState === 'loading' || mossPreviewState === 'playing'}
-                                onClick={() => { void refreshLocalMossStatus(); }}
-                                className="px-2.5 py-1 rounded-lg bg-white border border-amber-300/70 font-semibold text-amber-800 active:bg-amber-100 disabled:opacity-50"
-                            >
-                                {localMossProbing ? '检测中…' : '重新检测'}
-                            </button>
-                            {localMossStatus?.demoAvailable ? (
-                                <button
-                                    type="button"
-                                    disabled={mossPreviewState === 'loading' || mossPreviewState === 'playing'}
-                                    onClick={() => { void playMossDemoPreview(); }}
-                                    className="px-2.5 py-1 rounded-lg bg-white border border-amber-300/70 font-semibold text-amber-800 active:bg-amber-100 disabled:opacity-50"
-                                >
-                                    {mossPreviewState === 'loading' ? '合成中…' : mossPreviewState === 'playing' ? '播放中…' : '试听公开演示音色'}
-                                </button>
-                            ) : null}
-                            {mossPreviewState === 'error' && <span className="text-rose-600">试听失败（本机语音没就绪或缺参考音频）</span>}
-                        </div>
-                        <p className="text-[10px] text-amber-600">
-                            「试听公开演示音色」用的是模型自带的公开演示声音，只用来听本机效果，<span className="font-semibold">不是角色音色</span>，也不会写进角色的音色配置。
+                            所有角色默认共用这里的全局音色；角色编辑里可以单独选，没单独选就跟着这里。
+                            选完记得保存。
                         </p>
                     </div>
                 )}

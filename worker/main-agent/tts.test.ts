@@ -183,7 +183,14 @@ describe('main-agent /v1/tts/health：状态来自 runtime 真实探活', () => 
     }), healthEnv);
     expect(res.status).toBe(200);
     const body = await res.json() as Record<string, unknown>;
-    expect(body).toEqual({ ready: true, model: 'moss-tts-nano', referenceConfigured: false, demoAvailable: true, voices: ['ether'] });
+    expect(body).toEqual({
+      ready: true,
+      model: 'moss-tts-nano',
+      referenceConfigured: false,
+      demoAvailable: true,
+      voices: ['ether'],
+      voiceOptions: [{ id: 'ether', label: 'ether', origin: '', preview: false, registered: false }],
+    });
     expect(JSON.stringify(body)).not.toContain('secret');
     // 探活打的是派生出来的 /health，不是生成端点
     expect(String((fetchMock.mock.calls[0] as any[])[0])).toBe('http://127.0.0.1:19890/health');
@@ -289,6 +296,135 @@ describe('main-agent /v1/tts：音色 ID 白名单与 relay 密钥', () => {
     const body = await res.json() as Record<string, unknown>;
     expect(body.voices).toEqual(['ether', 'other']);
     expect(JSON.stringify(body)).not.toContain('/srv');
+  });
+});
+
+// ───────────── 音色目录元数据 + 2 秒试听（同一套鉴权与白名单）─────────────
+describe('main-agent /v1/tts/health：音色目录元数据', () => {
+  const metaEnv: Env = {
+    ...BASE_ENV,
+    NANO_VOICE_IDS: 'ether,official-sample',
+    NANO_VOICE_META: JSON.stringify([
+      { id: 'ether', label: 'ether（我的声音）', origin: '用户本人提供' },
+      { id: 'official-sample', label: '公开语料示例', origin: 'AISHELL-3（Apache-2.0）' },
+      // 白名单外的 ID 不能出现在目录里
+      { id: 'sneaky', label: '不该出现', origin: 'x' },
+    ]),
+  };
+  const healthOf = () =>
+    mainAgent.fetch(new Request('http://127.0.0.1:8830/v1/tts/health', {
+      headers: { 'x-client-token': TOKEN },
+    }), metaEnv);
+
+  it('只回白名单内的 ID，并带中文展示名/来源/试听与注册状态（来自 relay）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ready: true, referenceConfigured: true, model: 'moss-tts-nano',
+      voices: ['ether', 'official-sample', '../bad'],
+      previews: ['official-sample'],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const res = await healthOf();
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.voices).toEqual(['ether', 'official-sample']);
+    expect(body.voiceOptions).toEqual([
+      { id: 'ether', label: 'ether（我的声音）', origin: '用户本人提供', preview: false, registered: true },
+      { id: 'official-sample', label: '公开语料示例', origin: 'AISHELL-3（Apache-2.0）', preview: true, registered: true },
+    ]);
+    expect(JSON.stringify(body)).not.toContain('sneaky');
+    expect(JSON.stringify(body)).not.toContain('/srv');
+  });
+
+  it('relay 没给 voices/previews 时 preview 一律 false（不假装有试听）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ready: true, referenceConfigured: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    const body = await (await healthOf()).json() as any;
+    expect(body.voiceOptions.every((v: any) => v.preview === false)).toBe(true);
+    expect(body.voiceOptions.every((v: any) => v.registered === true)).toBe(true);
+  });
+});
+
+describe('main-agent /v1/tts/preview：按音色取 2 秒试听', () => {
+  const PREVIEW_ENV: Env = {
+    ...BASE_ENV,
+    NANO_VOICE_IDS: 'ether,official-sample',
+    NANO_RELAY_KEY: 'relay-key',
+  };
+  const get = (query: string, env: Env = PREVIEW_ENV, headers: Record<string, string> = { 'x-client-token': TOKEN }) =>
+    mainAgent.fetch(new Request(`http://127.0.0.1:8830/v1/tts/preview${query}`, { headers }), env);
+
+  it('鉴权先行：没有 token 一律 403，不触上游', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await get('?voice=ether', PREVIEW_ENV, {});
+    expect(res.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('非法 ID（路径/空值/超长）400，且不转发', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    for (const q of ['', '?voice=', '?voice=../../etc/passwd', '?voice=ether.wav', '?voice=a%20b', `?voice=${'x'.repeat(40)}`]) {
+      const res = await get(q);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe('invalid_voice');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('形状合法但不在白名单 → 409 no_ref_voice（不回落 demo/别的音色）', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await get('?voice=someone-else');
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('no_ref_voice');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('成功时只转发 ID（带 relay key），回 audio/wav 且禁止缓存', async () => {
+    const fetchMock = vi.fn(async () => new Response(new Blob([wavBytes(2) as unknown as BlobPart]), {
+      status: 200, headers: { 'content-type': 'audio/wav' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await get('?voice=official-sample');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('audio/wav');
+    expect(res.headers.get('cache-control')).toContain('no-store');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    const [url, init] = fetchMock.mock.calls[0] as any[];
+    expect(String(url)).toBe('http://127.0.0.1:19890/api/preview');
+    expect(init.method).toBe('GET');
+    expect(init.headers['x-voice-id']).toBe('official-sample');
+    expect(init.headers['x-relay-key']).toBe('relay-key');
+    expect(String(url)).not.toContain('official-sample');
+    expect((await res.arrayBuffer()).byteLength).toBe(wavBytes(2).length);
+  });
+
+  it('relay 说没有预览片段 → 404 no_preview（不换个音色顶上）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'no_preview' }), { status: 404 })));
+    const res = await get('?voice=ether');
+    expect(res.status).toBe(404);
+    expect((await res.json()).error).toBe('no_preview');
+  });
+
+  it('relay 返回坏字节 / 非 2 秒音频 → 502 preview_invalid（不把坏文件发给浏览器）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not-audio', { status: 200 })));
+    let res = await get('?voice=ether');
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toBe('preview_invalid');
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Blob([wavBytes(9) as unknown as BlobPart]), { status: 200 })));
+    res = await get('?voice=ether');
+    expect(res.status).toBe(502);
+  });
+
+  it('relay 不可达 → 503 nano_unavailable；relay 401/500 → 502 preview_failed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    let res = await get('?voice=ether');
+    expect(res.status).toBe(503);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 500 })));
+    res = await get('?voice=ether');
+    expect(res.status).toBe(502);
   });
 });
 

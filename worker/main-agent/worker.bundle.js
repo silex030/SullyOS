@@ -1200,6 +1200,27 @@ function nanoVoiceList(env) {
   return out;
 }
 
+/**
+ * 音色的展示元数据（`NANO_VOICE_META` JSON 数组：[{id,label,origin}]）。
+ * 只做展示名/来源，**不参与授权**：可选 ID 永远由 NANO_VOICE_IDS 白名单决定；
+ * meta 里出现白名单外的 ID 一律忽略，避免 env 写错就多出一个音色。
+ */
+function nanoVoiceMeta(env, voices) {
+  const map = new Map();
+  const raw = getJsonEnv(env, 'NANO_VOICE_META', []);
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      if (!voices.includes(id) || map.has(id)) continue;
+      const label = typeof item.label === 'string' ? item.label.replace(/[\u0000-\u001f\u007f]/g, ' ').trim() : '';
+      const origin = typeof item.origin === 'string' ? item.origin.replace(/[\u0000-\u001f\u007f]/g, ' ').trim() : '';
+      map.set(id, { label: label.slice(0, 40), origin: origin.slice(0, 60) });
+    }
+  }
+  return map;
+}
+
 /** 端点派生：base 只从 env 取，health 优先用显式 env，否则从 NANO_TTS_URL 推同主机 /health。 */
 function nanoEndpoints(env) {
   const url = (env?.NANO_TTS_URL || '').trim() || NANO_DEFAULT_URL;
@@ -1207,6 +1228,12 @@ function nanoEndpoints(env) {
   if (!health) {
     const m = /^(https?:\/\/[^/]+)/i.exec(url);
     health = m ? `${m[1]}/health` : 'http://127.0.0.1:19890/health';
+  }
+  // 试听预览与生成同一个 relay：显式 env 优先，否则从生成端点推同主机的 /api/preview。
+  let preview = (env?.NANO_PREVIEW_URL || '').trim();
+  if (!preview) {
+    const m = /^(https?:\/\/[^/]+)/i.exec(url);
+    preview = m ? `${m[1]}/api/preview` : 'http://127.0.0.1:19890/api/preview';
   }
   const voices = nanoVoiceList(env);
   const configured = (env?.NANO_VOICE_ID || '').trim();
@@ -1216,6 +1243,7 @@ function nanoEndpoints(env) {
   return {
     url,
     health,
+    preview,
     demoId: (env?.NANO_DEMO_ID || '').trim() || NANO_DEFAULT_DEMO_ID,
     voices,
     defaultVoice,
@@ -1343,6 +1371,25 @@ async function ttsHealth(request, env) {
     }
     const ready = !!data && typeof data === 'object' && data.ready === true;
     const referenceConfigured = !!data && typeof data === 'object' && data.referenceConfigured === true;
+    // relay 若报告已注册音色 / 已有预览片段的 ID，就用它给出权威的 registered/preview；
+    // 老 relay 没有这两个数组时，registered 按 referenceConfigured 推断，preview 一律 false（不假装能听）。
+    const registeredList = data && typeof data === 'object' && Array.isArray(data.voices)
+      ? data.voices.filter((id) => typeof id === 'string' && voices.includes(id))
+      : null;
+    const previewList = data && typeof data === 'object' && Array.isArray(data.previews)
+      ? data.previews.filter((id) => typeof id === 'string' && voices.includes(id))
+      : [];
+    const meta = nanoVoiceMeta(env, voices);
+    const voiceOptions = voices.map((id) => {
+      const m = meta.get(id);
+      return {
+        id,
+        label: m?.label || id,
+        origin: m?.origin || '',
+        preview: previewList.includes(id),
+        registered: registeredList ? registeredList.includes(id) : referenceConfigured,
+      };
+    });
     const body = {
       ready,
       referenceConfigured,
@@ -1351,10 +1398,60 @@ async function ttsHealth(request, env) {
       // 可选音色只回服务端白名单里的 ID（是「可选清单」，不代表每个都已注册；
       // 真缺参考时合成会明确 409）。绝不回参考文件路径或本机目录。
       voices,
+      // 结构化目录：展示名 / 来源 / 是否有约 2 秒试听 / 是否已注册参考音频。
+      voiceOptions,
     };
     const model = data && typeof data === 'object' && typeof data.model === 'string' ? data.model.trim() : '';
     if (model) body.model = model;
     return json(body);
+  } catch {
+    return json({ error: 'nano_unavailable' }, 503);
+  }
+}
+
+/**
+ * 音色试听：`GET /v1/tts/preview?voice=<id>` → 该音色约 2 秒参考副本（audio/wav）。
+ *
+ * 与合成同一套授权：先鉴权（路由层），再按 NANO_VOICE_IDS 白名单校验 ID，
+ * 只把 ID 交给 relay；**不接受任何路径/URL 参数**，所以不存在任意文件读。
+ * 下游 relay 也只回已注册音色的私有预览文件，找不到就是 404 no_preview，
+ * 绝不回落到 public-demo 或别的角色音色。
+ */
+async function ttsPreview(request, env, url) {
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const { preview, voices, key } = nanoEndpoints(env);
+  const requested = (url.searchParams.get('voice') || '').trim();
+  if (!requested || !NANO_VOICE_ID_RE.test(requested)) return json({ error: 'invalid_voice' }, 400);
+  if (!voices.includes(requested)) return json({ error: 'no_ref_voice' }, 409);
+  const headers = {};
+  headers['x-voice-id'] = requested;
+  if (key) headers['x-relay-key'] = key;
+  try {
+    const upstream = await fetch(preview, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (upstream.status === 404) return json({ error: 'no_preview' }, 404);
+    if (!upstream.ok) {
+      console.warn(`[tts] preview upstream ${upstream.status} → preview_failed`);
+      return json({ error: 'preview_failed' }, 502);
+    }
+    const raw = new Uint8Array(await upstream.arrayBuffer());
+    // 私有预览只应是 2 秒左右的 WAV：不是 RIFF / 时长不在 1–3 秒 / 体积过大都拒绝，
+    // 避免 relay 配错时把别的文件（或超长音频）当试听发出去。
+    const seconds = raw.length >= 44 ? wavDurationSeconds(raw) : null;
+    if (seconds === null || seconds < 1 || seconds > 3 || raw.length > 2 * 1024 * 1024) {
+      console.warn(`[tts] reject preview bytes=${raw.length} seconds=${seconds === null ? '-' : seconds.toFixed(2)}`);
+      return json({ error: 'preview_invalid' }, 502);
+    }
+    const out = new Headers();
+    out.set('content-type', 'audio/wav');
+    // 私有资产：禁止中间层/CDN 缓存，浏览器每次带 token 现取。
+    out.set('cache-control', 'private, no-store, max-age=0');
+    out.set('x-content-type-options', 'nosniff');
+    out.set('access-control-allow-origin', '*');
+    return new Response(raw, { status: 200, headers: out });
   } catch {
     return json({ error: 'nano_unavailable' }, 503);
   }
@@ -1727,6 +1824,8 @@ export default {
     // 不缓存参考音频、不接受任何上游地址或音色 id。
     // GET /v1/tts/health 是 UI 判断「就绪 / 待配置 / 未连接」的唯一来源，同样要 token。
     if (plain === '/v1/tts/health') return ttsHealth(request, env);
+    // GET /v1/tts/preview?voice=<id> 试听某个已授权音色的约 2 秒参考副本（同样要 token）。
+    if (plain === '/v1/tts/preview') return ttsPreview(request, env, url);
     if (plain === '/v1/tts') {
       if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
       return ttsProxy(request, env);

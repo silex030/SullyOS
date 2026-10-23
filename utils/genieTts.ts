@@ -121,19 +121,66 @@ export async function synthesizeSpeechGenieDetailed(
 ): Promise<TtsResult> {
   // 角色单独指定的本机音色优先；没有就用设置页的全局本机音色；
   // 都没选就交给服务端默认。前端不猜、也不拿别的角色音色顶替。
-  const voice = (char?.voiceProfile?.mossVoiceId || apiConfig?.mossVoiceId || '').trim();
+  const voice = resolveMossVoiceId(char, apiConfig);
   return postGenie(text, options?.demo === true, voice, 75_000);
 }
 
 /**
- * 试听公开演示音色。**不是角色音色**，只用来让用户在没配参考音频时听到本机效果。
- * 服务端只接受 demo:true → 固定 env 里的公开 demo，不能借这个接口读别人的音色。
+ * 角色实际使用的本机音色 ID：角色 > 全局 > 空串（服务端默认）。
+ * 纯函数，单独导出便于回归「两个角色各选各的不串音」。
  */
-export async function synthesizeMossDemoPreview(
-  text: string,
-  apiConfig?: APIConfig,
-): Promise<TtsResult> {
-  return synthesizeSpeechGenieDetailed(text, {} as CharacterProfile, apiConfig ?? ({} as APIConfig), { demo: true });
+export function resolveMossVoiceId(
+  char: Pick<CharacterProfile, 'voiceProfile'> | null | undefined,
+  apiConfig: Pick<APIConfig, 'mossVoiceId'> | null | undefined,
+): string {
+  return (char?.voiceProfile?.mossVoiceId || '').trim() || (apiConfig?.mossVoiceId || '').trim();
+}
+
+/** 与主代理/relay 一致的音色 ID 形状。前端先挡一次，避免把路径发给后端。 */
+const MOSS_VOICE_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
+/** 2 秒 48k 立体声 16bit ≈ 384KB；留足余量，超限一律拒播。 */
+export const MAX_MOSS_PREVIEW_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 取「某个已授权音色」的约 2 秒试听副本（鉴权主代理转发，asset 不进静态站）。
+ * 与合成完全分开：不跑模型、不写任何配置、不带 demo:true。
+ */
+export async function fetchMossVoicePreview(voiceId: string, timeoutMs = 15_000): Promise<TtsResult> {
+  const id = typeof voiceId === 'string' ? voiceId.trim() : '';
+  if (!MOSS_VOICE_ID_RE.test(id)) throw new Error('音色 ID 不合法，无法试听');
+
+  const { agentUrl, agentToken } = readAgentRoutingConfig();
+  if (!agentUrl) throw new Error('未配置主代理地址，无法试听本机音色');
+  const base = agentUrl.replace(/\/+$/, '');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers: Record<string, string> = {};
+    if (agentToken) headers['X-Client-Token'] = agentToken;
+    const res = await fetch(`${base}/agent/v1/tts/preview?voice=${encodeURIComponent(id)}`, {
+      headers,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      if (res.status === 403 || res.status === 401) throw new Error('没有访问本机语音的权限（主代理鉴权失败，请检查令牌）');
+      if (res.status === 404) throw new Error('该音色没有可试听的片段');
+      if (res.status === 409 || res.status === 400) throw new Error('这个音色不在已授权范围内（或还没有注册参考音频）');
+      throw new Error('试听暂时不可用，请稍后再试');
+    }
+    const ctype = String(res.headers.get('content-type') || '').toLowerCase();
+    if (!ctype.includes('audio/')) throw new Error('试听返回的不是音频（已拒绝播放）');
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength < 44 || buf.byteLength > MAX_MOSS_PREVIEW_BYTES) {
+      throw new Error('试听返回的音频为空或过大（已拒绝播放）');
+    }
+    const blob = new Blob([buf], { type: ctype.includes('wav') ? 'audio/wav' : 'audio/mpeg' });
+    return { url: URL.createObjectURL(blob), blob };
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') throw new Error('试听加载超时，请稍后再试');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export interface MossVoiceProbe {

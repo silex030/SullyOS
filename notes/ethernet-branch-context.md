@@ -187,3 +187,11 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - **缓存证据从哪看**：relay `/health` 现在回 `refCache` 只读计数器（hits/misses/encode_calls/entries/bytes），**不跑推理**；主代理只把布尔与白名单 ID 转给浏览器，计数器不外泄。真 refcache 的冷/热证据见 `/srv/model-tests/moss-nano/optimization/FINAL-RESULT.md`。
   - **定位**：FP32+cache warm 短句 ≈9.1 s（RTF≈3.5）不是实时，产品语义是「文字先出、语音后台」；`moss.service` 单并发 + 队列上限 3 + 90 s 超时；前端 abort 只停等待，不中断已进 ONNX 的计算（别写成已取消）。
   - 门禁与线上读回见 `/srv/model-tests/moss-nano/integration/RELEASE-RESULT.md`。
+
+- 🎚️ **2026-10-23 角色独立音色 + 2 秒试听（v3.22 Voice Picker）**：
+  - **「有字段」≠「有入口」**：上轮报告写「角色设置 → 音色 → 本机音色」其实不存在，只有 `types.ts` 的 `voiceProfile.mossVoiceId` 和读取优先级。本轮才在 `apps/Character.tsx` 加真实卡片，并且用 `apiConfig.genieVoiceEnabled === true` 门控：其他 provider 下不渲染、不探测。**验收要追到可点击的 UI 与落库路径，不能只 grep 字段。**
+  - **2 秒试听不要跑模型**：MOSS 是参考克隆，参考音频本身就是最诚实的音色样本。`scripts/make_voice_previews.py`（runtime，不在仓库）从只读参考裁 2.000 s PCM16 + 30ms 淡入淡出，写 `refs/previews/`（700/600）。**预览不能放 `refs/` 顶层**：relay 的 `_refs()` 只 glob 顶层 `*.wav`，放顶层就会变成一个可选/可注册音色。
+  - **预览链路三层都要白名单**：主代理 `/v1/tts/preview` 只收 `voice` 且必须命中 `NANO_VOICE_IDS`（畸形 400、越界 409，都不触上游）；relay `/api/preview` 再核 `x-voice-id` 已注册 + 预览文件真实存在，并校验 1–3 s / ≤2MiB；主代理回 `cache-control: private, no-store`，资产永远不进 `frontend-dist`。前端用 token fetch → blob objectURL，同一时刻只播一段。
+  - **音色元数据别塞进代码**：`NANO_VOICE_META`（JSON `[{id,label,origin}]`）只提供展示名与来源，授权仍只由 `NANO_VOICE_IDS` 决定；meta 里出现白名单外的 ID 必须忽略。`preview`/`registered` 来自 relay `/health` 的真实注册表与文件，不能由前端猜。
+  - **许可分层**：仓库/权重 Apache-2.0 ≠ 音频可分发。本轮只加 `public-zh-01`（AISHELL-3 `SSB01220090.wav`，语料级 Apache-2.0）；官方 demo 里 10 个 B 级发言人未知的样本按「不用未知真人声」不加，`zh_11`/`en_7` 含真实艺人名永久排除。UI 不写性别/年龄。
+  - 门禁与线上读回见 `/srv/model-tests/moss-nano/voice-selector/RELEASE-RESULT.md`。
