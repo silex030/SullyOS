@@ -109,6 +109,27 @@ describe('travel map credentials · 加密保存与最小回显', () => {
     expect(after?.amapJsKey).toBe(JS_MARKER);
   });
 
+  it('四个字段全清除后仍留着行，但 configured 必须为 false（不能显示已配置）', async () => {
+    await save({ amapWebKey: WEB_MARKER, amapJsKey: JS_MARKER, amapJsCode: CODE_MARKER, mapboxToken: MAPBOX_MARKER });
+    const cleared = await saveTravelMapCredentials({
+      db: db as never,
+      userId: USER,
+      masterKey: MASTER,
+      patch: {},
+      clear: ['amapWebKey', 'amapJsKey', 'amapJsCode', 'mapboxToken'],
+      nowMs: NOW + 2000,
+    });
+    expect(cleared.ok).toBe(true);
+    const rows = sql.prepare('SELECT COUNT(*) AS n FROM travel_map_credentials WHERE user_id = ?').get(USER) as { n: number };
+    expect(Number(rows.n)).toBe(1);
+
+    const status = await getTravelMapCredentialStatus({ db: db as never, userId: USER, masterKey: MASTER });
+    expect(status.has).toEqual({ amapWebKey: false, amapJsKey: false, amapJsCode: false, mapboxToken: false });
+    expect(status.configured).toBe(false);
+    expect(status.amapJsKey).toBeNull();
+    expect(status.mapboxToken).toBeNull();
+  });
+
   it('跨用户隔离：另一个主体读不到也不受影响', async () => {
     await save({ amapWebKey: WEB_MARKER }, { userId: USER });
     const other = await getTravelMapCredentialStatus({ db: db as never, userId: 'u2', masterKey: MASTER });

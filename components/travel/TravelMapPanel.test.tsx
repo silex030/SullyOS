@@ -19,7 +19,7 @@ import TravelMapPanel, {
     resolvePanelStatus,
     type TravelPanelView,
 } from './TravelMapPanel';
-import type { TravelCharacterView } from './TravelBall';
+import type { TravelCharacterView } from '../../utils/travel/activityPresentation';
 import type { TravelTripStatus } from '../../contracts/travel';
 
 const chars: TravelCharacterView[] = [

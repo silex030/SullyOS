@@ -470,13 +470,9 @@ export async function handleTravelRequest(
         userId,
         nowMs,
         baseVersion,
-        ...(typeof body.budgetTz === 'string' ? { budgetTz: body.budgetTz } : {}),
-        ...(body.tripRetentionDays !== undefined
-          ? { tripRetentionDays: readNumberOrNull(body.tripRetentionDays) ?? undefined }
-          : {}),
-        ...(body.eventRetentionDays !== undefined
-          ? { eventRetentionDays: readNumberOrNull(body.eventRetentionDays) ?? undefined }
-          : {}),
+        // 时区与保留期**不再接受用户输入**：账号预算固定用账号时区（服务端已有值或默认），
+        // 保留策略由服务端按用途/终态/共享代际 bounded prune。字段仍保留在读取响应里
+        // 以兼容旧客户端，但写请求里的这些字段会被忽略（不是报错）。
         ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
       });
       if (!result.ok) return fail(409, 'VERSION_CONFLICT');

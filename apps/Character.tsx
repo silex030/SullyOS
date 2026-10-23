@@ -13,6 +13,7 @@ import RoomPlatePanel from '../components/character/RoomPlatePanel';
 import MemoryArchivist from '../components/character/MemoryArchivist';
 import ChibiStudio, { ChibiShelfPanel } from '../components/character/ChibiStudio';
 import AutonomyPanel from '../components/character/AutonomyPanel';
+import TravelCharCard from '../components/character/TravelCharCard';
 import AirpPanel from '../components/character/AirpPanel';
 import TokenImg from '../components/os/TokenImg';
 import { resolveBlobRefsDeep, migrateDataUrlToRef } from '../utils/blobRef';
@@ -2310,6 +2311,7 @@ ${isInitialGeneration ? `
                                char={formData}
                                onChange={(next) => handleChange('airp', next)}
                            />
+                           <TravelCharCard charId={formData.id} className="mt-4" />
                        </div>
                    )}
 

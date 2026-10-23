@@ -205,6 +205,11 @@ import {
   resolveTravelSession,
 } from './travel/auth';
 import { createTravelSessionResolver } from './travel/auth';
+import {
+  createD1PairStore,
+  handleTravelPairRequest,
+  TRAVEL_PAIR_DDL,
+} from './travel/pairing';
 import { handleTravelRequest } from './travel/routes';
 import { handleTravelScheduled, inferRegionFromAnchor } from './travel/tick';
 import { handleTravelStaticMap, decodeStaticMapUser } from './travel/staticmap';
@@ -3569,6 +3574,41 @@ export default {
     // 全部排在配置门之后、未知 fallback 之前，所以既不会在缺配置时误报「能用」，
     // 也不会被 upstream 的 404 兜底吃掉。
     //
+    // 0) 首次连接：申请 → 管理员本机批准 → 同浏览器认领。
+    //    公开侧没有任何 approve 接口，也不接收 userId；owner 密钥只在 claim 的 POST
+    //    响应体里出现一次，不写 URL/日志。
+    if (method === 'POST' && pathname.endsWith('/travel/pair/request')) {
+      try {
+        await (env.DB as unknown as { prepare(sql: string): { run(): Promise<unknown> } })
+          .prepare(TRAVEL_PAIR_DDL)
+          .run();
+        await ensureTravelOwnerSchema(env.DB as never);
+      } catch {
+        return jsonWithCors(503, { success: false, error: { code: 'PAIR_STORE_UNCONFIGURED' } });
+      }
+    }
+    if (pathname.endsWith('/travel/pair/request')
+      || pathname.endsWith('/travel/pair/status')
+      || pathname.endsWith('/travel/pair/claim')) {
+      const forwarded = request.headers.get('cf-connecting-ip')
+        ?? (request.headers.get('x-forwarded-for') ?? '').split(',')[0]?.trim()
+        ?? '';
+      let paired: Response | null = null;
+      try {
+        paired = await handleTravelPairRequest(request, {
+          store: createD1PairStore(env.DB as never),
+          putOwnerKeyHash: (userId, keyHash, nowMs) => createD1OwnerStore(env.DB as never)
+            .putKeyHash(userId, keyHash, nowMs),
+          nowMs: Date.now(),
+          clientIp: forwarded || null,
+          ipSalt: resolveTravelSecretString(env as never) ?? null,
+        });
+      } catch {
+        return jsonWithCors(503, { success: false, error: { code: 'PAIR_STORE_UNCONFIGURED' } });
+      }
+      if (paired) return travelWithCors(paired);
+    }
+
     // 1) 会话交换：owner 密钥 → 短期 Bearer。**owner bootstrap 不挂 HTTP**
     //    （公开挂出去等于给任意人签发身份）；它只由运维在服务端跑见 docs/travel-contract.md。
     if (method === 'POST'

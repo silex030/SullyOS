@@ -13,7 +13,7 @@
 import React from 'react';
 import { ArrowsClockwise, MapTrifold, X } from '@phosphor-icons/react';
 import TravelMapCanvas, { type TravelMapAdapter } from './TravelMapCanvas';
-import type { TravelCharacterView } from './TravelBall';
+import type { TravelCharacterView } from '../../utils/travel/activityPresentation';
 import type {
     TravelCoordSys,
     TravelErrorCode,

@@ -1,24 +1,29 @@
 /**
- * 角色自主出行 · 悬浮层（B6 集成入口）
+ * 角色自主出行 · 悬浮层（顶部灵动岛式，B6 集成入口）
  *
- * 把 B5 的球 / 面板接到真实运行时上，并补齐 B5 刻意没做的两件事：
- * 1. **结束共享**：面板只负责看，授权开关放在这里（二次确认，避免误触）；
- * 2. **设置入口**：共享关闭时球消失，但仍要能进设置把共享/地址/预算配好。
+ * 与 B5 的区别（2026-10-24 用户要求）：**取消左下角悬浮球**，改成挂在状态栏下方的
+ * 一条顶部状态胶囊（`TravelActivityIsland`）——只有真的在出行、且位置共享允许展示时才出现，
+ * 轻点展开既有地图面板。设置不再靠底部小胶囊，而是走设置 App 里的出行板块
+ * （`components/settings/TravelMapServiceCard.tsx` + 角色页 `TravelCharCard`）。
  *
  * 边界：
- * - 共享未知（读失败）按「不可见」处理：不渲染球、不渲染面板，也不拿本地缓存补内容；
+ * - 共享未知（读失败）按「不可见」处理：不渲染岛、不渲染面板，也不拿本地缓存补内容；
  * - 面板数据只来自 `runtime.store` 的脱敏快照；UI 不推进相位、不改目的地、不写心情；
  * - 地图未配置（缺 JS Key / 同源安全代理 / 国外凭证）时由画布自己显示「未就绪」，
  *   这里不提供任何假底图；
- * - 多角色共享时球显示计数，面板顶部切换；切换只是「看谁」，不改任何人的行程。
+ * - 顶部优先级：通话 > 生成指示条（演出/梦境）> 出行岛；岛只占顶部一行，不挡底部触摸导航；
+ * - 旧悬浮球的位置记忆键在这里一次性清掉（只删那一把，不动用户其它 localStorage）。
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { GearSix, ShieldSlash } from '@phosphor-icons/react';
+import { ShieldSlash } from '@phosphor-icons/react';
 import { TRAVEL_ERROR_CODES, type TravelErrorCode } from '../../contracts/travel';
 import { getTravelRuntime, type TravelRuntime } from '../../utils/travel/runtime';
 import { readTravelMapConfig, type TravelMapRuntimeConfig } from '../../utils/travel/worldMapAdapter';
 import { loadTravelMapRuntime } from '../../utils/travel/mapRuntime';
-import TravelBall, { type TravelCharacterView } from './TravelBall';
+import { clearLegacyTravelBallStorage, type TravelCharacterView, type TravelIslandEntry } from '../../utils/travel/activityPresentation';
+import { usePersonaSim } from '../../utils/personaSimStore';
+import { useDreamSim } from '../../utils/dreamSimStore';
+import TravelActivityIsland from './TravelActivityIsland';
 import TravelMapPanel, { TRAVEL_PHASE_COPY, type TravelPanelView } from './TravelMapPanel';
 import TravelChatCard from './TravelChatCard';
 import type { TravelMapAdapter } from './TravelMapCanvas';
@@ -30,7 +35,10 @@ export interface TravelOverlayProps {
     runtime?: TravelRuntime;
     mapConfig?: TravelMapRuntimeConfig;
     adapter?: TravelMapAdapter | null;
+    /** 保留给外壳的兼容入口（设置已迁到设置 App，这里不再画底部胶囊）。 */
     onOpenSettings?: () => void;
+    /** 通话条在顶时整条让位；外壳可直接传，默认 false。 */
+    callBarActive?: boolean;
     className?: string;
 }
 
@@ -45,11 +53,14 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
     mapConfig,
     adapter = null,
     onOpenSettings,
+    callBarActive = false,
     className = '',
 }) => {
     const runtime = injected ?? getTravelRuntime();
     const state = useSyncExternalStore(runtime.store.subscribe, runtime.store.getState, runtime.store.getState);
     const overlay = useSyncExternalStore(runtime.overlay.subscribe, runtime.overlay.get, runtime.overlay.get);
+    const personaSim = usePersonaSim();
+    const dreamSim = useDreamSim();
     const [confirmEnd, setConfirmEnd] = useState(false);
     const refreshedFor = useRef<string | null>(null);
     // 地图配置：先在首帧用构建期兜底，随后按已签名会话拉服务端凭据（用户自己填的优先）。
@@ -73,6 +84,15 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
             alive = false;
         };
     }, [runtime, mapConfig]);
+
+    // 旧左下悬浮球退役：只清它自己的位置记忆，别动用户其它数据。
+    useEffect(() => {
+        try {
+            clearLegacyTravelBallStorage(window.localStorage);
+        } catch {
+            /* 隐私模式没有 localStorage：无需清理 */
+        }
+    }, []);
 
     const shareVisible = state.shareEnabled && state.shareKnown;
     const activeCharId = overlay.charId ?? characters[0]?.id ?? null;
@@ -141,6 +161,31 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
         };
     }, [state]);
 
+    /**
+     * 顶部状态条的输入。当前 runtime 的 store 一次只跟一个角色（谁在被轮询就是谁），
+     * 所以这里给出一条可信条目；多角色合并由不满足条件的条目被过滤掉自然退化，
+     * 换人/合并逻辑在 `TravelActivityIsland` 里已就绪（等 store 支持多角色时直接接上）。
+     */
+    const islandEntries: TravelIslandEntry[] = useMemo(() => {
+        if (!shareVisible) return [];
+        const trip = state.view?.code === 'OK' ? state.view.trip : null;
+        if (!trip) return [];
+        const chars = activeCharId ? characters.filter((c) => c.id === activeCharId) : characters.slice(0, 1);
+        return chars.map((char) => ({
+            char,
+            phase: trip.status,
+            destinationLabel: trip.dest?.label ?? null,
+            originLabel: trip.origin?.label ?? null,
+            // 面板与岛都不编 ETA：契约没有可信到达时间就空着。
+            etaMs: null,
+            updatedAt: state.confirmedAt || state.receivedAt || null,
+            paused: false,
+            stale: state.status === 'unconfirmed',
+            shareEnabled: state.shareEnabled,
+            shareKnown: state.shareKnown,
+        }));
+    }, [shareVisible, state, characters, activeCharId]);
+
     const handleSelect = useCallback(
         (charId: string) => {
             runtime.overlay.open(charId);
@@ -163,36 +208,25 @@ const TravelOverlay: React.FC<TravelOverlayProps> = ({
         }
     }, [runtime, activeCharId]);
 
+    // 外壳目前没传 callBarActive（PhoneShell 只读），默认放在通话条下沿之外，不压住「点击返回」。
+    const islandTop = callBarActive ? 0 : undefined;
+
     return (
         <>
-            {shareVisible && (
-                <TravelBall
-                    characters={characters}
-                    activeCharId={activeCharId}
-                    shareEnabled={shareVisible}
-                    phase={state.view?.trip?.status ?? null}
-                    onOpen={(id) => {
-                        runtime.overlay.open(id);
-                        refreshedFor.current = id;
-                        void runtime.refreshShare(id);
-                    }}
-                />
-            )}
-
-            <button
-                data-testid="travel-overlay-settings"
-                onClick={() => onOpenSettings?.()}
-                aria-label="打开出行设置"
-                className="absolute left-2 bottom-2 z-[57] flex items-center gap-1 px-2 py-1 rounded-full text-[10px] text-slate-600 active:scale-95 transition-transform"
-                style={{
-                    background: 'rgba(255,255,255,0.82)',
-                    border: '1px solid rgba(255,255,255,0.7)',
-                    boxShadow: '0 2px 8px rgba(15,23,42,0.12)',
+            <TravelActivityIsland
+                entries={islandEntries}
+                activeCharId={activeCharId}
+                onOpen={(id) => {
+                    runtime.overlay.open(id);
+                    refreshedFor.current = id;
+                    void runtime.refreshShare(id);
                 }}
-            >
-                <GearSix size={11} weight="bold" aria-hidden />
-                出行
-            </button>
+                onSelect={handleSelect}
+                callBarActive={callBarActive}
+                personaIndicator={personaSim.status === 'loading' || personaSim.status === 'ready'}
+                dreamIndicator={dreamSim.status === 'loading' || dreamSim.status === 'ready'}
+                offsetPx={islandTop}
+            />
 
             <TravelMapPanel
                 open={overlay.open && shareVisible}

@@ -994,7 +994,11 @@ const PhoneShell: React.FC = () => {
 
           {/* Overlays: 角色自主出行（共享悬浮球 + 行程地图面板）。共享关闭时球/面板都不渲染，
               但仍保留「出行」设置入口；数据来自 utils/travel/runtime，这里只读 characters。 */}
-          <TravelOverlay characters={characters} onOpenSettings={() => openApp(AppID.Settings)} />
+          <TravelOverlay
+            characters={characters}
+            callBarActive={!!suspendedCall}
+            onOpenSettings={() => openApp(AppID.Settings)}
+          />
 
           {/* Overlays: 人格模拟生成全局指示条 */}
           <PersonaSimIndicator />

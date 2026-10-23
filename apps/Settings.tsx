@@ -30,7 +30,7 @@ import { loadMcpServers, saveMcpServers, createMcpServer, effectiveMcpRouting, m
 import { getMcpResultList, clearMcpResults } from '../utils/mcpResultMemory';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
 import AutonomyGuardrailsSettings from '../components/settings/AutonomyGuardrailsSettings';
-import TravelSettings from '../components/settings/TravelSettings';
+import TravelMapServiceCard from '../components/settings/TravelMapServiceCard';
 import MemoryNegotiationSettings from '../components/settings/MemoryNegotiationSettings';
 import BluetoothPanel from '../components/settings/BluetoothPanel';
 import { bleEngine } from '../utils/bleEngine';
@@ -3932,20 +3932,10 @@ const Settings: React.FC = () => {
             <AutonomyGuardrailsSettings />
         </SettingsSection>
 
-        {/* ───────── 角色自主出行（授权 / 预算 / 固定地点；设置只在服务端持久化） ───────── */}
-        <SettingsSection
-            title="角色自主出行"
-            icon={
-                <div className="p-2 bg-sky-100/60 rounded-xl text-sky-600">
-                    <MapPin size={16} weight="bold" />
-                </div>
-            }
-        >
-            <p className="text-xs text-slate-500 mb-3 leading-relaxed">
-                角色可以自己出门、逛一逛再回来。这里只管授权与资源：能不能出门、能不能看位置、每天多少地图与模型额度、固定地点是哪儿。TA 想去哪、什么时候不想去，由 TA 自己决定。
-            </p>
-            <TravelSettings />
-        </SettingsSection>
+        {/* 角色自主出行的具体设置已按所有权拆走：
+            - 用户/角色固定地点 → 档案 App 的城市卡、神经链接角色页的城市卡（各一处，不复制）；
+            - 地图服务凭据 → 实时感知 →「地图服务」（唯一一处，服务端按账号加密）。
+            这里不再重复一块「角色自主出行」大面板。 */}
 
         {/* ───────── 记忆协商（全局实验开关；落记忆宫殿 config，默认关） ───────── */}
         <SettingsSection
@@ -4588,9 +4578,13 @@ const Settings: React.FC = () => {
                   </div>
                   <div className="space-y-2">
                       <div>
-                          <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">高德 Web 服务 Key（可选）</label>
-                          <input type="password" value={rtAmapKey} onChange={e => setRtAmapKey(e.target.value)} className="w-full bg-white/80 border border-teal-200 rounded-xl px-3 py-2 text-sm font-mono" placeholder="留空则只有城市级真实感，无真实地标" />
-                          <p className="text-[10px] text-slate-400 mt-1">高德开放平台注册即得（个人认证免费）：地理编码 15 万次/月、POI 搜索 5000 次/月，配合缓存个人用足够。Key 只存本机，经代理透传。</p>
+                          <TravelMapServiceCard
+                              legacyKey={rtAmapKey}
+                              onLegacyMigrated={() => {
+                                  setRtAmapKey('');
+                                  updateRealtimeConfig({ amapApiKey: undefined });
+                              }}
+                          />
                       </div>
                       <label className="flex items-center justify-between gap-2 bg-white/60 rounded-xl px-3 py-2">
                           <span className="text-xs text-slate-600">把「用户那边」（所在城市 + 天气）告诉角色<span className="block text-[10px] text-slate-400">只到城市级，精确位置不存也不说</span></span>

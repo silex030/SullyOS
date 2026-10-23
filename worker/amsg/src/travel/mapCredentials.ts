@@ -181,15 +181,19 @@ export async function getTravelMapCredentialStatus(args: {
     };
   }
   const v = read.values;
+  const has = {
+    amapWebKey: !!v.amapWebKey,
+    amapJsKey: !!v.amapJsKey,
+    amapJsCode: !!v.amapJsCode,
+    mapboxToken: !!v.mapboxToken,
+  };
+  // `configured` 是「实际存有可用凭据」，不是「表里有行」：四个字段全清除后
+  // 仍保留空行（用于保留 updatedAt 语义），此时必须回 false，否则设置页会
+  // 把空配置显示成「已加密保存」。
   return {
-    configured: true,
+    configured: has.amapWebKey || has.amapJsKey || has.amapJsCode || has.mapboxToken,
     unreadable: false,
-    has: {
-      amapWebKey: !!v.amapWebKey,
-      amapJsKey: !!v.amapJsKey,
-      amapJsCode: !!v.amapJsCode,
-      mapboxToken: !!v.mapboxToken,
-    },
+    has,
     amapJsKey: v.amapJsKey || null,
     mapboxToken: isPublicMapboxToken(v.mapboxToken) ? v.mapboxToken : null,
     mapboxStyleUrl: v.mapboxStyleUrl || null,
