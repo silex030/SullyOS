@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   cleanTextForTtsGenie,
   isGenieVoiceEnabled,
+  isMossVoiceUsableSync,
+  probeMossVoiceStatus,
+  refreshMossVoiceStatus,
   resolveGenieEmotion,
   synthesizeSpeechGenieDetailed,
 } from './genieTts';
@@ -15,6 +18,7 @@ function makeResponse(status: number, body: ArrayBuffer | string, contentType = 
     headers: { get: () => contentType },
     arrayBuffer: async () => (typeof body === 'string' ? new TextEncoder().encode(body).buffer : body),
     text: async () => (typeof body === 'string' ? body : new TextDecoder().decode(body)),
+    json: async () => JSON.parse(typeof body === 'string' ? body : new TextDecoder().decode(body)),
   } as unknown as Response;
 }
 
@@ -105,6 +109,73 @@ describe('synthesizeSpeechGenieDetailed', () => {
     vi.stubGlobal('fetch', vi.fn(async () => makeResponse(429, '{"error":"busy"}', 'application/json')));
     await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/正在忙/);
   });
+
+  it('把用户选的本机音色 ID 放进请求体 voice（不带路径、不进 header）', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('测试', char, { ...apiConfig, mossVoiceId: 'ether' } as any);
+    const [, init] = fetchMock.mock.calls[0] as any;
+    const body = JSON.parse(init.body);
+    expect(body.voice).toBe('ether');
+    expect(JSON.stringify(body)).not.toContain('/');
+  });
+
+  it('没选音色时不发 voice（由服务端默认决定，前端不猜也不串）', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('测试', char, apiConfig);
+    const [, init] = fetchMock.mock.calls[0] as any;
+    expect(JSON.parse(init.body)).not.toHaveProperty('voice');
+  });
+
+  it('试听 demo:true 时不带 voice（公开演示不能被当成角色音色）', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('测试', char, { ...apiConfig, mossVoiceId: 'ether' } as any, { demo: true });
+    const [, init] = fetchMock.mock.calls[0] as any;
+    const body = JSON.parse(init.body);
+    expect(body.demo).toBe(true);
+    expect(body).not.toHaveProperty('voice');
+  });
+
+  it('角色单独指定的本机音色优先于全局音色', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('测试', { id: 'c1', voiceProfile: { mossVoiceId: 'char-voice' } } as any,
+      { ...apiConfig, mossVoiceId: 'ether' } as any);
+    const [, init] = fetchMock.mock.calls[0] as any;
+    expect(JSON.parse(init.body).voice).toBe('char-voice');
+  });
+});
+
+describe('isMossVoiceUsableSync（自动合成的真实门）', () => {
+  beforeEach(() => {
+    localStorage.setItem('os_api_config', JSON.stringify({ agentUrl: AGENT, agentToken: 'tok' }));
+  });
+  afterEach(() => {
+    localStorage.removeItem('os_api_config');
+    vi.unstubAllGlobals();
+  });
+
+  const health = (body: unknown) => vi.stubGlobal('fetch', vi.fn(async () => makeResponse(200, JSON.stringify(body), 'application/json')));
+
+  it('模型 ready 但没有参考音频 → 不自动合成（避免每条消息都失败一次）', async () => {
+    health({ ready: true, referenceConfigured: false });
+    await refreshMossVoiceStatus(0);
+    expect(isMossVoiceUsableSync()).toBe(false);
+  });
+
+  it('ready + 有参考音频 → 允许自动合成', async () => {
+    health({ ready: true, referenceConfigured: true, voices: ['ether'] });
+    await refreshMossVoiceStatus(0);
+    expect(isMossVoiceUsableSync()).toBe(true);
+  });
+
+  it('探不通 → 门关闭，不猜成可用', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    await refreshMossVoiceStatus(0);
+    expect(isMossVoiceUsableSync()).toBe(false);
+  });
 });
 
 describe('isGenieVoiceEnabled', () => {
@@ -148,5 +219,98 @@ describe('cleanTextForTtsGenie', () => {
 
   it('剥掉 MiniMax 停顿标记与动作词', () => {
     expect(cleanTextForTtsGenie('你好<#0.5#>世界')).toBe('你好世界');
+  });
+});
+
+describe('MOSS-TTS-Nano 请求体：显式演示 vs 角色音色', () => {
+  const apiConfig = { genieVoiceEnabled: true, ttsProvider: 'minimax' } as any;
+  const char = { id: 'c1' } as any;
+
+  beforeEach(() => {
+    localStorage.setItem('os_api_config', JSON.stringify({ agentUrl: AGENT, agentToken: 'tok' }));
+    vi.stubGlobal('URL', { createObjectURL: () => 'blob:moss', revokeObjectURL: () => {} } as any);
+  });
+  afterEach(() => {
+    localStorage.removeItem('os_api_config');
+    vi.unstubAllGlobals();
+  });
+
+  it('默认只发 {text}，不带 demo 字段（用户没配参考音频时由 relay 报 no_ref_voice）', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('你好', char, apiConfig);
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(body).toEqual({ text: '你好' });
+  });
+
+  it('试听公开演示时显式 demo:true，且不夹带任何 id 字段（id 由服务端 env 决定）', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(200, new ArrayBuffer(2048)));
+    vi.stubGlobal('fetch', fetchMock);
+    await synthesizeSpeechGenieDetailed('试听一句', char, apiConfig, { demo: true });
+    const body = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(body).toEqual({ text: '试听一句', demo: true });
+    expect(body).not.toHaveProperty('demo_id');
+    expect(body).not.toHaveProperty('voice_id');
+  });
+
+  it('422 no_ref_voice 必须说清「待配置」，而不是笼统失败', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(422, '{"error":"no_ref_voice"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/还没有配置本地声音/);
+  });
+
+  it('参考音频不合规 / 过大给出可操作提示', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(422, '{"error":"reference_invalid"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/3.{0,4}15/);
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(413, '{"error":"payload_too_large"}', 'application/json')));
+    await expect(synthesizeSpeechGenieDetailed('x', char, apiConfig)).rejects.toThrow(/10\s?MB/i);
+  });
+});
+
+describe('probeMossVoiceStatus', () => {
+  const apiConfig = { genieVoiceEnabled: true, ttsProvider: 'minimax' } as any;
+
+  beforeEach(() => {
+    localStorage.setItem('os_api_config', JSON.stringify({ agentUrl: AGENT, agentToken: 'tok' }));
+  });
+  afterEach(() => {
+    localStorage.removeItem('os_api_config');
+    vi.unstubAllGlobals();
+  });
+
+  it('读主代理的 /agent/v1/tts/health（带 token），把真实字段规整成状态', async () => {
+    const fetchMock = vi.fn(async () => makeResponse(
+      200,
+      JSON.stringify({ ready: true, model: 'moss-tts-nano', referenceConfigured: false, demoAvailable: true }),
+      'application/json',
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await probeMossVoiceStatus(apiConfig);
+    expect(String((fetchMock.mock.calls[0] as any)[0])).toBe(`${AGENT}/agent/v1/tts/health`);
+    expect((fetchMock.mock.calls[0] as any)[1].headers['X-Client-Token']).toBe('tok');
+    expect(out.reachable).toBe(true);
+    expect(out.status.state).toBe('needs_reference');
+  });
+
+  it('主代理 503 时 reachable=false（UI 说未连接，不说已成功）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => makeResponse(503, '{"error":"nano_unavailable"}', 'application/json')));
+    const out = await probeMossVoiceStatus(apiConfig);
+    expect(out.reachable).toBe(false);
+    expect(out.status.state).toBe('offline');
+  });
+
+  it('网络异常也不抛，返回 offline 供 UI 展示', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network'); }));
+    const out = await probeMossVoiceStatus(apiConfig);
+    expect(out.reachable).toBe(false);
+    expect(out.status.state).toBe('offline');
+  });
+
+  it('没配主代理地址时不发请求，直接 offline', async () => {
+    localStorage.removeItem('os_api_config');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await probeMossVoiceStatus(apiConfig);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(out.status.state).toBe('offline');
   });
 });

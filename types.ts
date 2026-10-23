@@ -300,6 +300,11 @@ export interface APIConfig {
   ttsProvider?: TtsProvider;
   /** Genie 自建中文语音。阶段 A 是 opt-in：undefined 视为 false。见 spec §10.1。 */
   genieVoiceEnabled?: boolean;
+  /**
+   * 本机 MOSS-TTS-Nano 用哪个音色 ID（服务端白名单内的短标识符，例如 `ether`）。
+   * 留空 → 用主代理 env 的默认音色；未知/越权 ID 服务端会直接 409 no_ref_voice，不回落。
+   */
+  mossVoiceId?: string;
   /** 情绪来源：'auto' 跟随 <语音 emotion>；'fixed' 固定用 genieEmotion。 */
   genieEmotionMode?: 'auto' | 'fixed';
   /** 固定模式下使用的情绪，7 项之一；非法值回落 calm。 */
@@ -3199,6 +3204,8 @@ export interface CharacterProfile {
       fishModel?: string;
       // ElevenLabs 角色音色 ID。与 MiniMax voiceId / Fish reference_id 各存各的。
       elevenLabsVoiceId?: string;
+      // 本机 MOSS-TTS-Nano 音色 ID（服务端白名单内的短标识符）。留空 = 用设置页的全局本机音色。
+      mossVoiceId?: string;
       voiceName?: string;
       source?: 'system' | 'voice_cloning' | 'voice_generation' | 'custom';
       model?: string;

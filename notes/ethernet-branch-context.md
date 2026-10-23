@@ -179,3 +179,11 @@ SSH：`root@<your-vps-ip>:<ssh-port>`（opencode 的 vps 工具里叫 `default`�
   - 仍未完成（不许写成已完成）：SoVITS CPU 不达标（`disabled`+`inactive`，未接主代理）；云端 BGE 无同题实测只保留；前端备份 ZIP 无加密；CF `worker/amsg` 的 Google secret 无凭据未同步；Supabase 零 DDL；索引重建由用户自选；架构一键向导不在本轮。
   - **发布事故（真实发生，别当没发生过）**：第一次部署就是上面那条 data: URL 相对 import，main-agent 起不来、8830 无监听约 12 分钟（01:14–01:26），其余 6 个 worker 正常。停产窗口内只影响了 `/agent/*`，前端静态与后端其它路由仍可用。修复走独立提交 `fda84a0b`（内联 + 守卫用例），重新 pull/restart 后复验通过。**教训：源码级测试全绿不能证明部署面能启动，产物必须按部署加载方式实测。**
   - 上线读回（详细见 `RELEASE-RESULT.md`）：首页 200 + `v3.20 (Local Memory)`；本地 `dist` 与线上 **413/413 文件 sha256 逐字节一致**；`/agent` `/amsg` `/home` `/heartbeat` `/google-api` 健康 200（`/instant-push` 401 是设计）；本地 embedding 公网同源 health 200（无 `upstream`）、无 token/错 token 403、两条合成 query/doc 返回 768 维 L2=1.0；SoVITS `disabled`+`inactive`、19880 无监听；8850 仅回环；部署副本 backup/restore 脚本已消失、历史包 4 个未动、无新 timer；CF `worker/amsg` 的 Google secret 仍未同步（无凭据）。
+
+- 🎙️ **2026-10-23 本地语音上线（v3.21 Local Voice：MOSS-TTS-Nano FP32 + 真 refcache）**：
+  - **别新造接口**：本地语音早在 `utils/genieTts.ts` → `/agent/v1/tts` 上，本轮只补三件事：音色白名单（`NANO_VOICE_IDS`/`NANO_VOICE_ID`）、relay 共享密钥（`NANO_RELAY_KEY` → `x-relay-key`）、health 的 `voices`。请求体只认 `text`/`voice`/`demo`；`url`/`demo_id`/`voice_id`/路径字段一律忽略。
+  - **音色边界**：`voice` 必须命中服务端白名单，否则 **409 `no_ref_voice` 且不触上游**；缺参考不回落公开 demo、不换别的音色。用户授权音频经 relay `POST /api/reference`（`X-Voice-Id: ether`）正规注册成 `refs/ether.wav`（600、目录 700），原件与 `refs/user-ether/` 未改；**不要**把参考音频或密钥放进仓库/静态包。
+  - **跑起来的两条运行前提**（漏一个就 401/409）：`moss.service` 通过 `EnvironmentFile=/srv/model-tests/moss-nano/relay.env` 拿 `MOSS_RELAY_KEY`；`sullyos.service` 通过 `/opt/sullyos/secrets/moss-tts.env` 拿同一把 key 和音色白名单。值只做布尔/长度比较，绝不打印。
+  - **缓存证据从哪看**：relay `/health` 现在回 `refCache` 只读计数器（hits/misses/encode_calls/entries/bytes），**不跑推理**；主代理只把布尔与白名单 ID 转给浏览器，计数器不外泄。真 refcache 的冷/热证据见 `/srv/model-tests/moss-nano/optimization/FINAL-RESULT.md`。
+  - **定位**：FP32+cache warm 短句 ≈9.1 s（RTF≈3.5）不是实时，产品语义是「文字先出、语音后台」；`moss.service` 单并发 + 队列上限 3 + 90 s 超时；前端 abort 只停等待，不中断已进 ONNX 的计算（别写成已取消）。
+  - 门禁与线上读回见 `/srv/model-tests/moss-nano/integration/RELEASE-RESULT.md`。

@@ -312,7 +312,9 @@ describe('上游发完终止事件但不关连接', () => {
 
 describe('POST /v1/tts', () => {
     // checkAuth 读 env.AMSG_CLIENT_TOKEN（index.js:61-68）
-    const ttsEnv = { AMSG_CLIENT_TOKEN: 'tok' };
+    // 本机音色必须来自服务端白名单（NANO_VOICE_IDS）+ 默认音色（NANO_VOICE_ID）；
+    // 两者都没有时按设计一律 409 no_ref_voice（fail-closed），所以这里显式给出。
+    const ttsEnv = { AMSG_CLIENT_TOKEN: 'tok', NANO_VOICE_ID: 'ether', NANO_VOICE_IDS: 'ether' };
     const postTts = (
         body: unknown,
         headers: Record<string, string> = { 'x-client-token': 'tok' },
@@ -331,8 +333,13 @@ describe('POST /v1/tts', () => {
         expect(res.status).toBe(403);
     });
 
-    it('把 text/demo/seed/帧数组成 multipart 并把 base64 解回 wav', async () => {
-        const wav = new Uint8Array([0x52, 0x49, 0x46, 0x46, 1, 2, 3, 4]).buffer;
+    it('把 text 作为 JSON 发给本机 runtime，并把 base64 解回 wav', async () => {
+        // 44 字节 RIFF 头 + 1 秒数据：新契约会把非 WAV 的响应当坏字节拒收。
+        const wav = new Uint8Array(44 + 16000);
+        wav.set([0x52, 0x49, 0x46, 0x46], 0);           // RIFF
+        const dv = new DataView(wav.buffer);
+        dv.setUint32(28, 16000, true);                   // byteRate
+        dv.setUint32(40, 16000, true);                   // dataSize
         const audioB64 = Buffer.from(wav).toString('base64');
         const calls: Array<{ url: string; init: any }> = [];
         vi.stubGlobal('fetch', vi.fn(async (url: string, init: any) => {
@@ -346,21 +353,24 @@ describe('POST /v1/tts', () => {
         expect(res.headers.get('content-type')).toContain('audio/wav');
         expect(res.headers.get('access-control-allow-origin')).toBe('*');
         expect(res.headers.get('x-genie-resolved-emotion')).toBeNull();
-        expect(calls[0].url).toBe('http://127.0.0.1:18083/api/generate');
-        const body = calls[0].init.body as FormData;
-        expect(body.get('text')).toBe('你好');
-        expect(body.get('demo_id')).toBe('demo-30');
-        expect(body.get('seed')).toBe('7');
-        expect(body.get('max_new_frames')).toBe('200');
+        expect(calls[0].url).toBe('http://127.0.0.1:19890/api/generate');
+        // 上行只认 text：emotion/seed/帧数都不再发（runtime 契约是 {text,demo_id?}）
+        expect(calls[0].init.headers['content-type']).toBe('application/json');
+        // 音色走 header（生成音色是 relay 的 X-Voice-Id 契约），不出现在 body
+        expect(calls[0].init.headers['x-voice-id']).toBe('ether');
+        expect(JSON.parse(calls[0].init.body)).toEqual({ text: '你好' });
         const out = new Uint8Array(await res.arrayBuffer());
         expect(out[0]).toBe(0x52);
     });
 
     it.each([
-        [400, 502, 'synth_failed'],
-        [500, 502, 'synth_failed'],
-        [503, 502, 'synth_failed'],
-    ])('上游非 200 一律 502 synth_failed（Nano 用 status 表达失败）', async (status, want, code) => {
+        [400, 400, 'bad_request'],
+        [413, 413, 'payload_too_large'],
+        [429, 429, 'busy'],
+        [422, 409, 'no_ref_voice'],
+        [500, 503, 'nano_unavailable'],
+        [503, 503, 'nano_unavailable'],
+    ])('上游 %i 收敛成 %i %s（422 缺参考音频必须报待配置）', async (status, want, code) => {
         vi.stubGlobal('fetch', vi.fn(async () => new Response('oops', { status })));
         const res = await postTts({ text: 'x' });
         expect(res.status).toBe(want);
@@ -376,10 +386,11 @@ describe('POST /v1/tts', () => {
         expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('适配层不可达时返回 502 而不是抛异常', async () => {
+    it('适配层不可达时返回 503 而不是抛异常', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
         const res = await postTts({ text: 'x' });
-        expect(res.status).toBe(502);
+        expect(res.status).toBe(503);
+        expect(await res.json()).toEqual({ error: 'nano_unavailable' });
     });
 
     it('超长音频被时长守卫拒收（12 秒/6 字）', async () => {

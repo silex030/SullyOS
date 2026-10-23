@@ -26,7 +26,13 @@ import { resolveMiniMaxApiKey } from './minimaxApiKey';
 
 export type { TtsResult };
 
-export type SynthOptions = { languageBoost?: string; groupId?: string; emotion?: string };
+export type SynthOptions = {
+  languageBoost?: string;
+  groupId?: string;
+  emotion?: string;
+  /** 本机 MOSS-TTS-Nano 专用：true 表示「试听公开演示音色」，不是角色音色。 */
+  demo?: boolean;
+};
 
 /** 粤语并非三家所有模型都支持；在发起计费请求前给出明确错误。 */
 export const assertTtsLanguageSupported = (

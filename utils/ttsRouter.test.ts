@@ -62,6 +62,17 @@ describe('Genie 开关分流', () => {
     expect(() => assertTtsLanguageSupported({ id: 'x' } as any, OFF, 'yue')).not.toThrow();
   });
 
+  // 本机 MOSS-TTS-Nano 只做中文（含中英混读）：任何 languageBoost 都在计费/排队前拒绝，
+  // 且提示词里要能看出是 MOSS，不留给用户猜是哪家。
+  it('assertTtsLanguageSupported 开启时对所有语种增强都拒绝，并点名 MOSS + 只支持中文', () => {
+    for (const boost of ['yue', 'en', 'ja', 'auto']) {
+      expect(() => assertTtsLanguageSupported({ id: 'x' } as any, ON, boost)).toThrow(/MOSS/);
+      expect(() => assertTtsLanguageSupported({ id: 'x' } as any, ON, boost)).toThrow(/只支持中文/);
+    }
+    expect(() => assertTtsLanguageSupported({ id: 'x' } as any, ON, '')).not.toThrow();
+    expect(() => assertTtsLanguageSupported({ id: 'x' } as any, ON, '   ')).not.toThrow();
+  });
+
   // 阶段 A 没有 UI 开关，只有显式 true 才可能触发。这条是"链路真的接通"的唯一自动化证据。
   describe('真实分发', () => {
     beforeEach(() => {

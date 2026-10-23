@@ -220,6 +220,17 @@
 - 版本名 `v3.20 (Local Memory)`。
 - **明确未完成（别当已完成）**：SoVITS 本机 CPU 推理不达标，服务保持 `disabled`+`inactive`，未接主代理；云端 BGE 无同题实测，仅保留为可选；前端备份 ZIP 仍未加密；Cloudflare `worker/amsg` 的 Google secret 未同步（本机无 wrangler/无 CF 凭据）；Supabase 零 DDL（768 迁移仍是文本方案，需用户自己执行）；索引重建需用户自选触发，不自动全量重建；「架构一键向导」不是本轮内容。**上线回滚资产只有旧前端静态产物 + 旧代码 SHA，不做数据库备份/恢复。**
 
+## 十九、本地语音 MOSS-TTS-Nano（v3.21 Local Voice，2026-10-23 已发布）
+
+- **真实可用链路**：浏览器 `utils/genieTts.ts` → 主代理 `/agent/v1/tts`（`AMSG_CLIENT_TOKEN` 鉴权）→ 本机 loopback `127.0.0.1:19890` relay（`x-relay-key` 共享密钥）→ MOSS-TTS-Nano **FP32 + 真实参考特征缓存**（16 条 / 64 MiB、scope `relay-single-user`；无结果音频缓存、无 KV 缓存）。设置页「语音 → 本地语音（MOSS-TTS-Nano）」选它才走本机，云端三家完全不受影响。
+- **音色选择**：唯一授权音色 ID `ether`（用户授权音频，8.789 s / 48 kHz / mono；经 relay `POST /api/reference` 正规注册，落 `refs/ether.wav` 600、目录 700，原件与 `refs/user-ether/` 未改未剪）。设置页「本机音色」下拉只列**主代理 env 白名单**（`NANO_VOICE_IDS`）里的 ID，选完保存写 `apiConfig.mossVoiceId`。
+- **安全边界**：上行只认 `text` / `voice` / `demo`；`url`、`demo_id`、`voice_id`、任何路径字段一律忽略（无 SSRF、无任意文件读）；`voice` 必须命中白名单，否则 **409 `no_ref_voice` 且不触上游**；`demo` 只走服务端 env 的公开演示条目；`/tts/health` 只回布尔 + 白名单 ID + model，不回本机路径/参考文件名/密钥。
+- **缺参考不串音色**：没注册参考音频 → 409 `no_ref_voice` → 界面「待配置」，绝不回落公开 demo，也绝不换成别的音色。
+- **性能定位是「后台语音」**：FP32+cache 短句 cold 13.38 s / warm 9.12 s，relay 端 14.50 → 10.89 s，warm 音频与 FP32 基线逐字节相同（RTF ≈3.5，非实时）。所以文字先出、语音后台，不阻塞回复。
+- **资源与排队**：`moss.service` = CPUQuota 400% / 4 线程（ORT intra=4、inter=1）/ MemoryMax 4G / `MemorySwapMax=0` / Nice 10；relay 单并发、队列上限 3、单请求超时 90 s，主代理 80 s，前端 75 s；`/health` 只读计数器、不跑推理（实测 3–7 ms）。
+- **取消语义（如实）**：前端 abort 只停止等待，**不中断已进入 ONNX 的计算**；排队位靠单并发 + 超时回收，不宣称「已取消」。
+- **可直接关闭**：`systemctl stop moss.service` → 主代理回 `nano_unavailable`，文字与云端 TTS 不受影响；`MOSS_REF_CACHE_ENABLED=0` 单独回滚缓存。
+
 ## 开发备注（自用）
 
 - ethernet 是唯一主力开发线，同步上游按提交等价移植，不整分支合并。
@@ -248,3 +259,4 @@
 - 2026-10-23：**本地记忆候选（v3.20，未提交/未部署）**——本地 EmbeddingGemma2 主代理路由三路径挂载 + `sullyos.service` 载入受限 env 文件（未重启）+ 向量空间指纹（检索/去重严格分区，legacy 不当新模型）+ 记忆宫殿本地模型卡（重建可取消/可续）+ Supabase 1024 不兼容显式告警（不静默假同步、无 DDL）+ 设置页本地语音改标「未启用」+ 版本号 `v3.20 (Local Memory)`。门禁：全量 566 文件 / 6853 用例全绿、`tsc` 0 新增（55 条，基线实测 56）、`build:workers` 两次同哈希、`vite build` 通过；`check:workers` 因未提交必红。详见 `/srv/model-tests/next-phase/INTEGRATION-CANDIDATE.md`。
 - 2026-10-23：**本地记忆（v3.20 Local Memory）发布**——本地 EmbeddingGemma2 主代理三路径 + 受限 env + 向量空间指纹严格分区 + 记忆宫殿本地模型卡 + Supabase 不兼容显式告警（无 DDL）+ 设置页本地语音改标「未启用」；发布轮只做 3 项有限修正（删坏自启脚本、`/health` 去内网地址回显、语音项标题准确化）并补守卫用例。SoVITS 仍停用、CF Google secret 仍未同步、前端备份 ZIP 仍未加密、索引需用户自选重建。门禁与线上读回见 `/srv/model-tests/next-phase/RELEASE-RESULT.md`。
 - 2026-10-22：**发布候选收尾（三路阻断修复后的最终打通）**——①记忆协商开关前后台统一走 `getMemoryNegotiationGate()`（正式 config 的 false 压过旧 localkey，config 读坏按关且不回落）；②导入备份后清空旧协商账本（OSContext 收尾 + `db.importFullData` 两条入口，幂等，清不掉如实提示）；③角色面板改用权威快照显示全局护栏（读不到云端显示「后台未确认」，不再拿默认 6 次的兜底值冒充）；④补上「角色自己排着的事」提示段（服务端 id + 标题 + 能不能撤），聊天工具登记/撤销后同步本地 `airp_workflow_plans`，取消不再被同一条用户消息误判；⑤人工重试保留旧 run 审计（released 行改名让位而非删除），旧 task payload 只认自己那一代计划；⑥全局护栏新增受鉴权专用 CAS 写路由（`POST /autonomy-guardrails/patch`），并在泛写入口拦「把远端暂停改回未暂停」的普通保存，带真 SQL 并发回归。未提交/未部署；门禁与产物哈希见 `/srv/model-tests/implementation/RELEASE-CANDIDATE.md`。
+- 2026-10-23：**本地语音 MOSS-TTS-Nano 上线（v3.21 Local Voice）**——既有 `/agent/v1/tts` 路由补音色白名单 + relay 共享密钥 + health `voices`，用户授权参考以 `ether` 正规注册（原件未改），设置页「本机音色」可选并保存 `mossVoiceId`；缺参考 409 `no_ref_voice`、不回落 demo 不串音色；FP32 + 真实参考特征缓存（16/64MiB、single-user），定位后台语音（warm 短句 ≈9.1 s）。门禁与线上读回见 `/srv/model-tests/moss-nano/integration/RELEASE-RESULT.md`。
