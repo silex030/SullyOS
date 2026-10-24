@@ -18,8 +18,8 @@
  *    不会出现“DNS 慢 + 响应头慢”两段各自领满预算、加起来越过 deadline 的情况。
  *  - 没有 deadline 时退化为 perRequestTimeoutMs 的逐跳预算（行为与旧版大致等价，
  *    但正文读取也被预算约束，不再无限等待）。
- *  - 所有分支（重定向、非 2xx、超时、抛错）都在 finally 里清定时器；需要丢弃响应体时
- *    显式 discard，避免 keep-alive 连接被未读响应占住。
+ *  - 所有分支（重定向、非 2xx、超时、正文读取异步拒绝或同步抛出）都在 try/finally 里清定时器；
+ *    需要丢弃响应体时显式 abort + discard，避免 keep-alive 连接被未读响应占住。
  *
  * 依赖注入（resolve/transport/now）让全部行为可离线测试，测试不碰真实网络。
  */
@@ -100,6 +100,85 @@ function isSameOrigin(a: URL, b: URL): boolean {
 function headerValue(headers: Record<string, string>, name: string): string | null {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
   return key ? headers[key] : null;
+}
+
+type BodyChunk = { text: string; bytes: number; truncated: boolean };
+
+/**
+ * 错误映射（与旧实现保持一致）：已到期 → TIMEOUT body_timeout；调用方自带的 SocialError 原样透传；
+ * 其余一律 NETWORK_ERROR body_read_failed。先判到期，再判 SocialError，顺序不能反。
+ */
+function mapBodyError(err: unknown, timedOut: boolean): SocialError {
+  if (timedOut) return new SocialError('TIMEOUT', 'body_timeout', { autoRetryable: true });
+  if (err instanceof SocialError) return err;
+  return new SocialError('NETWORK_ERROR', 'body_read_failed', { autoRetryable: true });
+}
+
+/**
+ * 在预算内读完正文，并保证**任何**退出路径都清掉正文定时器、释放响应（原卡第 2 项「所有路径 finally 释放」）：
+ *  - 到期：abort 底层连接 + discard，抛 TIMEOUT body_timeout；
+ *  - readBody 异步拒绝：先 abort + discard 再抛错（旧实现只 clearTimeout，socket 留给 GC）；
+ *  - readBody **同步**抛出：Promise executor 只会自动 reject，不会走任何清理分支——旧实现此时
+ *    bodyTimer 会一直活到期限才触发，等于给一个已失败的调用留下延迟副作用。这里显式 catch。
+ *  - 读取成功：不 discard（正文已读完，连接可复用）。
+ * 定时器与释放都收在同一个 try/finally 里，失败路径额外做一次释放，两次释放是幂等的（见 released 标记）。
+ */
+async function readBodyWithinBudget(
+  res: TransportResponse,
+  maxBytes: number,
+  budgetMs: number,
+  controller: AbortController,
+): Promise<BodyChunk> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  let released = false;
+  // 释放：先 abort（transport 未必理会 signal），再 discard（释放 keep-alive socket）。均幂等。
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      controller.abort();
+    } catch {
+      /* 已 abort 或不可 abort 都不影响错误语义 */
+    }
+    try {
+      res.discard?.();
+    } catch {
+      /* 释放失败不影响错误语义 */
+    }
+  };
+
+  try {
+    return await new Promise<BodyChunk>((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        release();
+        reject(new SocialError('TIMEOUT', 'body_timeout', { autoRetryable: true }));
+      }, budgetMs);
+
+      let pending: Promise<BodyChunk>;
+      try {
+        pending = res.readBody(maxBytes);
+      } catch (err) {
+        // 同步抛出：自己映射并释放，不能指望 executor 的自动 reject 清定时器
+        release();
+        reject(mapBodyError(err, timedOut));
+        return;
+      }
+
+      pending.then(
+        (value) => resolve(value),
+        (err) => {
+          // 异步拒绝：即时 abort + discard，避免半读的 socket 活到进程退出
+          release();
+          reject(mapBodyError(err, timedOut));
+        },
+      );
+    });
+  } finally {
+    // 成功、失败、到期三种路径都在这里清定时器：不会出现「已失败但定时器还在」的延迟副作用
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** 给任意 promise 套一个预算；超时抛 TIMEOUT（调用方按 reason 区分 DNS/正文）。 */
@@ -223,31 +302,7 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
         1,
         Math.min(hopBudget - consumed, deadline == null ? Number.POSITIVE_INFINITY : deadline - now()),
       );
-      const body = await new Promise<{ text: string; bytes: number; truncated: boolean }>((resolve, reject) => {
-        const bodyTimer = setTimeout(() => {
-          controller.abort();
-          // 到期就释放底层连接：transport 未必理会 signal（测试桩/第三方实现），
-          // 不主动 discard 会让一条半读的 keep-alive socket 活到进程退出。
-          try {
-            res.discard?.();
-          } catch {
-            /* 释放失败不影响超时语义 */
-          }
-          reject(new SocialError('TIMEOUT', 'body_timeout', { autoRetryable: true }));
-        }, bodyBudget);
-        res.readBody(maxBytes).then(
-          (value) => {
-            clearTimeout(bodyTimer);
-            resolve(value);
-          },
-          (err) => {
-            clearTimeout(bodyTimer);
-            if (controller.signal.aborted) reject(new SocialError('TIMEOUT', 'body_timeout', { autoRetryable: true }));
-            else if (err instanceof SocialError) reject(err);
-            else reject(new SocialError('NETWORK_ERROR', 'body_read_failed', { autoRetryable: true }));
-          },
-        );
-      });
+      const body = await readBodyWithinBudget(res, maxBytes, bodyBudget, controller);
 
       return {
         status: res.status,

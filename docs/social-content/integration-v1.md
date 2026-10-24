@@ -385,6 +385,16 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 
 模型/provider 与边界审计：见附件 `model-boundary-audit.log`（脱敏；未读取任何密钥）。
 
+### 10.2 复审返工（arch-reviewer comment #55）：正文异常路径的资源释放 + 边界审计原始记录
+
+| # | 复审意见 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| 1 | `safeFetch.ts` 的正文 timer 与异常响应清理没真正收口在 try/finally：`readBody` 异步拒绝只 `clearTimeout` 就 reject（既不 discard 也不 abort）；`readBody` 同步抛出时 `bodyTimer` 不进任何 finally，会一直活到正文期限才触发，给已失败的调用留下延迟副作用 | 抽出 `readBodyWithinBudget()`：到期 / 异步拒绝 / 同步抛出三条路径共用幂等的 `release()`（先 `abort()` 再 `discard()`），并与连接 timer 一起收在明确的 `finally`；错误映射保持原语义（到期 → `TIMEOUT/body_timeout`；`SocialError` 原样透传；其余 → `NETWORK_ERROR/body_read_failed`）。同步抛出过去会原样冒泡非 `SocialError`，现在统一映射为 `NETWORK_ERROR/body_read_failed` | `safeFetch.test.ts` 新增 5 例：异步拒绝（`SocialError`）保留错误码且 abort/discard 各恰好 1 次；异步拒绝（普通错误）→ `NETWORK_ERROR`；同步抛出 → `NETWORK_ERROR` + 即时释放；另两例用 fake timers 断言 `vi.getTimerCount() === 0`、推进 2s 后 abort/discard 不再增加。**返工前用同一组测试跑旧实现：5 failed / 28 passed（`safeFetch-red-old-impl.log`）**；修复后该文件 33 passed |
+| 2 | 边界审计缺原始运行记录（“会话元数据同值 / 未执行”是自述，config mtime 只覆盖 run74） | 新增可复跑脚本 `boundary_audit.py`：只读打开 per-profile `state.db`，投影 run69/run74 的 `sessions` + `session_model_usage` + 工具调用直方图与敏感面命中；对 default `config.yaml` 22:50:17 的写入做 hunk 级归档（密钥类值掩码） | `model-boundary-audit.log`：run69/run74 = `deepseek-v4.1-flash` + `opencode-go`（base_url `https://opencode.ai/zen/go/v1`）、237/137 次工具调用；run69 敏感面命中 0；run74 的 config/gateway/caddy 命中原文逐条核对为 `stat`/`grep`/`sed -n`/`ps` 只读；default 配置 22:50:17 的两个 hunk 是 `kanban.max_in_progress` 插入 + `fallback_providers` 首条路由改成 `opencode-go/deepseek-v4.1-flash/high`；gateway 最后一次启动 10:13:15（早于 run69）；`wt/t_42231e16` 无远端跟踪分支、两次 run 无 `git push`。**具体写入进程未验证**（无 config 写入审计日志、`/root/.bash_history` 空），只声明不是本卡 run69/run74 的工具动作 |
+
+本轮改动文件：`worker/social-content/safeFetch.ts`、`worker/social-content/safeFetch.test.ts`、本文。
+（`worker/social-content/worker.bundle.js` 由 `safeFetch.ts` 变化需重建，已重建并在门禁里核对一致。）
+
 ## 11. 发布步骤（本卡未执行，交发布流程）
 
 1. `pnpm run build`（含 `build:workers`，产出 `worker/social-content/worker.bundle.js`）。

@@ -791,6 +791,54 @@ function headerValue(headers, name) {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
   return key ? headers[key] : null;
 }
+function mapBodyError(err, timedOut) {
+  if (timedOut) return new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true });
+  if (err instanceof SocialError) return err;
+  return new SocialError("NETWORK_ERROR", "body_read_failed", { autoRetryable: true });
+}
+async function readBodyWithinBudget(res, maxBytes, budgetMs, controller) {
+  let timer;
+  let timedOut = false;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      controller.abort();
+    } catch {
+    }
+    try {
+      res.discard?.();
+    } catch {
+    }
+  };
+  try {
+    return await new Promise((resolve, reject2) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        release();
+        reject2(new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true }));
+      }, budgetMs);
+      let pending;
+      try {
+        pending = res.readBody(maxBytes);
+      } catch (err) {
+        release();
+        reject2(mapBodyError(err, timedOut));
+        return;
+      }
+      pending.then(
+        (value) => resolve(value),
+        (err) => {
+          release();
+          reject2(mapBodyError(err, timedOut));
+        }
+      );
+    });
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
 async function withBudget(promise, ms, reason) {
   let timer;
   try {
@@ -888,28 +936,7 @@ async function safeGet(rawUrl, deps, policy) {
         1,
         Math.min(hopBudget - consumed, deadline == null ? Number.POSITIVE_INFINITY : deadline - now())
       );
-      const body = await new Promise((resolve, reject2) => {
-        const bodyTimer = setTimeout(() => {
-          controller.abort();
-          try {
-            res.discard?.();
-          } catch {
-          }
-          reject2(new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true }));
-        }, bodyBudget);
-        res.readBody(maxBytes).then(
-          (value) => {
-            clearTimeout(bodyTimer);
-            resolve(value);
-          },
-          (err) => {
-            clearTimeout(bodyTimer);
-            if (controller.signal.aborted) reject2(new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true }));
-            else if (err instanceof SocialError) reject2(err);
-            else reject2(new SocialError("NETWORK_ERROR", "body_read_failed", { autoRetryable: true }));
-          }
-        );
-      });
+      const body = await readBodyWithinBudget(res, maxBytes, bodyBudget, controller);
       return {
         status: res.status,
         headers: res.headers,

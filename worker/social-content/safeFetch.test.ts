@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
-import { safeGet, type SafeFetchDeps, type TransportResponse } from './safeFetch';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { safeGet, type SafeFetchDeps, type TransportRequest, type TransportResponse } from './safeFetch';
 import { SocialError } from './errors';
 import { fakeDeps, hangingTransport } from './testSupport';
 import { nodePinningTransport } from './nodeTransport.js';
@@ -410,5 +410,140 @@ describe('全链路期限（DNS + 连接 + 正文）', () => {
     ).rejects.toMatchObject({ code: 'TIMEOUT', reason: 'body_timeout' });
     expect(discarded).toEqual(['200']);
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+/**
+ * 返工（review comment #55 第 1 条）：正文读取的**异常**路径也必须即时释放。
+ * 旧实现的两个缺口：
+ *  - readBody 异步拒绝：只 clearTimeout 就 reject，既不 discard 也不 abort（半读 socket 留到 GC）；
+ *  - readBody 同步抛出：Promise executor 自动 reject，bodyTimer 没进任何 finally，
+ *    会一直活到 body 预算到期才触发——给一个已失败的调用留下延迟副作用。
+ * 下面把「即时 abort + discard」「无残留定时器」「错误码不变」逐条钉住。
+ */
+describe('正文读取异常路径的资源释放', () => {
+  const URL_X = 'https://www.bilibili.com/x';
+  type Recorder = { discarded: number; aborts: number };
+  type Body = { text: string; bytes: number; truncated: boolean };
+
+  /** 造一个 200 响应，正文读取行为由调用方给定；同时记录 abort 与 discard 次数。 */
+  function recordingDeps(readBody: () => Promise<Body> | Body, rec: Recorder): SafeFetchDeps {
+    return {
+      resolve: async () => ['93.184.216.34'],
+      transport: async (req: TransportRequest): Promise<TransportResponse> => {
+        req.signal.addEventListener('abort', () => {
+          rec.aborts += 1;
+        });
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+          discard: () => {
+            rec.discarded += 1;
+          },
+          readBody: () => Promise.resolve(readBody()) as Promise<Body>,
+        };
+      },
+    };
+  }
+
+  it('readBody 异步拒绝时即时 abort + discard，并保留原始 SocialError 错误码', async () => {
+    const rec: Recorder = { discarded: 0, aborts: 0 };
+    const deps = recordingDeps(() => Promise.reject(new SocialError('ACCESS_DENIED', 'upstream_banned')), rec);
+    await expect(safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 })).rejects.toMatchObject({
+      code: 'ACCESS_DENIED',
+      reason: 'upstream_banned',
+    });
+    expect(rec).toEqual({ discarded: 1, aborts: 1 });
+  });
+
+  it('readBody 异步拒绝普通错误 → NETWORK_ERROR body_read_failed，同样即时释放', async () => {
+    const rec: Recorder = { discarded: 0, aborts: 0 };
+    const deps = recordingDeps(() => Promise.reject(new Error('socket hang up')), rec);
+    await expect(safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 })).rejects.toMatchObject({
+      code: 'NETWORK_ERROR',
+      reason: 'body_read_failed',
+      autoRetryable: true,
+    });
+    expect(rec).toEqual({ discarded: 1, aborts: 1 });
+  });
+
+  it('readBody 同步抛出 → NETWORK_ERROR body_read_failed，且不把 timer 留到期限', async () => {
+    const rec: Recorder = { discarded: 0, aborts: 0 };
+    const deps: SafeFetchDeps = {
+      resolve: async () => ['93.184.216.34'],
+      transport: async (req: TransportRequest): Promise<TransportResponse> => {
+        req.signal.addEventListener('abort', () => {
+          rec.aborts += 1;
+        });
+        return {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+          discard: () => {
+            rec.discarded += 1;
+          },
+          readBody: () => {
+            throw new Error('readBody exploded synchronously');
+          },
+        };
+      },
+    };
+    await expect(safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 })).rejects.toMatchObject({
+      code: 'NETWORK_ERROR',
+      reason: 'body_read_failed',
+    });
+    expect(rec).toEqual({ discarded: 1, aborts: 1 });
+  });
+
+  it('异常返回后没有残留定时器：预算到期也不会再来一次 abort/discard', async () => {
+    vi.useFakeTimers();
+    try {
+      const rec: Recorder = { discarded: 0, aborts: 0 };
+      const deps = recordingDeps(() => Promise.reject(new Error('socket destroyed')), rec);
+      await expect(safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 })).rejects.toMatchObject({
+        code: 'NETWORK_ERROR',
+      });
+      // 连接 timer 与正文 timer 都必须在返回前清掉（旧实现的同步抛出分支会留下正文 timer）
+      expect(vi.getTimerCount()).toBe(0);
+      expect(rec).toEqual({ discarded: 1, aborts: 1 });
+      // 推进到远超预算：没有二次副作用
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(rec).toEqual({ discarded: 1, aborts: 1 });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('同步抛出的形态同样不残留定时器（旧实现此处 bodyTimer 活到到期）', async () => {
+    vi.useFakeTimers();
+    try {
+      const rec: Recorder = { discarded: 0, aborts: 0 };
+      const deps: SafeFetchDeps = {
+        resolve: async () => ['93.184.216.34'],
+        transport: async (req: TransportRequest): Promise<TransportResponse> => {
+          req.signal.addEventListener('abort', () => {
+            rec.aborts += 1;
+          });
+          return {
+            status: 200,
+            headers: {},
+            discard: () => {
+              rec.discarded += 1;
+            },
+            readBody: () => {
+              throw new Error('sync boom');
+            },
+          };
+        },
+      };
+      await expect(safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 })).rejects.toMatchObject({
+        code: 'NETWORK_ERROR',
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(rec).toEqual({ discarded: 1, aborts: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
