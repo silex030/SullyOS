@@ -28,11 +28,15 @@ import { parseInteyProposal } from '../travel/decision';
 import { getTravelBudget } from '../travel/budget';
 import { getTravelCharSettings, getTravelSettings, type TravelDb } from '../travel/store';
 import { windowIdAt } from '../../../../utils/autonomyLife/budget';
+import type { EffectiveBoundaryV1 } from '../../../../contracts/autonomyLife';
+import { localDateKey } from '../../../../utils/autonomyLife/time';
 import {
   LEGACY_TRAVEL_KIND,
+  effectiveGrantFor,
   legacyBoundaryDenial,
   legacyGrantDenial,
   readEffectiveBoundary,
+  readExternalUsage,
   reserveLegacyEffect,
   reserveLegacyRoundCall,
   settleLegacyRoundCall,
@@ -54,7 +58,7 @@ export async function travelModelGateAllows(args: {
   ownerId: string;
   charId: string;
   nowMs: number;
-}): Promise<{ ok: true } | { ok: false; reason: LegacyAutonomySkipReason }> {
+}): Promise<{ ok: true; boundary: EffectiveBoundaryV1 } | { ok: false; reason: LegacyAutonomySkipReason }> {
   const read = await readEffectiveBoundary(args.db, {
     ownerId: args.ownerId,
     charId: args.charId,
@@ -63,12 +67,13 @@ export async function travelModelGateAllows(args: {
   if (!read.ok) return { ok: false, reason: read.reason };
   const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND)
     ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, args.nowMs);
-  return denial ? { ok: false, reason: denial } : { ok: true };
+  return denial ? { ok: false, reason: denial } : { ok: true, boundary: read.boundary };
 }
 
 /** 出行这条链路自己的失败原因（旧授权 + 新边界两套口径合起来）。 */
 export type TravelModelDenialReason =
   | LegacyAutonomySkipReason
+  | 'external_quota_exhausted'
   | 'travel_disabled'
   | 'travel_char_disabled'
   | 'travel_budget_missing'
@@ -110,6 +115,20 @@ export async function travelModelAccess(args: {
   if (!budget) return { ok: false, reason: 'travel_budget_missing' };
   if (budget.paused) return { ok: false, reason: 'travel_budget_paused' };
   if (!(budget.mapCallsLimit > 0)) return { ok: false, reason: 'travel_budget_zero' };
+
+  // 授权窗口的当日额度也用完 → 不再问模型：问了也落不了愿望（`reserveLegacyEffect`
+  // 会拒），白烧一次调用。额度 0 = 明确禁止。
+  const grant = effectiveGrantFor(gate.boundary, 'amap', args.nowMs);
+  if (grant) {
+    if (!(grant.dailyQuota > 0)) return { ok: false, reason: 'external_quota_exhausted' };
+    const used = await readExternalUsage({
+      db: args.db,
+      ownerId: args.ownerId,
+      dayKey: localDateKey(args.nowMs, gate.boundary.timezone),
+      provider: 'amap',
+    });
+    if (used >= grant.dailyQuota) return { ok: false, reason: 'external_quota_exhausted' };
+  }
   return { ok: true };
 }
 

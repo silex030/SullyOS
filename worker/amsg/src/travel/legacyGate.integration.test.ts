@@ -299,22 +299,29 @@ describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () 
     expect(outcome.skipped.length).toBeGreaterThan(0);
   });
 
-  it('授权窗口额度为 0 → 模型可以问（统一预算还在），但愿望不落、kind 不占', async () => {
-    await seedNewBoundary({ externalGrants: [amapGrant({ dailyQuota: 0 })] });
-    await seedTravelAuthorization();
-    const counter = { calls: 0 };
-    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
-    // 授权存在（只是额度为 0）→ wiring 照装；额度在**效果核销**那一步才拦。
-    expect(access.ok).toBe(true);
+  it('授权窗口额度为 0 / 已耗尽 → 连模型都不问（零模型请求、零愿望、零预算行）', async () => {
+    for (const scenario of [
+      { name: '额度为 0', grant: amapGrant({ dailyQuota: 0 }), seedUsed: 0 },
+      { name: '额度耗尽', grant: amapGrant({ dailyQuota: 2 }), seedUsed: 2 },
+    ]) {
+      await seedNewBoundary({ externalGrants: [scenario.grant] });
+      await seedTravelAuthorization();
+      if (scenario.seedUsed > 0) {
+        await lifeDb
+          .prepare('INSERT OR REPLACE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, ?, ?)')
+          .bind(USER, '2026-10-24', 'amap', scenario.seedUsed, NOW)
+          .run();
+      }
+      const counter = { calls: 0 };
+      const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+      expect(access, scenario.name).toMatchObject({ ok: false, reason: 'external_quota_exhausted' });
 
-    const outcome = await runTravelTickForSubject(db, subject, buildWiring(counter, access));
-    expect(counter.calls).toBe(1);
-    expect(await countWishes()).toBe(0);
-    expect(outcome.skipped).toContain('llm_unavailable');
-    // 模型调用照常记账（不白嫖），kind 配额一格都没占。
-    const rows = await budgetRows();
-    const account = rows.find((row) => row.scope === 'account');
-    expect(Number(account?.used_calls)).toBe(1);
+      const outcome = await runTravelTickForSubject(db, subject, buildWiring(counter, access));
+      expect(counter.calls, scenario.name).toBe(0);
+      expect(await countWishes(), scenario.name).toBe(0);
+      expect(await budgetRows(), scenario.name).toEqual([]);
+      expect(outcome.skipped.length, scenario.name).toBeGreaterThan(0);
+    }
   });
 
   it('模型返回那一刻按下总暂停 → 零愿望（模型调用照常记账）', async () => {

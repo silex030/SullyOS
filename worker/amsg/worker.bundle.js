@@ -27041,7 +27041,7 @@ async function travelModelGateAllows(args) {
   });
   if (!read.ok) return { ok: false, reason: read.reason };
   const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND) ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, args.nowMs);
-  return denial ? { ok: false, reason: denial } : { ok: true };
+  return denial ? { ok: false, reason: denial } : { ok: true, boundary: read.boundary };
 }
 async function travelModelAccess(args) {
   const gate = await travelModelGateAllows({
@@ -27061,6 +27061,17 @@ async function travelModelAccess(args) {
   if (!budget) return { ok: false, reason: "travel_budget_missing" };
   if (budget.paused) return { ok: false, reason: "travel_budget_paused" };
   if (!(budget.mapCallsLimit > 0)) return { ok: false, reason: "travel_budget_zero" };
+  const grant = effectiveGrantFor(gate.boundary, "amap", args.nowMs);
+  if (grant) {
+    if (!(grant.dailyQuota > 0)) return { ok: false, reason: "external_quota_exhausted" };
+    const used = await readExternalUsage({
+      db: args.db,
+      ownerId: args.ownerId,
+      dayKey: localDateKey(args.nowMs, gate.boundary.timezone),
+      provider: "amap"
+    });
+    if (used >= grant.dailyQuota) return { ok: false, reason: "external_quota_exhausted" };
+  }
   return { ok: true };
 }
 function gateTravelDecisionPort(port, deps) {

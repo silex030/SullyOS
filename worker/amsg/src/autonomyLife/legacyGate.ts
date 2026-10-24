@@ -333,7 +333,7 @@ export async function legacyRoundStillAllowed(args: {
 export type LegacyQuotaFailure = LegacyAutonomySkipReason | 'notifications_exhausted' | 'external_quota_exhausted' | 'boundary_changed';
 
 /** 授权窗口的当日已用（`/external/*` 也用这张表；0 = 还没有记录）。 */
-async function readExternalUsage(args: {
+export async function readExternalUsage(args: {
   db: LifeDb;
   ownerId: string;
   dayKey: string;

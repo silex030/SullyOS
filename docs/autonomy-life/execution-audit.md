@@ -346,7 +346,7 @@ worker/amsg/src/autonomyScheduler.test.ts
 | 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 909 用例全通过，EXIT 0**（`focused.log.gz`） |
 | 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7624 用例全通过，EXIT 0**（214.3s，`vitest-full.log.gz`，未裁剪） |
 | 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **两边各 56 条；归一化 worktree / 基线临时路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
-| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 33s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5；`build.log.gz`） |
+| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 41s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5；`build.log.gz`） |
 | 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=/tmp/r5-e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
 | 旧入口完整审计（按实际入口） | `bash scripts/autonomy-legacy-grep-audit.sh` | 见 `legacy-grep.log.gz`：旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client.ts` 均 **0 命中**；AIRP 回合、出行 tick 的模型调用与效果落库都有**执行期**统一闸 |
 | 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署 |

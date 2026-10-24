@@ -9,7 +9,7 @@
 | `vitest-full.log.gz`（全量原始） | `npx vitest run` | **624 文件 / 7624 用例通过，`EXIT:0`**（214.3s） |
 | `focused.log.gz` | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 909 用例通过，`EXIT:0`** |
 | `tsc-current.log.gz` / `tsc-baseline.log.gz` / `tsc-compare.txt` | `npx tsc --noEmit -p tsconfig.json`（当前 vs 基线 `f7f040c7`） | 两边各 **56 条**；归一化 worktree / 基线临时目录路径后逐行 diff **为空**（`EXIT:2` 是既有基线的同值退出码）；本卡范围 **0 条** |
-| `build.log.gz` | `pnpm run build`（= `build:workers` + `vite build`） | `EXIT:0`（worker bundle 重新生成，vite built in 1m 33s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5） |
+| `build.log.gz` | `pnpm run build`（= `build:workers` + `vite build`） | `EXIT:0`（worker bundle 重新生成，vite built in 1m 41s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5） |
 | `e2e-run.log.gz` / `e2e-report.json.gz` / `e2e-http-requests.json.gz` | `AUTONOMY_E2E_EVIDENCE=/tmp/r5-e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks，`EXIT:0`**（真 Chromium + 真 HTTP + 真 SQLite/IDB） |
 | `legacy-grep.log.gz` | `bash scripts/autonomy-legacy-grep-audit.sh` | 按**实际入口**逐个列：AIRP 调度/fire、出行 tick/模型端口/愿望落库、旧护栏账本、手机自动刷新、旧频率编辑、外部占位、新闸落点；旧频率编辑 / `external_window_not_implemented` / 旧 `autonomyLife/client.ts` 均 0 命中 |
 
