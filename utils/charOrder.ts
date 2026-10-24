@@ -5,13 +5,14 @@
 // Money-only module: order document building stays in lifeRecords.ts;
 // this file owns balance mutation + transaction writes + idempotency.
 //
+// v80（自主生活）：扣款/退款不再「先读流水判重 → saveBankState → saveTransaction」串两个
+// 事务，而是委托给 utils/autonomyLife/localLedger 的**同一 readwrite 事务**：
+//   `tx-order-<orderId>` 凭证 + 卡余额 + 流水 + 回执一起提交。
+// 对外 API/返回形状不变（调用方不用改），但中途崩溃不会再出现「钱扣了流水没写」。
 // Idempotency: outflow id = tx-order-<orderId>, refund id = tx-refund-<orderId>.
-// IndexedDB put() is an upsert, but we check existence BEFORE mutating balance
-// so replaying the same orderId never double-deducts.
-import { DB } from './db';
-import type { BankTransaction } from '../types';
+import { DB, openDB } from './db';
 import { charDefaultCard } from './charLedger';
-import { getLocalDateKey } from './localDate';
+import { createLocalDbPort, debitCharCardAtomic, refundCharCardAtomic } from './autonomyLife/localLedger';
 
 export const charOrderTxnId = (orderId: string): string => `tx-order-${orderId}`;
 export const charRefundTxnId = (orderId: string): string => `tx-refund-${orderId}`;
@@ -38,45 +39,51 @@ export interface CharOrderPaymentResult {
 
 const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
 
-/** Deduct the char's default card once per orderId (idempotent). */
+/** Deduct the char's default card once per orderId (idempotent, single transaction). */
 export async function debitCharCardForOrder(input: CharOrderPaymentInput): Promise<CharOrderPaymentResult> {
   const total = round2(input.total);
   const orderId = (input.orderId || '').trim();
   if (!orderId || !(total > 0)) return { ok: false, reason: 'invalid' };
-  const outId = charOrderTxnId(orderId);
-  try {
-    const prev = await DB.getAllTransactions().catch(() => [] as BankTransaction[]);
-    const hit = (prev || []).find(t => t.id === outId);
-    if (hit) return { ok: true, txnId: hit.id, replay: true };
-  } catch { /* fall through to normal path */ }
+
+  // 先做只读前置检查，只为给出准确原因（no_bank / no_card / insufficient）；
+  // 真正的判定与扣款在同一个事务里再做一次，读检查不承担正确性。
   const bank = await DB.getBankState().catch(() => null);
   if (!bank) return { ok: false, reason: 'no_bank' };
   const cards = bank.cards || [];
   const payCard = charDefaultCard(cards, input.charId);
   if (!payCard) return { ok: false, reason: 'no_card' };
-  if (round2(payCard.balance) < total) return { ok: false, reason: 'insufficient', balance: payCard.balance };
-  const cardId = payCard.id;
-  const cardLabel = `${payCard.name}·${payCard.tailNo}`;
-  const nextCards = cards.map(c => (c.id === cardId ? { ...c, balance: round2(c.balance - total) } : c));
-  await DB.saveBankState({ ...bank, cards: nextCards });
-  const now = Date.now();
-  const who = (input.charName || '').trim();
-  const tx: BankTransaction = {
-    id: outId,
-    amount: -total,
-    category: 'shopping',
-    note: who ? `${input.shop}（${who}点的）` : `${input.shop}`,
-    timestamp: now,
-    dateStr: getLocalDateKey(new Date(now)),
-    ownerId: input.charId,
-    linkedPurchaseId: orderId,
-    cardId,
-  };
-  await DB.saveTransaction(tx);
-  return { ok: true, txnId: outId, cardId, cardLabel };
+
+  const port = createLocalDbPort(await openDB());
+  const outcome = await debitCharCardAtomic(port, {
+    actionId: `legacy:charOrder:${orderId}`,
+    kind: 'shopping.order',
+    nowMs: Date.now(),
+    args: {
+      charId: input.charId,
+      orderId,
+      shop: input.shop,
+      totalMinor: Math.round(total * 100),
+      charName: input.charName,
+    },
+  });
+  if (outcome.status === 'succeeded') {
+    const meta = outcome.receipt.meta ?? {};
+    return {
+      ok: true,
+      txnId: charOrderTxnId(orderId),
+      cardId: meta.cardId || payCard.id,
+      cardLabel: meta.cardLabel || `${payCard.name}·${payCard.tailNo}`,
+      ...(outcome.replayed ? { replay: true } : {}),
+    };
+  }
+  if (outcome.code === 'BUDGET_EXHAUSTED') {
+    return { ok: false, reason: 'insufficient', balance: payCard.balance };
+  }
+  if (outcome.code === 'POLICY_DENIED') return { ok: false, reason: 'no_card' };
+  return { ok: false, reason: 'invalid' };
 }
 
-/** Explicit merchant-style refund: restores balance + writes an inflow txn (idempotent). */
+/** Explicit merchant-style refund: restores balance + writes an inflow txn (single transaction, idempotent). */
 export async function refundCharOrder(
   orderId: string,
   charId: string,
@@ -84,38 +91,19 @@ export async function refundCharOrder(
 ): Promise<{ refunded: boolean; txnId?: string; replay?: boolean }> {
   const oid = (orderId || '').trim();
   if (!oid) return { refunded: false };
-  const outId = charOrderTxnId(oid);
-  const refId = charRefundTxnId(oid);
-  const txs = await DB.getAllTransactions().catch(() => [] as BankTransaction[]);
-  const list = txs || [];
-  const already = list.find(t => t.id === refId);
-  if (already) return { refunded: true, txnId: already.id, replay: true };
-  const orig = list.find(t => t.id === outId);
-  if (!orig) return { refunded: false };
-  const amount = round2(opts?.total ?? -orig.amount);
-  if (!(amount > 0)) return { refunded: false };
-  const bank = await DB.getBankState().catch(() => null);
-  if (!bank) return { refunded: false };
-  const cards = bank.cards || [];
-  const target = (opts?.cardId && cards.find(c => c.id === opts.cardId && c.owner === 'char' && c.ownerId === charId))
-    || charDefaultCard(cards, charId)
-    || cards.find(c => c.owner === 'char' && c.ownerId === charId);
-  if (!target) return { refunded: false };
-  const nextCards = cards.map(c => (c.id === target.id ? { ...c, balance: round2(c.balance + amount) } : c));
-  await DB.saveBankState({ ...bank, cards: nextCards });
-  const now = Date.now();
-  await DB.saveTransaction({
-    id: refId,
-    amount,
-    category: 'income',
-    note: `${opts?.shop || orig.note}退款`,
-    timestamp: now,
-    dateStr: getLocalDateKey(new Date(now)),
-    ownerId: charId,
-    linkedPurchaseId: oid,
-    cardId: target.id,
+  const port = createLocalDbPort(await openDB());
+  const outcome = await refundCharCardAtomic(port, {
+    actionId: `legacy:charRefund:${oid}`,
+    nowMs: Date.now(),
+    args: {
+      charId,
+      orderId: oid,
+      shop: opts?.shop,
+      ...(typeof opts?.total === 'number' && opts.total > 0 ? { totalMinor: Math.round(opts.total * 100) } : {}),
+    },
   });
-  return { refunded: true, txnId: refId };
+  if (outcome.status !== 'succeeded') return { refunded: false };
+  return { refunded: true, txnId: charRefundTxnId(oid), ...(outcome.replayed ? { replay: true } : {}) };
 }
 
 /** Reject-rollback helper: user denial means "never happened" — give the money back. */
