@@ -19,6 +19,21 @@
   全部由 `resolveActiveMsgEndpoint()` 从既有主动消息配置派生。
 - 本卡没有修改任何模型/provider 配置，也没有引入新的 provider 依赖。
 
+### 1.1 实现期（ds-executor）会话的模型 / provider
+
+上面讲的是**产品运行时**的模型来源；实现这张卡的 agent 会话本身用的是：
+
+| 项目 | 值 | 证据 |
+| --- | --- | --- |
+| 模型 | `deepseek-v4.1-flash` | `~/.hermes/profiles/ds-executor/config.yaml` → `model.default` |
+| provider | `opencode-go` | 同上 → `model.provider`（`api_mode: chat_completions`，MoA 关闭） |
+| 本卡 model/provider 覆盖 | 无（`model_override=null` / `provider_override=null`） | kanban `tasks` 行 |
+| 两次实现 run | 68（首次交付）与 83（返工），均为 ds-executor | kanban `task_runs` |
+
+配置文件 mtime（`2026-10-24 22:50:17` / `2026-10-24 16:35:36`）都早于本 run 起点
+`2026-10-25T02:21:17+08:00`：本卡没有改 Hermes 配置、delegation / kanban / approvals / 工具权限，
+没有启动网关、没有部署。完整脱敏审计见附件 `runtime-audit.md`。
+
 ## 2. 配置与 schema 变更（都是 additive）
 
 | 变更 | 位置 | 说明 |
@@ -77,6 +92,44 @@ cron（每分钟）
   进待补报、下一轮用原 actionId 补报且不重做业务。
 - `utils/autonomyLife/localLedger.test.ts` —— 许可在业务事务内核销、重放幂等、跨角色拒绝。
 
+### 4.1 隔离环境真实联调（真浏览器 → 真 worker 路由 → 真 SQLite/IndexedDB）
+
+`scripts/autonomy-e2e/` 不是单测替身，而是把**仓库里的真实模块**串起来跑：
+
+| 组成 | 实现 | 是否真实 |
+| --- | --- | --- |
+| 浏览器 | Chromium 145（HeadlessChrome），页面 import `utils/autonomyLife/{api,executor,localLedger}` | 真浏览器 + 原生 IndexedDB（断言 `indexedDB._fake` 不存在） |
+| 执行器 | `createAutonomyLifeExecutor` → register → claim → commit-permit → 本地事务 → 回执 | 真实 HTTP（`fetch`），无假 api |
+| worker | `worker/amsg/src/autonomyLife/routes.ts` + D1 端口（esbuild 打包真实代码） | 真实路由 + 真实 `AMSG_SERVER_TOKEN` 校验 |
+| 持久化 | `node:sqlite` 文件 `scripts/autonomy-e2e/.data/autonomy-e2e.sqlite`（D1 适配 1:1 语义） | 真 SQL；重启进程后可复查 |
+| 外部只读 | 真实 https GET `https://api.github.com/users/octocat/repos`（匿名） | 真第三方响应，不是 fixture |
+
+复跑命令与结果（本机实跑，日志见附件 `e2e/e2e-run.log` + `e2e/e2e-report.json` +
+`e2e/e2e-http-requests.json`）：
+
+```bash
+$ AUTONOMY_E2E_EVIDENCE=... node scripts/autonomy-e2e/run.mjs
+[e2e] 40/40 checks passed        # EXIT 0
+```
+
+覆盖的 5 个场景（每条都断言服务端落库与本地效果一致）：
+
+1. **本地副作用**：`journal.write` → 本地 `diaries` 行 + `autonomy_action_receipts` +
+   `autonomy_action_permits.consumedAt`；服务端动作 `status=succeeded`、
+   `permitConsumedAt` 有值、`resultRef=diaries:...`。
+2. **重启持久化**：SIGTERM 停 server 再起（同一 SQLite 文件），动作行仍为 succeeded、许可核销时间仍在。
+3. **外部只读**：`external.read` → 真实出网 → 只回白名单字段（`{"url":"https://api.github.com/repos/..."}`）
+   → 本地 `external_read` 记录（`source=external_read_only`）→ 服务端配额 `xhs used=1`。
+4. **撤销 / 暂停**：先 claim + commit-permit 拿到一次性许可，再 `PATCH /boundaries` 撤销授权
+   → `/external/read` 返回 **403 GRANT_REQUIRED**；`POST /pause` 后同许可 → **409 GLOBAL_PAUSED**。
+   两次都断言：动作未被消费、配额未增加、愿望表零写入、请求日志只多一条被拒记录（没有出网痕迹）。
+5. **出行愿望**：`travel.wish` → 服务端落 1 行 + 本地 `travel_wish`；第二笔在配额耗尽后
+   `/external/wish` 返回 **429**，愿望表仍只有 1 行、第二笔动作不是 succeeded。
+
+请求日志（`e2e-http-requests.json`）里可见的路径/状态：`devices/register 200`、
+`execution/claim 200`、`actions/<id>/commit-permit 200`、`boundaries GET/PATCH 200`、
+`external/read 200 / 403 / 409`、`external/wish 200 / 429`、`actions/<id>/receipt 200`。
+
 ## 5. 旧入口退役证据
 
 ```bash
@@ -96,6 +149,25 @@ $ grep -rn "external_window_not_implemented" --include=*.ts . | grep -v node_mod
 （无输出）
 ```
 
+```bash
+# 旧 AIRP 自动回合（runAutonomyTick / createAutonomyPostTask）：入口仍在，但已被统一边界闸改道
+$ grep -rn "runAutonomyTick\|createAutonomyPostTask" --include=*.ts worker/ | grep -v node_modules
+worker/amsg/src/autonomyScheduler.ts:745   # 旧实现本身（保留执行能力）
+worker/amsg/src/index.ts:179/182/4077/4084 # cron 入口：packs 先过 gateLegacyAutonomyPacks
+worker/amsg/src/autonomyLife/legacyGate.ts  # 统一边界闸
+worker/amsg/src/autonomyLife/legacyGate.test.ts
+worker/amsg/src/autonomyScheduler.test.ts
+```
+
+- **改道而不是旁路**：`worker/amsg/src/index.ts` 的 cron 先用 `gateLegacyAutonomyPacks()` 按
+  **新边界**筛包（账号 enabled/globalPaused、角色登记与 charEnabled、`allowedKinds` 含
+  `interaction.message`、用户新增禁区/回避话题 fail closed、当前窗口 calls used+reserved 未到上限），
+  被拦下的包不会进 `runAutonomyTick`，只进日志 `gated: [...]`。
+- **存量旧配置不再能用**：没有新账号边界行 = 不跑（`account_disabled`）；角色没登记 = 不跑；
+  读边界/预算失败也按不跑处理（fail closed）。
+- 集成测试（真 SQLite）：`legacyGate.test.ts` 覆盖「只有旧 fire_pack + client_state 护栏 → 全不跑」、
+  「暂停 / 关角色 / allowedKinds 不含消息」、「用户新增禁区 → fail closed」、「used+reserved 到上限」、
+  「进程重启后再判一次结果一致」。
 - 旧定时器键（`RETIRED_LEGACY_TIMERS`）在开机时真正 `removeItem`，并清掉角色上的
   `phoneState.autoRefresh*`；迁移 marker 保证只做一次。
 - 迁移的 `allowedKinds` 只做**交集**：旧配置没开 → 不授予任何 kind；有旧能力清单 →
@@ -103,22 +175,25 @@ $ grep -rn "external_window_not_implemented" --include=*.ts . | grep -v node_mod
 
 ## 6. 仍未覆盖（residual risk，交付时如实列出）
 
-1. **AIRP 旧自主回合仍在**：`worker/amsg/src/autonomyScheduler.ts` 是另一条产品线
-   （amsg2 自主回合，走 `/schedule-message`）。本卡没有把它下线或改道到新引擎——
-   两者目前并存，**都受各自预算门约束**，但「统一到一个调度器」尚未做。
-2. **外部窗口默认不可用**：需要运营配置 `AUTONOMY_EXTERNAL_*` 端点；真实第三方响应
-   schema 未经线上验证（测试用的是假 fetch，覆盖的是拒绝面与投影面）。
-3. **浏览器端到端**：执行器已在 OSContext 启动，但本环境没有浏览器可跑，当前证据为
-   fake-indexeddb + 假 api 的集成测试；真机首跑需要一次人工冒烟（打开 App → 角色面板
-   触发一次 tick 后 claim → 本地日记可见）。
+1. **AIRP 旧自主回合是「改道」不是「删除」**：`worker/amsg/src/autonomyScheduler.ts` 的实现
+   仍在，cron 入口已先过 `gateLegacyAutonomyPacks()`（见 §5）；两个调度器仍并存，只是旧链路
+   不再能绕过新边界。彻底合并成一个调度器不在本卡范围。
+2. **外部窗口默认不可用**：需要运营配置 `AUTONOMY_EXTERNAL_XHS_URL` / `_AMAP_URL` /
+   `AUTONOMY_EXTERNAL_READ_HOSTS`；联调用的是真实第三方（api.github.com），但**线上要接的
+   平台响应 schema 仍需部署时验证**（字段投影会丢弃不在白名单/非标量的字段）。
+3. **真机首跑（真实 App 壳）仍缺一次人工冒烟**：本卡证据是 Chromium + 真实 IDB/worker，
+   但 App 里 OSContext 的启动时机、角色列表为空、浏览器权限策略等只在真实 App 里出现。
 4. **`putCharacterLife` 首次插入**：D1 实现在 `expectedRevision===0` 时 INSERT，若两个
    isolate 同时首插会有一方 changes=0 → 引擎下次 tick 重新读；不会双写，但会多一跳。
+5. **联调环境用的是 node:sqlite 适配器**（与 D1 API 语义 1:1，但不是 Cloudflare D1 本体）；
+   D1 特有的行为（如 `meta.changes` 返回形状）已在适配器里对齐并有测试，但生产首跑仍需观察。
 
 ## 7. 验证日志（本机真实输出，日志随任务附件 `autonomy-evidence/`）
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 自主生活相关用例 | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife components/autonomy-life` | **17 文件 / 228 用例全通过**（`focused-tests.log`，EXIT 0） |
+| 真实浏览器联调 | `node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e/e2e-run.log`、`e2e/e2e-report.json`、`e2e/e2e-http-requests.json`） |
+| 自主生活相关用例 | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife components/autonomy-life` | 见本次返工日志 `focused-tests.log` |
 | 全量用例（机器空闲时） | `npx vitest run` | **621 文件 / 7541 用例全通过**（`vitest-full-first.log`，EXIT 0） |
 | 全量用例（机器 load≈26 时重跑） | `npx vitest run --testTimeout=180000 --hookTimeout=180000` | 7539/7541；失败两条都是**与本卡无关的时序敏感用例**（见下），单独跑均通过（`vitest-full-load.log`） |
 | 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **56 条错误，与基线 `f7f040c7` 同集合；本卡新增 0 条，改动文件零错误**（`tsc.log`） |

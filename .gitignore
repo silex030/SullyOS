@@ -65,3 +65,6 @@ public/shopping/mall-shops-raw.json
 
 # superpowers agent workspaces（ledger/briefs/reports，不进仓库）
 .superpowers/
+
+# autonomy-life 联调产物（SQLite / 打包 ESM / 证据文件，均可由 run.mjs 重新生成）
+scripts/autonomy-e2e/.data/

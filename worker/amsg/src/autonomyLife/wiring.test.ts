@@ -547,6 +547,9 @@ describe('HTTP 路由：认证 / 归属 / 全链路', () => {
     const permitBody = await permit!.json() as any;
     expect(permitBody.permit.nonce).toBeTruthy();
     expect(permitBody.permit.charId).toBe(CHAR);
+    // 执行器要用服务端返回的**许可后**动作行（含 permitNonce），不能拿 claim 的旧快照。
+    expect(permitBody.action.permitNonce).toBe(permitBody.permit.nonce);
+    expect(permitBody.action.status).toBe('running');
 
     const receipt = await call('/autonomy-life/v1/actions/act-http/receipt', {
       method: 'POST',

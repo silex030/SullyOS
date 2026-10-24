@@ -303,7 +303,9 @@ export function createAutonomyLifeService(deps: AutonomyLifeServiceDeps) {
         const code: AutonomyLifeErrorCode = result.code ?? 'STATE_CONFLICT';
         return fail(deps, code, 'permit_denied');
       }
-      return ok(deps, { permit: result.permit });
+      // 必须把条件提交后的**动作行**一起回给执行器：许可 nonce/租约到期都在这份行里，
+      // 执行器不能拿 claim 时的旧快照去执行（旧快照没有 nonce，本地许可校验会失败）。
+      return ok(deps, { permit: result.permit, action: result.action });
     },
 
     /** POST /actions/{id}/receipt */

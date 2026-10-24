@@ -24,11 +24,12 @@
  */
 
 import {
+  DEFAULT_ACCOUNT_LIMITS,
   PLATFORM_FORBIDDEN_CATEGORIES,
   type EffectiveBoundaryV1,
 } from '../../../../contracts/autonomyLife';
 import { boundaryGate, mergeEffectiveBoundary } from '../../../../utils/autonomyLife/boundary';
-import { DEFAULT_ACCOUNT_LIMITS, windowIdAt, type BudgetRow } from '../../../../utils/autonomyLife/budget';
+import { windowIdAt, type BudgetRow } from '../../../../utils/autonomyLife/budget';
 import type { AutonomyTickPack } from '../autonomyScheduler';
 import { readBudgetRows, type LifeDb } from './store';
 
