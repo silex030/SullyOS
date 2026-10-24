@@ -193,20 +193,13 @@ worker/amsg/src/autonomyScheduler.test.ts
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
 | 真实浏览器联调 | `node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e/e2e-run.log`、`e2e/e2e-report.json`、`e2e/e2e-http-requests.json`） |
-| 自主生活相关用例 | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife components/autonomy-life` | 见本次返工日志 `focused-tests.log` |
-| 全量用例（机器空闲时） | `npx vitest run` | **621 文件 / 7541 用例全通过**（`vitest-full-first.log`，EXIT 0） |
-| 全量用例（机器 load≈26 时重跑） | `npx vitest run --testTimeout=180000 --hookTimeout=180000` | 7539/7541；失败两条都是**与本卡无关的时序敏感用例**（见下），单独跑均通过（`vitest-full-load.log`） |
-| 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **56 条错误，与基线 `f7f040c7` 同集合；本卡新增 0 条，改动文件零错误**（`tsc.log`） |
-| 构建 | `pnpm run build` | **EXIT 0**（7 个 worker bundle + vite build 5m36s，`build.log`） |
+| 自主生活相关用例 | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife components/autonomy-life` | **18 文件 / 245 用例全通过，EXIT 0**（`focused-tests.log`） |
+| 全量用例 | `npx vitest run` | **622 文件 / 7558 用例全通过，EXIT 0**（`vitest-full.log`，最终 HEAD 上实跑） |
+| 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **56 条错误，与基线 `f7f040c7` 逐行 diff 为空；本卡新增 0 条，本卡范围内 0 条**（`tsc-current.log`、`tsc-baseline.log`、`tsc-compare.txt`） |
+| 构建 | `pnpm run build` | 见 `build.log`（最终 HEAD 上重跑） |
 | 旧入口 grep | `grep -rn …` | 旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client` 均 **0 命中**；`autoRefresh*` 只剩退役清理代码与其测试（`legacy-grep.log`） |
 
-两条负载敏感用例（本次重跑的失败项，均与自主生活无关、代码未改）：
-
-```bash
-$ npx vitest run utils/backupRoundtrip.test.ts
-✓ 22 tests  — 4500×1024 真 ZIP 用例 13686ms（用例自带 30s 上限；并发跑时被挤到 >30s）
-$ npx vitest run utils/activeMsgRuntime.test.ts
-✓ 140 tests  — 失败项是「补收该跳过打字延迟」的 <400ms 断言，负载下实测 568ms
-```
-
-机器是共享主机（本卡运行期间 load average 19–26，另有其它 workspace 的 `tsc` 在跑）。
+说明：首次交付（提交 `617e598f`）时有两条负载敏感用例在**高负载重跑**里失败过
+（`utils/backupRoundtrip.test.ts` 的 30s 自带上限、`utils/activeMsgRuntime.test.ts` 的
+`<400ms` 时序断言），单独跑均通过。本次返工在最终 HEAD 上跑全量时机器为负载 3–7，
+622 文件 / 7558 用例一次全通过，没有再出现；两处用例的代码本卡未改。

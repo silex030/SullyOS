@@ -22691,6 +22691,9 @@ function mergeEffectiveBoundary(args) {
   return {
     schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
     revision: Math.max(account.revision, character?.revision ?? 0),
+    // 原始两层 revision：许可条件更新用它发现并发撤销/改限额（不是取 max）。
+    accountRevision: account.revision,
+    characterRevision: character?.revision ?? null,
     scope: "account",
     enabled: stricterOff(character?.enabled, account.enabled),
     globalPaused: account.globalPaused ?? false,
@@ -22802,6 +22805,255 @@ function boundaryGate(effective, kind) {
   if (effective.charEnabled === false) return { ok: false, code: "CHAR_DISABLED" };
   if (!isKindAllowed(effective, kind)) return { ok: false, code: "POLICY_DENIED" };
   return { ok: true };
+}
+
+// utils/autonomyLife/budget.ts
+function emptyBudgetRow(windowId, scope, updatedAt) {
+  return {
+    windowId,
+    scope,
+    usedCalls: 0,
+    reservedCalls: 0,
+    usedTokens: 0,
+    reservedTokens: 0,
+    notifications: 0,
+    kindCounts: {},
+    spendMinor: 0,
+    revision: 0,
+    updatedAt
+  };
+}
+var limitOf = (limits, key, scope) => {
+  const value = limits[key];
+  if (value === null || value === void 0) {
+    return Math.min(
+      DEFAULT_ACCOUNT_LIMITS[key] ?? 0,
+      MAXIMUM_ACCOUNT_LIMITS[key] ?? 0
+    );
+  }
+  return value;
+};
+function precheckBudget(inputs) {
+  const { accountRow, charRow, limits, request } = inputs;
+  const calls = request.calls ?? 1;
+  const tokens = request.tokens;
+  const spend = request.spendMinor ?? 0;
+  const acctCalls = limitOf(limits, "accountModelCallsPerDay", "account");
+  const charCalls = limitOf(limits, "charModelCallsPerDay", "char");
+  const acctTokens = limitOf(limits, "accountTokensPerDay", "account");
+  const charTokens = limitOf(limits, "charTokensPerDay", "char");
+  const notifLimit = limitOf(limits, "notificationsPerDay", "account");
+  const perKind = limitOf(limits, "perKindActionsPerDay", "char");
+  const spendLimit = limitOf(limits, "virtualSpendPerDayMinor", "char");
+  const orderMax = limitOf(limits, "virtualOrderMaxMinor", "char");
+  if (calls > 0) {
+    if (acctCalls <= 0) return { ok: false, dimension: "account_calls" };
+    if (charCalls <= 0) return { ok: false, dimension: "char_calls" };
+    if (accountRow.usedCalls + accountRow.reservedCalls + calls > acctCalls) {
+      return { ok: false, dimension: "account_calls" };
+    }
+    if (charRow.usedCalls + charRow.reservedCalls + calls > charCalls) {
+      return { ok: false, dimension: "char_calls" };
+    }
+  }
+  if (tokens > 0) {
+    if (acctTokens <= 0) return { ok: false, dimension: "account_tokens" };
+    if (charTokens <= 0) return { ok: false, dimension: "char_tokens" };
+    if (accountRow.usedTokens + accountRow.reservedTokens + tokens > acctTokens) {
+      return { ok: false, dimension: "account_tokens" };
+    }
+    if (charRow.usedTokens + charRow.reservedTokens + tokens > charTokens) {
+      return { ok: false, dimension: "char_tokens" };
+    }
+  }
+  if (request.notification) {
+    if (notifLimit <= 0) return { ok: false, dimension: "notifications" };
+    if (accountRow.notifications + 1 > notifLimit) return { ok: false, dimension: "notifications" };
+  }
+  if (request.kind) {
+    if (perKind <= 0) return { ok: false, dimension: "kind_actions" };
+    const used = charRow.kindCounts[request.kind] ?? 0;
+    if (used + 1 > perKind) return { ok: false, dimension: "kind_actions" };
+  }
+  if (spend > 0) {
+    if (spendLimit <= 0) return { ok: false, dimension: "virtual_spend" };
+    if (orderMax <= 0 || spend > orderMax) return { ok: false, dimension: "virtual_order_max" };
+    if (charRow.spendMinor + spend > spendLimit) return { ok: false, dimension: "virtual_spend" };
+  }
+  return { ok: true };
+}
+var reservationCounter = 0;
+function parseReservationId(reservationId) {
+  const raw = String(reservationId ?? "").trim();
+  if (!raw) return null;
+  const match = /^rsv_(w:[^_]+)_(.+)_(\d{1,16})_(\d{1,9})$/.exec(raw);
+  if (!match) return null;
+  const createdAt = Number(match[3]);
+  const counter = Number(match[4]);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(counter)) return null;
+  return { windowId: match[1], charId: match[2], createdAt, counter };
+}
+function verifyReservationHold(input) {
+  const parsed = parseReservationId(input.reservationId);
+  if (!parsed) {
+    return {
+      ok: false,
+      reason: String(input.reservationId ?? "").trim() ? "reservation_malformed" : "reservation_missing"
+    };
+  }
+  if (parsed.windowId !== input.windowId) return { ok: false, reason: "reservation_window_mismatch" };
+  if (parsed.charId !== input.charId) return { ok: false, reason: "reservation_character_mismatch" };
+  if (parsed.createdAt > input.nowMs) return { ok: false, reason: "reservation_malformed" };
+  if (input.timezone && budgetWindowId(parsed.createdAt, input.timezone) !== input.windowId) {
+    return { ok: false, reason: "reservation_window_mismatch" };
+  }
+  const account = input.rows.account;
+  const char = input.rows.char;
+  if (!account || !char) return { ok: false, reason: "reservation_not_held" };
+  if (account.windowId !== input.windowId || char.windowId !== input.windowId) {
+    return { ok: false, reason: "reservation_window_mismatch" };
+  }
+  if (account.reservedCalls + account.usedCalls < 1 || char.reservedCalls + char.usedCalls < 1) {
+    return { ok: false, reason: "reservation_not_held" };
+  }
+  return { ok: true };
+}
+async function reserveBudget(port, request) {
+  if (!port.available()) {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
+  }
+  const calls = request.calls ?? 1;
+  const windowId = budgetWindowId(request.nowMs, request.windowTimezone);
+  try {
+    const outcome = await port.mutate(windowId, ["account", request.charId], (rows) => {
+      const accountRow = rows.account ?? emptyBudgetRow(windowId, "account", request.nowMs);
+      const charRow = rows[request.charId] ?? emptyBudgetRow(windowId, request.charId, request.nowMs);
+      const precheck = precheckBudget({ accountRow, charRow, limits: request.limits, request });
+      if (!precheck.ok) return null;
+      reservationCounter += 1;
+      const grant = {
+        reservationId: `rsv_${windowId}_${request.charId}_${request.nowMs}_${reservationCounter}`,
+        windowId,
+        charId: request.charId,
+        calls,
+        tokens: request.tokens,
+        notification: request.notification === true,
+        spendMinor: request.spendMinor ?? 0,
+        kind: request.kind ?? null,
+        createdAt: request.nowMs
+      };
+      const nextAccount = {
+        ...accountRow,
+        reservedCalls: accountRow.reservedCalls + calls,
+        reservedTokens: accountRow.reservedTokens + request.tokens,
+        notifications: accountRow.notifications + (request.notification ? 1 : 0),
+        revision: accountRow.revision + 1,
+        updatedAt: request.nowMs
+      };
+      const kindCounts = { ...charRow.kindCounts };
+      if (request.kind) kindCounts[request.kind] = (kindCounts[request.kind] ?? 0) + 1;
+      const nextChar = {
+        ...charRow,
+        reservedCalls: charRow.reservedCalls + calls,
+        reservedTokens: charRow.reservedTokens + request.tokens,
+        kindCounts,
+        spendMinor: charRow.spendMinor + (request.spendMinor ?? 0),
+        revision: charRow.revision + 1,
+        updatedAt: request.nowMs
+      };
+      return { updates: [nextAccount, nextChar], result: grant };
+    });
+    if (!outcome) {
+      const detail = await port.mutate(windowId, ["account", request.charId], (rows) => {
+        const precheck = precheckBudget({
+          accountRow: rows.account,
+          charRow: rows[request.charId],
+          limits: request.limits,
+          request
+        });
+        return { result: precheck, updates: [] };
+      });
+      const dimension = detail && !detail.ok ? detail.dimension ?? "unknown" : "unknown";
+      return { ok: false, code: "BUDGET_EXHAUSTED", dimension };
+    }
+    return { ok: true, grant: outcome };
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
+  }
+}
+async function settleBudget(port, grant, input) {
+  if (!port.available()) return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  const released = !input.requestStarted;
+  const settledTokens = released ? 0 : typeof input.actualTokens === "number" && Number.isFinite(input.actualTokens) && input.actualTokens >= 0 ? Math.min(Math.round(input.actualTokens), grant.tokens) : grant.tokens;
+  try {
+    const outcome = await port.mutate(grant.windowId, ["account", grant.charId], (rows) => {
+      const accountRow = rows.account;
+      const charRow = rows[grant.charId];
+      if (!accountRow || !charRow) return null;
+      const nextAccount = {
+        ...accountRow,
+        reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, accountRow.reservedTokens - grant.tokens),
+        usedCalls: accountRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: accountRow.usedTokens + settledTokens,
+        revision: accountRow.revision + 1,
+        updatedAt: Date.now()
+      };
+      const nextChar = {
+        ...charRow,
+        reservedCalls: Math.max(0, charRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, charRow.reservedTokens - grant.tokens),
+        usedCalls: charRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: charRow.usedTokens + settledTokens,
+        revision: charRow.revision + 1,
+        updatedAt: Date.now()
+      };
+      return { updates: [nextAccount, nextChar], result: { usedTokens: settledTokens } };
+    });
+    if (!outcome) return { ok: false, code: "SERVICE_UNAVAILABLE" };
+    return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  }
+}
+function projectBudgetUsage(rowAccount, rowChar, limits) {
+  const account = rowAccount ?? emptyBudgetRow("", "account", 0);
+  const character = rowChar ?? emptyBudgetRow("", "char", 0);
+  return [
+    {
+      dimension: "model_calls",
+      used: character.usedCalls,
+      reserved: character.reservedCalls,
+      limit: limitOf(limits, "charModelCallsPerDay", "char")
+    },
+    {
+      dimension: "model_calls_account",
+      used: account.usedCalls,
+      reserved: account.reservedCalls,
+      limit: limitOf(limits, "accountModelCallsPerDay", "account")
+    },
+    {
+      dimension: "tokens",
+      used: character.usedTokens,
+      reserved: character.reservedTokens,
+      limit: limitOf(limits, "charTokensPerDay", "char")
+    },
+    {
+      dimension: "notifications",
+      used: account.notifications,
+      reserved: 0,
+      limit: limitOf(limits, "notificationsPerDay", "account")
+    },
+    {
+      dimension: "virtual_spend",
+      used: character.spendMinor,
+      reserved: 0,
+      limit: limitOf(limits, "virtualSpendPerDayMinor", "char")
+    }
+  ];
+}
+function windowIdAt(clock, timezone) {
+  return budgetWindowId(clock.now(), timezone);
 }
 
 // utils/autonomyLife/localLedger.ts
@@ -23207,220 +23459,6 @@ function describeCapabilities(input) {
       ...unavailableReason ? { unavailableReason } : {}
     };
   });
-}
-
-// utils/autonomyLife/budget.ts
-function emptyBudgetRow(windowId, scope, updatedAt) {
-  return {
-    windowId,
-    scope,
-    usedCalls: 0,
-    reservedCalls: 0,
-    usedTokens: 0,
-    reservedTokens: 0,
-    notifications: 0,
-    kindCounts: {},
-    spendMinor: 0,
-    revision: 0,
-    updatedAt
-  };
-}
-var limitOf = (limits, key, scope) => {
-  const value = limits[key];
-  if (value === null || value === void 0) {
-    return Math.min(
-      DEFAULT_ACCOUNT_LIMITS[key] ?? 0,
-      MAXIMUM_ACCOUNT_LIMITS[key] ?? 0
-    );
-  }
-  return value;
-};
-function precheckBudget(inputs) {
-  const { accountRow, charRow, limits, request } = inputs;
-  const calls = request.calls ?? 1;
-  const tokens = request.tokens;
-  const spend = request.spendMinor ?? 0;
-  const acctCalls = limitOf(limits, "accountModelCallsPerDay", "account");
-  const charCalls = limitOf(limits, "charModelCallsPerDay", "char");
-  const acctTokens = limitOf(limits, "accountTokensPerDay", "account");
-  const charTokens = limitOf(limits, "charTokensPerDay", "char");
-  const notifLimit = limitOf(limits, "notificationsPerDay", "account");
-  const perKind = limitOf(limits, "perKindActionsPerDay", "char");
-  const spendLimit = limitOf(limits, "virtualSpendPerDayMinor", "char");
-  const orderMax = limitOf(limits, "virtualOrderMaxMinor", "char");
-  if (calls > 0) {
-    if (acctCalls <= 0) return { ok: false, dimension: "account_calls" };
-    if (charCalls <= 0) return { ok: false, dimension: "char_calls" };
-    if (accountRow.usedCalls + accountRow.reservedCalls + calls > acctCalls) {
-      return { ok: false, dimension: "account_calls" };
-    }
-    if (charRow.usedCalls + charRow.reservedCalls + calls > charCalls) {
-      return { ok: false, dimension: "char_calls" };
-    }
-  }
-  if (tokens > 0) {
-    if (acctTokens <= 0) return { ok: false, dimension: "account_tokens" };
-    if (charTokens <= 0) return { ok: false, dimension: "char_tokens" };
-    if (accountRow.usedTokens + accountRow.reservedTokens + tokens > acctTokens) {
-      return { ok: false, dimension: "account_tokens" };
-    }
-    if (charRow.usedTokens + charRow.reservedTokens + tokens > charTokens) {
-      return { ok: false, dimension: "char_tokens" };
-    }
-  }
-  if (request.notification) {
-    if (notifLimit <= 0) return { ok: false, dimension: "notifications" };
-    if (accountRow.notifications + 1 > notifLimit) return { ok: false, dimension: "notifications" };
-  }
-  if (request.kind) {
-    if (perKind <= 0) return { ok: false, dimension: "kind_actions" };
-    const used = charRow.kindCounts[request.kind] ?? 0;
-    if (used + 1 > perKind) return { ok: false, dimension: "kind_actions" };
-  }
-  if (spend > 0) {
-    if (spendLimit <= 0) return { ok: false, dimension: "virtual_spend" };
-    if (orderMax <= 0 || spend > orderMax) return { ok: false, dimension: "virtual_order_max" };
-    if (charRow.spendMinor + spend > spendLimit) return { ok: false, dimension: "virtual_spend" };
-  }
-  return { ok: true };
-}
-var reservationCounter = 0;
-async function reserveBudget(port, request) {
-  if (!port.available()) {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
-  }
-  const calls = request.calls ?? 1;
-  const windowId = budgetWindowId(request.nowMs, request.windowTimezone);
-  try {
-    const outcome = await port.mutate(windowId, ["account", request.charId], (rows) => {
-      const accountRow = rows.account ?? emptyBudgetRow(windowId, "account", request.nowMs);
-      const charRow = rows[request.charId] ?? emptyBudgetRow(windowId, request.charId, request.nowMs);
-      const precheck = precheckBudget({ accountRow, charRow, limits: request.limits, request });
-      if (!precheck.ok) return null;
-      reservationCounter += 1;
-      const grant = {
-        reservationId: `rsv_${windowId}_${request.charId}_${request.nowMs}_${reservationCounter}`,
-        windowId,
-        charId: request.charId,
-        calls,
-        tokens: request.tokens,
-        notification: request.notification === true,
-        spendMinor: request.spendMinor ?? 0,
-        kind: request.kind ?? null,
-        createdAt: request.nowMs
-      };
-      const nextAccount = {
-        ...accountRow,
-        reservedCalls: accountRow.reservedCalls + calls,
-        reservedTokens: accountRow.reservedTokens + request.tokens,
-        notifications: accountRow.notifications + (request.notification ? 1 : 0),
-        revision: accountRow.revision + 1,
-        updatedAt: request.nowMs
-      };
-      const kindCounts = { ...charRow.kindCounts };
-      if (request.kind) kindCounts[request.kind] = (kindCounts[request.kind] ?? 0) + 1;
-      const nextChar = {
-        ...charRow,
-        reservedCalls: charRow.reservedCalls + calls,
-        reservedTokens: charRow.reservedTokens + request.tokens,
-        kindCounts,
-        spendMinor: charRow.spendMinor + (request.spendMinor ?? 0),
-        revision: charRow.revision + 1,
-        updatedAt: request.nowMs
-      };
-      return { updates: [nextAccount, nextChar], result: grant };
-    });
-    if (!outcome) {
-      const detail = await port.mutate(windowId, ["account", request.charId], (rows) => {
-        const precheck = precheckBudget({
-          accountRow: rows.account,
-          charRow: rows[request.charId],
-          limits: request.limits,
-          request
-        });
-        return { result: precheck, updates: [] };
-      });
-      const dimension = detail && !detail.ok ? detail.dimension ?? "unknown" : "unknown";
-      return { ok: false, code: "BUDGET_EXHAUSTED", dimension };
-    }
-    return { ok: true, grant: outcome };
-  } catch {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
-  }
-}
-async function settleBudget(port, grant, input) {
-  if (!port.available()) return { ok: false, code: "SERVICE_UNAVAILABLE" };
-  const released = !input.requestStarted;
-  const settledTokens = released ? 0 : typeof input.actualTokens === "number" && Number.isFinite(input.actualTokens) && input.actualTokens >= 0 ? Math.min(Math.round(input.actualTokens), grant.tokens) : grant.tokens;
-  try {
-    const outcome = await port.mutate(grant.windowId, ["account", grant.charId], (rows) => {
-      const accountRow = rows.account;
-      const charRow = rows[grant.charId];
-      if (!accountRow || !charRow) return null;
-      const nextAccount = {
-        ...accountRow,
-        reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
-        reservedTokens: Math.max(0, accountRow.reservedTokens - grant.tokens),
-        usedCalls: accountRow.usedCalls + (released ? 0 : grant.calls),
-        usedTokens: accountRow.usedTokens + settledTokens,
-        revision: accountRow.revision + 1,
-        updatedAt: Date.now()
-      };
-      const nextChar = {
-        ...charRow,
-        reservedCalls: Math.max(0, charRow.reservedCalls - grant.calls),
-        reservedTokens: Math.max(0, charRow.reservedTokens - grant.tokens),
-        usedCalls: charRow.usedCalls + (released ? 0 : grant.calls),
-        usedTokens: charRow.usedTokens + settledTokens,
-        revision: charRow.revision + 1,
-        updatedAt: Date.now()
-      };
-      return { updates: [nextAccount, nextChar], result: { usedTokens: settledTokens } };
-    });
-    if (!outcome) return { ok: false, code: "SERVICE_UNAVAILABLE" };
-    return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };
-  } catch {
-    return { ok: false, code: "SERVICE_UNAVAILABLE" };
-  }
-}
-function projectBudgetUsage(rowAccount, rowChar, limits) {
-  const account = rowAccount ?? emptyBudgetRow("", "account", 0);
-  const character = rowChar ?? emptyBudgetRow("", "char", 0);
-  return [
-    {
-      dimension: "model_calls",
-      used: character.usedCalls,
-      reserved: character.reservedCalls,
-      limit: limitOf(limits, "charModelCallsPerDay", "char")
-    },
-    {
-      dimension: "model_calls_account",
-      used: account.usedCalls,
-      reserved: account.reservedCalls,
-      limit: limitOf(limits, "accountModelCallsPerDay", "account")
-    },
-    {
-      dimension: "tokens",
-      used: character.usedTokens,
-      reserved: character.reservedTokens,
-      limit: limitOf(limits, "charTokensPerDay", "char")
-    },
-    {
-      dimension: "notifications",
-      used: account.notifications,
-      reserved: 0,
-      limit: limitOf(limits, "notificationsPerDay", "account")
-    },
-    {
-      dimension: "virtual_spend",
-      used: character.spendMinor,
-      reserved: 0,
-      limit: limitOf(limits, "virtualSpendPerDayMinor", "char")
-    }
-  ];
-}
-function windowIdAt(clock, timezone) {
-  return budgetWindowId(clock.now(), timezone);
 }
 
 // utils/autonomyLife/rhythm.ts
@@ -24285,27 +24323,30 @@ async function commitPermit(deps, args) {
   const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
   const action = await deps.store.getAction(args.actionId);
   if (!action) return { ok: false, code: "NOT_FOUND" };
+  if (!args.installationId) return { ok: false, code: "FORBIDDEN" };
   if (action.status === "unknown") return { ok: false, code: "UNKNOWN_EFFECT" };
   if (isTerminalActionStatus(action.status)) return { ok: false, code: "STATE_CONFLICT" };
-  if (action.status !== "running" && action.status !== "scheduled" && action.status !== "waiting_device") {
-    return { ok: false, code: "STATE_CONFLICT" };
-  }
   if (!action.charId) return { ok: false, code: "FORBIDDEN" };
-  if (action.installationId && action.installationId !== args.installationId) return { ok: false, code: "FORBIDDEN" };
-  if (action.leaseEpoch !== args.leaseEpoch) return { ok: false, code: "STATE_CONFLICT" };
-  if (action.leaseExpiresAt !== null && nowMs > action.leaseExpiresAt) return { ok: false, code: "STATE_CONFLICT" };
+  if (!action.installationId) return { ok: false, code: "FORBIDDEN" };
+  if (action.installationId !== args.installationId) return { ok: false, code: "FORBIDDEN" };
+  const pause = await deps.store.getAccountPause(args.accountId);
+  if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
+  const life = await deps.store.getCharacterLife(action.charId);
+  if (life?.pauseRequestedAt != null) return { ok: false, code: "GLOBAL_PAUSED" };
+  if (action.status !== "scheduled") return { ok: false, code: "STATE_CONFLICT" };
+  if (!Number.isInteger(action.leaseEpoch) || action.leaseEpoch < 1) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.leaseExpiresAt === null) return { ok: false, code: "STATE_CONFLICT" };
+  if (nowMs > action.leaseExpiresAt) return { ok: false, code: "STATE_CONFLICT" };
   if (nowMs > action.expiresAt) return { ok: false, code: "STATE_CONFLICT" };
   if (action.argsHash !== args.argsHash) return { ok: false, code: "STATE_CONFLICT" };
   if (hashArgs(action.args) !== args.argsHash) return { ok: false, code: "STATE_CONFLICT" };
   if (action.policyVersion !== args.policyVersion) return { ok: false, code: "STATE_CONFLICT" };
-  if (action.permitConsumedAt !== null) return { ok: false, code: "STATE_CONFLICT" };
-  const pause = await deps.store.getAccountPause(args.accountId);
-  if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
+  if (action.permitIssuedAt !== null || action.permitConsumedAt !== null) {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
   const boundary = await deps.boundaryFor(action.charId);
   if (boundary.globalPaused || boundary.enabled === false) return { ok: false, code: "GLOBAL_PAUSED" };
   if (boundary.charEnabled === false) return { ok: false, code: "CHAR_DISABLED" };
-  const life = await deps.store.getCharacterLife(action.charId);
-  if (life?.pauseRequestedAt != null) return { ok: false, code: "GLOBAL_PAUSED" };
   const kindGate = boundaryGate(boundary, action.kind);
   if (!kindGate.ok) return { ok: false, code: kindGate.code };
   const decision = checkIntentPolicy(
@@ -24328,7 +24369,20 @@ async function commitPermit(deps, args) {
   if (!deps.budget.available()) return { ok: false, code: "SERVICE_UNAVAILABLE" };
   const windowTimezone = life?.windowTimezone ?? boundary.timezone;
   const currentWindow = windowIdAt({ now: () => nowMs }, windowTimezone);
-  if (action.windowId !== currentWindow) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.windowId !== currentWindow) return { ok: false, code: "STATE_CONFLICT", detail: "window_mismatch" };
+  const budgetRows = await deps.budget.mutate(currentWindow, ["account", action.charId], (snapshot) => ({ updates: [], result: snapshot })).catch(() => null);
+  const hold = verifyReservationHold({
+    reservationId: action.reservationId,
+    windowId: currentWindow,
+    charId: action.charId,
+    nowMs,
+    timezone: windowTimezone,
+    rows: {
+      account: budgetRows?.account ?? null,
+      char: budgetRows ? budgetRows[action.charId] ?? null : null
+    }
+  });
+  if (!hold.ok) return { ok: false, code: "STATE_CONFLICT", detail: hold.reason };
   const expiresAt = nowMs + PERMIT_TTL_MS;
   const nonce = `nonce_${action.id}_${action.leaseEpoch}_${nowMs.toString(36)}_${hashString(`${action.argsHash}|${action.leaseEpoch}|${nowMs}`)}`;
   const committed = await deps.store.commitPermitAtomic({
@@ -24342,7 +24396,10 @@ async function commitPermit(deps, args) {
     nowMs,
     expiresAt,
     nonce,
-    expectedRevision: action.revision
+    expectedRevision: action.revision,
+    expectedWindowId: currentWindow,
+    expectedAccountBoundaryRevision: boundary.accountRevision ?? null,
+    expectedCharacterBoundaryRevision: boundary.characterRevision ?? null
   });
   if (!committed.ok) return { ok: false, code: committed.code };
   const next = committed.action;
@@ -24679,7 +24736,7 @@ function createAutonomyLifeService(deps) {
         const code = result.code ?? "STATE_CONFLICT";
         return fail6(deps, code, "permit_denied");
       }
-      return ok(deps, { permit: result.permit });
+      return ok(deps, { permit: result.permit, action: result.action });
     },
     /** POST /actions/{id}/receipt */
     async receipt(input) {
@@ -24958,10 +25015,15 @@ function createD1LifeStore(options) {
       const current = await readAction(input.actionId);
       if (!current) return { ok: false, code: "NOT_FOUND" };
       if (current.charId !== input.charId) return { ok: false, code: "FORBIDDEN" };
-      if (current.installationId && current.installationId !== input.installationId) return { ok: false, code: "FORBIDDEN" };
+      if (!input.installationId || !current.installationId || current.installationId !== input.installationId) {
+        return { ok: false, code: "FORBIDDEN" };
+      }
       if (isTerminalActionStatus(current.status)) return { ok: false, code: "STATE_CONFLICT" };
-      if (current.status !== "scheduled" && current.status !== "waiting_device") return { ok: false, code: "STATE_CONFLICT" };
-      if (current.leaseEpoch !== input.leaseEpoch) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.status !== "scheduled") return { ok: false, code: "STATE_CONFLICT" };
+      if (current.permitIssuedAt !== null) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.leaseEpoch !== input.leaseEpoch || current.leaseEpoch < 1) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.leaseExpiresAt === null || input.nowMs > current.leaseExpiresAt) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.windowId !== input.expectedWindowId) return { ok: false, code: "STATE_CONFLICT" };
       if (current.argsHash !== input.argsHash) return { ok: false, code: "STATE_CONFLICT" };
       if (current.policyVersion !== input.policyVersion) return { ok: false, code: "STATE_CONFLICT" };
       if (current.permitConsumedAt !== null) return { ok: false, code: "STATE_CONFLICT" };
@@ -24978,7 +25040,12 @@ function createD1LifeStore(options) {
       const updated = await db.prepare(`UPDATE autonomy_life_actions
           SET status = 'running', revision = revision + 1, payload = ?, updated_at = ?
           WHERE owner_id = ? AND id = ? AND revision = ?
-            AND status IN ('scheduled', 'waiting_device')
+            AND status = 'scheduled'
+            AND json_extract(payload, '$.windowId') = ?
+            AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+                  WHERE owner_id = ? AND scope = 'account' AND char_id = ''), -1) = ?
+            AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+                  WHERE owner_id = ? AND scope = 'character' AND char_id = ?), -1) = ?
             AND EXISTS (
               SELECT 1 FROM autonomy_life_accounts a
               WHERE a.owner_id = autonomy_life_actions.owner_id AND a.paused = 0
@@ -24988,7 +25055,19 @@ function createD1LifeStore(options) {
               WHERE c.owner_id = autonomy_life_actions.owner_id
                 AND c.char_id = autonomy_life_actions.char_id
                 AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
-            )`).bind(JSON.stringify(next), input.nowMs, ownerId, input.actionId, input.expectedRevision).run();
+            )`).bind(
+        JSON.stringify(next),
+        input.nowMs,
+        ownerId,
+        input.actionId,
+        input.expectedRevision,
+        input.expectedWindowId,
+        ownerId,
+        input.expectedAccountBoundaryRevision ?? null,
+        ownerId,
+        input.charId,
+        input.expectedCharacterBoundaryRevision ?? -1
+      ).run();
       if (changesOf5(updated) > 0) return { ok: true, action: next };
       const pause = await readAccount(db, ownerId, input.nowMs);
       if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
@@ -24999,6 +25078,82 @@ function createD1LifeStore(options) {
     }
   };
 }
+async function consumeExternalPermitAtomic(options, input) {
+  const { db, ownerId } = options;
+  const current = await db.prepare("SELECT payload FROM autonomy_life_actions WHERE owner_id = ? AND id = ?").bind(ownerId, input.actionId).first().catch(() => null);
+  const row = current ? parseJson2(current.payload, null) : null;
+  if (!row) return { ok: false, code: "NOT_FOUND" };
+  if (row.charId !== input.charId || row.kind !== input.kind) return { ok: false, code: "FORBIDDEN" };
+  if (!input.installationId || !row.installationId || row.installationId !== input.installationId) {
+    return { ok: false, code: "FORBIDDEN" };
+  }
+  if (row.leaseEpoch !== input.leaseEpoch || row.argsHash !== input.argsHash) {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (!row.permitNonce || !input.nonce || row.permitNonce !== input.nonce) {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (row.permitIssuedAt === null || row.status !== "running" || row.permitConsumedAt !== null) {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (row.leaseExpiresAt === null || input.nowMs > row.leaseExpiresAt) {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (row.windowId !== input.expectedWindowId) return { ok: false, code: "STATE_CONFLICT" };
+  const next = { ...row, permitConsumedAt: input.nowMs, revision: row.revision + 1 };
+  const updated = await db.prepare(`UPDATE autonomy_life_actions
+      SET revision = revision + 1, payload = ?, updated_at = ?
+      WHERE owner_id = ? AND id = ? AND revision = ?
+        AND status = 'running'
+        AND json_extract(payload, '$.kind') = ?
+        AND json_extract(payload, '$.installationId') = ?
+        AND json_extract(payload, '$.leaseEpoch') = ?
+        AND json_extract(payload, '$.argsHash') = ?
+        AND json_extract(payload, '$.permitNonce') = ?
+        AND json_extract(payload, '$.permitIssuedAt') IS NOT NULL
+        AND json_extract(payload, '$.permitConsumedAt') IS NULL
+        AND COALESCE(json_extract(payload, '$.leaseExpiresAt'), -1) >= ?
+        AND json_extract(payload, '$.windowId') = ?
+        AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''), -1) = ?
+        AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+              WHERE owner_id = ? AND scope = 'character' AND char_id = ?), -1) = ?
+        AND EXISTS (
+          SELECT 1 FROM autonomy_life_accounts a
+          WHERE a.owner_id = autonomy_life_actions.owner_id AND a.paused = 0
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_characters c
+          WHERE c.owner_id = autonomy_life_actions.owner_id
+            AND c.char_id = autonomy_life_actions.char_id
+            AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
+        )`).bind(
+    JSON.stringify(next),
+    input.nowMs,
+    ownerId,
+    input.actionId,
+    input.expectedRevision,
+    input.kind,
+    input.installationId,
+    input.leaseEpoch,
+    input.argsHash,
+    input.nonce,
+    input.nowMs,
+    input.expectedWindowId,
+    ownerId,
+    input.expectedAccountBoundaryRevision ?? null,
+    ownerId,
+    input.charId,
+    input.expectedCharacterBoundaryRevision ?? -1
+  ).run();
+  if (changesOf5(updated) > 0) return { ok: true, action: next };
+  const pause = await readAccount(db, ownerId, input.nowMs);
+  if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
+  const life = await db.prepare("SELECT payload FROM autonomy_life_characters WHERE owner_id = ? AND char_id = ?").bind(ownerId, input.charId).first();
+  const lifeRow = life ? parseJson2(life.payload, null) : null;
+  if (lifeRow?.pauseRequestedAt != null) return { ok: false, code: "GLOBAL_PAUSED" };
+  return { ok: false, code: "STATE_CONFLICT" };
+}
 function createD1BoundaryRepo(options) {
   const { db, ownerId } = options;
   const read = async (scope, charId) => {
@@ -25007,6 +25162,9 @@ function createD1BoundaryRepo(options) {
   };
   return {
     async getAccount() {
+      const existing = await read("account", "");
+      if (existing) return existing;
+      await db.prepare("INSERT OR IGNORE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)").bind(ownerId, "account", "", options.defaultBoundary.revision, JSON.stringify(options.defaultBoundary), Date.now()).run();
       return await read("account", "") ?? options.defaultBoundary;
     },
     async getCharacter(charId) {
@@ -25295,6 +25453,41 @@ function extractItems(payload) {
   }
   return [];
 }
+async function discardBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+  }
+}
+async function readBodyLimited(args) {
+  const body = args.response.body;
+  if (!body) return { ok: false, reason: "external_body_unreadable" };
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let text = "";
+  let totalBytes = 0;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > args.maxBytes) {
+        await reader.cancel().catch(() => void 0);
+        return { ok: false, reason: "response_too_large" };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    await reader.cancel().catch(() => void 0);
+    return {
+      ok: false,
+      reason: args.signal.aborted ? "external_timeout" : "external_body_unreadable"
+    };
+  }
+  return { ok: true, text };
+}
 async function handleExternalRead(args) {
   const endpoint = String(args.endpoint ?? "").trim();
   if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
@@ -25306,7 +25499,7 @@ async function handleExternalRead(args) {
   const url = new URL(safe.url.toString());
   url.searchParams.set("q", args.query);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), EXTERNAL_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
   let response;
   try {
     response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
@@ -25316,29 +25509,38 @@ async function handleExternalRead(args) {
       signal: controller.signal
     });
   } catch {
+    clearTimeout(timer);
     return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
+  }
+  try {
+    if (response.status >= 300 && response.status < 400) {
+      await discardBody(response);
+      return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
+    }
+    if (!response.ok) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
+    }
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
+    }
+    const limited = await readBodyLimited({
+      response,
+      signal: controller.signal,
+      maxBytes: EXTERNAL_MAX_BYTES
+    });
+    if (!limited.ok) {
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: limited.reason };
+    }
+    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
   } finally {
     clearTimeout(timer);
   }
-  if (response.status >= 300 && response.status < 400) {
-    return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
-  }
-  if (!response.ok) {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
-  }
-  const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
-  }
-  let text = "";
-  try {
-    text = await response.text();
-  } catch {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_body_unreadable" };
-  }
-  if (text.length > EXTERNAL_MAX_BYTES) {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
-  }
+}
+function finishRead(args) {
+  const text = args.text;
   let payload;
   try {
     payload = JSON.parse(text);
@@ -25511,73 +25713,15 @@ async function handleAutonomyLifeRequest(request, env, deps) {
   if (match.method === "POST" && first === "external" && (second === "read" || second === "wish")) {
     const body = await readJson2(request);
     if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "external", serverTime: nowMs }));
-    const charId = str(body.charId);
-    if (!charId) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "charId_required", { requestId: "external", serverTime: nowMs }));
-    const runtime = await runtimeFor(charId);
-    const effective = await runtime.boundaryFor(charId);
-    const provider = second === "read" ? "xhs" : "amap";
-    const grant = effective.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
-    if (!grant) {
-      return deps.respond(403, buildErrorBody("GRANT_REQUIRED", "grant_missing_or_expired", { requestId: "external", serverTime: nowMs }));
-    }
-    if (second === "read") {
-      if (grant.scopes.length > 0 && !grant.scopes.includes("read:search")) {
-        return deps.respond(403, buildErrorBody("POLICY_DENIED", "scope_not_granted", { requestId: "external", serverTime: nowMs }));
-      }
-      const query = str(body.query);
-      if (!query || query.length > 80) {
-        return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "query_invalid", { requestId: "external", serverTime: nowMs }));
-      }
-      const requested = Array.isArray(body.fields) ? body.fields.filter((item) => typeof item === "string") : [];
-      const fields = (requested.length ? requested : [...EXTERNAL_RESPONSE_FIELDS[provider].slice(0, 4)]).filter((field) => EXTERNAL_RESPONSE_FIELDS[provider].includes(field));
-      if (fields.length === 0) {
-        return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "fields_not_allowed", { requestId: "external", serverTime: nowMs }));
-      }
-      const quotaOk = await consumeExternalQuota({
-        db,
-        ownerId: owner.userId,
-        dayKey: localDateKey(nowMs, effective.timezone),
-        provider,
-        limit: grant.dailyQuota,
-        nowMs
-      });
-      if (!quotaOk) {
-        return deps.respond(429, buildErrorBody("RATE_LIMITED", "external_daily_quota_exhausted", { requestId: "external", serverTime: nowMs }));
-      }
-      const endpoint = provider === "xhs" ? env.AUTONOMY_EXTERNAL_XHS_URL : env.AUTONOMY_EXTERNAL_AMAP_URL;
-      const envHosts = parseAllowedHosts(env.AUTONOMY_EXTERNAL_READ_HOSTS);
-      const allowedHosts = envHosts.filter((host) => isHostAllowed(host, grant.allowedHosts));
-      const read = await handleExternalRead({
-        provider,
-        query,
-        fields,
-        endpoint: endpoint ?? null,
-        allowedHosts,
-        nowMs
-      });
-      if (!read.ok) {
-        return deps.respond(read.code === "POLICY_DENIED" ? 403 : 503, buildErrorBody(read.code, read.reason, { requestId: "external", serverTime: nowMs }));
-      }
-      return deps.respond(200, {
-        schemaVersion: 1,
-        requestId: deps.requestId?.() ?? "external",
-        serverTime: nowMs,
-        provider,
-        fields,
-        items: read.result.items,
-        fetchedAt: read.result.fetchedAt
-      });
-    }
-    const text = str(body.text ?? body.wish);
-    if (!text || text.length > 200) {
-      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "wish_invalid", { requestId: "external", serverTime: nowMs }));
-    }
-    const wish = await insertTravelWish2({ db, ownerId: owner.userId, charId, text, grantId: `${grant.provider}:${grant.expiresAt}`, nowMs });
-    return deps.respond(200, {
-      schemaVersion: 1,
-      requestId: deps.requestId?.() ?? "external",
-      serverTime: nowMs,
-      wishId: wish.wishId
+    return handleExternalWindowAction({
+      db,
+      env,
+      deps,
+      ownerId: owner.userId,
+      mode: second,
+      body,
+      nowMs,
+      runtimeFor
     });
   }
   if (match.method === "POST" && first === "devices" && second === "register") {
@@ -25642,6 +25786,172 @@ async function handleAutonomyLifeRequest(request, env, deps) {
     requestId: deps.requestId?.() ?? "route",
     serverTime: nowMs
   }));
+}
+var EXTERNAL_MODE = {
+  read: { kind: "external.read", provider: "xhs" },
+  wish: { kind: "travel.wish", provider: "amap" }
+};
+var isExternalMode = (value) => value === "read" || value === "wish";
+async function handleExternalWindowAction(args) {
+  const { db, deps, ownerId, body, nowMs, runtimeFor } = args;
+  if (!isExternalMode(args.mode)) {
+    return deps.respond(404, buildErrorBody("NOT_FOUND", "external_route_not_found", { requestId: "external", serverTime: nowMs }));
+  }
+  const mode = args.mode;
+  const { kind, provider } = EXTERNAL_MODE[mode];
+  const charId = str(body.charId);
+  const actionId = str(body.actionId);
+  const installationId = str(body.installationId);
+  const leaseEpoch = num(body.leaseEpoch);
+  const argsHash = str(body.argsHash);
+  const nonce = str(body.nonce);
+  if (!charId || !actionId || !installationId || leaseEpoch === null || !argsHash || !nonce) {
+    return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "permit_binding_required", { requestId: "external", serverTime: nowMs }));
+  }
+  if (body.provider !== void 0 && str(body.provider) !== provider) {
+    return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "provider_mismatch", { requestId: "external", serverTime: nowMs }));
+  }
+  const runtime = await runtimeFor(charId);
+  const action = await runtime.store.getAction(actionId);
+  if (!action) {
+    return deps.respond(404, buildErrorBody("NOT_FOUND", "action_not_found", { requestId: "external", serverTime: nowMs }));
+  }
+  const conflict = (reason, code = "STATE_CONFLICT") => deps.respond(code === "FORBIDDEN" ? 403 : 409, buildErrorBody(code, reason, { requestId: "external", serverTime: nowMs }));
+  if (action.charId !== charId || action.kind !== kind) return conflict("action_scope_mismatch", "FORBIDDEN");
+  if (!action.installationId || action.installationId !== installationId) return conflict("device_mismatch", "FORBIDDEN");
+  if (action.status !== "running" || action.permitIssuedAt === null) return conflict("action_not_permitted");
+  if (action.permitConsumedAt !== null) return conflict("permit_consumed");
+  if (action.leaseEpoch !== leaseEpoch) return conflict("lease_epoch_mismatch");
+  if (action.leaseExpiresAt === null || nowMs > action.leaseExpiresAt) return conflict("permit_expired");
+  if (!action.permitNonce || action.permitNonce !== nonce) return conflict("permit_nonce_mismatch");
+  if (action.argsHash !== argsHash || hashArgs(action.args) !== argsHash) return conflict("args_hash_mismatch");
+  const effective = await runtime.boundaryFor(charId);
+  if (effective.globalPaused || effective.enabled === false) {
+    return deps.respond(409, buildErrorBody("GLOBAL_PAUSED", "paused", { requestId: "external", serverTime: nowMs }));
+  }
+  if (effective.charEnabled === false) {
+    return deps.respond(403, buildErrorBody("CHAR_DISABLED", "character_disabled", { requestId: "external", serverTime: nowMs }));
+  }
+  const gate = boundaryGate(effective, kind);
+  if (!gate.ok) return deps.respond(403, buildErrorBody(gate.code, "kind_not_allowed", { requestId: "external", serverTime: nowMs }));
+  const grant = effective.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
+  if (!grant) {
+    return deps.respond(403, buildErrorBody("GRANT_REQUIRED", "grant_missing_or_expired", { requestId: "external", serverTime: nowMs }));
+  }
+  if (mode === "read" && grant.scopes.length > 0 && !grant.scopes.includes("read:search")) {
+    return deps.respond(403, buildErrorBody("POLICY_DENIED", "scope_not_granted", { requestId: "external", serverTime: nowMs }));
+  }
+  let query = "";
+  let fields = [];
+  let wishText = "";
+  if (mode === "read") {
+    query = str(body.query);
+    const approved = String(action.args.query ?? "").trim();
+    if (!query || query !== approved) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "query_not_approved", { requestId: "external", serverTime: nowMs }));
+    }
+    const approvedFields = Array.isArray(action.args.fields) ? action.args.fields.filter((item) => typeof item === "string") : [];
+    const requested = Array.isArray(body.fields) ? body.fields.filter((item) => typeof item === "string") : [];
+    const source = requested.length ? requested : approvedFields.length ? approvedFields : [...EXTERNAL_RESPONSE_FIELDS[provider].slice(0, 4)];
+    fields = source.filter((field) => EXTERNAL_RESPONSE_FIELDS[provider].includes(field));
+    if (requested.some((field) => !EXTERNAL_RESPONSE_FIELDS[provider].includes(field))) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "fields_not_allowed", { requestId: "external", serverTime: nowMs }));
+    }
+    if (approvedFields.length && requested.some((field) => !approvedFields.includes(field))) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "fields_not_approved", { requestId: "external", serverTime: nowMs }));
+    }
+    if (fields.length === 0) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "fields_not_allowed", { requestId: "external", serverTime: nowMs }));
+    }
+  } else {
+    const text = str(body.text ?? body.wish);
+    const approved = String(action.args.wishText ?? "").trim();
+    if (!text || text !== approved) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "wish_not_approved", { requestId: "external", serverTime: nowMs }));
+    }
+    wishText = text;
+  }
+  const windowId = windowIdAt({ now: () => nowMs }, effective.timezone);
+  if (action.windowId !== windowId) return conflict("window_mismatch");
+  const budgetRows = await runtime.budget.mutate(windowId, ["account", charId], (snapshot) => ({ updates: [], result: snapshot })).catch(() => null);
+  const hold = verifyReservationHold({
+    reservationId: action.reservationId,
+    windowId,
+    charId,
+    nowMs,
+    timezone: effective.timezone,
+    rows: { account: budgetRows?.account ?? null, char: budgetRows ? budgetRows[charId] ?? null : null }
+  });
+  if (!hold.ok) return conflict(hold.reason ?? "reservation_not_held");
+  const consumed = await consumeExternalPermitAtomic({ db: args.db, ownerId }, {
+    actionId,
+    charId,
+    installationId,
+    leaseEpoch,
+    argsHash,
+    nonce,
+    kind,
+    nowMs,
+    expectedRevision: action.revision,
+    expectedWindowId: windowId,
+    expectedAccountBoundaryRevision: effective.accountRevision ?? null,
+    expectedCharacterBoundaryRevision: effective.characterRevision ?? null
+  });
+  if (!consumed.ok) {
+    const status = consumed.code === "NOT_FOUND" ? 404 : consumed.code === "FORBIDDEN" ? 403 : consumed.code === "GLOBAL_PAUSED" ? 409 : 409;
+    return deps.respond(status, buildErrorBody(consumed.code, "permit_not_consumable", { requestId: "external", serverTime: nowMs }));
+  }
+  const quotaOk = await consumeExternalQuota({
+    db: args.db,
+    ownerId,
+    dayKey: localDateKey(nowMs, effective.timezone),
+    provider,
+    limit: grant.dailyQuota,
+    nowMs
+  });
+  if (!quotaOk) {
+    return deps.respond(429, buildErrorBody("RATE_LIMITED", "external_daily_quota_exhausted", { requestId: "external", serverTime: nowMs }));
+  }
+  if (mode === "wish") {
+    const wish = await insertTravelWish2({
+      db: args.db,
+      ownerId,
+      charId,
+      text: wishText,
+      grantId: `${grant.provider}:${grant.expiresAt}`,
+      nowMs
+    });
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? "external",
+      serverTime: nowMs,
+      provider,
+      wishId: wish.wishId
+    });
+  }
+  const endpoint = provider === "xhs" ? args.env.AUTONOMY_EXTERNAL_XHS_URL : args.env.AUTONOMY_EXTERNAL_AMAP_URL;
+  const envHosts = parseAllowedHosts(args.env.AUTONOMY_EXTERNAL_READ_HOSTS);
+  const allowedHosts = envHosts.filter((host) => isHostAllowed(host, grant.allowedHosts));
+  const read = await handleExternalRead({
+    provider,
+    query,
+    fields,
+    endpoint: endpoint ?? null,
+    allowedHosts,
+    nowMs
+  });
+  if (!read.ok) {
+    return deps.respond(read.code === "POLICY_DENIED" ? 403 : 503, buildErrorBody(read.code, read.reason, { requestId: "external", serverTime: nowMs }));
+  }
+  return deps.respond(200, {
+    schemaVersion: 1,
+    requestId: deps.requestId?.() ?? "external",
+    serverTime: nowMs,
+    provider,
+    fields,
+    items: read.result.items,
+    fetchedAt: read.result.fetchedAt
+  });
 }
 async function registerCharacter(runtime, charId, nowMs) {
   if (!charId) return;
@@ -25919,6 +26229,54 @@ function summariseAutonomyLifeOutcomes(outcomes) {
     scheduled: outcomes.filter((item) => item.status === "ticked" && item.tick === "scheduled").length,
     skipped: outcomes.filter((item) => item.status === "skipped").map((item) => ({ charId: item.charId, reason: item.reason }))
   };
+}
+
+// worker/amsg/src/autonomyLife/legacyGate.ts
+var LEGACY_AUTONOMY_KIND = "interaction.message";
+var sumCalls = (row) => row ? row.usedCalls + row.reservedCalls : 0;
+var userForbidden = (boundary) => boundary.forbiddenCategories.filter(
+  (item) => !PLATFORM_FORBIDDEN_CATEGORIES.includes(item)
+);
+async function gateLegacyAutonomyPacks(args) {
+  const allowed = [];
+  const skipped = [];
+  for (const pack of args.packs) {
+    const reason = await reasonToSkip(args.db, pack, args.nowMs);
+    if (reason) skipped.push({ userId: pack.userId, charId: pack.charId, reason });
+    else allowed.push(pack);
+  }
+  return { allowed, skipped };
+}
+async function reasonToSkip(db, pack, nowMs) {
+  let boundary;
+  try {
+    const accountRow = await db.prepare("SELECT payload FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = ''").bind(pack.userId).first();
+    const characterRow = await db.prepare("SELECT payload FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?").bind(pack.userId, pack.charId).first();
+    if (!accountRow || !characterRow) {
+      return accountRow ? "character_not_registered" : "account_disabled";
+    }
+    const account = JSON.parse(String(accountRow.payload));
+    const character = JSON.parse(String(characterRow.payload));
+    boundary = mergeEffectiveBoundary({ account, character, charId: pack.charId, nowMs });
+  } catch {
+    return "account_disabled";
+  }
+  if (!boundary.enabled || boundary.globalPaused) return "paused";
+  if (boundary.charEnabled === false) return "char_disabled";
+  const gate = boundaryGate(boundary, LEGACY_AUTONOMY_KIND);
+  if (!gate.ok) return gate.code === "CHAR_DISABLED" ? "char_disabled" : "kind_not_allowed";
+  if (userForbidden(boundary).length > 0 || boundary.avoidTopics.length > 0) return "forbidden_topic";
+  try {
+    const windowId = windowIdAt({ now: () => nowMs }, boundary.timezone);
+    const rows = await readBudgetRows({ db, ownerId: pack.userId, charId: pack.charId, windowId });
+    const accountLimit = boundary.limits.accountModelCallsPerDay ?? DEFAULT_ACCOUNT_LIMITS.accountModelCallsPerDay;
+    const charLimit = boundary.limits.charModelCallsPerDay ?? DEFAULT_ACCOUNT_LIMITS.charModelCallsPerDay;
+    if (sumCalls(rows.account) >= accountLimit) return "budget_exhausted";
+    if (sumCalls(rows.char) >= charLimit) return "budget_exhausted";
+  } catch {
+    return "budget_exhausted";
+  }
+  return null;
 }
 
 // utils/airp/chatLifeWorkflow.ts
@@ -28240,10 +28598,15 @@ var src_default = {
         return;
       }
       const scanned = await scanAutonomyPacks({ db, masterKey: env.AMSG_MASTER_KEY });
+      const legacyGate = await gateLegacyAutonomyPacks({
+        db: env.DB,
+        packs: scanned.packs,
+        nowMs
+      });
       const result = await runAutonomyTick({
         nowMs,
         db,
-        packs: scanned.packs,
+        packs: legacyGate.allowed,
         // 扫描与 tick 内的兜底读取必须同一把钥：缺了它护栏只能按「读不出来」暂停，
         // 而以前是把用户的总暂停静默降级成「未暂停 + 默认 6 次/天」。
         masterKey: env.AMSG_MASTER_KEY,
@@ -28256,10 +28619,12 @@ var src_default = {
       const notableSkips = result.skipped.filter(
         (entry) => entry.reason !== AUTONOMY_SKIP_REASONS.disabled
       );
-      if (result.built.length > 0 || notableSkips.length > 0 || scanned.skipped.length > 0) {
+      if (result.built.length > 0 || notableSkips.length > 0 || scanned.skipped.length > 0 || legacyGate.skipped.length > 0) {
         console.log("[amsg:autonomy]", {
           built: result.built,
           skipped: result.skipped,
+          // 新边界闸拦下来的（旧链路旁路证据）。
+          gated: legacyGate.skipped,
           unreadable: scanned.skipped
         });
       }
