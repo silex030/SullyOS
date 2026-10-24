@@ -52,7 +52,10 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     expect(chatSrc).toMatch(/let shareExcerptRecorder: ShareExcerptPairRecorder \| null = null;/);
     expect(chatSrc).toMatch(/shareExcerptRecorder = shareExcerptTurn\s*\?\s*new ShareExcerptPairRecorder\(\{/);
     expect(chatSrc).toMatch(/anchorId: shareExcerptAnchorId/);
-    expect(chatSrc).toMatch(/DB\.updateMessageMetadata\(messageId, \(prev: any\) => attachShareExcerptPairs\(prev, records\)\)/);
+    // 返工第 3 轮 P1：必须用「等事务提交」的专用入口；旧的 updateMessageMetadata 在 put 之后
+    // 就 resolve，配额/abort 会把其实没落盘的批次当已保存清掉。
+    expect(chatSrc).toMatch(/DB\.updateMessageMetadataCommitted\(messageId, \(prev: any\) => attachShareExcerptPairs\(prev, records\)\)/);
+    expect(chatSrc).not.toMatch(/DB\.updateMessageMetadata\(messageId/);
     // 返工要求：不再用「最近 30 条里找 assistant」这种猜锚点
     expect(chatSrc).not.toContain('pickShareExcerptAnchor');
     expect(chatSrc).not.toContain('executeShareExcerptToolCall');
@@ -66,7 +69,17 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     expect(chatSrc).toMatch(/SHARE_EXCERPT_OUTBOX/);
     expect(chatSrc).toMatch(/outbox: SHARE_EXCERPT_OUTBOX/);
     // 收尾仍没落库 → 明确打日志（不静默当作已保存）
-    expect(chatSrc).toMatch(/if \(excerptPersist\.unsaved\) \{\s*console\.error\('\[share-excerpt\] 本轮工具记录未写入历史，保留在待补偿队列：'/);
+    expect(chatSrc).toMatch(/if \(excerptPersist\.unsaved\) \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*console\.error\('\[share-excerpt\] 分享工具记录仍有未写入历史的批次，保留在待补偿队列：'/);
+  });
+
+  it('专用落库入口必须等事务提交（db.ts 里是 oncomplete/onerror/onabort 三件套）', () => {
+    const dbSrc = readFileSync(fileURLToPath(new URL('./db.ts', import.meta.url)), 'utf8');
+    const block = dbSrc.match(/updateMessageMetadataCommitted: async \(id: number, updater: \(prev: any\) => any\): Promise<void> => \{[\s\S]*?\n  \},\n/);
+    expect(block, '找不到 updateMessageMetadataCommitted').not.toBeNull();
+    expect(block![0]).toContain('transaction.oncomplete');
+    expect(block![0]).toContain('transaction.onerror');
+    expect(block![0]).toContain('transaction.onabort');
+    expect(block![0]).not.toMatch(/store\.put\(data\);\s*\n\s*resolve\(\)/);
   });
 
   it('拿不到本轮持久化锚点时不注入工具（读完却没地方落库的调用不该存在）', () => {
@@ -113,5 +126,9 @@ describe('read_share_excerpts · 可见标识与文档', () => {
     expect(doc).toContain('HISTORY_UNAVAILABLE');
     expect(doc).toContain('ShareExcerptPairOutbox');
     expect(doc).toContain('未保存·待补偿');
+    // 返工第 3 轮：去重按（锚点, toolCallId）+ 写库等事务提交，都必须写进文档
+    expect(doc).toContain('（锚点, toolCallId）');
+    expect(doc).toContain('updateMessageMetadataCommitted');
+    expect(doc).toContain('### 8.12 返工记录（第 3 轮');
   });
 });

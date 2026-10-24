@@ -269,14 +269,25 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
   `dispatchShareExcerptToolCall` 也返回 `HISTORY_UNAVAILABLE` 且一次请求都不发。
   理由：读到了却没有确定落库位置，就是「读过却没有记录」，下一轮回放不出来，模型只能凭记忆复述，
   等于给了一个无法追溯的来源。宁可不给片段，也不给不留痕的片段。
-- **幂等与串行**：`toolCallId` 去重（内存 + `attachShareExcerptPairs` 落库侧各一次），
+- **幂等与串行（第 3 轮校正）**：去重键是 **（锚点, toolCallId）**，且去重状态放在**共享的待补偿队列**里
+  （`ShareExcerptPairOutbox.hasWritten/markWritten`），不是每个记录器各存一份裸 id。
+  原因：共享队列里不同轮次完全可能撞上同一个 `toolCallId`（模型每轮都从 `call_1` 开始），
+  裸 id 去重会在「先写成功上一轮的 101」之后把这一轮 404 的记录当成已写直接清掉——404 一条没落库，
+  统计却是 `pending=0 / unsaved=false`。`attachShareExcerptPairs` 落库侧仍按 id 去重，
   重复提交/DB 重试不产生重复对；同一记录器内的写入排在同一条 promise 链上，避免并发
-  read-modify-write 互相覆盖。
+  read-modify-write 互相覆盖。`snapshot().recorded` 只算本锚点、`recordedAll` 是共享队列已写总数，
+  `has(toolCallId)` 默认问本锚点，问别的轮次必须显式给锚点。
+- **落库必须等事务提交（第 3 轮，P1）**：生产 saver 用 `DB.updateMessageMetadataCommitted`
+  （专用入口，**不改**旧 `updateMessageMetadata`——它在 `store.put()` 之后就 resolve，
+  配额/abort 这类 put 之后的失败会静默丢失，而全仓库大量旧调用点依赖它当前行为）。
+  新入口以 `transaction.oncomplete` 为成功、`onerror/onabort` 为失败，`updater` 抛错或消息不存在
+  会中止事务并 reject。于是「写成功」= 真的提交了；失败批次才不会在队列里被误清。
 - **写库失败 = 未保存 + 待补偿**（返工第 2 轮，`ShareExcerptPairOutbox`）：
   失败的批次**留在待补偿队列**里，不标记已写、也不当作已保存；下一次工具调用（`record`）
   与收尾 `flush` 会按原始锚点**有界重试**（每次 flush 最多 `SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts = 3` 轮，
-  hook 有两个收尾点，所以一整轮最多 6 轮 + 每次调用自带 1 轮）。队列按「每条消息 ≤16 条 / ≤8 条消息」
-  封顶，超限丢最旧并 `console.error`。重试用尽仍失败 → `snapshot().unsaved === true` +
+  hook 有两个收尾点，所以一整轮最多 6 轮 + 每次调用自带 1 轮）。队列按「每条消息 ≤16 条 / ≤8 条消息」封顶，
+  已写集合按 512 条封顶，超限丢最旧并 `console.error`。重试用尽仍失败 →
+  `snapshot().unsaved === true`（= 队列里还有任何未落库记录，含往轮遗留）+
   `console.error`「工具记录未能写入历史（待补偿）」，**不承诺已保存**；下一轮收尾还会用同一份队列补写。
   待补偿队列是进程内内存结构：应用重启后这些记录确实会丢（这在日志里是可见的失败，不是静默）。
 - **下一轮投影**：`normalizeMessageContent` 把这对记录渲染成
@@ -298,17 +309,18 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 
 ```
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts
-                                            → 2 files / 51 passed（38 + 13）
+                                            → 2 files / 56 passed（42 + 14）
 npx vitest run $(ls utils/*[cC]hat*.test.ts) → 38 files / 354 passed
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
   utils/mcpToolBridge utils/agenticTools utils/messageFormat utils/socialShare \
   utils/chatRequestPayload worker/social-content utils/socialContent
-                                            → 29 files / 350 passed
+                                            → 29 files / 355 passed
 ```
 
-> 计数口径：返工第 2 轮（2026-10-25，按 arch-reviewer 第 2 次复核意见）为 51 / 354 / 350。
-> 第 1 轮返工为 45 / 354 / 344；执行卡最初记的 22 + 8 = 30 例、定向 329 例是更早的数字，
-> 旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在 `evidence/`（提交内）。
+> 计数口径：返工第 3 轮（2026-10-25，按 arch-reviewer 第 3 次复核意见）为 56 / 354 / 355；
+> 第 2 轮为 51 / 354 / 350，第 1 轮为 45 / 354 / 344。执行卡最初记的 22 + 8 = 30 例、
+> 定向 329 例是更早的数字，旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在
+> `evidence/`（提交内），第 3 轮为 `evidence/*-r3.log`。
 
 覆盖点：
 
@@ -333,6 +345,16 @@ npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.t
 - **无锚点（返工第 2 轮）**：`anchorId = null` 时**读取前**就拒绝（`HISTORY_UNAVAILABLE`）——
   零 HTTP 请求、零落库、`turn.calls` 里有这条被拒的调用但没有片段；无 recorder 同样拒绝；
   无锚点轮与有锚点轮并发时只有有锚点那条消息被写，不串轮。
+- **跨锚点补偿（返工第 3 轮 P1-1）**：共享待补偿队列里旧锚点失败的 `call_1` + 新锚点同 id 的
+  `call_1` → 两份都写回**各自**消息（断言 A 卡/B 卡字幕互不串）；只对某个锚点持续失败时，
+  别的锚点写成功也不会把它从队列里抹掉（`outboxPending=1 / unsaved=true` 可见）；
+  同 id 两轮并发（共享队列）各自成对、队列清空、`has` 按锚点隔离。
+- **事务提交（返工第 3 轮 P1-2）**：走真实 DB 层（fake-indexeddb，不是注入 saver）。
+  正常路径：dispatch → 提交后从真实库里读回成对 call/result，且下一轮投影真读得回来；
+  故障路径：`get` 成功后 `put` 被事务 abort（配额/中断语义）→ `updateMessageMetadataCommitted`
+  reject、记录**不**标 recorded、`pendingRecords=1 / unsaved=true`、库里没有该 metadata；
+  生产收尾 `flush()` 一次提交成功后读回完整 pair。该用例在旧 `updateMessageMetadata`
+  （put 后立即 resolve）上会失败，是本轮修复的判别性证据。
 - 预算：单次夹紧、轮次累计、并发不超卖、小额直接拒绝、同参去重、次数上限、收费按自身重算。
 - 权限：URL/baseUrl/token/scope 拒绝且不发请求；集合外 shareRef/contentId 拒绝；状态不符拒绝；
   cursor 格式校验；shareRef/contentId 映射与错配。
@@ -394,6 +416,32 @@ arch-reviewer 在 `fd65b32e` 上复核，认定 P1-2 未闭环（另外两条 P1
   `console.error`（不是静默），但不会自动补写到服务端。
 - 两次写库尝试之间没有事务锁：同一 `toolCallId` 若被两个记录器同时写，靠
   `attachShareExcerptPairs` 落库侧按 id 去重，最多浪费一次写，不会产生重复对。
+  > 第 3 轮修正：这句只对「同一条消息」成立；跨轮同 id 必须按（锚点, toolCallId）隔离，见 §8.12。
+
+### 8.12 返工记录（第 3 轮，2026-10-25）
+
+arch-reviewer 在 `62569fd1` 上复核，判定「失败批次不重试」「无锚点仍返回片段」已修好（保持不变），
+但历史成对保留还有两条 P1：
+
+| # | 问题 | 修法 | 复验（真实执行） |
+| --- | --- | --- | --- |
+| P1-1 | `writePending` 遍历**共享** outbox，却只用裸 `toolCallId` 记「已写」：旧锚点 101/call_1 与新锚点 404/call_1 同在队列时，先写成功 101 就把 404 的 call_1 当成已写清掉（`pending=0/unsaved=false`），404 一条没落库 | 去重键改为 **（anchorId, toolCallId）**，且去重状态从「每个记录器一份」移到**共享 outbox**（`hasWritten/markWritten/writtenCount`，512 条封顶）；`record/writePending/has/snapshot` 全部按锚点校准（`recorded`=本锚点、`recordedAll`=队列已写总数、`has(id)` 默认本锚点、`has(id, anchor)` 才能问别轮）；`unsaved` = 队列里还有任何未落库记录（含往轮） | 新增「旧锚点失败 call_1 + 新锚点同 id call_1」：两份都写回各自消息、A/B 卡字幕互不串、队列清空；「只对 101 持续失败」时 404 写成功也不会抹掉 101；原同 id 并发测试改为**传共享 outbox** 并断言队列清空 + `has` 按锚点隔离。判别性证据：把 key 临时改回裸 id（mutation）→ 该用例立刻失败（404 无 pair、pending=0），恢复后通过 |
+| P1-2 | hook 的 saver 走 `DB.updateMessageMetadata`，`utils/db.ts` 在 `store.put()` 之后**立即 resolve**（不等 `transaction.oncomplete`、不处理 onerror/onabort）→ 配额/abort 这类提交期失败被 recorder 当成功，done 标记 + outbox 清空，收尾也无法重试 | 新增**专用**入口 `DB.updateMessageMetadataCommitted`：成功 = `transaction.oncomplete`，失败 = `onerror/onabort`，`updater` 抛错/消息不存在则 abort+reject；hook 的 saver 改用它。**旧 `updateMessageMetadata` 行为保持不变**（全仓库大量调用点依赖其当前语义，属共享热点，不做静默改语义） | 走真实 DB 层（fake-indexeddb）：正常路径 dispatch → 提交后从库里读回成对 call/result 且下一轮投影读得回来；故障路径把 `IDBObjectStore.prototype.put` 包装成「put 后立即 `transaction.abort()`」（配额/中断语义，写回滚）→ 专用接口 reject、`recorder.has()` 仍为 false、`recorded=0/pendingRecords=1/unsaved=true`、库里没有该 metadata；仅调生产 `flush()` 后提交成功、读回完整 pair。判别性证据：把 saver 临时换回 `updateMessageMetadata`（mutation）→ 该用例失败（recorded 被提前标成 1），恢复后通过 |
+
+本轮**未**改模型 / provider / 配置 / 审批 / 权限，未启动任何消息网关，未部署、未合并。
+边界材料继续放在 `evidence/EXECUTION-AUDIT.md`（第 3 轮 run 见该文件 §9）。
+
+本轮新增/变化的残余风险：
+
+- `written`（已写成功）集合是**进程内**结构：只在本次运行内跨轮共享，重启后归零（归零只影响统计与
+  幂等去重的短期精度，不影响「已落库的数据」；队列里也不会因为归零而重写已落库记录）。
+- 「已写成功」以事务提交为准，但**没有**做读回校验（提交成功即认为落库成功）；IndexedDB 提交后回滚
+  的极端情况（连接被强制 abort 之后）不在覆盖范围。
+- `updateMessageMetadataCommitted` 是新增入口，旧调用点未迁移；两条路径对「写成功」的定义不同，
+  后续若有人把本工具改回旧入口，wiring 测试会失败（已钉）。
+- 事务提交失败时工具结果仍照常返回给模型（不阻断对话），所以模型可能读到片段、而该次读在库里
+  处于「待补偿」；这与「不承诺工具片段不占未来上下文」一致，但**模型侧无法感知**该差异。
+
 
 ## 9. 已知限制（必须带着交付）
 

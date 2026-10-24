@@ -967,6 +967,8 @@ export const SHARE_EXCERPT_OUTBOX_LIMITS = {
   perAnchorRecords: 16,
   anchors: 8,
   flushAttempts: 3,
+  /** 「已写成功」这一事实最多记多少条（跨轮共享；只增不去重写，容量只防无界增长）。 */
+  writtenKeys: 512,
 } as const;
 
 export interface ShareExcerptOutboxEntry {
@@ -985,9 +987,19 @@ export interface ShareExcerptOutboxEntry {
  *
  * 每条记录带自己的 `anchorId`（原始触发消息 id），所以跨轮重试仍然写回同一条消息，
  * 不会挂到后来的轮次上。容量有界：超限时丢最旧的锚点并 `console.error` 明确说丢了多少。
+ *
+ * 去重状态（哪些「锚点 + toolCallId」已经真正写成功）也放在这里，而不是每个记录器各存一份：
+ * 队列是跨轮共享的，写成功也可能由**另一个**记录器（下一次 dispatch / 收尾 flush）完成；
+ * 若各存一份，A 轮的记录器永远不知道自己那批已被 B 轮写下，统计会失真（返工第 3 轮 P1-1）。
  */
 export class ShareExcerptPairOutbox {
   private readonly bins = new Map<number, Map<string, ShareExcerptCallRecord>>();
+  private readonly written = new Set<string>();
+
+  /** 去重键 = 锚点 + toolCallId；中间夹 NUL 防止拼接歧义。 */
+  private static key(anchorId: number, toolCallId: string): string {
+    return `${anchorId}\u0000${toolCallId}`;
+  }
 
   add(anchorId: number, records: readonly ShareExcerptCallRecord[]): void {
     if (!Number.isFinite(anchorId)) return;
@@ -1039,6 +1051,34 @@ export class ShareExcerptPairOutbox {
     for (const bin of this.bins.values()) total += bin.size;
     return total;
   }
+
+  /** 这条（锚点, toolCallId）是否已经**真正写成功**（事务提交过；跨轮共享这一事实）。 */
+  hasWritten(anchorId: number, toolCallId: string): boolean {
+    if (!Number.isFinite(anchorId) || !toolCallId) return false;
+    return this.written.has(ShareExcerptPairOutbox.key(anchorId, toolCallId));
+  }
+
+  /** 标记（锚点, toolCallId）已写成功；容量有界，超限丢最旧的（只影响统计精度，不影响正确性）。 */
+  markWritten(anchorId: number, toolCallId: string): void {
+    if (!Number.isFinite(anchorId) || !toolCallId) return;
+    const key = ShareExcerptPairOutbox.key(anchorId, toolCallId);
+    if (this.written.has(key)) return;
+    this.written.add(key);
+    while (this.written.size > SHARE_EXCERPT_OUTBOX_LIMITS.writtenKeys) {
+      const oldest = this.written.values().next().value as string | undefined;
+      if (oldest == null) break;
+      this.written.delete(oldest);
+    }
+  }
+
+  /** 已写成功的条数：给锚点算这个锚点，不给算全部。 */
+  writtenCount(anchorId?: number): number {
+    if (typeof anchorId !== 'number') return this.written.size;
+    const prefix = `${anchorId}\u0000`;
+    let count = 0;
+    for (const key of this.written) if (key.startsWith(prefix)) count += 1;
+    return count;
+  }
 }
 
 /** 生产用的进程内待补偿队列（hook 显式传入；测试默认每个 recorder 私有，互不污染）。 */
@@ -1046,8 +1086,10 @@ export const SHARE_EXCERPT_OUTBOX = new ShareExcerptPairOutbox();
 
 export interface ShareExcerptRecorderSnapshot {
   anchorId: number | null;
-  /** 已成功写库的 toolCallId 数。 */
+  /** 本锚点已成功写库的条数（共享队列里的事实；可能是别的轮次补偿写下的）。 */
   recorded: number;
+  /** 共享待补偿队列里已知写成功的（锚点, toolCallId）总数（含往轮）。 */
+  recordedAll: number;
   /** 写库失败次数（每轮失败计一次；失败批次留在待补偿队列，不会被标成已写）。 */
   failures: number;
   /** 当前排队的写操作数（>0 表示还有没落地的写入）。 */
@@ -1056,7 +1098,7 @@ export interface ShareExcerptRecorderSnapshot {
   pendingRecords: number;
   /** 待补偿队列里所有锚点的未落库记录总数（含往轮遗留）。 */
   outboxPending: number;
-  /** 收尾重试后仍未落库 → true。这时**不能对外声称已保存**。 */
+  /** 待补偿队列里还有任何未落库记录（含往轮遗留）→ true。这时**不能对外声称已保存**。 */
   unsaved: boolean;
   lastError: string | null;
 }
@@ -1080,7 +1122,10 @@ export interface ShareExcerptPairRecorderOptions {
  * 保证（对应契约「工具 call/result 必须成对保留在历史里」）：
  *  - 成对：call 与 result 在同一批、同一次 metadata 写入里落盘，不存在只有一半。
  *  - 及时：读成功/失败/超限/取消都会立刻落，后续模型请求失败或用户中断都不影响已读过的调用。
- *  - 幂等：同一 toolCallId 只写一次（内存去重 + attachShareExcerptPairs 落库侧按 id 去重）。
+ *  - 幂等：同一 **（锚点, toolCallId）** 只写一次（内存去重键带锚点 + attachShareExcerptPairs
+ *    落库侧按 id 去重）。光用裸 toolCallId 去重会出事：共享待补偿队列里，上一轮（消息 101）
+ *    与这一轮（消息 404）完全可能都叫 `call_1`；先写成功 101 就按 id 把 404 当成「已写」清掉，
+ *    404 的片段根本没落库却被报成 pending=0 —— 见返工第 3 轮 P1。
  *  - 串行：同一记录器内的写入排在同一条 promise 链上，避免并发 read-modify-write 互相覆盖。
  *  - **不丢**：写库失败只记账并把批次留在待补偿队列（`ShareExcerptPairOutbox`），
  *    下一次 `record`/`flush` 有界重试；重试后仍失败 → `snapshot().unsaved === true` +
@@ -1094,7 +1139,6 @@ export class ShareExcerptPairRecorder {
   private readonly maxAttemptsPerFlush: number;
   private readonly retryDelayMs: number;
   private readonly reportUnsaved: (info: { anchorId: number | null; pending: number; lastError: string }) => void;
-  private readonly done = new Set<string>();
   private queue: Promise<void> = Promise.resolve();
   private failures = 0;
   private writes = 0;
@@ -1121,9 +1165,15 @@ export class ShareExcerptPairRecorder {
    * 同一批里已经写成功过的 id 会被跳过；失败的留在待补偿队列里等 flush / 下一次 dispatch 重试。
    */
   record(records: readonly ShareExcerptCallRecord[] | null | undefined): Promise<void> {
-    const fresh = (records ?? []).filter((r) => typeof r?.toolCallId === 'string' && r.toolCallId && !this.done.has(r.toolCallId));
-    if (this.anchorId == null || fresh.length === 0) return this.queue;
-    this.outbox.add(this.anchorId, fresh);
+    const anchor = this.anchorId;
+    if (anchor == null) return this.queue;
+    // 只按**本锚点**的（锚点, id）判断是否已写：别的轮次同 id 的批次不能被当成本轮已写。
+    const fresh = (records ?? []).filter((r) => {
+      if (typeof r?.toolCallId !== 'string' || !r.toolCallId) return false;
+      return !this.outbox.hasWritten(anchor, r.toolCallId);
+    });
+    if (fresh.length === 0) return this.queue;
+    this.outbox.add(anchor, fresh);
     return this.enqueueAttempt();
   }
 
@@ -1145,14 +1195,17 @@ export class ShareExcerptPairRecorder {
    */
   private async writePending(): Promise<void> {
     for (const entry of this.outbox.entries()) {
-      const still = entry.records.filter((r) => !this.done.has(r.toolCallId));
+      // 按（锚点, toolCallId）判断：别的锚点写成功过同 id 的记录，不代表这一条也写过了。
+      const still = entry.records.filter((r) => !this.outbox.hasWritten(entry.anchorId, r.toolCallId));
       if (still.length === 0) {
+        // 该锚点的这批都已是「本队列确认写成功」的（只可能来自同一队列重复入队 / 别的记录器已写）：
+        // 只清这个锚点自己的这些 id，绝不碰别的锚点。
         this.outbox.clear(entry.anchorId, entry.records.map((r) => r.toolCallId));
         continue;
       }
       try {
         await this.savePairs(entry.anchorId, still);
-        for (const r of still) this.done.add(r.toolCallId);
+        for (const r of still) this.outbox.markWritten(entry.anchorId, r.toolCallId);
         this.outbox.clear(entry.anchorId, still.map((r) => r.toolCallId));
         this.writes += 1;
         this.unsavedReported = false;
@@ -1195,20 +1248,30 @@ export class ShareExcerptPairRecorder {
     }
   }
 
-  has(toolCallId: string): boolean {
-    return this.done.has(toolCallId);
+  /**
+   * 某个 toolCallId 是否已写成功。
+   * 默认问**本记录器的锚点**；要问别的轮次必须显式给 `anchorId`（共享队列里同 id 不同锚点
+   * 是两回事，裸 id 无法区分）。
+   */
+  has(toolCallId: string, anchorId?: number | null): boolean {
+    const anchor = typeof anchorId === 'number' ? anchorId : this.anchorId;
+    if (anchor == null || !toolCallId) return false;
+    return this.outbox.hasWritten(anchor, toolCallId);
   }
 
   snapshot(): ShareExcerptRecorderSnapshot {
-    const ownPending = this.anchorId == null ? 0 : this.outbox.pendingCount(this.anchorId);
+    const anchor = this.anchorId;
+    const ownPending = anchor == null ? 0 : this.outbox.pendingCount(anchor);
+    const outboxPending = this.outbox.pendingCount();
     return {
-      anchorId: this.anchorId,
-      recorded: this.done.size,
+      anchorId: anchor,
+      recorded: anchor == null ? 0 : this.outbox.writtenCount(anchor),
+      recordedAll: this.outbox.writtenCount(),
       failures: this.failures,
       pendingWrites: this.queued,
       pendingRecords: ownPending,
-      outboxPending: this.outbox.pendingCount(),
-      unsaved: ownPending > 0,
+      outboxPending,
+      unsaved: outboxPending > 0,
       lastError: this.lastError,
     };
   }

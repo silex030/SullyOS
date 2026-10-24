@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildExcerpts, estimateTokens } from '../worker/social-content/excerpts';
 import type { ContentRecord, ShareAttachment } from './socialContent/types';
 import { normalizeMessageContent } from './messageFormat';
+import { DB, openDB } from './db';
 import { buildToolResultMessage } from './toolCallCompat';
 import {
   attachShareExcerptPairs,
@@ -789,23 +790,26 @@ describe('read_share_excerpts · call/result 成对落历史（不依赖最终�
     expect(recorder.snapshot().recorded).toBe(1);
   });
 
-  it('两轮并发各写各自的触发消息：同 toolCallId 也不串轮、不互相覆盖', async () => {
+  it('两轮并发各写各自的触发消息：同 toolCallId 也不串轮、不互相覆盖（共享待补偿队列）', async () => {
     stubShareServer(null, {
       [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
       [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
     });
     const { store, saver } = memoryStore();
+    // 生产配置：两轮共用同一个进程级待补偿队列（SHARE_EXCERPT_OUTBOX），且模型两轮都用 call_1
+    const outbox = new ShareExcerptPairOutbox();
     const msgA = { id: 301, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[0]] } }, role: 'user', type: 'text', content: 'A', charId: 'c' };
     const msgB = { id: 302, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[1]] } }, role: 'user', type: 'text', content: 'B', charId: 'c' };
     const turnA = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
     const turnB = createShareExcerptTurn([msgB], { endpoint, now: () => 1_000 })!;
-    const recA = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgA]), savePairs: saver });
-    const recB = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgB]), savePairs: saver });
+    const recA = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgA]), savePairs: saver, outbox });
+    const recB = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgB]), savePairs: saver, outbox });
 
     await Promise.all([
       dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_1'), turn: turnA, recorder: recA }),
       dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refB, fields: ['transcript'] }, 'call_1'), turn: turnB, recorder: recB }),
     ]);
+    await Promise.all([recA.flush(), recB.flush()]);
 
     const pairsA = store.get(301)[SHARE_EXCERPT_META_KEY].pairs;
     const pairsB = store.get(302)[SHARE_EXCERPT_META_KEY].pairs;
@@ -816,6 +820,13 @@ describe('read_share_excerpts · call/result 成对落历史（不依赖最终�
     expect(pairsA[0].result.text).not.toContain('B卡字幕片段内容');
     expect(pairsB[0].call.args.shareRef).toBe(DUAL.refB);
     expect(pairsB[0].result.text).toContain('B卡字幕片段内容');
+    // 共享队列必须被清空，且同 id 的两条记录各自独立记成已写（按锚点区分）
+    expect(outbox.pendingCount()).toBe(0);
+    expect(recA.has('call_1')).toBe(true);
+    expect(recB.has('call_1')).toBe(true);
+    expect(recA.has('call_1', 302)).toBe(true);
+    expect(recB.has('call_1', 301)).toBe(true);
+    expect(recA.has('call_1', 999)).toBe(false);
   });
 
   it('幂等：同一批记录重复提交只写一次，落库侧也按 toolCallId 去重（DB 重试不产生重复对）', async () => {
@@ -1066,6 +1077,119 @@ describe('read_share_excerpts · call/result 成对落历史（不依赖最终�
   });
 });
 
+/**
+ * 返工第 3 轮 P1-1：共享待补偿队列的跨轮补偿必须按（锚点, toolCallId）去重。
+ *
+ * 裸 id 去重的最小反例（审查给出的确定性追踪，这里跑成真实测试）：
+ *  - 上一轮（消息 101）写库失败 → 队列留下 `101 / call_1`；
+ *  - 这一轮（消息 404）模型又叫 `call_1`，此时库已恢复；
+ *  - 若去重只看裸 id：先写成功 101 就把 404 的 `call_1` 当成「已写」清掉，404 一条都没落库，
+ *    却报 pending=0 / unsaved=false。
+ */
+describe('read_share_excerpts · 共享待补偿队列的跨锚点补偿（返工第 3 轮 P1-1）', () => {
+  it('旧锚点失败的 call_1 + 新锚点同 id 的 call_1：两份都写回各自消息，不误清', async () => {
+    stubShareServer(null, {
+      [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
+      [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new Map<number, any>();
+    const outbox = new ShareExcerptPairOutbox();
+    let dbDown = true;
+    // 生产里两轮用的是同一个落库函数（DB 层），这里共用同一个 saver
+    const saver = async (id: number, records: readonly any[]) => {
+      if (dbDown) throw new Error('db busy');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const msgA = { id: 101, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[0]] } }, role: 'user', type: 'text', content: 'A', charId: 'c' };
+    const msgB = { id: 404, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[1]] } }, role: 'user', type: 'text', content: 'B', charId: 'c' };
+    const turnA = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
+    const turnB = createShareExcerptTurn([msgB], { endpoint, now: () => 1_000 })!;
+
+    // 1) 上一轮（锚点 101）写库失败：批次留在共享队列里
+    const recA = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver, outbox });
+    const outA = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_1'),
+      turn: turnA,
+      recorder: recA,
+    });
+    expect(outA.ok).toBe(true);
+    expect(outbox.pendingCount(101)).toBe(1);
+    expect(recA.snapshot()).toMatchObject({ recorded: 0, pendingRecords: 1, outboxPending: 1, unsaved: true });
+
+    // 2) 这一轮（锚点 404）模型又叫 call_1，库已恢复 → 一次写要把两个锚点都各自写回
+    dbDown = false;
+    const recB = new ShareExcerptPairRecorder({ anchorId: 404, savePairs: saver, outbox });
+    const outB = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: DUAL.refB, fields: ['transcript'] }, 'call_1'),
+      turn: turnB,
+      recorder: recB,
+    });
+    expect(outB.ok).toBe(true);
+
+    // 3) 队列干净，且**两条记录都在各自原始消息上**——404 的片段没有被 101 的写成功顺手清掉
+    expect(outbox.pendingCount()).toBe(0);
+    const pairsA = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    const pairsB = store.get(404)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairsA).toHaveLength(1);
+    expect(pairsB).toHaveLength(1);
+    expect(pairsA[0].call.toolCallId).toBe('call_1');
+    expect(pairsA[0].call.args.shareRef).toBe(DUAL.refA);
+    expect(pairsA[0].result.text).toContain('A卡字幕片段内容');
+    expect(pairsA[0].result.text).not.toContain('B卡字幕片段内容');
+    expect(pairsB[0].call.toolCallId).toBe('call_1');
+    expect(pairsB[0].call.args.shareRef).toBe(DUAL.refB);
+    expect(pairsB[0].result.text).toContain('B卡字幕片段内容');
+    expect(pairsB[0].result.text).not.toContain('A卡字幕片段内容');
+
+    // 4) 统计口径：recorded 只算本锚点，recordedAll 是共享队列的已写总数（含替往轮补偿的批次）；
+    //    has 默认问本锚点，要问别轮必须显式给锚点（裸 id 在两个锚点之间没有意义）
+    expect(recA.snapshot()).toMatchObject({ recorded: 1, recordedAll: 2, pendingRecords: 0, outboxPending: 0, unsaved: false });
+    expect(recB.snapshot()).toMatchObject({ recorded: 1, recordedAll: 2, pendingRecords: 0, outboxPending: 0, unsaved: false });
+    expect(recB.has('call_1')).toBe(true);
+    expect(recB.has('call_1', 101)).toBe(true);
+    expect(recB.has('call_1', 999)).toBe(false);
+    expect(recA.has('call_1', 404)).toBe(true);
+    expect(recA.has('call_1')).toBe(true);
+    // 重复 record 同锚点同 id：仍是单条（幂等不以锚点隔离为代价）
+    await recB.record([outB.record]);
+    expect(store.get(404)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('共享队列跨轮补偿：往轮失败批次写回后，本轮的进度不影响它（互不清除）', async () => {
+    stubShareServer(null, {
+      [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
+      [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new Map<number, any>();
+    const outbox = new ShareExcerptPairOutbox();
+    // 只对 101 失败（模拟那一条消息的写一直过不去），其它锚点正常
+    const saver = async (id: number, records: readonly any[]) => {
+      if (id === 101) throw new Error('row locked');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const msgA = { id: 101, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[0]] } }, role: 'user', type: 'text', content: 'A', charId: 'c' };
+    const msgB = { id: 404, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[1]] } }, role: 'user', type: 'text', content: 'B', charId: 'c' };
+    const turnA = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
+    const turnB = createShareExcerptTurn([msgB], { endpoint, now: () => 1_000 })!;
+    const recA = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver, outbox, maxAttemptsPerFlush: 1 });
+    const recB = new ShareExcerptPairRecorder({ anchorId: 404, savePairs: saver, outbox, maxAttemptsPerFlush: 1 });
+
+    await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA }, 'call_1'), turn: turnA, recorder: recA });
+    await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refB }, 'call_1'), turn: turnB, recorder: recB });
+    await recB.flush();
+
+    // 404 已落库、101 仍待补偿：不能因为「这一轮写成功了」就把 101 也从队列里抹掉
+    expect(store.get(404)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+    expect(store.has(101)).toBe(false);
+    expect(outbox.pendingCount(101)).toBe(1);
+    expect(recB.snapshot()).toMatchObject({ pendingRecords: 0, outboxPending: 1, unsaved: true });
+    warn.mockRestore();
+  });
+});
+
 describe('read_share_excerpts · 落历史与下一轮投影', () => {
   it('成对记录：call 与 result 一一对应，投影只回放成对块且有界', () => {
     const records = [
@@ -1123,5 +1247,143 @@ describe('read_share_excerpts · 落历史与下一轮投影', () => {
     // 尾部系统提示不抢占锚点（system 角色不投影，锚在它身上等于白存）
     expect(pickShareExcerptTurnAnchor([{ id: 5, role: 'user' }, { id: 6, role: 'system' }])).toBe(5);
     expect(pickShareExcerptTurnAnchor([{}, { id: 'oops' }, { id: 0 }, { id: -1 }])).toBeNull();
+  });
+});
+
+/**
+ * 返工第 3 轮 P1-2：生产落库必须等 IndexedDB **事务提交**才算写成功。
+ *
+ * 走真实 DB 层（fake-indexeddb，与其它 DB 测试同一套 setup），不是注入的 saver：
+ *  - 正常路径：写完后立刻从库里读得到成对 call/result；
+ *  - get 成功、put 之后事务 abort（配额/中断这类真实失败），专用接口必须 reject，
+ *    记录**留在待补偿队列**（不标 recorded），生产收尾 flush 事后补写并读回；
+ *  - 旧 `updateMessageMetadata` 在 put 后立即 resolve 的行为不改（大量旧调用点依赖），
+ *    所以另开专用入口 —— 这是本测试存在的理由。
+ */
+describe('read_share_excerpts · 真实 IndexedDB 事务提交（返工第 3 轮 P1-2）', () => {
+  async function clearMessages(): Promise<void> {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('messages', 'readwrite');
+      tx.objectStore('messages').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function seedShareMessage(): Promise<number> {
+    return DB.saveMessage({
+      charId: 'char-db',
+      role: 'user',
+      type: 'text',
+      content: '看这个 https://www.bilibili.com/video/BV1xx411c7mD 讲了什么？',
+      timestamp: 10,
+      metadata: { shares: { version: 1, attachments: [attachment()] } },
+    } as any);
+  }
+
+  function turnFor(id: number, metadata: any) {
+    const messages: any[] = [{ id, role: 'user', metadata }];
+    return createShareExcerptTurn(messages, { endpoint, now: () => 1_000 })!;
+  }
+
+  const committedSaver = (messageId: number, records: readonly any[]) =>
+    DB.updateMessageMetadataCommitted(messageId, (prev: any) => attachShareExcerptPairs(prev, records));
+
+  it('正常路径：dispatch → 事务提交后成对记录在真实库里读得回来', async () => {
+    await clearMessages();
+    stubShareServer();
+    const id = await seedShareMessage();
+    const saved = await DB.getMessageById(id);
+    expect(saved).not.toBeNull();
+    const turn = turnFor(id, saved!.metadata);
+    const recorder = new ShareExcerptPairRecorder({
+      anchorId: pickShareExcerptTurnAnchor([{ id, role: 'user' }]),
+      savePairs: committedSaver,
+      outbox: new ShareExcerptPairOutbox(),
+    });
+
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn,
+      recorder,
+    });
+    await recorder.flush();
+
+    expect(outcome.ok).toBe(true);
+    expect(recorder.snapshot()).toMatchObject({ recorded: 1, pendingRecords: 0, outboxPending: 0, unsaved: false });
+
+    const after = await DB.getMessageById(id);
+    const pairs = (after!.metadata as any)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+    expect(pairs[0].call.args.shareRef).toBe(SHARE_REF);
+    expect(pairs[0].result.ok).toBe(true);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    // 下一轮投影也能从真实 metadata 读回来（不是只在内存里成对）
+    const projection = normalizeMessageContent(after as any, '角色', '我');
+    expect(projection).toContain('read_share_excerpts 记录');
+    expect(projection).toContain('第一段字幕');
+  });
+
+  it('get 成功后 put/提交失败（事务 abort）：reject 且不算已保存，生产 flush 补偿后读回', async () => {
+    await clearMessages();
+    stubShareServer();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const id = await seedShareMessage();
+    const saved = await DB.getMessageById(id);
+    const turn = turnFor(id, saved!.metadata);
+
+    // 忠实模拟「put 发出去了、但事务在提交前 abort（配额/中断）」：put 成功后立刻 abort，
+    // 写回滚。fake-indexeddb 的事务语义与浏览器一致：onabort 触发、数据不落盘。
+    const proto = IDBObjectStore.prototype as any;
+    const realPut = proto.put;
+    let abortNextPut = true;
+    proto.put = function (this: IDBObjectStore, ...args: any[]) {
+      const req = realPut.apply(this, args);
+      if (abortNextPut) {
+        abortNextPut = false;
+        try { (this as any).transaction.abort(); } catch { /* 已结束 */ }
+      }
+      return req;
+    };
+    try {
+      // 1) 专用接口本身：put 后事务 abort → 必须 reject（旧 updateMessageMetadata 这里会 resolve）
+      await expect(
+        DB.updateMessageMetadataCommitted(id, (prev: any) => ({ ...(prev || {}), probe: 'should-not-commit' })),
+      ).rejects.toThrow();
+      expect((await DB.getMessageById(id))!.metadata?.probe).toBeUndefined();
+
+      // 2) 工具调用走同一条事务：结果照常给模型，但记录**不算保存**
+      abortNextPut = true;
+      const outbox = new ShareExcerptPairOutbox();
+      const recorder = new ShareExcerptPairRecorder({
+        anchorId: pickShareExcerptTurnAnchor([{ id, role: 'user' }]),
+        savePairs: committedSaver,
+        outbox,
+      });
+      const outcome = await dispatchShareExcerptToolCall({
+        toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+        turn,
+        recorder,
+      });
+      expect(outcome.ok).toBe(true);
+      expect(outcome.text).toContain('第一段字幕');
+      expect(recorder.has(outcome.record.toolCallId)).toBe(false);
+      expect(recorder.snapshot()).toMatchObject({ recorded: 0, pendingRecords: 1, outboxPending: 1, unsaved: true });
+      expect((await DB.getMessageById(id))!.metadata?.[SHARE_EXCERPT_META_KEY]).toBeUndefined();
+
+      // 3) 生产收尾只有 flush（useChatAI 成功尾部/finally 就是这么调）：这次事务正常提交
+      await recorder.flush();
+      expect(recorder.snapshot()).toMatchObject({ recorded: 1, pendingRecords: 0, outboxPending: 0, unsaved: false });
+      const after = await DB.getMessageById(id);
+      const pairs = (after!.metadata as any)[SHARE_EXCERPT_META_KEY].pairs;
+      expect(pairs).toHaveLength(1);
+      expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+      expect(pairs[0].result.text).toContain('第一段字幕');
+    } finally {
+      proto.put = realPut;
+      warn.mockRestore();
+    }
   });
 });

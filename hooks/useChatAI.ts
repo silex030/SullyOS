@@ -1267,8 +1267,11 @@ export const useChatAI = ({
             shareExcerptRecorder = shareExcerptTurn
                 ? new ShareExcerptPairRecorder({
                     anchorId: shareExcerptAnchorId,
+                    // 必须等事务**真正提交**才算写成功（updateMessageMetadataCommitted 走
+                    // transaction.oncomplete）：否则配额不足/abort 这类 put 之后的失败会被当成
+                    // 已保存，待补偿队列随即清空，片段其实一条都没落盘。
                     savePairs: (messageId, records) =>
-                        DB.updateMessageMetadata(messageId, (prev: any) => attachShareExcerptPairs(prev, records)),
+                        DB.updateMessageMetadataCommitted(messageId, (prev: any) => attachShareExcerptPairs(prev, records)),
                     // 跨轮待补偿队列：本轮写库失败的记录留在这里，下一次 dispatch / 收尾 flush
                     // 还能按原始锚点有界重试（不是 console.warn 一下就算完）。
                     outbox: SHARE_EXCERPT_OUTBOX,
@@ -2427,7 +2430,9 @@ export const useChatAI = ({
                 await shareExcerptRecorder.flush();
                 const excerptPersist = shareExcerptRecorder.snapshot();
                 if (excerptPersist.unsaved) {
-                    console.error('[share-excerpt] 本轮工具记录未写入历史，保留在待补偿队列：', excerptPersist);
+                    // unsaved = 待补偿队列里还有任何未落库记录（可能含往轮遗留的同队列批次，
+                    // 见 snapshot.outboxPending / pendingRecords）。
+                    console.error('[share-excerpt] 分享工具记录仍有未写入历史的批次，保留在待补偿队列：', excerptPersist);
                 }
             }
             KeepAlive.stop();

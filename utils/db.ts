@@ -940,6 +940,69 @@ export const DB = {
     });
   },
 
+  /**
+   * 同 updateMessageMetadata，但**等 IndexedDB 事务真正提交**才 resolve（`transaction.oncomplete`），
+   * 事务 put/提交失败（配额不足、被 abort 等）走 reject。
+   *
+   * 为什么另加一个而不改 updateMessageMetadata（返工卡 t_38463abd 第 3 轮 P1）：
+   *  - `updateMessageMetadata` 在 `store.put()` 之后立即 resolve，put/事务阶段的失败（iOS Safari
+   *    配额、连接被 abort）会**静默丢失**，调用方却以为写成功；全仓库大量旧调用点依赖它当前的
+   *    「不 reject 也不等提交」行为，擅自改语义会把那些路径的 catch 逻辑全带偏。
+   *  - 分享工具记录（`read_share_excerpts` 的 call/result 成对落库）需要「写成功才算数」，
+   *    否则待补偿队列会把其实没落盘的批次当已保存清掉。所以给它一个语义明确的专用入口。
+   *
+   * updater 抛错或消息不存在时中止事务并 reject（不留半条更新）。
+   */
+  updateMessageMetadataCommitted: async (id: number, updater: (prev: any) => any): Promise<void> => {
+    const db = await openDB();
+    const transaction = db.transaction(STORE_MESSAGES, 'readwrite');
+    const store = transaction.objectStore(STORE_MESSAGES);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const abort = () => {
+        try { transaction.abort(); } catch { /* 已结束的事务再 abort 会抛，忽略 */ }
+      };
+      const req = store.get(id);
+      req.onsuccess = () => {
+        const data = req.result as Message | undefined;
+        if (!data) {
+          fail(new Error('Message not found'));
+          abort();
+          return;
+        }
+        let nextMetadata: any;
+        try {
+          nextMetadata = updater((data as any).metadata);
+        } catch (e) {
+          fail(e);
+          abort();
+          return;
+        }
+        (data as any).metadata = nextMetadata;
+        try {
+          store.put(data);
+        } catch (e) {
+          fail(e);
+          abort();
+        }
+      };
+      req.onerror = () => fail(req.error);
+      transaction.oncomplete = () => done();
+      transaction.onerror = () => fail(transaction.error || new Error('updateMessageMetadataCommitted transaction failed'));
+      transaction.onabort = () => fail(transaction.error || new Error('updateMessageMetadataCommitted transaction aborted'));
+    });
+  },
+
   deleteMessage: async (id: number): Promise<void> => {
     const { preserveContentFavoritesBeforeMessageDeletion } = await import('./contentFavorites');
     await preserveContentFavoritesBeforeMessageDeletion({ ids: [id] });
