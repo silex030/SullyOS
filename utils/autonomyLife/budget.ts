@@ -561,6 +561,13 @@ export interface SettleInput {
   actualTokens?: number | null;
   /** 是否真的把请求交给了 provider（false 且能证明没发出 → 释放）。 */
   requestStarted: boolean;
+  /**
+   * 当前可信服务端时钟（安全判定用）。
+   *
+   * 给了就按它校验**凭据是否已经过期**：调用方漏掉一次到期复核，也不能拿一张过了期的
+   * 凭据把账结掉（旧实现只要求 `held`，不看期限）。不给 = 保持既有语义（引擎内部调用）。
+   */
+  nowMs?: number;
 }
 
 export type SettleOutcome =
@@ -592,8 +599,9 @@ export async function settleBudget(
       const accountRow = rows.account;
       const charRow = rows[grant.charId];
       const record = held[grant.reservationId];
-      // 记录不在 / 已经结算过 / 已释放 → 这次结算没有依据，整笔拒绝（不写预算行）。
+      // 记录不在 / 已经结算过 / 已释放 / 已过期 → 这次结算没有依据，整笔拒绝（不写预算行）。
       if (!accountRow || !charRow || !record || record.state !== 'held') return null;
+      if (input.nowMs != null && record.expiresAt <= input.nowMs) return null;
       const nextAccount: BudgetRow = {
         ...accountRow,
         reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
@@ -626,8 +634,10 @@ export async function settleBudget(
     }, [grant.reservationId]);
     if (!outcome) {
       const record = await port.readReservation(grant.reservationId).catch(() => null);
-      // 记录已存在且不是 held → 明确的「重复结算」；其余按存储不可用处理。
-      if (record && record.state !== 'held') return { ok: false, code: 'STATE_CONFLICT' };
+      // 记录已存在且不是 held（重复结算 / 已释放），或按当前时钟已过期 → 明确拒绝。
+      if (record && (record.state !== 'held' || (input.nowMs != null && record.expiresAt <= input.nowMs))) {
+        return { ok: false, code: 'STATE_CONFLICT' };
+      }
       return { ok: false, code: 'SERVICE_UNAVAILABLE' };
     }
     return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };

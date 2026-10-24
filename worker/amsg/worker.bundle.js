@@ -12101,6 +12101,7 @@ async function settleBudget(port, grant, input) {
       const charRow = rows[grant.charId];
       const record = held[grant.reservationId];
       if (!accountRow || !charRow || !record || record.state !== "held") return null;
+      if (input.nowMs != null && record.expiresAt <= input.nowMs) return null;
       const nextAccount = {
         ...accountRow,
         reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
@@ -12133,7 +12134,9 @@ async function settleBudget(port, grant, input) {
     }, [grant.reservationId]);
     if (!outcome) {
       const record = await port.readReservation(grant.reservationId).catch(() => null);
-      if (record && record.state !== "held") return { ok: false, code: "STATE_CONFLICT" };
+      if (record && (record.state !== "held" || input.nowMs != null && record.expiresAt <= input.nowMs)) {
+        return { ok: false, code: "STATE_CONFLICT" };
+      }
       return { ok: false, code: "SERVICE_UNAVAILABLE" };
     }
     return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };
@@ -12179,6 +12182,192 @@ function projectBudgetUsage(rowAccount, rowChar, limits) {
 }
 function windowIdAt(clock, timezone) {
   return budgetWindowId(clock.now(), timezone);
+}
+
+// worker/amsg/src/autonomyLife/external.ts
+var EXTERNAL_RESPONSE_FIELDS = {
+  xhs: ["title", "excerpt", "author", "likes", "url"],
+  amap: ["name", "address", "distanceM", "category"]
+};
+var EXTERNAL_TIMEOUT_MS = 8e3;
+var EXTERNAL_MAX_BYTES = 256 * 1024;
+var EXTERNAL_MAX_ITEMS = 5;
+var EXTERNAL_MAX_FIELD_CHARS = 200;
+var parseAllowedHosts = (raw, fallback = []) => {
+  const fromEnv = String(raw ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
+};
+function isHostAllowed(host, allowlist) {
+  const target = host.trim().toLowerCase();
+  if (!target) return false;
+  return allowlist.some((entry) => {
+    const rule = entry.toLowerCase();
+    if (!rule) return false;
+    if (rule.startsWith("*.")) return target === rule.slice(2) || target.endsWith(rule.slice(1));
+    return target === rule;
+  });
+}
+var IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+var BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".home", ".lan"];
+var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data"
+]);
+function assertFetchableUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+  if (url.protocol !== "https:") return { ok: false, reason: "https_required" };
+  if (url.username || url.password) return { ok: false, reason: "credentials_in_url_forbidden" };
+  if (url.port && url.port !== "443") return { ok: false, reason: "port_forbidden" };
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return { ok: false, reason: "host_required" };
+  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: "host_forbidden" };
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: "host_forbidden" };
+  if (IPV4.test(host)) return { ok: false, reason: "ip_literal_forbidden" };
+  if (host.includes(":")) return { ok: false, reason: "ip_literal_forbidden" };
+  return { ok: true, url };
+}
+function projectItem(raw, fields, allow) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
+    if (!allow.includes(field)) continue;
+    const value = raw[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      out[field] = value;
+    } else if (typeof value === "string") {
+      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}\u2026` : value;
+    }
+  }
+  return out;
+}
+var ITEM_ARRAY_KEYS = ["items", "data", "results", "pois"];
+function extractItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  for (const key of ITEM_ARRAY_KEYS) {
+    const value = payload[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+async function discardBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+  }
+}
+async function readBodyLimited(args) {
+  const body = args.response.body;
+  if (!body) return { ok: false, reason: "external_body_unreadable" };
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let text = "";
+  let totalBytes = 0;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > args.maxBytes) {
+        await reader.cancel().catch(() => void 0);
+        return { ok: false, reason: "response_too_large" };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    await reader.cancel().catch(() => void 0);
+    return {
+      ok: false,
+      reason: args.signal.aborted ? "external_timeout" : "external_body_unreadable"
+    };
+  }
+  return { ok: true, text };
+}
+async function handleExternalRead(args) {
+  const endpoint = String(args.endpoint ?? "").trim();
+  if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, code: "POLICY_DENIED", reason: safe.reason };
+  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
+    return { ok: false, code: "POLICY_DENIED", reason: "host_not_allowed" };
+  }
+  const url = new URL(safe.url.toString());
+  url.searchParams.set("q", args.query);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
+  let response;
+  try {
+    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
+      method: "GET",
+      redirect: "manual",
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
+  } catch {
+    clearTimeout(timer);
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
+  }
+  try {
+    if (response.status >= 300 && response.status < 400) {
+      await discardBody(response);
+      return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
+    }
+    if (!response.ok) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
+    }
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
+    }
+    const limited = await readBodyLimited({
+      response,
+      signal: controller.signal,
+      maxBytes: EXTERNAL_MAX_BYTES
+    });
+    if (!limited.ok) {
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: limited.reason };
+    }
+    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function finishRead(args) {
+  const text = args.text;
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_not_json" };
+  }
+  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
+  const fields = args.fields.filter((field) => allow.includes(field));
+  const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
+  return { ok: true, result: { items, fetchedAt: args.nowMs } };
+}
+async function consumeExternalQuota(args) {
+  const limit = Math.max(0, Math.trunc(args.limit));
+  if (limit <= 0) return false;
+  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
+  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
+  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
+  return Number.isFinite(changes) && changes > 0;
+}
+async function insertTravelWish2(args) {
+  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
+  return { wishId };
 }
 
 // utils/autonomyLife/localLedger.ts
@@ -13805,6 +13994,26 @@ var AUTONOMY_LIFE_DDL = [
     revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner_id, round_ref)
   )`,
+  // 效果/决策的一次性认领（出行模型结果 → 愿望/行程、外部窗口决策位）。
+  //
+  // 为什么单独一张表：这些效果的「额度」住在预算行里（通知/kind 计数），但**能不能核销**
+  // 还取决于当时的账号/角色边界与外部授权。核销语句必须把边界 revision 与授权放进同一条
+  // WHERE（D1 没有跨语句事务，先读后写就是竞态窗口），成功核销再留一行可追溯记录。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_effect_claims (
+    owner_id TEXT NOT NULL,
+    claim_ref TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    notification INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'claimed',
+    revision INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, claim_ref)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_effect_claims_window
+    ON autonomy_life_effect_claims (owner_id, window_id, kind)`,
   // 预留凭据：许可签发/外部副作用前按 id 查这一条（不是看「本窗口有过用量」）。
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget_reservations (
     owner_id TEXT NOT NULL,
@@ -14370,6 +14579,138 @@ async function readBudgetRows(options) {
   };
   return { account: await read("account"), char: await read(charId) };
 }
+var BOUNDARY_ATOMIC_GUARD = `EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries b
+    WHERE b.owner_id = ? AND b.scope = 'account' AND b.char_id = ''
+      AND b.revision = ?
+      AND COALESCE(json_extract(b.payload, '$.globalPaused'), 0) <> 1
+      AND COALESCE(json_extract(b.payload, '$.enabled'), 1) <> 0
+  )
+  AND EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries c
+    WHERE c.owner_id = ? AND c.scope = 'character' AND c.char_id = ?
+      AND c.revision = ?
+      AND COALESCE(json_extract(c.payload, '$.charEnabled'), 1) <> 0
+      AND COALESCE(json_extract(c.payload, '$.enabled'), 1) <> 0
+  )`;
+var GRANT_ATOMIC_GUARD = `EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+    WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+      AND json_extract(ge.value, '$.provider') = ?
+      AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+  )`;
+var kindJsonPath = (kind) => `$."${String(kind).replace(/["\\]/g, "")}"`;
+async function consumeLegacyQuotaAtomic(input) {
+  const { db, ownerId, charId, windowId, nowMs } = input;
+  if (!ownerId || !charId || !windowId) return { ok: false, reason: "invalid_input" };
+  if (input.notificationLimit == null && !input.kind) return { ok: false, reason: "invalid_input" };
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  const guardBindings = () => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const grantBindings = () => input.requireGrant ? [ownerId, input.requireGrant, nowMs] : [];
+  const grantClause = input.requireGrant ? `AND ${GRANT_ATOMIC_GUARD}` : "";
+  try {
+    if (input.notificationLimit != null) {
+      const limit = Math.max(0, Math.trunc(input.notificationLimit));
+      const updated = await db.prepare(`UPDATE autonomy_life_budget
+          SET notifications = notifications + 1, revision = revision + 1, updated_at = ?
+          WHERE owner_id = ? AND window_id = ? AND scope = 'account'
+            AND notifications < ?
+            AND ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`).bind(nowMs, ownerId, windowId, limit, ...guardBindings(), ...grantBindings()).run();
+      if (changesOf4(updated) > 0) return { ok: true };
+      if (limit > 0) {
+        const inserted = await db.prepare(`INSERT OR IGNORE INTO autonomy_life_budget
+            (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens,
+             notifications, kind_counts, spend_minor, revision, updated_at)
+            SELECT ?, ?, 'account', 0, 0, 0, 0, 1, '{}', 0, 1, ?
+            WHERE ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`).bind(ownerId, windowId, nowMs, ...guardBindings(), ...grantBindings()).run();
+        if (changesOf4(inserted) > 0) return { ok: true };
+      }
+    }
+    if (input.kind) {
+      const limit = Math.max(0, Math.trunc(input.kind.limit));
+      const path = kindJsonPath(input.kind.kind);
+      const rowScope = charId;
+      const updated = await db.prepare(`UPDATE autonomy_life_budget
+          SET kind_counts = json_set(
+                CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END,
+                ?,
+                COALESCE(json_extract(CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END, ?), 0) + 1
+              ),
+              revision = revision + 1, updated_at = ?
+          WHERE owner_id = ? AND window_id = ? AND scope = ?
+            AND COALESCE(json_extract(CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END, ?), 0) < ?
+            AND ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`).bind(path, path, nowMs, ownerId, windowId, rowScope, path, limit, ...guardBindings(), ...grantBindings()).run();
+      if (changesOf4(updated) > 0) return { ok: true };
+      if (limit > 0) {
+        const inserted = await db.prepare(`INSERT OR IGNORE INTO autonomy_life_budget
+            (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens,
+             notifications, kind_counts, spend_minor, revision, updated_at)
+            SELECT ?, ?, ?, 0, 0, 0, 0, 0, json_set('{}', ?, 1), 0, 1, ?
+            WHERE ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`).bind(ownerId, windowId, rowScope, path, nowMs, ...guardBindings(), ...grantBindings()).run();
+        if (changesOf4(inserted) > 0) return { ok: true };
+      }
+    }
+    const stillCurrent = await db.prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`).bind(ownerId, ownerId, charId).first().catch(() => null);
+    if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: "boundary_changed" };
+    }
+    if (input.requireGrant && !input.kind) return { ok: false, reason: "external_quota_exhausted" };
+    if (input.kind) return { ok: false, reason: "kind_exhausted" };
+    return { ok: false, reason: input.notificationLimit != null ? "notifications_exhausted" : "kind_exhausted" };
+  } catch {
+    return { ok: false, reason: "store_unavailable" };
+  }
+}
+async function claimTravelDecisionAtomic(input) {
+  const { db, ownerId, charId, windowId, nowMs } = input;
+  const claimRef = String(input.claimRef ?? "").trim();
+  if (!ownerId || !charId || !windowId || !claimRef) return { ok: false, reason: "invalid_input" };
+  const claimId = `eff_${claimRef}`;
+  const expiresAt = nowMs + (input.ttlMs ?? 60 * 60 * 1e3);
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  try {
+    const inserted = await db.prepare(`INSERT OR IGNORE INTO autonomy_life_effect_claims
+        (owner_id, claim_ref, char_id, kind, window_id, notification, created_at, expires_at, state, revision)
+        SELECT ?, ?, ?, 'travel.decision', ?, 0, ?, ?, 'claimed', 0
+        WHERE ${BOUNDARY_ATOMIC_GUARD}
+          AND ${GRANT_ATOMIC_GUARD}`).bind(
+      ownerId,
+      claimRef,
+      charId,
+      windowId,
+      nowMs,
+      expiresAt,
+      ownerId,
+      accountRevision,
+      ownerId,
+      charId,
+      characterRevision,
+      ownerId,
+      "amap",
+      nowMs
+    ).run();
+    if (changesOf4(inserted) > 0) return { ok: true, claimId };
+    const existing = await db.prepare("SELECT claim_id FROM autonomy_life_effect_claims WHERE owner_id = ? AND claim_ref = ?").bind(ownerId, claimRef).first().catch(() => null);
+    if (existing) return { ok: false, reason: "claim_exists" };
+    const stillCurrent = await db.prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`).bind(ownerId, ownerId, charId).first().catch(() => null);
+    if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: "boundary_changed" };
+    }
+    return { ok: false, reason: "external_quota_exhausted" };
+  } catch {
+    return { ok: false, reason: "store_unavailable" };
+  }
+}
 async function claimRoundEffect(input) {
   const ownerId = asString3(input.ownerId).trim();
   const charId = asString3(input.charId).trim();
@@ -14434,6 +14775,19 @@ async function readEffectiveBoundary(db, args) {
     return { ok: false, reason: "account_disabled" };
   }
 }
+var KIND_GRANT_PROVIDER = {
+  "travel.wish": "amap",
+  "external.read": "xhs"
+};
+function legacyGrantDenial(boundary, kind, nowMs) {
+  const provider = KIND_GRANT_PROVIDER[kind];
+  if (!provider) return null;
+  const grant = boundary.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
+  return grant ? null : "grant_missing";
+}
+function effectiveGrantFor(boundary, provider, nowMs) {
+  return boundary.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs) ?? null;
+}
 function legacyBoundaryDenial(boundary, kind = LEGACY_AUTONOMY_KIND) {
   if (!boundary.enabled || boundary.globalPaused) return "paused";
   if (boundary.charEnabled === false) return "char_disabled";
@@ -14458,6 +14812,8 @@ async function reasonToSkip(db, pack, nowMs) {
   const boundary = read.boundary;
   const denial = legacyBoundaryDenial(boundary);
   if (denial) return denial;
+  const grantDenial = legacyGrantDenial(boundary, LEGACY_AUTONOMY_KIND, nowMs);
+  if (grantDenial) return grantDenial;
   try {
     const windowId = windowIdAt({ now: () => nowMs }, boundary.timezone);
     const rows = await readBudgetRows({ db, ownerId: pack.userId, charId: pack.charId, windowId });
@@ -14480,6 +14836,8 @@ async function reserveLegacyRoundCall(args) {
   const boundary = read.boundary;
   const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
   if (denial) return { ok: false, reason: denial };
+  const grantDenial = legacyGrantDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs);
+  if (grantDenial) return { ok: false, reason: grantDenial };
   const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
   if (!port.available()) return { ok: false, reason: "budget_exhausted" };
   const windowId = windowIdAt({ now: () => args.nowMs }, boundary.timezone);
@@ -14501,10 +14859,10 @@ async function reserveLegacyRoundCall(args) {
     charId: args.charId,
     nowMs: args.nowMs
   });
-  const changed = !recheck.ok || recheck.boundary.accountRevision !== boundary.accountRevision || recheck.boundary.characterRevision !== boundary.characterRevision || legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) !== null;
+  const changed = !recheck.ok || recheck.boundary.accountRevision !== boundary.accountRevision || recheck.boundary.characterRevision !== boundary.characterRevision || legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) !== null || legacyGrantDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs) !== null;
   if (changed) {
     await settleBudget(settledPort, reservation.grant, { requestStarted: false }).catch(() => void 0);
-    return { ok: false, reason: recheck.ok ? legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) ?? "paused" : recheck.reason };
+    return { ok: false, reason: recheck.ok ? legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) ?? legacyGrantDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs) ?? "paused" : recheck.reason };
   }
   return {
     ok: true,
@@ -14522,7 +14880,8 @@ async function settleLegacyRoundCall(args) {
   const port = createD1BudgetPort({ db: args.db, ownerId: args.permit.ownerId });
   const settled = await settleBudget(port, args.permit.grant, {
     actualTokens: args.actualTokens ?? null,
-    requestStarted: args.requestStarted
+    requestStarted: args.requestStarted,
+    ...args.nowMs != null ? { nowMs: args.nowMs } : {}
   });
   return settled.ok;
 }
@@ -14535,6 +14894,11 @@ async function legacyRoundStillAllowed(args) {
   if (!read.ok) return read.reason;
   return legacyBoundaryDenial(read.boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
 }
+async function readExternalUsage(args) {
+  const row = await args.db.prepare("SELECT used FROM autonomy_life_external_usage WHERE owner_id = ? AND day_key = ? AND provider = ?").bind(args.ownerId, args.dayKey, args.provider).first().catch(() => null);
+  const used = Number(row?.used ?? 0);
+  return Number.isFinite(used) && used > 0 ? used : 0;
+}
 async function chargeLegacyQuota(args) {
   const read = await readEffectiveBoundary(args.db, {
     ownerId: args.ownerId,
@@ -14543,31 +14907,61 @@ async function chargeLegacyQuota(args) {
   });
   if (!read.ok) return { ok: false, reason: read.reason };
   const boundary = read.boundary;
-  const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
+  const kind = args.kind;
+  const denial = legacyBoundaryDenial(boundary, kind ?? LEGACY_AUTONOMY_KIND);
   if (denial) return { ok: false, reason: denial };
-  const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
-  if (!port.available()) return { ok: false, reason: "budget_exhausted" };
-  const reserved = await reserveBudget(port, {
-    nowMs: args.nowMs,
-    windowTimezone: boundary.timezone,
-    accountId: args.ownerId,
-    charId: args.charId,
-    limits: boundary.limits,
-    // 只占「配额」，不占模型调用/ token：calls=0 / tokens=0 时 precheckBudget 不判这两维，
-    // 通知与 kind 计数各自按自己的额度判。
-    calls: 0,
-    tokens: 0,
-    ...args.notification ? { notification: true } : {},
-    ...args.kind ? { kind: args.kind } : {},
-    planRef: `legacy-quota:${args.kind ?? "notification"}:${args.charId}`
-  });
-  if (!reserved.ok) {
-    return {
-      ok: false,
-      reason: args.notification ? "notifications_exhausted" : "budget_exhausted"
-    };
+  if (kind) {
+    const grantDenial = legacyGrantDenial(boundary, kind, args.nowMs);
+    if (grantDenial) return { ok: false, reason: grantDenial };
   }
-  await settleBudget(port, reserved.grant, { requestStarted: true, actualTokens: 0 }).catch(() => void 0);
+  const windowId = windowIdAt({ now: () => args.nowMs }, boundary.timezone);
+  const kindLimit = boundary.limits.perKindActionsPerDay ?? DEFAULT_ACCOUNT_LIMITS.perKindActionsPerDay;
+  const notificationLimit = boundary.limits.notificationsPerDay ?? DEFAULT_ACCOUNT_LIMITS.notificationsPerDay;
+  let grant = null;
+  let dayKey2 = "";
+  if (kind) {
+    const provider = KIND_GRANT_PROVIDER[kind];
+    if (provider) {
+      grant = effectiveGrantFor(boundary, provider, args.nowMs);
+      if (grant) {
+        dayKey2 = localDateKey(args.nowMs, boundary.timezone);
+        if (!(grant.dailyQuota > 0)) return { ok: false, reason: "external_quota_exhausted" };
+        const used = await readExternalUsage({ db: args.db, ownerId: args.ownerId, dayKey: dayKey2, provider });
+        if (used >= grant.dailyQuota) return { ok: false, reason: "external_quota_exhausted" };
+      }
+    }
+  }
+  const consumed = await consumeLegacyQuotaAtomic({
+    db: args.db,
+    ownerId: args.ownerId,
+    charId: args.charId,
+    windowId,
+    nowMs: args.nowMs,
+    expectedAccountRevision: boundary.accountRevision ?? null,
+    expectedCharacterRevision: boundary.characterRevision ?? null,
+    ...args.notification ? { notificationLimit } : {},
+    ...kind ? { kind: { kind, limit: kindLimit } } : {},
+    ...kind && KIND_GRANT_PROVIDER[kind] ? { requireGrant: KIND_GRANT_PROVIDER[kind] } : {}
+  });
+  if (!consumed.ok) {
+    if (consumed.reason === "notifications_exhausted") return { ok: false, reason: "notifications_exhausted" };
+    if (consumed.reason === "external_quota_exhausted") return { ok: false, reason: "external_quota_exhausted" };
+    if (consumed.reason === "boundary_changed") return { ok: false, reason: "boundary_changed" };
+    if (consumed.reason === "kind_exhausted") return { ok: false, reason: "budget_exhausted" };
+    if (consumed.reason === "invalid_input") return { ok: false, reason: "budget_exhausted" };
+    return { ok: false, reason: "budget_exhausted" };
+  }
+  if (grant && dayKey2) {
+    const quotaOk = await consumeExternalQuota({
+      db: args.db,
+      ownerId: args.ownerId,
+      dayKey: dayKey2,
+      provider: grant.provider,
+      limit: grant.dailyQuota,
+      nowMs: args.nowMs
+    });
+    if (!quotaOk) return { ok: false, reason: "external_quota_exhausted" };
+  }
   return { ok: true };
 }
 async function reserveLegacyNotification(args) {
@@ -15077,6 +15471,11 @@ var readUsage = (ctx) => {
   const total = pick2("total_tokens") || prompt + completion;
   return { prompt, completion, total };
 };
+var currentServerTimeMs = (ctx) => {
+  const raw = ctx.now;
+  const injected = raw instanceof Date ? raw.getTime() : typeof raw === "number" ? raw : null;
+  return injected !== null && Number.isFinite(injected) ? injected : Date.now();
+};
 function hashAutonomyOutput(text) {
   const raw = String(text ?? "");
   let h1 = 2166136261;
@@ -15455,6 +15854,7 @@ var autonomyRoundHandler = {
       });
       return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.governanceDenied };
     }
+    const nowMs = currentServerTimeMs(ctx);
     const outputHash = hashAutonomyOutput(ctx.llmOutputText || "");
     const claim = await claimRoundEffect({
       db,
@@ -15463,7 +15863,7 @@ var autonomyRoundHandler = {
       roundRef: carried.roundRef,
       reservationId: carried.budgetPermit.reservationId,
       outputHash,
-      nowMs: carried.nowMs
+      nowMs
     });
     if (!claim.ok) {
       console.warn("[amsg:autonomy] \u8F93\u51FA\u6548\u679C\u8BA4\u9886\u88AB\u62D2\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4EFB\u4F55\u4E1A\u52A1\u4EA7\u7269", carried.charId, claim.reason);
@@ -15474,7 +15874,8 @@ var autonomyRoundHandler = {
       db,
       permit: carried.budgetPermit,
       actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
-      requestStarted: true
+      requestStarted: true,
+      nowMs
     });
     if (!settled) {
       console.warn("[amsg:autonomy] \u9884\u7B97\u7ED3\u7B97\u88AB\u62D2\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4E1A\u52A1\u4EA7\u7269", carried.charId, carried.budgetPermit.reservationId);
@@ -15484,7 +15885,7 @@ var autonomyRoundHandler = {
       db,
       ownerId: carried.ownerUserId,
       charId: carried.charId,
-      nowMs: carried.nowMs
+      nowMs
     });
     if (denial) {
       console.warn("[amsg:autonomy] \u6267\u884C\u671F\u8FB9\u754C\u5DF2\u53D8\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4E1A\u52A1\u4EA7\u7269", carried.charId, denial);
@@ -15510,7 +15911,8 @@ var autonomyRoundHandler = {
         db,
         ownerId: carried.ownerUserId,
         charId: carried.charId,
-        nowMs: carried.nowMs,
+        // 效果配额按**当前窗口**核算（排队时可能还在前一天）。
+        nowMs,
         kind: LEGACY_TRAVEL_KIND
       });
       if (!effect.ok) {
@@ -15565,7 +15967,8 @@ var autonomyRoundHandler = {
         db,
         ownerId: carried.ownerUserId,
         charId: carried.charId,
-        nowMs: carried.nowMs
+        // 通知额度是**按当前窗口**算的：排队时是昨天，执行时已经是今天 → 必须用当前时钟。
+        nowMs
       });
       if (!quota.ok) {
         console.log("[amsg:autonomy] \u7EDF\u4E00\u901A\u77E5\u989D\u5EA6\u5DF2\u6EE1/\u5173\u95ED\uFF0C\u8FD9\u4E00\u8F6E\u53EA\u843D\u7ECF\u5386\u4E0D\u53D1\u63D0\u9192", carried.charId, quota.reason);
@@ -25933,192 +26336,6 @@ async function ensureCharacterLife(runtime, charId, nowMs, timezone) {
   await runtime.store.putCharacterLife(emptyCharacterLife(charId, nowMs, timezone), 0);
 }
 
-// worker/amsg/src/autonomyLife/external.ts
-var EXTERNAL_RESPONSE_FIELDS = {
-  xhs: ["title", "excerpt", "author", "likes", "url"],
-  amap: ["name", "address", "distanceM", "category"]
-};
-var EXTERNAL_TIMEOUT_MS = 8e3;
-var EXTERNAL_MAX_BYTES = 256 * 1024;
-var EXTERNAL_MAX_ITEMS = 5;
-var EXTERNAL_MAX_FIELD_CHARS = 200;
-var parseAllowedHosts = (raw, fallback = []) => {
-  const fromEnv = String(raw ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
-  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
-};
-function isHostAllowed(host, allowlist) {
-  const target = host.trim().toLowerCase();
-  if (!target) return false;
-  return allowlist.some((entry) => {
-    const rule = entry.toLowerCase();
-    if (!rule) return false;
-    if (rule.startsWith("*.")) return target === rule.slice(2) || target.endsWith(rule.slice(1));
-    return target === rule;
-  });
-}
-var IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
-var BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".home", ".lan"];
-var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
-  "localhost",
-  "metadata.google.internal",
-  "metadata.goog",
-  "instance-data"
-]);
-function assertFetchableUrl(raw) {
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    return { ok: false, reason: "invalid_url" };
-  }
-  if (url.protocol !== "https:") return { ok: false, reason: "https_required" };
-  if (url.username || url.password) return { ok: false, reason: "credentials_in_url_forbidden" };
-  if (url.port && url.port !== "443") return { ok: false, reason: "port_forbidden" };
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (!host) return { ok: false, reason: "host_required" };
-  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: "host_forbidden" };
-  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: "host_forbidden" };
-  if (IPV4.test(host)) return { ok: false, reason: "ip_literal_forbidden" };
-  if (host.includes(":")) return { ok: false, reason: "ip_literal_forbidden" };
-  return { ok: true, url };
-}
-function projectItem(raw, fields, allow) {
-  const out = {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
-    if (!allow.includes(field)) continue;
-    const value = raw[field];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      out[field] = value;
-    } else if (typeof value === "string") {
-      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}\u2026` : value;
-    }
-  }
-  return out;
-}
-var ITEM_ARRAY_KEYS = ["items", "data", "results", "pois"];
-function extractItems(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (!payload || typeof payload !== "object") return [];
-  for (const key of ITEM_ARRAY_KEYS) {
-    const value = payload[key];
-    if (Array.isArray(value)) return value;
-  }
-  return [];
-}
-async function discardBody(response) {
-  try {
-    await response.body?.cancel();
-  } catch {
-  }
-}
-async function readBodyLimited(args) {
-  const body = args.response.body;
-  if (!body) return { ok: false, reason: "external_body_unreadable" };
-  const reader = body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: false });
-  let text = "";
-  let totalBytes = 0;
-  try {
-    for (; ; ) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > args.maxBytes) {
-        await reader.cancel().catch(() => void 0);
-        return { ok: false, reason: "response_too_large" };
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-  } catch {
-    await reader.cancel().catch(() => void 0);
-    return {
-      ok: false,
-      reason: args.signal.aborted ? "external_timeout" : "external_body_unreadable"
-    };
-  }
-  return { ok: true, text };
-}
-async function handleExternalRead(args) {
-  const endpoint = String(args.endpoint ?? "").trim();
-  if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
-  const safe = assertFetchableUrl(endpoint);
-  if (!safe.ok) return { ok: false, code: "POLICY_DENIED", reason: safe.reason };
-  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
-    return { ok: false, code: "POLICY_DENIED", reason: "host_not_allowed" };
-  }
-  const url = new URL(safe.url.toString());
-  url.searchParams.set("q", args.query);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
-  let response;
-  try {
-    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
-      method: "GET",
-      redirect: "manual",
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    });
-  } catch {
-    clearTimeout(timer);
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
-  }
-  try {
-    if (response.status >= 300 && response.status < 400) {
-      await discardBody(response);
-      return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
-    }
-    if (!response.ok) {
-      await discardBody(response);
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
-    }
-    const declared = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
-      await discardBody(response);
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
-    }
-    const limited = await readBodyLimited({
-      response,
-      signal: controller.signal,
-      maxBytes: EXTERNAL_MAX_BYTES
-    });
-    if (!limited.ok) {
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: limited.reason };
-    }
-    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-function finishRead(args) {
-  const text = args.text;
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_not_json" };
-  }
-  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
-  const fields = args.fields.filter((field) => allow.includes(field));
-  const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
-  return { ok: true, result: { items, fetchedAt: args.nowMs } };
-}
-async function consumeExternalQuota(args) {
-  const limit = Math.max(0, Math.trunc(args.limit));
-  if (limit <= 0) return false;
-  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
-  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
-  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
-  return Number.isFinite(changes) && changes > 0;
-}
-async function insertTravelWish2(args) {
-  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
-  return { wishId };
-}
-
 // worker/amsg/src/autonomyLife/routes.ts
 var matchRoute = (request) => {
   const url = new URL(request.url);
@@ -26823,7 +27040,7 @@ async function travelModelGateAllows(args) {
     nowMs: args.nowMs
   });
   if (!read.ok) return { ok: false, reason: read.reason };
-  const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND);
+  const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND) ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, args.nowMs);
   return denial ? { ok: false, reason: denial } : { ok: true };
 }
 async function travelModelAccess(args) {
@@ -26849,35 +27066,86 @@ async function travelModelAccess(args) {
 function gateTravelDecisionPort(port, deps) {
   if (!port) return null;
   const now = deps.now ?? (() => Date.now());
-  const gated = async (run) => {
-    const nowMs = now();
+  const gated = async (effect, run) => {
+    const reservedAt = now();
     const reserved = await reserveLegacyRoundCall({
       db: deps.db,
       ownerId: deps.ownerId,
       charId: deps.charId,
-      nowMs,
+      nowMs: reservedAt,
       kind: TRAVEL_MODEL_KIND
     });
     if (!reserved.ok) {
       throw new Error(`autonomy-life-gate:${reserved.reason}`);
     }
+    let value;
     try {
-      return await run();
-    } finally {
+      value = await run();
+    } catch (error) {
       await settleLegacyRoundCall({
         db: deps.db,
         permit: reserved.permit,
-        actualTokens: port.lastUsageTokens?.() ?? null,
+        actualTokens: null,
         requestStarted: true
       }).catch(() => void 0);
+      throw error;
     }
+    const settled = await settleLegacyRoundCall({
+      db: deps.db,
+      permit: reserved.permit,
+      actualTokens: port.lastUsageTokens?.() ?? null,
+      requestStarted: true
+    });
+    if (!settled) {
+      throw new Error("autonomy-life-gate:budget_settle_failed");
+    }
+    const nowMs = now();
+    const read = await readEffectiveBoundary(deps.db, {
+      ownerId: deps.ownerId,
+      charId: deps.charId,
+      nowMs
+    });
+    if (!read.ok) throw new Error(`autonomy-life-gate:${read.reason}`);
+    const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND) ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, nowMs);
+    if (denial) throw new Error(`autonomy-life-gate:${denial}`);
+    if (effect === "intent") {
+      const proposal = parseInteyProposal(value);
+      if (proposal && proposal.kind !== "none") {
+        const permit = await reserveLegacyEffect({
+          db: deps.db,
+          ownerId: deps.ownerId,
+          charId: deps.charId,
+          nowMs,
+          kind: TRAVEL_MODEL_KIND
+        });
+        if (!permit.ok) throw new Error(`autonomy-life-gate:${permit.reason}`);
+      }
+    } else {
+      const claim = await claimTravelDecisionAtomic({
+        db: deps.db,
+        ownerId: deps.ownerId,
+        charId: deps.charId,
+        windowId: windowIdAt({ now: () => nowMs }, read.boundary.timezone),
+        nowMs,
+        expectedAccountRevision: read.boundary.accountRevision ?? null,
+        expectedCharacterRevision: read.boundary.characterRevision ?? null,
+        claimRef: `${deps.charId}:${effectClaimRef()}`
+      });
+      if (!claim.ok) throw new Error(`autonomy-life-gate:${claim.reason}`);
+    }
+    return value;
   };
   return {
-    choose: (input) => gated(() => port.choose(input)),
-    ...port.nextSegment ? { nextSegment: (input) => gated(() => port.nextSegment(input)) } : {},
+    choose: (input) => gated("decision", () => port.choose(input)),
+    ...port.nextSegment ? { nextSegment: (input) => gated("decision", () => port.nextSegment(input)) } : {},
     ...port.lastUsageTokens ? { lastUsageTokens: () => port.lastUsageTokens() } : {},
-    ...port.proposeIntent ? { proposeIntent: (input) => gated(() => port.proposeIntent(input)) } : {}
+    ...port.proposeIntent ? { proposeIntent: (input) => gated("intent", () => port.proposeIntent(input)) } : {}
   };
+}
+function effectClaimRef() {
+  const webCrypto = globalThis.crypto;
+  if (webCrypto?.randomUUID) return webCrypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 // utils/airp/chatLifeWorkflow.ts

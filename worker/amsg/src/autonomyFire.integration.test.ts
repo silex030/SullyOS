@@ -207,6 +207,7 @@ describe('旧自动回合 fire：真 SQLite 上过统一边界与原子预算', 
           experiences: [{ q: '傍晚的风', note: '窗外起风了，翻了两页书。', kind: 'quiet', importance: 1 }],
         }),
         usage: { total_tokens: 77 },
+        now: new Date(NOW),
       } as unknown as KindSessionCtx,
       state: plan.state,
     });
@@ -244,6 +245,7 @@ describe('旧自动回合 fire：真 SQLite 上过统一边界与原子预算', 
           experiences: [{ q: '傍晚的风', note: '翻了两页书。', kind: 'quiet', importance: 1 }],
         }),
         usage: { total_tokens: 50 },
+        now: new Date(NOW),
       } as unknown as KindSessionCtx,
       state: plan.state,
     });
@@ -280,6 +282,8 @@ const smallOutput = (overrides: Record<string, unknown> = {}): string => JSON.st
 const makeSinkCtx = (
   llmOutputText: string,
   usage: Record<string, unknown>,
+  /** 执行期的当前服务端时钟（`llmOutput` 的安全判定只看它，不看 carried.nowMs）。 */
+  nowMs: number = NOW,
 ): { ctx: KindSessionCtx; emitted: Array<Record<string, unknown>> } => {
   const emitted: Array<Record<string, unknown>> = [];
   return {
@@ -287,6 +291,7 @@ const makeSinkCtx = (
     ctx: {
       llmOutputText,
       usage,
+      now: new Date(nowMs),
       emitResult: async (payload: Record<string, unknown>) => {
         emitted.push(payload);
       },
@@ -323,6 +328,21 @@ const readAccountBudget = async () => {
     .first();
   return row ?? null;
 };
+
+/**
+ * 出行愿望的 amap 外部授权（与 `/external/wish` 同口径：allowedKinds 不够，必须有 grant）。
+ */
+const amapGrant = (overrides: Record<string, unknown> = {}) => ({
+  provider: 'amap' as const,
+  scopes: ['read:geo'],
+  allowedHosts: ['restapi.amap.com'],
+  allowedMethods: ['GET'],
+  allowedFieldKeys: ['name'],
+  purpose: '出行天气与地点',
+  expiresAt: NOW + 86_400_000,
+  dailyQuota: 5,
+  ...overrides,
+});
 
 /** 出行愿望要落库，需要旧的出行授权 + 地图额度（旧链路语义原样保留）。 */
 async function seedTravelWishPrereqs(charId = CHAR) {
@@ -497,6 +517,27 @@ describe('旧自动回合输出：一次性执行门（真 SQLite handler）', (
     configureAutonomyFireDb(db as unknown as AutonomyDb);
   });
 
+  it('许可按**排队时的 expires_at** 到期：执行时钟越过后第一次输出也进不来（零经历/零下发）', async () => {
+    await seedBoundary();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    // 排队状态与附件里的 expires_at 完全不动，只把执行时钟推过 6h 的 TTL。
+    const reservation = await db
+      .prepare('SELECT expires_at FROM autonomy_life_budget_reservations WHERE owner_id = ?')
+      .bind(USER)
+      .first();
+    const expiresAt = Number(reservation?.expires_at);
+    expect(expiresAt).toBe(NOW + 6 * 60 * 60 * 1000);
+
+    const sink = makeSinkCtx(smallOutput(), { total_tokens: 10 }, expiresAt + 60_000);
+    const decision = await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    expect(decision).toEqual({ decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied });
+    expect(sink.emitted).toHaveLength(0);
+    expect(await countExperiences()).toBe(0);
+    expect(await countClaims()).toBe(0);
+  });
+
   it('正常首次：认领记录可追溯（绑定 owner/角色/凭据/输出指纹）', async () => {
     await seedBoundary();
     const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
@@ -573,6 +614,72 @@ describe('旧自动回合的提醒：受用户新通知上限约束（真 SQLite
     expect(Number((await readAccountBudget())?.notifications ?? 0)).toBe(0);
   });
 
+  it('读完边界、扣通知额度之前用户收紧到 0 并暂停 → 零提醒（私人活动照落）', async () => {
+    await seedBoundary();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    // 边界读完之后、核销 UPDATE 执行之前：另一台设备把通知关成 0 并按下总暂停。
+    // 核销语句的 WHERE 里带着账号/角色 revision，所以这次占格必须 0 行。
+    let injected = false;
+    const hooked = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (!injected && text.includes('SET notifications = notifications + 1')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1,
+                  payload = json_set(payload, '$.limits.notificationsPerDay', 0, '$.globalPaused', json('true'))
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    configureAutonomyFireDb(hooked as unknown as AutonomyDb);
+
+    const sink = makeSinkCtx(bigOutput(), { total_tokens: 60 });
+    await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    configureAutonomyFireDb(db as unknown as AutonomyDb);
+
+    expect(injected).toBe(true);
+    expect(await countExperiences()).toBe(1);
+    expect(await countPushedExperiences()).toBe(0);
+    expect(notificationShows(sink.emitted[0])).toBe(false);
+    expect(Number((await readAccountBudget())?.notifications ?? 0)).toBe(0);
+  });
+
+  it('跨日执行：通知额度按**当前**窗口核算（排队时的旧窗口不算数）', async () => {
+    await seedBoundary();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    // 模拟「排在本地 12:00、半夜 01:00 才执行」：只把凭据的到期时间拉长（TTL 本身允许），
+    // carried.nowMs / dateKey 保持排队时的值不动。
+    const nextDay = NOW + 13 * 60 * 60 * 1000; // 2026-10-25 01:00 Asia/Shanghai
+    await db
+      .prepare('UPDATE autonomy_life_budget_reservations SET expires_at = ? WHERE owner_id = ?')
+      .bind(nextDay + 60_000, USER)
+      .run();
+
+    const sink = makeSinkCtx(bigOutput(), { total_tokens: 60 }, nextDay);
+    const decision = await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    expect(decision).toEqual({ decision: 'skip-push', reason: 'autonomy-result-emitted' });
+    expect(await countExperiences()).toBe(1);
+    expect(await countPushedExperiences()).toBe(1);
+    expect(notificationShows(sink.emitted[0])).toBe(true);
+
+    // 通知计数落在**今天**的窗口里（w:2026-10-25），不是排队那天的 w:2026-10-24。
+    const nextWindow = await db
+      .prepare('SELECT notifications FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+      .bind(USER, 'w:2026-10-25', 'account')
+      .first();
+    expect(Number(nextWindow?.notifications ?? 0)).toBe(1);
+    const oldWindow = await db
+      .prepare('SELECT notifications FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+      .bind(USER, WINDOW, 'account')
+      .first();
+    expect(Number(oldWindow?.notifications ?? 0)).toBe(0);
+  });
+
   it('额度还有 1 条 → 提醒发出，统一通知计数 +1（下一轮就被挡）', async () => {
     await seedBoundary();
     const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
@@ -621,8 +728,8 @@ describe('旧自动回合的出行愿望：受统一边界与 kind 配额约束�
     expect(await countExperiences()).toBe(1);
   });
 
-  it('允许 travel.wish → 落一条愿望，并占一格 per-kind 配额', async () => {
-    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'] });
+  it('允许 travel.wish（含 amap 授权）→ 落一条愿望，并占一格 per-kind 配额', async () => {
+    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], externalGrants: [amapGrant()] });
     await seedTravelWishPrereqs();
     const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
     if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
@@ -635,6 +742,52 @@ describe('旧自动回合的出行愿望：受统一边界与 kind 配额约束�
       .bind(USER, WINDOW, CHAR)
       .first();
     expect(JSON.parse(String(charRow?.kind_counts ?? '{}'))['travel.wish']).toBe(1);
+  });
+
+  it('没有 amap 授权（allowedKinds 有 travel.wish、旧出行设置开着）→ 零新增愿望', async () => {
+    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'] });
+    await seedTravelWishPrereqs();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    const sink = makeSinkCtx(travelOutput(), { total_tokens: 30 });
+    await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    expect(await countWishes()).toBe(0);
+    expect(await countExperiences()).toBe(1);
+    const charRow = await db
+      .prepare('SELECT kind_counts FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+      .bind(USER, WINDOW, CHAR)
+      .first();
+    expect(JSON.parse(String(charRow?.kind_counts ?? '{}'))['travel.wish'] ?? 0).toBe(0);
+  });
+
+  it('读完边界、核销 kind 之前 amap 授权被撤 → 零愿望（其余产物照常）', async () => {
+    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], externalGrants: [amapGrant()] });
+    await seedTravelWishPrereqs();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    let injected = false;
+    const hooked = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (!injected && text.includes('SET kind_counts = json_set')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1, payload = json_remove(payload, '$.externalGrants')
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    configureAutonomyFireDb(hooked as unknown as AutonomyDb);
+
+    const sink = makeSinkCtx(travelOutput(), { total_tokens: 30 });
+    await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    configureAutonomyFireDb(db as unknown as AutonomyDb);
+
+    expect(injected).toBe(true);
+    expect(await countWishes()).toBe(0);
+    expect(await countExperiences()).toBe(1);
   });
 
   it('账号暂停后（模型跑完那一刻）→ 零新增愿望', async () => {

@@ -8,7 +8,18 @@
 > 更新（本卡）：`docs/autonomy-life/entry-migration.md` 里「后端 D1 端口与 worker 路由
 > 尚未接线」的限制已解除，见第 4 节。
 
-## 0. 本轮返工摘要（对应第四轮复审 comment 的四个阻断项）
+## 0. 本轮（第五轮）返工摘要（对应第五轮复审 comment 的四个阻断项）
+
+| 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler / 真 tick） |
+| --- | --- | --- |
+| 1. 出行链路把 `allowedKinds` 当外部授权：不看 amap grant 的缺失/到期/撤权与授权窗口额度 | 新增 `legacyGrantDenial()` / `effectiveGrantFor()`（`legacyGate.ts`）：`travel.wish` 与 `/external/wish` 同口径，必须有未过期的 amap grant；`travelModelAccess()`、`reserveLegacyRoundCall()`、`reserveLegacyEffect()` 全部加这道闸；授权窗口的 `dailyQuota` 由 `consumeExternalQuota` 原子扣（0 / 耗尽 → 拒）。旧的「只加 allowedKinds 就成功」测试已改成**先给 grant**，并补了缺 grant / 到期 / 撤权 / 额度 0 / 额度耗尽五类负例 | `worker/amsg/src/autonomyLife/legacyGate.ts`、`travelGate.ts`、`autonomyFire.ts`；`legacyGate.test.ts`（+5 例）、`travel/legacyGate.integration.test.ts`（+6 例，真 tick）、`autonomyFire.integration.test.ts`（缺授权零愿望、授权时落一条） |
+| 2. 出行模型返回后没有当前效果门：模型执行期间暂停/撤权仍能写愿望/行程 | `gateTravelDecisionPort()` 的 `gated()` 改为「预留 → 调模型 → **结算（失败即 fail closed）** → 现读边界 + 当前授权复核 → 一次性效果核销 → 才把结果交给 tick」；意图探针要出门时按 `reserveLegacyEffect('travel.wish')` 占 kind 配额，选点/分段走 `claimTravelDecisionAtomic()`（一条 `INSERT … SELECT`，边界 revision + amap 授权在同一条 WHERE，`claim_ref` 主键去重）。被拒时抛错 → tick 记 `llm_unavailable`：**模型调用照常记账，业务零写入** | `travelGate.ts`、`store.ts`；`travel/legacyGate.integration.test.ts` 新增「模型返回那一刻暂停 / 关角色 / 新增禁区 / 撤授权 / 结算失败」5 例（都断言零愿望、`used_calls` 仍为 1） |
+| 3. 旧回合许可期限用排队时的旧时钟：过期后第一次输出仍可通过 | `llmOutput` 新增 `currentServerTimeMs(ctx)`（`ctx.now` 注入 / 服务端时钟），`claimRoundEffect`、`settleLegacyRoundCall`、`legacyRoundStillAllowed`、`reserveLegacyEffect`、`reserveLegacyNotification` 全部改用它；`settleBudget` 增加可选 `nowMs`，按当前时钟复核凭据到期；`carried.nowMs` 只留给展示字段（经历 `createdAt`、推送冷却） | `autonomyFire.ts`、`legacyGate.ts`、`utils/autonomyLife/budget.ts`；`autonomyFire.integration.test.ts` 新增「state 与 `expires_at` 都不动、只把执行时钟推过 6h TTL → 零经历/零下发/零认领」与「跨日执行 → 通知额度落在 `w:2026-10-25`、旧窗口 0」两例 |
+| 4. 通知/愿望配额仍有「读完边界再写预算」的竞态 | 新增 `consumeLegacyQuotaAtomic()`（`store.ts`）：判额 + 占额 + **账号/角色 revision + 暂停/开关标志 + amap 授权**全部放进**同一条**条件 UPDATE/INSERT 的 WHERE；`chargeLegacyQuota` 不再走「先读边界再 reserveBudget」。读完边界后用户收紧额度/暂停/撤权 → 语句 0 行 → 零提醒 / 零愿望 | `store.ts`、`legacyGate.ts`；`legacyGate.test.ts` 新增 2 例 `beforeStatement` 注入（收紧通知额度+暂停 / 撤授权）→ `boundary_changed` 且预算行 0；`autonomyFire.integration.test.ts` 新增同口径的 handler 级 2 例（零提醒、零愿望，私人活动照落） |
+
+上一轮（第四轮）的返工摘要保留在下面，便于对照。
+
+## 0.1 第四轮返工摘要（对应第四轮复审 comment 的四个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler） |
 | --- | --- | --- |
@@ -19,7 +30,7 @@
 
 上一轮（第三轮）的返工摘要保留在下面，便于对照。
 
-## 0.1 上一轮返工摘要（第三轮复审 comment 的四条）
+## 0.2 第三轮返工摘要（第三轮复审 comment 的四条）
 
 | 复审意见 | 本轮改动 | 证据 |
 | --- | --- | --- |
@@ -268,6 +279,26 @@ worker/amsg/src/autonomyScheduler.test.ts
 > 继续，必须在新入口里显式打开总开关、允许 `travel.wish`、不设未验证禁区、且额度有余量。
 > 已有行程的时间相位推进、地图候选/路线（旧地图额度）不受影响。
 
+### 5.2 第五轮补的四道闸（复现用例见 §7 与 `evidence/`）
+
+1. **外部授权不再是 `allowedKinds` 的同义词**（`legacyGate.ts` 的 `legacyGrantDenial` /
+   `effectiveGrantFor`）：`travel.wish` / `external.read` 分别要求当前生效边界里有未过期的
+   `amap` / `xhs` grant。出行 tick 的 `travelModelAccess`、旧回合的 `reserveLegacyRoundCall`
+   （`kind` 参数）与 `reserveLegacyEffect` 都走这道闸；`reserveLegacyEffect` 另外用
+   `consumeExternalQuota` 原子扣授权窗口的 `dailyQuota`（0 / 耗尽 → 拒）。
+2. **出行模型返回后的当前效果门**（`travelGate.ts` 的 `gated`）：
+   预留 → 调模型 → 结算（`settleLegacyRoundCall`，被拒即抛错）→ 现读边界 + 授权复核 →
+   一次性效果核销（意图探针走 `reserveLegacyEffect` 占 kind 配额；选点/分段走
+   `claimTravelDecisionAtomic` 的一条 `INSERT … SELECT`，边界 revision + amap 授权在 WHERE 里，
+   `claim_ref` 主键去重）→ 才把结果交给 tick。被拒时 tick 记 `llm_unavailable`：
+   **模型调用已经记账，业务效果为零**。
+3. **执行期时钟**（`autonomyFire.ts` 的 `currentServerTimeMs`）：许可到期、外部授权到期、
+   预算窗口一律用当前服务端时钟；`carried.nowMs`（排队时）只用于展示字段。`settleBudget`
+   也接受 `nowMs`，按当前时钟复核凭据是否过期。
+4. **配额核销的原子条件**（`store.ts` 的 `consumeLegacyQuotaAtomic`）：通知 / per-kind 效果
+   的「判额 + 占额」与「账号/角色 revision + 暂停/开关标志 + amap 授权」在同一条
+   条件 UPDATE/INSERT 的 WHERE 里；读完边界之后发生的收紧/暂停/撤权会让语句 0 行。
+
 
 ## 6. 仍未覆盖（residual risk，交付时如实列出）
 
@@ -297,20 +328,41 @@ worker/amsg/src/autonomyScheduler.test.ts
     的用量（旧端口语义），一次 tick 里先 `proposeIntent` 再 `nextSegment` 时，第二次结算可能
     按同一次 usage 记账 → **只多算不少算**；调用次数（`used_calls`）是逐次准确的。
     该口径与旧 travel 账本一致，本卡没有改它。
+11. **出行愿望现在必须同时有 amap 外部授权**（第五轮）：`allowedKinds` 只表示能力允许。
+    没有 grant / grant 过期 / 授权窗口额度为 0 或耗尽 → 出行探针不调模型、愿望不落。
+    这是有意的收紧（与 `/external/wish` 同口径），但对「只在新入口勾了 travel.wish 却没配
+    外部授权」的用户是行为变更：需要在设置里授予 amap 只读授权。
+12. **效果核销的顺序代价**：`travel.wish` 先占 per-kind 名额、再扣授权窗口当日额度；
+    如果第二步因并发耗尽失败，会浪费一格 per-kind（不会写业务效果，也不会超额）。
+    反过来的顺序同样会浪费一格授权额度，本卡选择了「先保证业务配额」的方向。
+13. **D1 无跨语句事务的结算残影**：`settleBudget` 先推进预留记录、再写预算行；若预算行
+    写入失败（存储异常），预留记录可能已是 `settled` 而预算行仍是 `reserved_calls`。
+    两种状态都**不可再用**（fail closed），但对账时需要按预留记录核对；不会超额。
 
 ## 7. 验证日志（本机真实输出，日志作为本任务 durable attachments）
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `pnpm exec vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 891 用例全通过，EXIT 0**（`focused.log.gz`） |
-| 全量用例（**完整原始输出**） | `pnpm exec vitest run` | **624 文件 / 7606 用例全通过，EXIT 0**（212.7s，`vitest-full.log.gz`，未裁剪） |
-| 类型检查（全仓） | `pnpm exec tsc -p tsconfig.json --noEmit` | **两边各 56 条；归一化 worktree 路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
-| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 2m 13s；`build.log.gz`） |
-| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=/tmp/ev/e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
+| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 909 用例全通过，EXIT 0**（`focused.log.gz`） |
+| 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7624 用例全通过，EXIT 0**（214.3s，`vitest-full.log.gz`，未裁剪） |
+| 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **两边各 56 条；归一化 worktree / 基线临时路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
+| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 33s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5；`build.log.gz`） |
+| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=/tmp/r5-e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
 | 旧入口完整审计（按实际入口） | `bash scripts/autonomy-legacy-grep-audit.sh` | 见 `legacy-grep.log.gz`：旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client.ts` 均 **0 命中**；AIRP 回合、出行 tick 的模型调用与效果落库都有**执行期**统一闸 |
 | 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署 |
 
-本轮新增的可复现用例（都在上面两份日志里，真 SQLite）：
+本轮（第五轮）新增的可复现用例（都在上面两份日志里，真 SQLite / 真 handler / 真 tick）：
+
+- `autonomyFire.integration.test.ts`：执行期时钟越 6h TTL → 零经历/零下发；跨日执行 → 通知落在
+  `w:2026-10-25`；读完边界后收紧通知额度+暂停 → 零提醒（私人活动照落）；无 amap 授权 / 读完边界后
+  撤授权 → 零愿望。
+- `legacyGate.test.ts`：缺 amap 授权 / 授权到期 / 授权窗口额度 0 / 额度耗尽 → 拒且零预算行；
+  `beforeStatement` 注入收紧通知额度+暂停 / 撤 amap 授权 → `boundary_changed`。
+- `travel/legacyGate.integration.test.ts`：没有 amap 授权（allowedKinds 与旧设置开着）→ 零模型请求、
+  零愿望；授权到期 → 同上；额度 0 → 模型可问但愿望不落；**模型返回那一刻暂停 / 关角色 / 新增禁区 /
+  撤授权** → 零愿望（`used_calls` 仍为 1）；结算失败 fail closed。
+
+第四轮的可复现用例（同样仍在上面两份日志里）：
 
 - `autonomyFire.integration.test.ts`：顺序回放 / 并发回放 / 旧形状 state / 伪造 owner /
   伪造凭据 id / 换角色凭据 / 已释放 / 已过期 / 认领写失败 / 认领记录可追溯；

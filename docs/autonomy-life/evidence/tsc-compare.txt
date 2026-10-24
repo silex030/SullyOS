@@ -1,1 +1,3 @@
 no differences after path normalization (56 errors both sides)
+current: EXIT:2, 56 errors; baseline f7f040c7: EXIT:2, 56 errors
+normalization: /root/SullyOS/.worktrees/<task>/ -> <ROOT>/ and the baseline scratch dir -> <ROOT>/

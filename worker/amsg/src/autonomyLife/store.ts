@@ -192,6 +192,26 @@ export const AUTONOMY_LIFE_DDL = [
     revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner_id, round_ref)
   )`,
+  // 效果/决策的一次性认领（出行模型结果 → 愿望/行程、外部窗口决策位）。
+  //
+  // 为什么单独一张表：这些效果的「额度」住在预算行里（通知/kind 计数），但**能不能核销**
+  // 还取决于当时的账号/角色边界与外部授权。核销语句必须把边界 revision 与授权放进同一条
+  // WHERE（D1 没有跨语句事务，先读后写就是竞态窗口），成功核销再留一行可追溯记录。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_effect_claims (
+    owner_id TEXT NOT NULL,
+    claim_ref TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    notification INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'claimed',
+    revision INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, claim_ref)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_effect_claims_window
+    ON autonomy_life_effect_claims (owner_id, window_id, kind)`,
   // 预留凭据：许可签发/外部副作用前按 id 查这一条（不是看「本窗口有过用量」）。
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget_reservations (
     owner_id TEXT NOT NULL,
@@ -1008,6 +1028,235 @@ export async function readBudgetRows(options: {
     return row ? rowFromBudget(row) : null;
   };
   return { account: await read('account'), char: await read(charId) };
+}
+
+/* ------------------------------------------------------------------ *
+ * 统一配额核销（提醒 / kind 效果）：边界 revision + 授权在同一条语句里
+ * ------------------------------------------------------------------ */
+
+export type QuotaConsumeFailure =
+  | 'invalid_input'
+  | 'boundary_changed'
+  | 'notifications_exhausted'
+  | 'kind_exhausted'
+  | 'external_quota_exhausted'
+  | 'claim_exists'
+  | 'store_unavailable';
+
+/**
+ * 边界必须「还是读它时那一版」才允许核销。
+ *
+ * 为什么不用「再读一次再判」：D1 没有跨语句事务，读完边界到写预算之间永远有一个窗口。
+ * 把两层 revision 与暂停/开关标志放进**同一条** UPDATE/INSERT 的 WHERE，窗口就没了：
+ * 期间任何一次 PATCH（撤权、暂停、收紧额度）都会让 revision 变，语句 0 行 → 核销失败。
+ */
+const BOUNDARY_ATOMIC_GUARD = `EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries b
+    WHERE b.owner_id = ? AND b.scope = 'account' AND b.char_id = ''
+      AND b.revision = ?
+      AND COALESCE(json_extract(b.payload, '$.globalPaused'), 0) <> 1
+      AND COALESCE(json_extract(b.payload, '$.enabled'), 1) <> 0
+  )
+  AND EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries c
+    WHERE c.owner_id = ? AND c.scope = 'character' AND c.char_id = ?
+      AND c.revision = ?
+      AND COALESCE(json_extract(c.payload, '$.charEnabled'), 1) <> 0
+      AND COALESCE(json_extract(c.payload, '$.enabled'), 1) <> 0
+  )`;
+
+/** 外部授权也进原子条件：核销那一刻重新读 payload 里的授权（撤权/到期 → 0 行）。 */
+const GRANT_ATOMIC_GUARD = `EXISTS (
+    SELECT 1 FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+    WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+      AND json_extract(ge.value, '$.provider') = ?
+      AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+  )`;
+
+/** kind_counts 的 JSON 路径（kind 来自固定白名单；仍去掉引号防路径注入）。 */
+const kindJsonPath = (kind: string): string => `$."${String(kind).replace(/["\\]/g, '')}"`;
+
+export interface QuotaConsumeInput {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  windowId: string;
+  nowMs: number;
+  /** 读边界时拿到的两层 revision（null = 该层没有行，条件里用 -1 恒不成立）。 */
+  expectedAccountRevision: number | null;
+  expectedCharacterRevision: number | null;
+  /** 账号层通知额度（null = 这次不占通知）。0 = 明确禁止。 */
+  notificationLimit?: number | null;
+  /** 角色层同类动作额度（null = 这次不占 kind）。 */
+  kind?: { kind: string; limit: number } | null;
+  /** 要求当前仍存在未过期的外部授权（travel.wish → amap）。 */
+  requireGrant?: 'amap' | 'xhs' | null;
+}
+
+/**
+ * **原子**核销一格配额（通知 / per-kind 效果）。
+ *
+ * 判额与占额都在同一条条件语句里：UPDATE 命中 `notifications < limit`（或 kind 计数 < limit）
+ * 才 +1；行不存在时用带同样条件的 INSERT 兜底。两条语句各自原子，并发下都不会超额。
+ * 失败时**不留下任何行**（与被拒即零写入的既有语义一致）。
+ */
+export async function consumeLegacyQuotaAtomic(
+  input: QuotaConsumeInput,
+): Promise<{ ok: true } | { ok: false; reason: QuotaConsumeFailure }> {
+  const { db, ownerId, charId, windowId, nowMs } = input;
+  if (!ownerId || !charId || !windowId) return { ok: false, reason: 'invalid_input' };
+  if (input.notificationLimit == null && !input.kind) return { ok: false, reason: 'invalid_input' };
+
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  // 绑定顺序与 BOUNDARY_ATOMIC_GUARD 的占位符顺序一致。
+  const guardBindings = (): unknown[] => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const grantBindings = (): unknown[] =>
+    input.requireGrant ? [ownerId, input.requireGrant, nowMs] : [];
+  const grantClause = input.requireGrant ? `AND ${GRANT_ATOMIC_GUARD}` : '';
+
+  try {
+    if (input.notificationLimit != null) {
+      const limit = Math.max(0, Math.trunc(input.notificationLimit));
+      const updated = await db
+        .prepare(`UPDATE autonomy_life_budget
+          SET notifications = notifications + 1, revision = revision + 1, updated_at = ?
+          WHERE owner_id = ? AND window_id = ? AND scope = 'account'
+            AND notifications < ?
+            AND ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`)
+        .bind(nowMs, ownerId, windowId, limit, ...guardBindings(), ...grantBindings())
+        .run();
+      if (changesOf(updated) > 0) return { ok: true };
+      if (limit > 0) {
+        const inserted = await db
+          .prepare(`INSERT OR IGNORE INTO autonomy_life_budget
+            (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens,
+             notifications, kind_counts, spend_minor, revision, updated_at)
+            SELECT ?, ?, 'account', 0, 0, 0, 0, 1, '{}', 0, 1, ?
+            WHERE ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`)
+          .bind(ownerId, windowId, nowMs, ...guardBindings(), ...grantBindings())
+          .run();
+        if (changesOf(inserted) > 0) return { ok: true };
+      }
+    }
+
+    if (input.kind) {
+      const limit = Math.max(0, Math.trunc(input.kind.limit));
+      const path = kindJsonPath(input.kind.kind);
+      const rowScope = charId;
+      const updated = await db
+        .prepare(`UPDATE autonomy_life_budget
+          SET kind_counts = json_set(
+                CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END,
+                ?,
+                COALESCE(json_extract(CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END, ?), 0) + 1
+              ),
+              revision = revision + 1, updated_at = ?
+          WHERE owner_id = ? AND window_id = ? AND scope = ?
+            AND COALESCE(json_extract(CASE WHEN json_valid(kind_counts) THEN kind_counts ELSE '{}' END, ?), 0) < ?
+            AND ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`)
+        .bind(path, path, nowMs, ownerId, windowId, rowScope, path, limit, ...guardBindings(), ...grantBindings())
+        .run();
+      if (changesOf(updated) > 0) return { ok: true };
+      if (limit > 0) {
+        const inserted = await db
+          .prepare(`INSERT OR IGNORE INTO autonomy_life_budget
+            (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens,
+             notifications, kind_counts, spend_minor, revision, updated_at)
+            SELECT ?, ?, ?, 0, 0, 0, 0, 0, json_set('{}', ?, 1), 0, 1, ?
+            WHERE ${BOUNDARY_ATOMIC_GUARD}
+            ${grantClause}`)
+          .bind(ownerId, windowId, rowScope, path, nowMs, ...guardBindings(), ...grantBindings())
+          .run();
+        if (changesOf(inserted) > 0) return { ok: true };
+      }
+    }
+
+    // 0 行：把原因说准（非原子，只用于返回码/日志；业务效果已经确定为「不许」）。
+    const stillCurrent = await db
+      .prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`)
+      .bind(ownerId, ownerId, charId)
+      .first()
+      .catch(() => null);
+    if (!stillCurrent
+      || Number(stillCurrent.ar ?? -1) !== accountRevision
+      || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: 'boundary_changed' };
+    }
+    if (input.requireGrant && !input.kind) return { ok: false, reason: 'external_quota_exhausted' };
+    if (input.kind) return { ok: false, reason: 'kind_exhausted' };
+    return { ok: false, reason: input.notificationLimit != null ? 'notifications_exhausted' : 'kind_exhausted' };
+  } catch {
+    return { ok: false, reason: 'store_unavailable' };
+  }
+}
+
+/**
+ * 出行模型结果的**一次性效果许可**（`choose` / `nextSegment` 这类不占 kind 额度的决策位）。
+ *
+ * 一条 INSERT … SELECT 完成：账号/角色边界还是读它时那一版（revision + 暂停/开关）+
+ * 当前仍有未过期的 amap 授权 + 同一个 claim_ref 只允许认领一次。0 行 = 拒绝，
+ * 业务侧不写任何行程。
+ */
+export async function claimTravelDecisionAtomic(input: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  windowId: string;
+  nowMs: number;
+  expectedAccountRevision: number | null;
+  expectedCharacterRevision: number | null;
+  claimRef: string;
+  ttlMs?: number;
+}): Promise<{ ok: true; claimId: string } | { ok: false; reason: QuotaConsumeFailure }> {
+  const { db, ownerId, charId, windowId, nowMs } = input;
+  const claimRef = String(input.claimRef ?? '').trim();
+  if (!ownerId || !charId || !windowId || !claimRef) return { ok: false, reason: 'invalid_input' };
+  const claimId = `eff_${claimRef}`;
+  const expiresAt = nowMs + (input.ttlMs ?? 60 * 60 * 1000);
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  try {
+    const inserted = await db
+      .prepare(`INSERT OR IGNORE INTO autonomy_life_effect_claims
+        (owner_id, claim_ref, char_id, kind, window_id, notification, created_at, expires_at, state, revision)
+        SELECT ?, ?, ?, 'travel.decision', ?, 0, ?, ?, 'claimed', 0
+        WHERE ${BOUNDARY_ATOMIC_GUARD}
+          AND ${GRANT_ATOMIC_GUARD}`)
+      .bind(
+        ownerId, claimRef, charId, windowId, nowMs, expiresAt,
+        ownerId, accountRevision, ownerId, charId, characterRevision,
+        ownerId, 'amap', nowMs,
+      )
+      .run();
+    if (changesOf(inserted) > 0) return { ok: true, claimId };
+    const existing = await db
+      .prepare('SELECT claim_id FROM autonomy_life_effect_claims WHERE owner_id = ? AND claim_ref = ?')
+      .bind(ownerId, claimRef)
+      .first()
+      .catch(() => null);
+    if (existing) return { ok: false, reason: 'claim_exists' };
+    const stillCurrent = await db
+      .prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`)
+      .bind(ownerId, ownerId, charId)
+      .first()
+      .catch(() => null);
+    if (!stillCurrent
+      || Number(stillCurrent.ar ?? -1) !== accountRevision
+      || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: 'boundary_changed' };
+    }
+    return { ok: false, reason: 'external_quota_exhausted' };
+  } catch {
+    return { ok: false, reason: 'store_unavailable' };
+  }
 }
 
 /* ------------------------------------------------------------------ *

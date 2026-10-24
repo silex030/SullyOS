@@ -1007,6 +1007,19 @@ const readUsage = (ctx: KindSessionCtx): AutonomyUsage => {
 };
 
 /**
+ * 执行期的**当前服务端时钟**（安全判定唯一时间来源）。
+ *
+ * `carried.nowMs` 是排队时的时间，不能用来判断许可/授权是否过期（那一轮被退回的 P0）。
+ * 这里优先用运行时注入的 `ctx.now`（D1 worker 的 `ctx.now` 是服务端时间；测试用它注入
+ * 可控时钟），没有就退回进程时钟。
+ */
+const currentServerTimeMs = (ctx: KindSessionCtx): number => {
+  const raw = (ctx as unknown as { now?: unknown }).now;
+  const injected = raw instanceof Date ? raw.getTime() : typeof raw === 'number' ? raw : null;
+  return injected !== null && Number.isFinite(injected) ? injected : Date.now();
+};
+
+/**
  * 模型输出的稳定指纹（认领记录里存一份，便于事后核对「落库的那批产物对应哪份输出」）。
  *
  * 不需要密码学强度：一次性门的权威判据是 `(owner, round_ref)` 主键 + 可信预留绑定，
@@ -1512,6 +1525,16 @@ export const autonomyRoundHandler: FireKindHandler = {
       return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied };
     }
 
+    /*
+     * 安全判定一律用**当前服务端时钟**，不用 `carried.nowMs`。
+     *
+     * `carried.nowMs` 是 beforeFire 排队那一刻的时间：上游模型可能跑很久、任务也可能在队列里
+     * 等到授权窗口过期之后才执行。拿它去比 `expires_at` / 授权到期 / 当前预算窗口，等于
+     * 「凭一张早就过期的一次性许可继续落业务效果」。展示时间（经历 createdAt、推送冷却）
+     * 仍可用 `carried.nowMs`，但**许可到期、外部授权到期、预算窗口**必须走这里。
+     */
+    const nowMs = currentServerTimeMs(ctx);
+
     const outputHash = hashAutonomyOutput(ctx.llmOutputText || '');
     const claim = await claimRoundEffect({
       db: db as unknown as LifeDb,
@@ -1520,7 +1543,7 @@ export const autonomyRoundHandler: FireKindHandler = {
       roundRef: carried.roundRef,
       reservationId: carried.budgetPermit.reservationId,
       outputHash,
-      nowMs: carried.nowMs,
+      nowMs,
     });
     if (!claim.ok) {
       // claim_exists = 同一回合的第二次（重放/并发）；reservation_invalid = 凭据不可信。
@@ -1538,6 +1561,7 @@ export const autonomyRoundHandler: FireKindHandler = {
       permit: carried.budgetPermit,
       actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
       requestStarted: true,
+      nowMs,
     });
     if (!settled) {
       // 结算失败（凭据已结算过 / 存储不可用）→ 不落业务。以前这里只 warn 就继续，
@@ -1552,7 +1576,7 @@ export const autonomyRoundHandler: FireKindHandler = {
       db: db as unknown as LifeDb,
       ownerId: carried.ownerUserId,
       charId: carried.charId,
-      nowMs: carried.nowMs,
+      nowMs,
     });
     if (denial) {
       console.warn('[amsg:autonomy] 执行期边界已变，这一轮不落业务产物', carried.charId, denial);
@@ -1586,7 +1610,8 @@ export const autonomyRoundHandler: FireKindHandler = {
         db: db as unknown as LifeDb,
         ownerId: carried.ownerUserId,
         charId: carried.charId,
-        nowMs: carried.nowMs,
+        // 效果配额按**当前窗口**核算（排队时可能还在前一天）。
+        nowMs,
         kind: LEGACY_TRAVEL_KIND,
       });
       if (!effect.ok) {
@@ -1656,7 +1681,8 @@ export const autonomyRoundHandler: FireKindHandler = {
         db: db as unknown as LifeDb,
         ownerId: carried.ownerUserId,
         charId: carried.charId,
-        nowMs: carried.nowMs,
+        // 通知额度是**按当前窗口**算的：排队时是昨天，执行时已经是今天 → 必须用当前时钟。
+        nowMs,
       });
       if (!quota.ok) {
         console.log('[amsg:autonomy] 统一通知额度已满/关闭，这一轮只落经历不发提醒', carried.charId, quota.reason);

@@ -63,6 +63,22 @@ async function seedNewBoundary(overrides: Record<string, unknown> = {}) {
   return boundary;
 }
 
+/**
+ * 一条可用的 amap 外部授权（`travel.wish` 的硬前置）。
+ * 与 `/external/*` 同口径：provider + 只读 scope + 到期时间 + 每日额度。
+ */
+export const amapGrant = (overrides: Record<string, unknown> = {}) => ({
+  provider: 'amap' as const,
+  scopes: ['read:geo'],
+  allowedHosts: ['restapi.amap.com'],
+  allowedMethods: ['GET'],
+  allowedFieldKeys: ['name'],
+  purpose: '出行天气与地点',
+  expiresAt: NOW + 86_400_000,
+  dailyQuota: 5,
+  ...overrides,
+});
+
 async function registerCharacter(charPayload: Record<string, unknown> = {}, charId = CHAR) {
   const row = normalizeBoundary(charPayload, { scope: 'character', nowMs: NOW, revision: 0 });
   await db
@@ -363,7 +379,11 @@ describe('旧链路统一配额：提醒 / kind 效果（真 SQLite）', () => {
   });
 
   it('travel.wish 授权后：占一格 per-kind（额度 1 时第二次被拒）', async () => {
-    await seedNewBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], limits: { perKindActionsPerDay: 1 } });
+    await seedNewBoundary({
+      allowedKinds: ['interaction.message', 'travel.wish'],
+      externalGrants: [amapGrant()],
+      limits: { perKindActionsPerDay: 1 },
+    });
     await registerCharacter();
     const first = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
     expect(first).toEqual({ ok: true });
@@ -382,5 +402,121 @@ describe('旧链路统一配额：提醒 / kind 效果（真 SQLite）', () => {
     expect(await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' }))
       .toEqual({ ok: false, reason: 'paused' });
     expect(await countBudgetRows()).toBe(0);
+  });
+});
+
+/**
+ * 外部授权 + 效果核销的**原子条件**（第五轮返工）。
+ *
+ * 两类漏洞一起钉住：
+ *   1. `allowedKinds` 不等于外部授权：`travel.wish` 必须当前有未过期的 amap 授权，
+ *      授权窗口的每日额度也必须有余额（与 `/external/wish` 同口径）；
+ *   2. 「读完边界再写预算」的竞态：核销语句把账号/角色 revision 与授权放进同一条
+ *      WHERE，判完之后用户收紧额度/暂停/撤权 → 0 行、零提醒、零愿望。
+ */
+describe('旧链路效果：外部授权与核销原子条件（真 SQLite）', () => {
+  const countBudgetRows = async () => Number(
+    (await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_budget WHERE owner_id = ?').bind(USER).first())?.n ?? 0,
+  );
+  const kindCount = async (): Promise<number> => {
+    const row = await db
+      .prepare("SELECT kind_counts FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?")
+      .bind(USER, WINDOW, CHAR)
+      .first();
+    return Number(JSON.parse(String(row?.kind_counts ?? '{}'))['travel.wish'] ?? 0);
+  };
+
+  const travelBoundary = (overrides: Record<string, unknown> = {}) => seedNewBoundary({
+    allowedKinds: ['interaction.message', 'travel.wish'],
+    ...overrides,
+  });
+
+  it('缺 amap 授权（allowedKinds 与旧出行设置都开着）→ grant_missing，零写入', async () => {
+    await travelBoundary();
+    await registerCharacter();
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: false, reason: 'grant_missing' });
+    expect(await countBudgetRows()).toBe(0);
+    expect(await kindCount()).toBe(0);
+  });
+
+  it('amap 授权已过期（执行时钟越过 expiresAt）→ grant_missing，零写入', async () => {
+    await travelBoundary({ externalGrants: [amapGrant({ expiresAt: NOW + 1000 })] });
+    await registerCharacter();
+    // 排队时还在有效期内（NOW + 1s 之后），执行时已经过期：必须按**当前**时钟判。
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW + 60_000, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: false, reason: 'grant_missing' });
+    expect(await countBudgetRows()).toBe(0);
+  });
+
+  it('授权窗口额度为 0 → external_quota_exhausted，零写入', async () => {
+    await travelBoundary({ externalGrants: [amapGrant({ dailyQuota: 0 })] });
+    await registerCharacter();
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: false, reason: 'external_quota_exhausted' });
+    expect(await countBudgetRows()).toBe(0);
+  });
+
+  it('授权窗口当日额度已耗尽 → external_quota_exhausted，零写入', async () => {
+    await travelBoundary({ externalGrants: [amapGrant({ dailyQuota: 1 })] });
+    await registerCharacter();
+    await db
+      .prepare('INSERT OR REPLACE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(USER, '2026-10-24', 'amap', 1, NOW)
+      .run();
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: false, reason: 'external_quota_exhausted' });
+    expect(await countBudgetRows()).toBe(0);
+  });
+
+  it('读完边界、核销之前用户把通知额度收紧到 0 并总暂停 → boundary_changed，零提醒、零写入', async () => {
+    await seedNewBoundary();
+    await registerCharacter();
+    let injected = false;
+    db = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        // 边界读完之后、核销 UPDATE 执行之前：另一台设备收紧额度并按下暂停。
+        if (!injected && text.includes('SET notifications = notifications + 1')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1,
+                  payload = json_set(payload, '$.limits.notificationsPerDay', 0, '$.globalPaused', json('true'))
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const result = await reserveLegacyNotification({ db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(injected).toBe(true);
+    expect(result).toEqual({ ok: false, reason: 'boundary_changed' });
+    expect(await countBudgetRows()).toBe(0);
+  });
+
+  it('读完边界、核销之前 amap 授权被撤 → 零愿望、kind 计数不动', async () => {
+    await travelBoundary({ externalGrants: [amapGrant()] });
+    await registerCharacter();
+    let injected = false;
+    db = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (!injected && text.includes('SET kind_counts = json_set')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1, payload = json_remove(payload, '$.externalGrants')
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(injected).toBe(true);
+    expect(result).toEqual({ ok: false, reason: 'boundary_changed' });
+    expect(await countBudgetRows()).toBe(0);
+    expect(await kindCount()).toBe(0);
   });
 });

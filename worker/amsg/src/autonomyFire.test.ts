@@ -387,6 +387,9 @@ const makeSessionCtx = (
       taskId: 11,
       taskUuid: 'task-uuid-autonomy',
       occurrenceMs: NOW,
+      // 执行期的**当前**服务端时钟（生产走 Date.now()；测试注入可控时钟）。
+      // 注意不能用 occurrenceMs 代替：那是排队/计划时刻，许可到期必须按执行时刻判。
+      now: new Date(NOW),
       ...(usage ? { usage } : {}),
     } as never,
     emitResult,

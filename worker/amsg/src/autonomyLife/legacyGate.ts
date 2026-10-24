@@ -42,8 +42,10 @@ import {
   type BudgetGrant,
   type BudgetRow,
 } from '../../../../utils/autonomyLife/budget';
+import { localDateKey } from '../../../../utils/autonomyLife/time';
 import type { AutonomyTickPack } from '../autonomyScheduler';
-import { createD1BudgetPort, readBudgetRows, type LifeDb } from './store';
+import { consumeExternalQuota } from './external';
+import { consumeLegacyQuotaAtomic, createD1BudgetPort, readBudgetRows, type LifeDb } from './store';
 
 /** 旧自主回合映射到新边界的 kind（它就是「角色发一条消息」）。 */
 export const LEGACY_AUTONOMY_KIND = 'interaction.message' as const;
@@ -58,6 +60,7 @@ export type LegacyAutonomySkipReason =
   | 'char_disabled'
   | 'kind_not_allowed'
   | 'forbidden_topic'
+  | 'grant_missing'
   | 'budget_exhausted';
 
 export interface LegacyAutonomyGateResult {
@@ -105,6 +108,38 @@ export async function readEffectiveBoundary(
   }
 }
 
+/** 需要外部授权的 kind → provider（与 policy.ts / routes.ts 的契约一致）。 */
+const KIND_GRANT_PROVIDER: Partial<Record<string, 'amap' | 'xhs'>> = {
+  'travel.wish': 'amap',
+  'external.read': 'xhs',
+};
+
+/**
+ * 外部授权闸：`allowedKinds` 只是「允许这个能力」，**不等于**用户给了外部授权。
+ * `travel.wish` 必须在当前生效边界里有一条未过期的 amap grant（撤权/到期 → 拒），
+ * 口径与 `routes.ts` 的 `/external/*` 完全一致——旧出行链路以前只看 allowedKinds 就调模型、
+ * 落愿望，等于绕过了授权窗口。
+ */
+export function legacyGrantDenial(
+  boundary: EffectiveBoundaryV1,
+  kind: string,
+  nowMs: number,
+): LegacyAutonomySkipReason | null {
+  const provider = KIND_GRANT_PROVIDER[kind];
+  if (!provider) return null;
+  const grant = boundary.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
+  return grant ? null : 'grant_missing';
+}
+
+/** 当前生效的 provider 授权（没有/过期 → null）。 */
+export function effectiveGrantFor(
+  boundary: EffectiveBoundaryV1,
+  provider: 'amap' | 'xhs',
+  nowMs: number,
+): EffectiveBoundaryV1['externalGrants'][number] | null {
+  return boundary.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs) ?? null;
+}
+
 /** 边界门（暂停/开关/角色/kind/未验证禁区）。纯判定，不写任何东西。 */
 export function legacyBoundaryDenial(
   boundary: EffectiveBoundaryV1,
@@ -149,6 +184,8 @@ async function reasonToSkip(
 
   const denial = legacyBoundaryDenial(boundary);
   if (denial) return denial;
+  const grantDenial = legacyGrantDenial(boundary, LEGACY_AUTONOMY_KIND, nowMs);
+  if (grantDenial) return grantDenial;
 
   try {
     const windowId = windowIdAt({ now: () => nowMs }, boundary.timezone);
@@ -198,6 +235,8 @@ export async function reserveLegacyRoundCall(args: {
   const boundary = read.boundary;
   const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
   if (denial) return { ok: false, reason: denial };
+  const grantDenial = legacyGrantDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs);
+  if (grantDenial) return { ok: false, reason: grantDenial };
 
   const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
   if (!port.available()) return { ok: false, reason: 'budget_exhausted' };
@@ -226,10 +265,11 @@ export async function reserveLegacyRoundCall(args: {
   const changed = !recheck.ok
     || recheck.boundary.accountRevision !== boundary.accountRevision
     || recheck.boundary.characterRevision !== boundary.characterRevision
-    || legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) !== null;
+    || legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) !== null
+    || legacyGrantDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs) !== null;
   if (changed) {
     await settleBudget(settledPort, reservation.grant, { requestStarted: false }).catch(() => undefined);
-    return { ok: false, reason: recheck.ok ? (legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) ?? 'paused') : recheck.reason };
+    return { ok: false, reason: recheck.ok ? (legacyBoundaryDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND) ?? legacyGrantDenial(recheck.boundary, args.kind ?? LEGACY_AUTONOMY_KIND, args.nowMs) ?? 'paused') : recheck.reason };
   }
 
   return {
@@ -254,11 +294,14 @@ export async function settleLegacyRoundCall(args: {
   permit: LegacyRoundPermit;
   actualTokens?: number | null;
   requestStarted: boolean;
+  /** 当前可信服务端时钟：给了就按它复核凭据是否已过期（不看排队时的旧时钟）。 */
+  nowMs?: number;
 }): Promise<boolean> {
   const port = createD1BudgetPort({ db: args.db, ownerId: args.permit.ownerId });
   const settled = await settleBudget(port, args.permit.grant, {
     actualTokens: args.actualTokens ?? null,
     requestStarted: args.requestStarted,
+    ...(args.nowMs != null ? { nowMs: args.nowMs } : {}),
   });
   return settled.ok;
 }
@@ -287,19 +330,40 @@ export async function legacyRoundStillAllowed(args: {
  * 统一配额：提醒（通知）与「效果」类 kind
  * ------------------------------------------------------------------ */
 
-export type LegacyQuotaFailure = LegacyAutonomySkipReason | 'notifications_exhausted';
+export type LegacyQuotaFailure = LegacyAutonomySkipReason | 'notifications_exhausted' | 'external_quota_exhausted' | 'boundary_changed';
+
+/** 授权窗口的当日已用（`/external/*` 也用这张表；0 = 还没有记录）。 */
+async function readExternalUsage(args: {
+  db: LifeDb;
+  ownerId: string;
+  dayKey: string;
+  provider: 'amap' | 'xhs';
+}): Promise<number> {
+  const row = await args.db
+    .prepare('SELECT used FROM autonomy_life_external_usage WHERE owner_id = ? AND day_key = ? AND provider = ?')
+    .bind(args.ownerId, args.dayKey, args.provider)
+    .first()
+    .catch(() => null);
+  const used = Number(row?.used ?? 0);
+  return Number.isFinite(used) && used > 0 ? used : 0;
+}
 
 /**
- * 在统一账本里**原子**占用一格配额（不涉及模型调用）。
+ * 在统一账本里**原子**核销一格配额（不涉及模型调用）。
  *
  *   - `notification: true` → 账号层 `notificationsPerDay`（多角色共享同一格）；
- *   - `kind: 'travel.wish'` → 角色层 `perKindActionsPerDay` + kind 计数。
+ *   - `kind: 'travel.wish'` → 角色层 `perKindActionsPerDay` + kind 计数，
+ *     并且必须当前仍有未过期的 amap 授权、授权窗口的当日额度还有余量。
  *
  * 为什么必须走统一账本：旧链路（AIRP 回合的提醒、出行愿望）以前只读自己的旧开关，
- * 于是「新设置里通知关掉 / 额度用完」根本挡不住它。这里把「判额 + 占额」放进
- * `reserveBudget` 的同一临界区（D1 侧是条件 UPDATE），并发下不会超额。
+ * 于是「新设置里通知关掉 / 额度用完 / 授权撤掉」根本挡不住它。
  *
- * 失败时不留下任何预算行/预留记录（`reserveBudget` 的既有语义）。
+ * 并发安全怎么来的：判额 + 占额 + **边界 revision / 暂停 / 授权**都在
+ * `consumeLegacyQuotaAtomic` 的**同一条条件语句**里（`store.ts`）。这里不再
+ * 「读完边界再写预算」——那正是上一轮被退回的竞态窗口（读完边界后用户收紧额度/暂停，
+ * 预算仍按旧值占格并放行）。
+ *
+ * 失败时不留下任何预算行/预留记录/效果记录（条件语句 0 行 = 零写入）。
  */
 async function chargeLegacyQuota(args: {
   db: LifeDb;
@@ -316,35 +380,70 @@ async function chargeLegacyQuota(args: {
   });
   if (!read.ok) return { ok: false, reason: read.reason };
   const boundary = read.boundary;
+  const kind = args.kind;
   // 边界本身先过一遍：暂停/关角色/kind 未授权时连额度都不该占。
-  const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
+  const denial = legacyBoundaryDenial(boundary, kind ?? LEGACY_AUTONOMY_KIND);
   if (denial) return { ok: false, reason: denial };
-
-  const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
-  if (!port.available()) return { ok: false, reason: 'budget_exhausted' };
-  const reserved = await reserveBudget(port, {
-    nowMs: args.nowMs,
-    windowTimezone: boundary.timezone,
-    accountId: args.ownerId,
-    charId: args.charId,
-    limits: boundary.limits,
-    // 只占「配额」，不占模型调用/ token：calls=0 / tokens=0 时 precheckBudget 不判这两维，
-    // 通知与 kind 计数各自按自己的额度判。
-    calls: 0,
-    tokens: 0,
-    ...(args.notification ? { notification: true } : {}),
-    ...(args.kind ? { kind: args.kind } : {}),
-    planRef: `legacy-quota:${args.kind ?? 'notification'}:${args.charId}`,
-  });
-  if (!reserved.ok) {
-    return {
-      ok: false,
-      reason: args.notification ? 'notifications_exhausted' : 'budget_exhausted',
-    };
+  if (kind) {
+    const grantDenial = legacyGrantDenial(boundary, kind, args.nowMs);
+    if (grantDenial) return { ok: false, reason: grantDenial };
   }
-  // 立刻结算这张「零调用」凭据：配额在预留时就已经记账（notifications / kindCounts），
-  // 结算只是把记录推进到 settled，避免留下一条无主的在途预留。
-  await settleBudget(port, reserved.grant, { requestStarted: true, actualTokens: 0 }).catch(() => undefined);
+
+  const windowId = windowIdAt({ now: () => args.nowMs }, boundary.timezone);
+  const kindLimit = boundary.limits.perKindActionsPerDay ?? DEFAULT_ACCOUNT_LIMITS.perKindActionsPerDay;
+  const notificationLimit = boundary.limits.notificationsPerDay ?? DEFAULT_ACCOUNT_LIMITS.notificationsPerDay;
+
+  // 授权窗口的每日额度（与 `/external/wish` 同口径）：先只读预判，避免白占 kind 名额；
+  // 真正的占用在核销之后用条件 UPDATE 原子扣（并发不会超卖）。
+  let grant: ReturnType<typeof effectiveGrantFor> = null;
+  let dayKey = '';
+  if (kind) {
+    const provider = KIND_GRANT_PROVIDER[kind];
+    if (provider) {
+      grant = effectiveGrantFor(boundary, provider, args.nowMs);
+      if (grant) {
+        dayKey = localDateKey(args.nowMs, boundary.timezone);
+        if (!(grant.dailyQuota > 0)) return { ok: false, reason: 'external_quota_exhausted' };
+        const used = await readExternalUsage({ db: args.db, ownerId: args.ownerId, dayKey, provider });
+        if (used >= grant.dailyQuota) return { ok: false, reason: 'external_quota_exhausted' };
+      }
+    }
+  }
+
+  const consumed = await consumeLegacyQuotaAtomic({
+    db: args.db,
+    ownerId: args.ownerId,
+    charId: args.charId,
+    windowId,
+    nowMs: args.nowMs,
+    expectedAccountRevision: boundary.accountRevision ?? null,
+    expectedCharacterRevision: boundary.characterRevision ?? null,
+    ...(args.notification ? { notificationLimit } : {}),
+    ...(kind ? { kind: { kind, limit: kindLimit } } : {}),
+    ...(kind && KIND_GRANT_PROVIDER[kind] ? { requireGrant: KIND_GRANT_PROVIDER[kind]! } : {}),
+  });
+  if (!consumed.ok) {
+    if (consumed.reason === 'notifications_exhausted') return { ok: false, reason: 'notifications_exhausted' };
+    if (consumed.reason === 'external_quota_exhausted') return { ok: false, reason: 'external_quota_exhausted' };
+    if (consumed.reason === 'boundary_changed') return { ok: false, reason: 'boundary_changed' };
+    if (consumed.reason === 'kind_exhausted') return { ok: false, reason: 'budget_exhausted' };
+    if (consumed.reason === 'invalid_input') return { ok: false, reason: 'budget_exhausted' };
+    return { ok: false, reason: 'budget_exhausted' };
+  }
+
+  // kind 名额已经占上；授权窗口的当日额度最后扣。扣不动 → 拒绝写效果（fail closed，
+  // 名额浪费一格是可接受的保守方向：宁可少发，也不越过授权窗口的限额）。
+  if (grant && dayKey) {
+    const quotaOk = await consumeExternalQuota({
+      db: args.db,
+      ownerId: args.ownerId,
+      dayKey,
+      provider: grant.provider,
+      limit: grant.dailyQuota,
+      nowMs: args.nowMs,
+    });
+    if (!quotaOk) return { ok: false, reason: 'external_quota_exhausted' };
+  }
   return { ok: true };
 }
 

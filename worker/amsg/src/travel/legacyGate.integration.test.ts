@@ -72,7 +72,23 @@ beforeEach(async () => {
   }
 });
 
-/** 新边界（账号 + 角色两行）。默认允许 interaction.message + travel.wish。 */
+/** 一条可用的 amap 外部授权（`travel.wish` 的硬前置，与 `/external/*` 同口径）。 */
+const amapGrant = (overrides: Record<string, unknown> = {}) => ({
+  provider: 'amap' as const,
+  scopes: ['read:geo'],
+  allowedHosts: ['restapi.amap.com'],
+  allowedMethods: ['GET'],
+  allowedFieldKeys: ['name'],
+  purpose: '出行天气与地点',
+  expiresAt: NOW + 86_400_000,
+  dailyQuota: 5,
+  ...overrides,
+});
+
+/**
+ * 新边界（账号 + 角色两行）。默认允许 interaction.message + travel.wish，
+ * 并带一条未过期的 amap 授权——`allowedKinds` 只表示「能力允许」，真正的对外授权是 grant。
+ */
 async function seedNewBoundary(overrides: Record<string, unknown> = {}) {
   const account = normalizeBoundary(
     {
@@ -80,6 +96,7 @@ async function seedNewBoundary(overrides: Record<string, unknown> = {}) {
       globalPaused: false,
       timezone: 'Asia/Shanghai',
       allowedKinds: ['interaction.message', 'travel.wish'],
+      externalGrants: [amapGrant()],
       limits: {
         accountModelCallsPerDay: 5,
         charModelCallsPerDay: 5,
@@ -207,6 +224,14 @@ describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () 
         await setTravelBudgetPaused(db, { userId: USER, paused: true, nowMs: NOW });
       },
     },
+    {
+      // allowedKinds 里有 travel.wish、旧出行开关也开着，但用户没给（或撤掉了）amap 授权。
+      name: '没有 amap 外部授权（allowedKinds 与旧出行设置都开着）',
+      seed: async () => {
+        await seedNewBoundary({ externalGrants: [] });
+        await seedTravelAuthorization();
+      },
+    },
   ];
 
   for (const scenario of denials) {
@@ -253,6 +278,229 @@ describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () 
     expect(counter.calls).toBe(0);
     expect(await countWishes()).toBe(0);
     expect(outcome.skipped).toContain('llm_unavailable');
+  });
+
+  it('amap 授权在排队后到期（执行时钟越过 expiresAt）→ 零模型请求、零愿望', async () => {
+    // 排队时还在有效期里（NOW + 1s），tick 执行时已经过期。
+    await seedNewBoundary({ externalGrants: [amapGrant({ expiresAt: NOW + 1000 })] });
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({
+      db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW + 60_000,
+    });
+    expect(access).toMatchObject({ ok: false, reason: 'grant_missing' });
+
+    const outcome = await runTravelTickForSubject(db, subject, {
+      ...buildWiring(counter, access),
+      now: () => NOW + 60_000,
+    });
+    expect(counter.calls).toBe(0);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped.length).toBeGreaterThan(0);
+  });
+
+  it('授权窗口额度为 0 → 模型可以问（统一预算还在），但愿望不落、kind 不占', async () => {
+    await seedNewBoundary({ externalGrants: [amapGrant({ dailyQuota: 0 })] });
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    // 授权存在（只是额度为 0）→ wiring 照装；额度在**效果核销**那一步才拦。
+    expect(access.ok).toBe(true);
+
+    const outcome = await runTravelTickForSubject(db, subject, buildWiring(counter, access));
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+    // 模型调用照常记账（不白嫖），kind 配额一格都没占。
+    const rows = await budgetRows();
+    const account = rows.find((row) => row.scope === 'account');
+    expect(Number(account?.used_calls)).toBe(1);
+  });
+
+  it('模型返回那一刻按下总暂停 → 零愿望（模型调用照常记账）', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(access.ok).toBe(true);
+
+    // 端口在**请求已经发出之后**、返回之前把用户按下的总暂停写进库（另一台设备）。
+    const rawPort = {
+      async choose() { counter.calls += 1; return { kind: 'wait' }; },
+      async proposeIntent() {
+        counter.calls += 1;
+        await lifeDb
+          .prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1, payload = json_set(payload, '$.globalPaused', json('true'))
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+          .bind(USER)
+          .run();
+        return { want: 'wander', wish: '想去公园走走' };
+      },
+      lastUsageTokens: () => 111,
+    };
+    const decisionPort = gateTravelDecisionPort(rawPort, {
+      db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW,
+    });
+    const wiring = {
+      now: () => NOW,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    };
+
+    const outcome = await runTravelTickForSubject(db, subject, wiring);
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+    const rows = await budgetRows();
+    const account = rows.find((row) => row.scope === 'account');
+    expect(Number(account?.used_calls)).toBe(1);
+    expect(Number(account?.reserved_calls)).toBe(0);
+  });
+
+  it('模型返回那一刻关掉角色 / 新增禁区 → 零愿望（同一效果门）', async () => {
+    const scenarios: Array<{ name: string; mutate: () => Promise<void> }> = [
+      {
+        name: '关角色',
+        mutate: async () => {
+          await lifeDb
+            .prepare(`UPDATE autonomy_life_boundaries
+                SET revision = revision + 1, payload = json_set(payload, '$.charEnabled', json('false'))
+                WHERE owner_id = ? AND scope = 'character' AND char_id = ?`)
+            .bind(USER, CHAR)
+            .run();
+        },
+      },
+      {
+        name: '新增禁区',
+        mutate: async () => {
+          await lifeDb
+            .prepare(`UPDATE autonomy_life_boundaries
+                SET revision = revision + 1, payload = json_set(payload, '$.avoidTopics', json('[\"前任\"]'))
+                WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .bind(USER)
+            .run();
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      await seedNewBoundary();
+      await seedTravelAuthorization();
+      await lifeDb.prepare('DELETE FROM travel_wishes').run().catch(() => undefined);
+      await lifeDb.prepare('DELETE FROM autonomy_life_budget').run().catch(() => undefined);
+      await lifeDb.prepare('DELETE FROM autonomy_life_budget_reservations').run().catch(() => undefined);
+      const counter = { calls: 0 };
+      const rawPort = {
+        async choose() { return { kind: 'wait' }; },
+        async proposeIntent() {
+          counter.calls += 1;
+          await scenario.mutate();
+          return { want: 'wander', wish: '想去公园走走' };
+        },
+        lastUsageTokens: () => 77,
+      };
+      const decisionPort = gateTravelDecisionPort(rawPort, {
+        db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW,
+      });
+      const outcome = await runTravelTickForSubject(db, subject, {
+        now: () => NOW,
+        providers: [],
+        region: 'CN' as const,
+        readAnchor: async () => anchor,
+        decisionPort,
+        intentWindowMs: 3 * 60 * 60 * 1000,
+      });
+      expect(counter.calls, scenario.name).toBe(1);
+      expect(await countWishes(), scenario.name).toBe(0);
+      expect(outcome.skipped, scenario.name).toContain('llm_unavailable');
+    }
+  });
+
+  it('模型返回那一刻撤掉 amap 授权 → 零愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(access.ok).toBe(true);
+
+    const rawPort = {
+      async choose() { return { kind: 'wait' }; },
+      async proposeIntent() {
+        counter.calls += 1;
+        await lifeDb
+          .prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1, payload = json_remove(payload, '$.externalGrants')
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+          .bind(USER)
+          .run();
+        return { want: 'wander', wish: '想去公园走走' };
+      },
+      lastUsageTokens: () => 90,
+    };
+    const decisionPort = gateTravelDecisionPort(rawPort, {
+      db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW,
+    });
+
+    await runTravelTickForSubject(db, subject, {
+      now: () => NOW,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    });
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+  });
+
+  it('模型回来后结算失败（存储异常）→ fail closed：零愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    let broken = false;
+    const failingDb = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (text.includes('SET used_calls = ?')) {
+          broken = true;
+          throw new Error('d1 write exploded');
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(failingDb);
+    const counter = { calls: 0 };
+    const decisionPort = gateTravelDecisionPort(
+      {
+        async choose() { return { kind: 'wait' }; },
+        async proposeIntent() { counter.calls += 1; return { want: 'wander', wish: '想去公园走走' }; },
+        lastUsageTokens: () => 50,
+      },
+      { db: failingDb, ownerId: USER, charId: CHAR, now: () => NOW },
+    );
+
+    const outcome = await runTravelTickForSubject(db, subject, {
+      now: () => NOW,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    });
+    expect(counter.calls).toBe(1);
+    expect(broken).toBe(true);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+    // 凭据不会被释放（请求确实发出去了）：D1 没有跨语句事务，预算行写失败时凭据可能
+    // 已被推进到 settled / 仍停在 held，两种都是「不可再用」的保守状态——留给对账，
+    // 不是「账记了但没产物」。
+    const record = await lifeDb
+      .prepare('SELECT state FROM autonomy_life_budget_reservations WHERE owner_id = ?')
+      .bind(USER)
+      .first();
+    expect(['held', 'settled']).toContain(record?.state);
   });
 
   it('允许时：模型调用进统一预算（used_calls + usage），愿望落一条', async () => {
