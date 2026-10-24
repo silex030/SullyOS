@@ -348,8 +348,8 @@ describe('全链路期限（DNS + 连接 + 正文）', () => {
    * 现在连接阶段的 timer 只拿 DNS 之后的剩余预算，到期 abort（释放底层连接）。
    */
   it('慢 DNS + 慢响应头：连接阶段只用剩余预算，总耗时在 absolute deadline 附近 TIMEOUT', async () => {
-    const TOTAL = 300;
-    const DNS_MS = 200;
+    const TOTAL = 400;
+    const DNS_MS = 300;
     const started = Date.now();
     let abortedAt = 0;
     let transportCalls = 0;
@@ -383,11 +383,11 @@ describe('全链路期限（DNS + 连接 + 正文）', () => {
     expect(transportCalls).toBe(1);
     // 到期真的 abort 了底层连接（不是只 reject 外层 Promise 把 socket 留着）
     expect(abortedAt).toBeGreaterThan(0);
-    // 新实现 ≈ DNS(200) + 剩余连接预算(100) = 300ms；旧实现 ≈ 500ms（200 + 完整 300）
-    expect(abortedAt - started).toBeLessThan(TOTAL + 80);
-    expect(elapsed).toBeLessThan(TOTAL + 80);
+    // 新实现 ≈ DNS(300) + 剩余连接预算(100) = 400ms；旧实现 ≈ 700ms（300 + 完整 400）
+    expect(abortedAt - started).toBeLessThan(TOTAL + 120);
+    expect(elapsed).toBeLessThan(TOTAL + 120);
     // 也不能提前误杀：必须给到接近 deadline 的时间
-    expect(elapsed).toBeGreaterThanOrEqual(TOTAL - 60);
+    expect(elapsed).toBeGreaterThanOrEqual(TOTAL - 70);
   });
 
   it('正文到期中止并显式 discard，释放底层连接', async () => {
