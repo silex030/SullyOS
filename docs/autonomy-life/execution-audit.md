@@ -252,3 +252,6 @@ worker/amsg/src/autonomyScheduler.test.ts
 
 说明：`vitest-full.log` 是完整的原始 stdout（600+ KB），不是手工汇总；两次全量分别跑在
 04:05 与 04:46，均一次全通过，没有再出现首次交付时那两条负载敏感用例的偶发失败。
+
+验证跑在提交 **`98e570dd`** 的内容上（提交前工作树与提交内容一致；此后仅本文件与
+`runtime-audit.md` 的文档更新）。
