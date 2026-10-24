@@ -257,6 +257,14 @@ interface CommonWriteArgs {
   permit?: LocalPermitRecord | null;
   /** 没带许可时的强制开关：只有明确的系统内务（如退款补偿）才允许跳过。 */
   allowPermitless?: boolean;
+  /**
+   * 参与许可/回执签名的那组参数。缺省 = `args`。
+   *
+   * 为什么需要分开：外部只读这类动作的「参数」包含**读取结果**（items/fetchedAt），
+   * 那是输出不是输入；许可签的必须是模型给的 query/fields。签名与幂等都用这一份，
+   * 业务记录本身仍存完整结果。
+   */
+  signedArgs?: Record<string, unknown>;
 }
 
 /**
@@ -284,7 +292,7 @@ async function commitWithReceipt(
   stores: readonly string[],
   body: (tx: LocalTx, ctx: { argsHash: string }) => Promise<{ resultRef: string; stores: Array<{ store: string; key: string }> }>,
 ): Promise<LocalWriteOutcome> {
-  const argsHash = hashOf(args.args);
+  const argsHash = hashOf(args.signedArgs ?? args.args);
   // 许可核销必须和业务写在同一个事务里，所以事务范围要显式带上许可 store。
   const txStores = args.permit ? [...stores, PERMIT_STORE] : stores;
   if (!args.permit && !args.allowPermitless) {
@@ -486,6 +494,72 @@ export async function writePhoneRecord(port: LocalDbPort, input: PhoneRecordArgs
       /** 显著标记：这是 OS 内的角色生活模拟，不是用户真实通讯记录。 */
       simulated: true,
       label: '角色生活模拟',
+    };
+    await tx.put('autonomy_local_life', record);
+    return { resultRef: `autonomy_local_life:${recordId}`, stores: [{ store: 'autonomy_local_life', key: recordId }] };
+  });
+}
+
+// ─── 外部只读窗口 / 出行愿望 ───────────────────────────────────────────────
+
+export interface ExternalResultArgs extends CommonWriteArgs {
+  args: {
+    charId: string;
+    provider: 'xhs' | 'amap';
+    query: string;
+    /** 受控字段投影后的结果（只有白名单字段，已截断）。 */
+    items: Array<Record<string, string | number>>;
+    fetchedAt: number;
+    /** 本次读取的授权 id（审计用）。 */
+    grantId: string;
+  };
+}
+
+/**
+ * 外部只读读取的本地落库：**只存受控投影**（白名单字段、已截断），不存原始响应。
+ * 与其它业务写一样：许可核销 + 业务记录 + 回执同一事务。
+ */
+export async function writeExternalRead(port: LocalDbPort, input: ExternalResultArgs): Promise<LocalWriteOutcome> {
+  const recordId = `external_read_${input.actionId}`;
+  return commitWithReceipt(port, input, ['autonomy_local_life', 'autonomy_action_receipts'], async (tx) => {
+    const record = {
+      id: recordId,
+      kind: 'external_read',
+      charId: input.args.charId,
+      provider: input.args.provider,
+      query: input.args.query,
+      items: input.args.items,
+      fetchedAt: input.args.fetchedAt,
+      grantId: input.args.grantId,
+      actionId: input.actionId,
+      timestamp: input.nowMs,
+      /** 外部内容：明确标来源与「只读」性质，不与角色本地生活混为一谈。 */
+      source: 'external_read_only',
+      simulated: false,
+    };
+    await tx.put('autonomy_local_life', record);
+    return { resultRef: `autonomy_local_life:${recordId}`, stores: [{ store: 'autonomy_local_life', key: recordId }] };
+  });
+}
+
+export interface TravelWishArgs extends CommonWriteArgs {
+  args: { charId: string; text: string; wishId: string; grantId: string };
+}
+
+/** 出行愿望：不是「外部写」，只是交给出行状态机的待选池；同样同事务写回执。 */
+export async function writeTravelWish(port: LocalDbPort, input: TravelWishArgs): Promise<LocalWriteOutcome> {
+  const recordId = `travel_wish_${input.actionId}`;
+  return commitWithReceipt(port, input, ['autonomy_local_life', 'autonomy_action_receipts'], async (tx) => {
+    const record = {
+      id: recordId,
+      kind: 'travel_wish',
+      charId: input.args.charId,
+      text: input.args.text,
+      wishId: input.args.wishId,
+      grantId: input.args.grantId,
+      actionId: input.actionId,
+      timestamp: input.nowMs,
+      source: 'autonomy_life',
     };
     await tx.put('autonomy_local_life', record);
     return { resultRef: `autonomy_local_life:${recordId}`, stores: [{ store: 'autonomy_local_life', key: recordId }] };

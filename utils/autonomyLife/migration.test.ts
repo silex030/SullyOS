@@ -114,3 +114,36 @@ describe('迁移 autonomy-life-v1（§9）', () => {
     expect(result.boundary.allowedKinds).not.toContain('external.read');
   });
 });
+
+describe('迁移 · 不扩权（allowedKinds 只做缩减）', () => {
+  it('旧配置没开 → 一个 kind 都不授予（打开后由用户逐项选）', () => {
+    const result = migrateLegacyAutonomyConfig({
+      nowMs: NOW,
+      timezone: 'Asia/Shanghai',
+      legacy: legacy({ enabled: false }),
+    });
+    expect(result.boundary.allowedKinds).toEqual([]);
+    expect(result.notes.join('\n')).toContain('不授予任何活动');
+  });
+
+  it('旧配置带能力清单 → 与首期内部能力取交集，不认识的/外部窗口一律不授予', () => {
+    const result = migrateLegacyAutonomyConfig({
+      nowMs: NOW,
+      timezone: 'Asia/Shanghai',
+      legacy: legacy({ capabilities: ['journal.write', 'external.read', 'phone.record', 'real_payment'] }),
+    });
+    expect(result.boundary.allowedKinds).toEqual(['journal.write', 'phone.record']);
+    expect(result.boundary.allowedKinds).not.toContain('external.read');
+    expect(result.notes.join('\n')).toContain('取交集');
+  });
+
+  it('调用方传入的 legacyAllowedKinds 与旧配置里的 capabilities 同口径（都只做交集）', () => {
+    const result = migrateLegacyAutonomyConfig({
+      nowMs: NOW,
+      timezone: 'Asia/Shanghai',
+      legacy: legacy({ capabilities: undefined }),
+      legacyAllowedKinds: ['room.note', 'travel.wish'],
+    });
+    expect(result.boundary.allowedKinds).toEqual(['room.note']);
+  });
+});

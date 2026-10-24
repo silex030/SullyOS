@@ -248,7 +248,8 @@ export const KIND_ARG_SCHEMA: Record<ActivityKind, ArgSpec> = {
   },
   'external.read': {
     required: ['query'],
-    optional: ['provider', 'maxNotes'],
+    // fields：只允许请求白名单里的回传字段（服务端还会再投影一次）。
+    optional: ['provider', 'maxNotes', 'fields'],
   },
 };
 

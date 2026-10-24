@@ -473,3 +473,197 @@ describe('端到端：时间与存储一致性', () => {
     expect(h.store.actions.size).toBe(1);
   });
 });
+
+describe('受控外部只读窗口（external.read / travel.wish）', () => {
+  const externalBoundary = (over: Partial<EffectiveBoundaryV1> = {}): EffectiveBoundaryV1 => ({
+    ...boundary,
+    allowedKinds: ['external.read', 'travel.wish'],
+    externalGrants: [
+      {
+        provider: 'xhs',
+        scopes: ['read:search'],
+        allowedHosts: ['xhs.example'],
+        allowedMethods: ['GET'],
+        allowedFieldKeys: ['query'],
+        purpose: '兴趣浏览',
+        expiresAt: NOW + 3_600_000,
+        dailyQuota: 3,
+      },
+      {
+        provider: 'amap',
+        scopes: ['read:geo'],
+        allowedHosts: ['amap.example'],
+        allowedMethods: ['GET'],
+        allowedFieldKeys: ['query'],
+        purpose: '出行愿望',
+        expiresAt: NOW + 3_600_000,
+        dailyQuota: 3,
+      },
+    ],
+    ...over,
+  });
+
+  const fakeExternal = (over: Partial<{ readOk: boolean; wishOk: boolean }> = {}) => {
+    const calls: Array<Record<string, unknown>> = [];
+    const port = {
+      read: async (input: { provider: string; query: string; fields: readonly string[] }) => {
+        calls.push({ op: 'read', ...input });
+        if (over.readOk === false) return { ok: false as const, code: 'SERVICE_UNAVAILABLE' as const, reason: 'external_fetch_failed' };
+        return { ok: true as const, items: [{ title: '咖啡探店', excerpt: '街角小店', author: 'someone', likes: 12 }], fetchedAt: NOW };
+      },
+      submitWish: async (input: { charId: string; text: string }) => {
+        calls.push({ op: 'wish', ...input });
+        if (over.wishOk === false) return { ok: false as const, code: 'SERVICE_UNAVAILABLE' as const, reason: 'wish_store_failed' };
+        return { ok: true as const, wishId: 'wish-1' };
+      },
+    };
+    return { port, calls };
+  };
+
+  async function externalAction(kind: 'external.read' | 'travel.wish', args: Record<string, unknown>) {
+    return {
+      ...buildActionRow({
+        charId: CHAR,
+        chosen: {
+          kind,
+          semanticPurpose: kind === 'external.read' ? 'look_around' : 'travel_wish',
+          purposeKey: `k-${kind}`,
+          args,
+          reasonSummary: '想看看',
+          candidate: CANDIDATES[0],
+        },
+        nowMs: NOW,
+        budgetWindowId: 'w:2026-10-24',
+        reservationId: 'rsv-ext',
+        policyVersion: 'autonomy-life-v1',
+        tz: TZ,
+        installationId: 'install-e2e',
+        online: true,
+      }),
+      status: 'running' as const,
+      leaseEpoch: 1,
+      permitIssuedAt: NOW,
+      permitNonce: `nonce-${kind}`,
+      leaseExpiresAt: NOW + 60_000,
+    };
+  }
+
+  const permitForAction = (action: ActionRow): ExecutionPermit => ({
+    actionId: action.id,
+    charId: CHAR,
+    installationId: 'install-e2e',
+    leaseEpoch: 1,
+    argsHash: hashArgs(action.args),
+    policyVersion: action.policyVersion,
+    reservationId: 'rsv-ext',
+    nonce: action.permitNonce ?? 'nonce',
+    issuedAt: NOW,
+    expiresAt: NOW + 60_000,
+  });
+
+  async function localLifeRows(): Promise<Array<Record<string, unknown>>> {
+    return port.runTransaction(['autonomy_local_life'], 'readonly', async (tx) => tx.getAll('autonomy_local_life'));
+  }
+
+  it('授权有效：读到的结果只存白名单字段，并落回执', async () => {
+    const h = harness();
+    const args = { query: '咖啡探店', fields: ['title', 'excerpt', 'author', 'likes', 'url', 'phoneNumber'] };
+    const action = await externalAction('external.read', args);
+    const { port: ext, calls } = fakeExternal();
+    const result = await runLocalAction({
+      deps: h.deps,
+      port,
+      action,
+      installationId: 'install-e2e',
+      nowMs: NOW,
+      policyVersion: action.policyVersion,
+      permit: permitForAction(action),
+      boundaryFor: async () => externalBoundary(),
+      external: ext,
+    });
+    expect(result.status).toBe('succeeded');
+    expect(calls[0]).toMatchObject({ op: 'read', provider: 'xhs', query: '咖啡探店' });
+    // 越权字段（phoneNumber）不会发给外部服务。
+    expect((calls[0].fields as string[]).includes('phoneNumber')).toBe(false);
+
+    const rows = await localLifeRows();
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ kind: 'external_read', provider: 'xhs', source: 'external_read_only' });
+    expect(await readReceipt(port, action.id)).not.toBeNull();
+    expect(await diaryCount()).toBe(0); // 外部读取不写日记
+  });
+
+  it('授权过期 → GRANT_REQUIRED，端口不被调用、零本地写入', async () => {
+    const h = harness();
+    const args = { query: '咖啡探店' };
+    const action = await externalAction('external.read', args);
+    const expired = externalBoundary({
+      externalGrants: [{
+        provider: 'xhs', scopes: ['read:search'], allowedHosts: ['xhs.example'], allowedMethods: ['GET'],
+        allowedFieldKeys: ['query'], purpose: '兴趣', expiresAt: NOW - 1, dailyQuota: 3,
+      }],
+    });
+    const { port: ext, calls } = fakeExternal();
+    const result = await runLocalAction({
+      deps: h.deps,
+      port,
+      action,
+      installationId: 'install-e2e',
+      nowMs: NOW,
+      policyVersion: action.policyVersion,
+      permit: permitForAction(action),
+      boundaryFor: async () => expired,
+      external: ext,
+    });
+    expect(result).toMatchObject({ status: 'failed', code: 'GRANT_REQUIRED' });
+    expect(calls.length).toBe(0);
+    expect(await localLifeRows()).toEqual([]);
+    expect(await readReceipt(port, action.id)).toBeNull();
+  });
+
+  it('外部端口未配置 → CAPABILITY_UNAVAILABLE（不假装读到）', async () => {
+    const h = harness();
+    const action = await externalAction('external.read', { query: '咖啡探店' });
+    const result = await runLocalAction({
+      deps: h.deps,
+      port,
+      action,
+      installationId: 'install-e2e',
+      nowMs: NOW,
+      policyVersion: action.policyVersion,
+      permit: permitForAction(action),
+      boundaryFor: async () => externalBoundary(),
+      external: null,
+    });
+    expect(result).toMatchObject({ status: 'failed', code: 'CAPABILITY_UNAVAILABLE' });
+    expect(await localLifeRows()).toEqual([]);
+    expect(await readReceipt(port, action.id)).toBeNull();
+  });
+
+  it('出行愿望：提交成功才落本地记录；失败不写', async () => {
+    const h = harness();
+    const args = { wishText: '想去海边看一次日出' };
+    const action = await externalAction('travel.wish', args);
+
+    const okPort = fakeExternal();
+    const ok = await runLocalAction({
+      deps: h.deps, port, action, installationId: 'install-e2e', nowMs: NOW,
+      policyVersion: action.policyVersion, permit: permitForAction(action),
+      boundaryFor: async () => externalBoundary(), external: okPort.port,
+    });
+    expect(ok.status).toBe('succeeded');
+    const rows = await localLifeRows();
+    expect(rows[0]).toMatchObject({ kind: 'travel_wish', wishId: 'wish-1' });
+
+    // 换一个新 actionId 再跑失败分支（同一 actionId 会命中幂等回执）。
+    const failingAction = { ...action, id: `${action.id}_fail`, permitNonce: 'nonce-wish-fail' };
+    const failPort = fakeExternal({ wishOk: false });
+    const failed = await runLocalAction({
+      deps: h.deps, port, action: failingAction, installationId: 'install-e2e', nowMs: NOW,
+      policyVersion: failingAction.policyVersion, permit: permitForAction(failingAction),
+      boundaryFor: async () => externalBoundary(), external: failPort.port,
+    });
+    expect(failed.status).toBe('failed');
+    expect(await readReceipt(port, failingAction.id)).toBeNull();
+  });
+});

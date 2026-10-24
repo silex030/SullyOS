@@ -30,11 +30,13 @@ import { toLocalPermit } from './executionPermit';
 import {
   placeSimulatedOrder,
   refundSimulatedOrder,
+  writeExternalRead,
   writeInteractionMessage,
   writeJournalEntry,
   writePhoneRecord,
   writeRoomNote,
   writeRoomPlan,
+  writeTravelWish,
   type LocalDbPort,
   type LocalWriteOutcome,
 } from './localLedger';
@@ -229,21 +231,59 @@ export function validateAndPrepare(input: AdapterIntentInput): AdapterValidateRe
   }
 
   if (input.kind === 'external.read') {
-    const grant = input.boundary.externalGrants.find((item) => item.provider === 'xhs');
+    // 授权必须**当前有效**：过期/撤销的 grant 不算（不只是「曾经给过」）。
+    const grant = input.boundary.externalGrants.find(
+      (item) => item.provider === 'xhs' && item.expiresAt > input.nowMs,
+    );
     if (!grant) return { ok: false, code: 'GRANT_REQUIRED', reason: 'grant_missing' };
-    const query = String(input.args.query ?? '');
+    const query = String(input.args.query ?? '').trim();
+    if (!query) return { ok: false, code: 'VALIDATION_FAILED', reason: 'query_required' };
+    if (query.length > EXTERNAL_MAX_QUERY_LEN) {
+      return { ok: false, code: 'VALIDATION_FAILED', reason: 'query_too_long' };
+    }
     // 只发用户允许的字段：查询词里出现聊天全文/地址/联系方式特征就拦。
     if (/(https?:\/\/|@|地址|电话|身份证|密码|token)/i.test(query)) {
       return { ok: false, code: 'POLICY_DENIED', reason: 'pii_in_query' };
     }
-    return { ok: true, args: input.args, prepared: { summary: `只读检索「${query.slice(0, 24)}」` } };
+    const requestedFields = Array.isArray(input.args.fields)
+      ? (input.args.fields as unknown[]).filter((item): item is string => typeof item === 'string')
+      : [];
+    // 授权里的 allowedFieldKeys 约束的是**外传内容**（本次只外传 query），不是回传字段。
+    if (grant.allowedFieldKeys.length > 0 && !grant.allowedFieldKeys.includes('query')) {
+      return { ok: false, code: 'GRANT_REQUIRED', reason: 'query_not_allowed_by_grant' };
+    }
+    // 回传字段 = 用户要求 ∩ 平台白名单（响应投影只发生在服务端，见 worker external.ts）。
+    const fields = (requestedFields.length ? requestedFields : [...EXTERNAL_FIELD_ALLOWLIST.xhs.slice(0, 4)])
+      .filter((field) => (EXTERNAL_FIELD_ALLOWLIST.xhs as readonly string[]).includes(field));
+    if (fields.length === 0) return { ok: false, code: 'VALIDATION_FAILED', reason: 'fields_not_allowed' };
+    // 注意：**不改写 args**。许可签的是模型给的参数；grant 绑定/字段投影是执行期的
+    // 派生身份信息，写进 args 会让「被批准的参数」与「实际参数」hash 错位。
+    return {
+      ok: true,
+      args: input.args,
+      prepared: {
+        summary: `只读检索「${query.slice(0, 24)}」`,
+        resourceHints: { provider: 'xhs', fields: fields.slice(0, EXTERNAL_MAX_FIELDS).join(','), grantExpiresAt: String(grant.expiresAt) },
+      },
+    };
   }
 
   if (input.kind === 'travel.wish') {
-    if (!grantActive(input.boundary, 'amap', input.nowMs)) {
-      return { ok: false, code: 'GRANT_REQUIRED', reason: 'grant_missing' };
-    }
-    return { ok: true, args: input.args, prepared: { summary: '提一个出行愿望，交给出行状态机推进' } };
+    const grant = input.boundary.externalGrants.find(
+      (item) => item.provider === 'amap' && item.expiresAt > input.nowMs,
+    );
+    if (!grant) return { ok: false, code: 'GRANT_REQUIRED', reason: 'grant_missing' };
+    const text = String(input.args.wishText ?? '').trim();
+    if (!text) return { ok: false, code: 'VALIDATION_FAILED', reason: 'wish_required' };
+    if (text.length > 200) return { ok: false, code: 'VALIDATION_FAILED', reason: 'wish_too_long' };
+    return {
+      ok: true,
+      args: input.args,
+      prepared: {
+        summary: '提一个出行愿望，交给出行状态机推进',
+        resourceHints: { provider: 'amap', grantExpiresAt: String(grant.expiresAt) },
+      },
+    };
   }
 
   const summaryByKind: Record<string, string> = {
@@ -256,11 +296,49 @@ export function validateAndPrepare(input: AdapterIntentInput): AdapterValidateRe
   return { ok: true, args: input.args, prepared: { summary: summaryByKind[input.kind] ?? input.kind } };
 }
 
+/** 外部只读窗口允许的字段（超出即拒；默认只取前 4 个）。 */
+export const EXTERNAL_FIELD_ALLOWLIST = {
+  xhs: ['title', 'excerpt', 'author', 'likes', 'url'],
+  amap: ['name', 'address', 'distanceM', 'category'],
+} as const;
+export const EXTERNAL_MAX_ITEMS = 5;
+export const EXTERNAL_MAX_FIELDS = 5;
+export const EXTERNAL_MAX_QUERY_LEN = 80;
+
+export type ExternalProvider = keyof typeof EXTERNAL_FIELD_ALLOWLIST;
+
+/**
+ * 受控外部窗口的端口。**真正的网络访问不在执行器里**：
+ *   - 浏览器执行器通过 worker 的 `/external/read` 走服务端白名单 fetch（SSRF 防线在服务端）；
+ *   - 本接口只负责「把投影后的结果拿回来」，不接触 URL，也没有任意抓取能力。
+ */
+export interface ExternalWindowPort {
+  read(input: {
+    provider: ExternalProvider;
+    query: string;
+    fields: readonly string[];
+    charId: string;
+    grantId: string;
+    nowMs: number;
+  }): Promise<
+    | { ok: true; items: Array<Record<string, string | number>>; fetchedAt: number }
+    | { ok: false; code: AutonomyLifeErrorCode; reason: string }
+  >;
+  submitWish(input: {
+    charId: string;
+    text: string;
+    grantId: string;
+    nowMs: number;
+  }): Promise<{ ok: true; wishId: string } | { ok: false; code: AutonomyLifeErrorCode; reason: string }>;
+}
+
 export interface ExecuteDeps {
   port: LocalDbPort;
   /** 策略版本：许可里绑定，执行时不许悄悄换。 */
   policyVersion: string;
   tz: string;
+  /** 外部窗口端口；缺省 = 未配置（明确不可执行，不假装做到）。 */
+  external?: ExternalWindowPort | null;
 }
 
 export type ExecuteOutcome =
@@ -363,15 +441,70 @@ export async function executeAction(
       }
       return fromLocalWrite(await placeSimulatedOrder(deps.port, { ...common, kind: ctx.kind, args }));
     }
-    case 'external.read':
-    case 'travel.wish':
-      // 外部窗口首期只做受控读取/愿望提交，执行端未接真实服务：明确不可执行。
-      return {
-        status: 'failed',
-        code: 'CAPABILITY_UNAVAILABLE',
-        message: 'external_window_not_implemented',
-        effectVerified: false,
-      };
+    case 'external.read': {
+      if (!deps.external) {
+        return { status: 'failed', code: 'CAPABILITY_UNAVAILABLE', message: 'external_window_unconfigured', effectVerified: false };
+      }
+      const args = ctx.args as unknown as { charId: string; query: string; fields?: string[] };
+      if (!args.charId || !args.query) {
+        return { status: 'failed', code: 'VALIDATION_FAILED', message: 'external_args_missing', effectVerified: false };
+      }
+      const provider: ExternalProvider = 'xhs';
+      const requested = Array.isArray(args.fields) ? args.fields : [];
+      const fields = (requested.length ? requested : [...EXTERNAL_FIELD_ALLOWLIST[provider].slice(0, 4)])
+        .filter((field) => (EXTERNAL_FIELD_ALLOWLIST[provider] as readonly string[]).includes(field));
+      const read = await deps.external.read({
+        provider,
+        query: args.query,
+        fields,
+        charId: args.charId,
+        // 授权 id 只作审计提示：真正的授权校验在 validateAndPrepare（现读边界）与服务端。
+        grantId: `grant:${provider}:${ctx.nowMs}`,
+        nowMs: ctx.nowMs,
+      });
+      if (!read.ok) {
+        return { status: 'failed', code: read.code, message: read.reason, effectVerified: false };
+      }
+      return fromLocalWrite(await writeExternalRead(deps.port, {
+        ...common,
+        kind: ctx.kind,
+        // 许可签的是模型给的 query/fields；读取结果只是业务记录，不参与签名。
+        signedArgs: ctx.args,
+        args: {
+          charId: args.charId,
+          provider,
+          query: args.query,
+          items: read.items,
+          fetchedAt: read.fetchedAt,
+          grantId: args.grantId,
+        },
+      }));
+    }
+    case 'travel.wish': {
+      if (!deps.external) {
+        return { status: 'failed', code: 'CAPABILITY_UNAVAILABLE', message: 'external_window_unconfigured', effectVerified: false };
+      }
+      const args = ctx.args as unknown as { charId: string; wishText?: string };
+      const text = String(args.wishText ?? '').trim();
+      if (!args.charId || !text) {
+        return { status: 'failed', code: 'VALIDATION_FAILED', message: 'wish_args_missing', effectVerified: false };
+      }
+      const wish = await deps.external.submitWish({
+        charId: args.charId,
+        text,
+        grantId: `grant:amap:${ctx.nowMs}`,
+        nowMs: ctx.nowMs,
+      });
+      if (!wish.ok) {
+        return { status: 'failed', code: wish.code, message: wish.reason, effectVerified: false };
+      }
+      return fromLocalWrite(await writeTravelWish(deps.port, {
+        ...common,
+        kind: ctx.kind,
+        signedArgs: ctx.args,
+        args: { charId: args.charId, text, wishId: wish.wishId, grantId: `grant:amap:${ctx.nowMs}` },
+      }));
+    }
     default:
       return { status: 'failed', code: 'CAPABILITY_UNAVAILABLE', message: 'unknown_kind', effectVerified: false };
   }

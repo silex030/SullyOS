@@ -40,6 +40,7 @@ import {
   type LifePhase,
   type LifeReasonCode,
   type AutonomyLifeErrorCode,
+  type ExecutionPermit,
 } from '../../contracts/autonomyLife';
 
 /** 逻辑基址之上的路径片段。集中一处，服务端路由若调整只改这里。 */
@@ -55,6 +56,12 @@ export const AUTONOMY_LIFE_PATHS = {
   cancel: (id: string) => `${AUTONOMY_LIFE_API_BASE}/actions/${encodeURIComponent(id)}/cancel`,
   resolveConfirmation: (id: string) =>
     `${AUTONOMY_LIFE_API_BASE}/confirmations/${encodeURIComponent(id)}/resolve`,
+  registerDevice: () => `${AUTONOMY_LIFE_API_BASE}/devices/register`,
+  claim: () => `${AUTONOMY_LIFE_API_BASE}/execution/claim`,
+  commitPermit: (id: string) => `${AUTONOMY_LIFE_API_BASE}/actions/${encodeURIComponent(id)}/commit-permit`,
+  receipt: (id: string) => `${AUTONOMY_LIFE_API_BASE}/actions/${encodeURIComponent(id)}/receipt`,
+  externalRead: () => `${AUTONOMY_LIFE_API_BASE}/external/read`,
+  externalWish: () => `${AUTONOMY_LIFE_API_BASE}/external/wish`,
 } as const;
 
 /** 客户端本地失败码（不是服务端错误码，永不发给服务端）。 */
@@ -159,6 +166,49 @@ export interface ConfirmationDecision {
   expectedRevision: number;
 }
 
+/** 服务端动作行（执行器需要完整字段才能跑本地事务；只做结构校验，不做业务解释）。 */
+export interface LifeActionWire {
+  id: string;
+  charId: string;
+  kind: ActivityKind;
+  status: ActionStatus;
+  args: Record<string, unknown>;
+  argsHash: string;
+  policyVersion: string;
+  leaseEpoch: number;
+  leaseExpiresAt: number | null;
+  permitIssuedAt: number | null;
+  permitNonce: string | null;
+  permitConsumedAt: number | null;
+  installationId: string | null;
+  revision: number;
+  windowId: string;
+  expiresAt: number;
+  [key: string]: unknown;
+}
+
+export interface ClaimPayload {
+  action: LifeActionWire | null;
+  leaseEpoch: number;
+  leaseExpiresAt: number | null;
+}
+
+export interface CommitPermitPayload {
+  permit: ExecutionPermit;
+  action: LifeActionWire;
+}
+
+export interface ReceiptPayload {
+  action: LifeActionWire;
+}
+
+export interface ExternalReadPayload {
+  provider: 'xhs' | 'amap';
+  fields: string[];
+  items: Array<Record<string, string | number>>;
+  fetchedAt: number;
+}
+
 export interface AutonomyLifeApi {
   readLife: (charId: string) => Promise<AutonomyLifeApiResult<LifeStatePayload>>;
   readBoundaries: (charId?: string) => Promise<AutonomyLifeApiResult<LifeBoundaryPayload>>;
@@ -180,6 +230,36 @@ export interface AutonomyLifeApi {
   resolveConfirmation: (
     decision: ConfirmationDecision,
   ) => Promise<AutonomyLifeApiResult<ActivityRecord>>;
+  /** 执行设备注册（幂等；换设备要显式，不自动抢占）。 */
+  registerDevice: (installationId: string) => Promise<AutonomyLifeApiResult<{ bindingState: string }>>;
+  /** 领取一个到点的动作（只登记，不产生副作用）。 */
+  claim: (charId: string, installationId: string) => Promise<AutonomyLifeApiResult<ClaimPayload>>;
+  /** 条件提交一次性许可：返回许可 + 提交后的动作行（执行器只能用这一份）。 */
+  commitPermit: (input: {
+    actionId: string;
+    installationId: string;
+    leaseEpoch: number;
+    argsHash: string;
+    policyVersion: string;
+  }) => Promise<AutonomyLifeApiResult<CommitPermitPayload>>;
+  /** 上报回执（成功/失败/未知都报；服务端按 argsHash + 安装校验）。 */
+  receipt: (input: {
+    actionId: string;
+    installationId: string;
+    leaseEpoch: number;
+    argsHash: string;
+    status: 'succeeded' | 'failed' | 'unknown';
+    resultRef?: string | null;
+    errorCode?: AutonomyLifeErrorCode;
+  }) => Promise<AutonomyLifeApiResult<ReceiptPayload>>;
+  /** 受控外部只读：服务端按白名单 fetch + 字段投影，客户端只拿投影后的结果。 */
+  externalRead: (input: {
+    charId: string;
+    query: string;
+    fields?: string[];
+  }) => Promise<AutonomyLifeApiResult<ExternalReadPayload>>;
+  /** 出行愿望：落到出行状态机的待选池（不是外部写）。 */
+  submitWish: (input: { charId: string; text: string }) => Promise<AutonomyLifeApiResult<{ wishId: string }>>;
 }
 
 // ── 形状校验 ────────────────────────────────────────────────────────────────
@@ -360,6 +440,40 @@ const readRetryAt = (body: unknown): number | undefined => {
   if (!isRecord(body) || !isRecord(body.error)) return undefined;
   const retryAt = body.error.retryAt;
   return isFiniteNumber(retryAt) ? retryAt : undefined;
+};
+
+
+/** 动作行的最小结构校验：执行器要拿它跑本地事务，形状不对一律 MALFORMED。 */
+const isLifeActionWire = (v: unknown): v is LifeActionWire => {
+  if (!isRecord(v)) return false;
+  if (typeof v.id !== 'string' || !v.id) return false;
+  if (typeof v.charId !== 'string' || !v.charId) return false;
+  if (!isActivityKind(v.kind)) return false;
+  if (typeof v.status !== 'string' || !(ACTION_STATUS_VALUES as readonly string[]).includes(v.status)) return false;
+  if (!isRecord(v.args)) return false;
+  if (typeof v.argsHash !== 'string' || !v.argsHash) return false;
+  if (typeof v.policyVersion !== 'string' || !v.policyVersion) return false;
+  if (!isFiniteNumber(v.leaseEpoch) || !isFiniteNumber(v.revision)) return false;
+  if (!isNullableNumber(v.leaseExpiresAt) || !isNullableNumber(v.permitIssuedAt)) return false;
+  if (!isNullableNumber(v.permitConsumedAt) || !isFiniteNumber(v.expiresAt)) return false;
+  if (typeof v.windowId !== 'string') return false;
+  if (v.permitNonce !== null && typeof v.permitNonce !== 'string') return false;
+  if (v.installationId !== null && typeof v.installationId !== 'string') return false;
+  return true;
+};
+
+const isExecutionPermit = (v: unknown): v is ExecutionPermit => {
+  if (!isRecord(v)) return false;
+  return typeof v.actionId === 'string' && v.actionId.length > 0
+    && typeof v.charId === 'string' && v.charId.length > 0
+    && typeof v.installationId === 'string' && v.installationId.length > 0
+    && typeof v.argsHash === 'string' && v.argsHash.length > 0
+    && typeof v.policyVersion === 'string' && v.policyVersion.length > 0
+    && typeof v.nonce === 'string' && v.nonce.length > 0
+    && isFiniteNumber(v.leaseEpoch)
+    && isFiniteNumber(v.issuedAt)
+    && isFiniteNumber(v.expiresAt)
+    && (v.reservationId === null || typeof v.reservationId === 'string');
 };
 
 export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeApi {
@@ -616,6 +730,130 @@ export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeAp
       const action = raw.data.action ?? raw.data;
       if (!isActivityRecord(action)) return malformed();
       return { ok: true, data: action };
+    },
+
+    registerDevice: async (installationId) => {
+      const id = String(installationId ?? '').trim();
+      if (!id) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'installationId_required' };
+      const raw = await request(AUTONOMY_LIFE_PATHS.registerDevice(), {
+        method: 'POST',
+        body: { installationId: id, capabilitiesVersion: 'autonomy-local-v1' },
+        purpose: '注册自主生活执行设备',
+        idempotent: true,
+      });
+      if (!raw.ok) return raw;
+      const bindingState = raw.data.bindingState;
+      if (typeof bindingState !== 'string') return malformed();
+      return { ok: true, data: { bindingState } };
+    },
+
+    claim: async (charId, installationId) => {
+      const id = String(charId ?? '').trim();
+      const device = String(installationId ?? '').trim();
+      if (!id || !device) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_and_installationId_required' };
+      const raw = await request(AUTONOMY_LIFE_PATHS.claim(), {
+        method: 'POST',
+        body: { charId: id, installationId: device, limit: 1 },
+        purpose: '领取一个自主动作',
+      });
+      if (!raw.ok) return raw;
+      const action = raw.data.action;
+      if (action === null) {
+        return { ok: true, data: { action: null, leaseEpoch: 0, leaseExpiresAt: null } };
+      }
+      if (!isLifeActionWire(action)) return malformed();
+      if (action.charId !== id) return malformed();
+      return {
+        ok: true,
+        data: {
+          action,
+          leaseEpoch: isFiniteNumber(raw.data.leaseEpoch) ? raw.data.leaseEpoch : action.leaseEpoch,
+          leaseExpiresAt: isNullableNumber(raw.data.leaseExpiresAt) ? raw.data.leaseExpiresAt : action.leaseExpiresAt,
+        },
+      };
+    },
+
+    commitPermit: async (input) => {
+      const raw = await request(AUTONOMY_LIFE_PATHS.commitPermit(input.actionId), {
+        method: 'POST',
+        body: {
+          installationId: input.installationId,
+          leaseEpoch: input.leaseEpoch,
+          argsHash: input.argsHash,
+          policyVersion: input.policyVersion,
+        },
+        purpose: '提交一次性执行许可',
+      });
+      if (!raw.ok) return raw;
+      const { permit, action } = raw.data;
+      if (!isExecutionPermit(permit) || !isLifeActionWire(action)) return malformed();
+      if (permit.actionId !== input.actionId || action.id !== input.actionId) return malformed();
+      if (permit.argsHash !== input.argsHash) return malformed();
+      return { ok: true, data: { permit, action } };
+    },
+
+    receipt: async (input) => {
+      const raw = await request(AUTONOMY_LIFE_PATHS.receipt(input.actionId), {
+        method: 'POST',
+        body: {
+          installationId: input.installationId,
+          leaseEpoch: input.leaseEpoch,
+          argsHash: input.argsHash,
+          status: input.status,
+          ...(input.resultRef !== undefined ? { resultRef: input.resultRef } : {}),
+          ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+        },
+        purpose: '上报自主动作回执',
+        idempotent: true,
+      });
+      if (!raw.ok) return raw;
+      const action = raw.data.action;
+      if (!isLifeActionWire(action)) return malformed();
+      if (action.id !== input.actionId) return malformed();
+      return { ok: true, data: { action } };
+    },
+
+    externalRead: async (input) => {
+      const charId = String(input.charId ?? '').trim();
+      const query = String(input.query ?? '').trim();
+      if (!charId || !query) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_and_query_required' };
+      const raw = await request(AUTONOMY_LIFE_PATHS.externalRead(), {
+        method: 'POST',
+        body: { charId, query, ...(input.fields ? { fields: input.fields } : {}) },
+        purpose: '外部只读检索',
+      });
+      if (!raw.ok) return raw;
+      const provider = raw.data.provider;
+      const items = raw.data.items;
+      const fields = raw.data.fields;
+      if (provider !== 'xhs' && provider !== 'amap') return malformed();
+      if (!Array.isArray(items) || !items.every(isRecord)) return malformed();
+      if (!Array.isArray(fields) || !fields.every((field) => typeof field === 'string')) return malformed();
+      if (!isFiniteNumber(raw.data.fetchedAt)) return malformed();
+      return {
+        ok: true,
+        data: {
+          provider,
+          fields: fields as string[],
+          items: items as Array<Record<string, string | number>>,
+          fetchedAt: raw.data.fetchedAt,
+        },
+      };
+    },
+
+    submitWish: async (input) => {
+      const charId = String(input.charId ?? '').trim();
+      const text = String(input.text ?? '').trim();
+      if (!charId || !text) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_and_text_required' };
+      const raw = await request(AUTONOMY_LIFE_PATHS.externalWish(), {
+        method: 'POST',
+        body: { charId, text },
+        purpose: '提交出行愿望',
+      });
+      if (!raw.ok) return raw;
+      const wishId = raw.data.wishId;
+      if (typeof wishId !== 'string' || !wishId) return malformed();
+      return { ok: true, data: { wishId } };
     },
   };
 }

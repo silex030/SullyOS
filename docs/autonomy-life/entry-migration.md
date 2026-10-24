@@ -1,9 +1,12 @@
 # 自主生活：入口迁移与验证说明（UI 卡 t_c621b16a）
 
 本卡把散落在角色设定页、设置页与若干 App 里的「自主功能」收敛成一个入口，并按
-`autonomous-life-contract-v1.md` §8 接入 `/autonomy-life/v1`。**这里不含真实联调结果**：
-后端 D1 端口与 worker 路由尚未接线（见引擎卡 t_62985966 的已知限制），所以界面在未配置
-worker 地址时按 fail-closed 显示「状态暂无法确认」，不会退化成演示数据。
+`autonomous-life-contract-v1.md` §8 接入 `/autonomy-life/v1`。
+
+> 2026-10-24 整改卡 t_984b3cfc 已把后端接通：D1 端口、worker 路由、cron 调度、浏览器
+> 执行器与回执都在 `worker/amsg/src/autonomyLife/` 与 `utils/autonomyLife/` 里，边界与
+> 证据见 [`execution-audit.md`](./execution-audit.md)。未配置 worker 地址时仍按
+> fail-closed 显示「状态暂无法确认」，不会退化成演示数据。
 
 ## 1. 入口迁移
 

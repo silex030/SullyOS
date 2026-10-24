@@ -311,3 +311,88 @@ describe('自主生活客户端 · 查询参数', () => {
     expect(q.get('charId')).toBe('char-1');
   });
 });
+
+describe('自主生活客户端 · 执行链（claim / permit / receipt）', () => {
+  const wireAction = (over: Record<string, unknown> = {}) => ({
+    id: 'act-1',
+    charId: 'char-1',
+    kind: 'journal.write',
+    status: 'running',
+    args: { title: '今天', body: '雨停了。' },
+    argsHash: 'hash-1',
+    policyVersion: 'autonomy-life-v1',
+    leaseEpoch: 2,
+    leaseExpiresAt: 1_793_000_060_000,
+    permitIssuedAt: 1_793_000_000_000,
+    permitNonce: 'nonce-1',
+    permitConsumedAt: null,
+    installationId: 'inst-1',
+    revision: 3,
+    windowId: 'w:2026-10-24',
+    expiresAt: 1_793_021_600_000,
+    ...over,
+  });
+  const permit = {
+    actionId: 'act-1',
+    charId: 'char-1',
+    installationId: 'inst-1',
+    leaseEpoch: 2,
+    argsHash: 'hash-1',
+    policyVersion: 'autonomy-life-v1',
+    reservationId: 'rsv-1',
+    nonce: 'nonce-1',
+    issuedAt: 1_793_000_000_000,
+    expiresAt: 1_793_000_060_000,
+  };
+
+  it('claim 带上 installationId；没有动作时返回 null 而不是报错', async () => {
+    const { api, transport } = makeApi(() => jsonResponse(envelope({ action: null, leaseEpoch: 0, leaseExpiresAt: null })));
+    const res = await api.claim('char-1', 'inst-1');
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.data.action).toBeNull();
+    const [url, init] = transport.mock.calls[0] as unknown as [string, { body: string }];
+    expect(url).toContain('/execution/claim');
+    expect(JSON.parse(init.body)).toMatchObject({ charId: 'char-1', installationId: 'inst-1' });
+  });
+
+  it('claim 回一个别的角色的动作 → MALFORMED（不能替别人执行）', async () => {
+    const { api } = makeApi(() => jsonResponse(envelope({ action: wireAction({ charId: 'char-2' }), leaseEpoch: 2 })));
+    const res = await api.claim('char-1', 'inst-1');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe('MALFORMED_RESPONSE');
+  });
+
+  it('commit-permit 只接受同一个 actionId / argsHash 的回包', async () => {
+    const ok = makeApi(() => jsonResponse(envelope({ permit, action: wireAction() })));
+    expect((await ok.api.commitPermit({ actionId: 'act-1', installationId: 'inst-1', leaseEpoch: 2, argsHash: 'hash-1', policyVersion: 'autonomy-life-v1' })).ok).toBe(true);
+
+    const wrongHash = makeApi(() => jsonResponse(envelope({ permit: { ...permit, argsHash: 'other' }, action: wireAction() })));
+    const res = await wrongHash.api.commitPermit({ actionId: 'act-1', installationId: 'inst-1', leaseEpoch: 2, argsHash: 'hash-1', policyVersion: 'autonomy-life-v1' });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe('MALFORMED_RESPONSE');
+  });
+
+  it('receipt 自动带 Idempotency-Key，且只收本动作的回执', async () => {
+    const { api, transport } = makeApi(() => jsonResponse(envelope({ action: wireAction({ status: 'succeeded', permitConsumedAt: 1_793_000_010_000 }) })));
+    const res = await api.receipt({
+      actionId: 'act-1', installationId: 'inst-1', leaseEpoch: 2, argsHash: 'hash-1', status: 'succeeded', resultRef: 'diaries:1',
+    });
+    expect(res.ok).toBe(true);
+    const [, init] = transport.mock.calls[0] as unknown as [string, { headers?: Record<string, string>; body: string }];
+    expect(init.headers?.['Idempotency-Key']).toBeTruthy();
+    expect(JSON.parse(init.body)).toMatchObject({ installationId: 'inst-1', argsHash: 'hash-1', resultRef: 'diaries:1' });
+
+    const mismatch = makeApi(() => jsonResponse(envelope({ action: wireAction({ id: 'act-other' }) })));
+    const bad = await mismatch.api.receipt({ actionId: 'act-1', installationId: 'inst-1', leaseEpoch: 2, argsHash: 'hash-1', status: 'succeeded', resultRef: 'x' });
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.code).toBe('MALFORMED_RESPONSE');
+  });
+
+  it('设备注册缺 installationId 时不发请求', async () => {
+    const { api, transport } = makeApi(() => jsonResponse(envelope({ bindingState: 'bound' })));
+    const res = await api.registerDevice('   ');
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe('NOT_CONFIGURED');
+    expect(transport).not.toHaveBeenCalled();
+  });
+});

@@ -13,6 +13,7 @@
 
 import {
   AUTONOMY_LIFE_SCHEMA_VERSION,
+  CORE_ACTIVITY_KINDS,
   CURRENCY_DEFAULT,
   DEFAULT_ACCOUNT_LIMITS,
   MAXIMUM_ACCOUNT_LIMITS,
@@ -53,12 +54,19 @@ export interface LegacyAutonomyConfig {
   calendarSyncEnabled?: boolean;
   xhsCredentialsPresent?: boolean;
   mapQuotaPerDay?: number;
+  /** 旧版逐项能力开关（有的老版本存过）；只取与首期内部能力的交集。 */
+  capabilities?: string[];
 }
 
 export interface MigrationInput {
   nowMs: number;
   timezone: string;
   legacy: unknown;
+  /**
+   * 调用方知道的「旧版允许的活动清单」（例如旧配置里的 capabilities）。给了就只取
+   * 交集：迁移绝不因为「新系统支持更多 kind」而替用户打开没开过的能力。
+   */
+  legacyAllowedKinds?: readonly string[];
   /** 已存在边界（非 null）= 已经迁移过；原样返回，不动预算/开关。 */
   existingBoundary?: BoundaryV1 | null;
 }
@@ -171,17 +179,37 @@ export function migrateLegacyAutonomyConfig(input: MigrationInput): MigrationRes
   if (accountTokens !== undefined) limits.accountTokensPerDay = accountTokens;
   if (notifications !== undefined) limits.notificationsPerDay = notifications;
 
+  // K5 + 不扩权：开关原值保留（默认关）；allowedKinds 只做**缩减**——
+  //   - 旧配置没开 → 一个 kind 都不授予（打开后由用户在边界里逐项选）；
+  //   - 旧配置开了且有清单 → 与首期内部能力取交集（外部窗口仍需单独授权）；
+  //   - 旧配置开了但没有清单 → 按首期内部能力迁移（并在 notes 里说明口径）。
+  const legacyEnabled = legacyRaw.enabled === true;
+  const legacyKindsRaw = Array.isArray(legacyRaw.capabilities)
+    ? legacyRaw.capabilities
+    : input.legacyAllowedKinds;
+  const legacyKinds = Array.isArray(legacyKindsRaw)
+    ? legacyKindsRaw.filter((item): item is string => typeof item === 'string')
+    : null;
+  const allowedKinds = !legacyEnabled
+    ? []
+    : legacyKinds
+      ? CORE_ACTIVITY_KINDS.filter((kind) => legacyKinds.includes(kind))
+      : [...CORE_ACTIVITY_KINDS];
+  if (!legacyEnabled) {
+    notes.push('旧配置未开启自主生活：迁移不授予任何活动；打开总开关后请在边界里逐项选择。');
+  } else if (legacyKinds) {
+    notes.push(`旧能力清单与首期内部能力取交集，结果为：${allowedKinds.join(' / ') || '（空）'}；外部窗口仍需单独授权。`);
+  } else {
+    notes.push('旧配置没有逐项能力清单：按首期内部能力迁移，外部窗口仍需单独授权。');
+  }
+
   const boundaryRaw = {
-    // K5：开关/暂停原值保留，绝不因为升级而自动开启。
-    enabled: typeof legacyRaw.enabled === 'boolean' ? legacyRaw.enabled : false,
+    enabled: legacyEnabled,
     globalPaused: legacyRaw.paused === true,
-    charEnabled: typeof legacyRaw.enabled === 'boolean' ? legacyRaw.enabled : false,
+    charEnabled: legacyEnabled,
     timezone: input.timezone,
-    // 首期只把已实现的核心窗口交给用户授权；外部窗口默认关闭（K14）。
-    allowedKinds: [
-      'journal.write', 'room.plan', 'room.note', 'phone.record',
-      'takeout.order', 'shopping.order', 'interaction.message',
-    ],
+    // 首期只把已实现的核心窗口（且旧版确实开过的）交给用户授权；外部窗口默认关闭（K14）。
+    allowedKinds,
     forbiddenCategories: [],
     avoidTopics: Array.isArray(legacyRaw.avoidTopics)
       ? legacyRaw.avoidTopics.filter((t): t is string => typeof t === 'string')

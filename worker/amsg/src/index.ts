@@ -222,6 +222,8 @@ import { reserveMapCall as reserveTravelMapCall, getTravelBudget as getTravelBud
 import { getTravelAnchor, type TravelDb as TravelStoreDb } from './travel/store';
 import type { TravelPlaceAnchor, TravelCoordSys } from '../../../contracts/travel';
 import type { TravelTickSubject } from './travel/tick';
+import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './autonomyLife/routes';
+import { handleAutonomyLifeScheduled, summariseAutonomyLifeOutcomes } from './autonomyLife/tick';
 import { AUTONOMY_DAILY_TOKEN_BUDGET } from '../../../utils/airp/autonomySettings';
 import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
 import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
@@ -3662,6 +3664,28 @@ export default {
       if (travel) return travel;
     }
 
+    // 自主生活 v1（/autonomy-life/v1/*）：许可签发 / 领取 / 回执都走这里。
+    // 认证：AMSG_SERVER_TOKEN + X-Client-Token（共享口令）+ X-User-Id 主体断言；
+    // 所有读写按 ownerId 隔离（见 autonomyLife/routes.ts 的说明）。
+    {
+      const autonomy = await handleAutonomyLifeRequest(request, env as never, {
+        now: Date.now,
+        resolveOwner: (req) => resolveOwnerFromSharedToken(req, env as never),
+        respond: jsonWithCors,
+        hasModelCredentials: async (userId, charId) => {
+          const creds = await resolveTravelModelCredentialsForUser({
+            db: env.DB as never,
+            userId,
+            charId,
+            masterKey: env.AMSG_MASTER_KEY,
+          });
+          return !!creds;
+        },
+        requestId: () => (globalThis.crypto?.randomUUID?.() ?? `al_${Date.now().toString(36)}`),
+      });
+      if (autonomy) return autonomy;
+    }
+
     // 即时对话：一个请求把「传云端状态 + 建任务」串完，回 202 之后立刻起一跳。
     // 排在配置门之后，所以走到这里 D1 和密钥必然都在。
     if (pathname.endsWith('/push-test')) {
@@ -4068,6 +4092,26 @@ export default {
       }
     } catch (error) {
       console.error('[amsg:autonomy] 本轮调度失败（下一分钟重来）', error);
+    }
+
+    // 自主生活 v1（utils/autonomyLife + worker/amsg/src/autonomyLife）：只推进状态机，
+    // 不建上游任务、不发推送。单独扫一次包，与 AIRP 回合解耦（两者互不因对方失败而停）。
+    // 整段 fail-soft：cron 没人看返回值，失败只代表「这一分钟白跑」。
+    try {
+      const lifeNowMs = Date.now();
+      const lifePacks = await scanAutonomyPacks({ db: env.DB as unknown as AutonomyDb, masterKey: env.AMSG_MASTER_KEY });
+      const lifeResult = await handleAutonomyLifeScheduled({
+        db: env.DB as unknown as Parameters<typeof handleAutonomyLifeScheduled>[0]['db'],
+        packs: lifePacks.packs,
+        nowMs: lifeNowMs,
+        masterKey: env.AMSG_MASTER_KEY,
+      });
+      const lifeSummary = summariseAutonomyLifeOutcomes(lifeResult.outcomes);
+      if (lifeSummary.scheduled > 0 || lifeSummary.skipped.length > 0) {
+        console.log('[amsg:autonomy-life]', lifeSummary);
+      }
+    } catch (error) {
+      console.error('[amsg:autonomy-life] 本轮调度失败（下一分钟重来）', error);
     }
 
     // 角色自主出行：与推送订阅、页面开关**没有**依赖关系，靠时钟 + DB 推进。

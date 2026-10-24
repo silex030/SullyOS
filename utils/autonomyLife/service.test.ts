@@ -4,8 +4,10 @@
  *   - PATCH 旧频率字段 422、revision 冲突 409；
  *   - 暂停返回 acknowledged/quiesced（不是「已撤销在途」）；
  *   - activities 稳定降序分页；
- *   - cancel 冲突 409 CANNOT_CANCEL；
- *   - 客户端不手拼 URL、自动带 Idempotency-Key、错误映射成 AutonomyLifeApiError。
+ *   - cancel 冲突 409 CANNOT_CANCEL。
+ *
+ * 传输层（不手拼 URL / Idempotency-Key / 错误映射）只在 utils/autonomyLife/api.ts 的
+ * api.test.ts 里测一份，这里不再重复第二个客户端。
  */
 import { describe, expect, it } from 'vitest';
 
@@ -16,8 +18,6 @@ import { createMemoryBudgetPort } from './budget';
 import type { BudgetPort } from './budget';
 import { buildActionRow, createInMemoryLifeStore, emptyCharacterLife, reportReceipt, type EngineDeps } from './engine';
 import { createAutonomyLifeService, type AutonomyLifeServiceDeps, type BoundaryRepo } from './service';
-import { AutonomyLifeApiError, createAutonomyLifeClient, type TransportRequest } from './client';
-import { AUTONOMY_LIFE_API_BASE } from '../../contracts/autonomyLife';
 
 const NOW = Date.UTC(2026, 9, 24, 4, 0, 0);
 const TZ = 'Asia/Shanghai';
@@ -300,65 +300,5 @@ describe('服务：状态与边界（§7）', () => {
     expect(body.bindingState).toBe('not_bound');
     expect(body.requiresExplicitSwitch).toBe(true);
     expect(await store.getBoundInstallation('acct-http')).toBe('install-1');
-  });
-});
-
-describe('客户端：只走封装，不手拼 URL（§7 / §8）', () => {
-  it('生成 base 路径、自动带 Idempotency-Key，并把错误信封映射成 AutonomyLifeApiError', async () => {
-    const seen: TransportRequest[] = [];
-    const client = createAutonomyLifeClient({
-      installationId: 'install-9',
-      transport: async (request) => {
-        seen.push(request);
-        if (request.path.includes('/boundaries') && request.method === 'PATCH') {
-          return {
-            status: 422,
-            body: {
-              schemaVersion: 1,
-              requestId: 'req-x',
-              serverTime: NOW,
-              error: { code: 'DEPRECATED_FIELD', message: 'frequency_fields_removed', retryable: false, details: { fields: ['cadence'] } },
-            },
-          };
-        }
-        return { status: 200, body: { schemaVersion: 1, requestId: 'req-y', serverTime: NOW, items: [], nextCursor: null } };
-      },
-    });
-
-    await client.activities({ charId: CHAR, limit: 20 });
-    expect(seen[0].path).toBe(`${AUTONOMY_LIFE_API_BASE}/activities?charId=${CHAR}&limit=20`);
-    expect(seen[0].method).toBe('GET');
-
-    const failure = client.patchBoundaries({ scope: 'account', expectedRevision: 1, changes: { cadence: {} } });
-    await expect(failure).rejects.toBeInstanceOf(AutonomyLifeApiError);
-    await expect(failure).rejects.toMatchObject({ status: 422, code: 'DEPRECATED_FIELD', details: { fields: ['cadence'] } });
-    const patchRequest = seen[1];
-    expect(patchRequest.headers?.['Idempotency-Key']).toBeTruthy();
-    expect(patchRequest.path).toBe(`${AUTONOMY_LIFE_API_BASE}/boundaries`);
-    expect(JSON.stringify(patchRequest.body)).toContain('expectedRevision');
-  });
-
-  it('claim / receipt 自动带 installationId（服务端不必信任 body 里的 ownerId）', async () => {
-    const seen: TransportRequest[] = [];
-    const client = createAutonomyLifeClient({
-      installationId: 'install-9',
-      transport: async (request) => {
-        seen.push(request);
-        return { status: 200, body: { schemaVersion: 1, requestId: 'r', serverTime: NOW, action: null } };
-      },
-    });
-    await client.claim(CHAR);
-    await client.receipt({ actionId: 'act-1', leaseEpoch: 2, argsHash: 'h', status: 'succeeded', resultRef: 'diaries:1' });
-    expect((seen[0].body as any).installationId).toBe('install-9');
-    expect((seen[1].body as any).installationId).toBe('install-9');
-    expect(seen[1].headers?.['Idempotency-Key']).toBe('receipt-act-1');
-  });
-
-  it('schemaVersion 不一致时按升级处理（旧客户端不能继续制造副作用）', async () => {
-    const client = createAutonomyLifeClient({
-      installationId: 'i',
-      transport: async () => ({ status: 200, body: { schemaVersion: 0, requestId: 'r', serverTime: NOW } }),
-    });
-    await expect(client.getState(CHAR)).rejects.toMatchObject({ code: 'AUTONOMY_UPGRADE_REQUIRED' });
   });
 });

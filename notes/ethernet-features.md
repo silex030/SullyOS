@@ -191,6 +191,21 @@
 - 用户纠正保留原正文 + 追加失效关系；短期状态不升级成长偏好。
 - 开关：`featureFlags.epistemicState`（默认关），本机调试 key 仅作覆盖；设置页如实显示开关来源。
 
+### 4.1 自主生活 v1（autonomy-life，2026-10-24 整改完成）
+
+- **入口**：角色详情唯一状态卡 → 全屏「概况 / 活动 / 边界」；设置页只有账号层边界。
+  用户能设的只有边界（允许活动、每日上限、总暂停、禁止方向、外部只读授权），**没有频率**。
+- **引擎与执行**：`utils/autonomyLife/`（rhythm/budget/engine/localLedger/localRunner/
+  executor/startup）+ `worker/amsg/src/autonomyLife/`（D1 端口 / 路由 / cron / 外部只读）。
+  副作用必须「服务端一次性许可 → 本地事务内核销 → 回执」三件齐备才算成功。
+- **数据源/外部服务**：IDB v81（`autonomy_action_permits` 等）；worker D1 8 张
+  `autonomy_life_*` 表；模型走用户自己的 `llm_credentials`（`char:<charId>/chat`）；
+  外部只读需要运营配置 `AUTONOMY_EXTERNAL_*`（默认不可用）。
+- **退役**：旧「手机每 15/30/60/120 分钟自动刷新」、`utils/phoneAutoRefresh.ts`、
+  `phoneState.autoRefresh*` 字段、旧自主回合护栏的**频率编辑**（UI 侧）全部下线；
+  旧配置由 `utils/autonomyLife/startup.ts` 一次性迁移（只缩不扩）。
+- **证据/说明**：`docs/autonomy-life/execution-audit.md`；`docs/autonomy-life/entry-migration.md`。
+
 ### 4. 感知与自主生活（P4/P5）
 
 - 感知归一（`utils/airp/perception.ts`）：source / subject / observedAt / expiresAt / permissions / version / dedupeKey；本地过滤过期、重复、无权限、无关联；只把相关小快照放动态尾段，缺席就省略（`utils/airp/perceptionPrompt.ts` 支持「已渲染来源」去重，绝不重复注入、不发请求）。

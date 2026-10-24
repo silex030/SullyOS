@@ -157,8 +157,8 @@ function concatBytes(...chunks) {
   }
   return out;
 }
-function utf8(str) {
-  return TEXT_ENCODER.encode(String(str));
+function utf8(str2) {
+  return TEXT_ENCODER.encode(String(str2));
 }
 function utf8Decode(buf) {
   return TEXT_DECODER.decode(toUint8(buf));
@@ -176,8 +176,8 @@ function bytesToBase64Url(buf) {
 }
 function base64UrlToBytes(input) {
   const s = String(input).replace(/-/g, "+").replace(/_/g, "/");
-  const pad = (4 - s.length % 4) % 4;
-  const padded = s + "=".repeat(pad);
+  const pad3 = (4 - s.length % 4) % 4;
+  const padded = s + "=".repeat(pad3);
   const bin = typeof atob === "function" ? atob(padded) : Buffer.from(padded, "base64").toString("binary");
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
@@ -6608,8 +6608,8 @@ async function getSchemaVersion(db) {
   for (const index of SQLITE_REQUIRED_SCHEMA.indexes) {
     if (!liveIndexes.has(index)) missing.push(`index:${index}`);
   }
-  const ok = missing.length === 0;
-  return { current: ok ? SCHEMA_VERSION : null, required: SCHEMA_VERSION, ok, missing };
+  const ok2 = missing.length === 0;
+  return { current: ok2 ? SCHEMA_VERSION : null, required: SCHEMA_VERSION, ok: ok2, missing };
 }
 async function ensureSchema(db) {
   const before = await getSchemaVersion(db);
@@ -9872,17 +9872,17 @@ var isEncryptedEnvelope2 = (value) => {
 var handleInstantChat = async (args) => {
   const { request, env, upstream: upstream2, json: json4 } = args;
   const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
-  const fail7 = (status, code, message, extra) => json4(status, { success: false, error: { code, message, ...extra ?? {} } });
+  const fail8 = (status, code, message, extra) => json4(status, { success: false, error: { code, message, ...extra ?? {} } });
   const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
   const clientToken = request.headers.get("X-Client-Token") ?? "";
   if (token) {
     if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
-      return fail7(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
+      return fail8(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
     }
   }
   const userId = request.headers.get("X-User-Id") ?? "";
-  if (!userId) return fail7(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
-  if (!UUID_V4_RE.test(userId)) return fail7(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
+  if (!userId) return fail8(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
+  if (!UUID_V4_RE.test(userId)) return fail8(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
   let body;
   try {
     const text = await readMaybeGzippedBody(request);
@@ -9890,13 +9890,13 @@ var handleInstantChat = async (args) => {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
     body = parsed;
   } catch {
-    return fail7(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
+    return fail8(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
   }
   if (!isEncryptedEnvelope2(body.statePayload)) {
-    return fail7(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+    return fail8(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
   }
   if (!isEncryptedEnvelope2(body.taskPayload)) {
-    return fail7(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+    return fail8(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
   }
   const requestUrl = new URL(request.url);
   const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
@@ -9987,7 +9987,7 @@ var handleInstantChat = async (args) => {
   }
   const uuid = taskBody?.data?.uuid;
   if (typeof uuid !== "string" || !uuid) {
-    return fail7(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
+    return fail8(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
       step: "schedule-message"
     });
   }
@@ -13156,12 +13156,12 @@ var HOTNEWS_FALLBACK_MAX_AGE_MS = 24 * 60 * 60 * 1e3;
 var HOTNEWS_SLOT_TZ = "Asia/Shanghai";
 var HOTNEWS_KEEP = 60;
 var FETCH_BUDGET_MS = 1e4;
-var parseSnapshot = (rows, key, ok) => {
+var parseSnapshot = (rows, key, ok2) => {
   const raw = rows.find((r) => r.key === key)?.value;
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    return ok(parsed) ? parsed : null;
+    return ok2(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -18766,9 +18766,9 @@ var toBase64Url2 = (bytes) => {
 var fromBase64Url2 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad);
+    const binary = atob(padded + pad3);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -19113,9 +19113,9 @@ var toBase64Url3 = (bytes) => {
 var fromBase64Url3 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad);
+    const binary = atob(padded + pad3);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -19626,7 +19626,7 @@ async function handleTravelRequest(request, env, deps) {
       const base = (deps.mapTestUpstreamBase ?? "https://restapi.amap.com").replace(/\/+$/, "");
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 8e3);
-      let ok = false;
+      let ok2 = false;
       let code = "PROVIDER_FAILED";
       try {
         const params = new URLSearchParams({ address: "\u5317\u4EAC\u5E02", key: webKey });
@@ -19636,16 +19636,16 @@ async function handleTravelRequest(request, env, deps) {
         );
         if (res.ok) {
           const body = await res.json().catch(() => null);
-          ok = String(body?.status ?? "") === "1" && Array.isArray(body?.geocodes) && body.geocodes.length > 0;
-          code = ok ? "OK" : "PROVIDER_FAILED";
+          ok2 = String(body?.status ?? "") === "1" && Array.isArray(body?.geocodes) && body.geocodes.length > 0;
+          code = ok2 ? "OK" : "PROVIDER_FAILED";
         }
       } catch {
-        ok = false;
+        ok2 = false;
         code = "PROVIDER_FAILED";
       } finally {
         clearTimeout(timer);
       }
-      return json3(200, { ok, code });
+      return json3(200, { ok: ok2, code });
     }
     if (suffix === "char" && method === "GET") {
       const charId = readString2(url.searchParams.get("charId"));
@@ -19816,15 +19816,15 @@ var TravelProviderError = class extends Error {
 };
 var isCoordSys2 = (value) => value === "gcj02" || value === "wgs84";
 var assertGeoPoint = (point, provider = "amap") => {
-  const fail7 = () => {
+  const fail8 = () => {
     throw new TravelProviderError({ kind: "bad-input", code: "PROVIDER_FAILED", provider });
   };
-  if (!point || typeof point !== "object") fail7();
-  if (!isCoordSys2(point.coordSys)) fail7();
-  if (typeof point.lat !== "number" || typeof point.lng !== "number") fail7();
-  if (!Number.isFinite(point.lat) || !Number.isFinite(point.lng)) fail7();
-  if (point.lat < -90 || point.lat > 90) fail7();
-  if (point.lng < -180 || point.lng > 180) fail7();
+  if (!point || typeof point !== "object") fail8();
+  if (!isCoordSys2(point.coordSys)) fail8();
+  if (typeof point.lat !== "number" || typeof point.lng !== "number") fail8();
+  if (!Number.isFinite(point.lat) || !Number.isFinite(point.lng)) fail8();
+  if (point.lat < -90 || point.lat > 90) fail8();
+  if (point.lng < -180 || point.lng > 180) fail8();
 };
 var formatLonLat = (point, provider = "amap") => {
   assertGeoPoint(point, provider);
@@ -20393,7 +20393,7 @@ async function runTravelTickForSubject(db, subject, wiring = {}) {
       decisionPort: wiring.decisionPort,
       fallbackStayMinutes: dwellMinutes
     });
-    const settleSegment = async (ok) => {
+    const settleSegment = async (ok2) => {
       if (!reservation || !wiring.llmPort) return;
       const real = wiring.decisionPort?.lastUsageTokens?.();
       const usage = typeof real === "number" && Number.isFinite(real) && real > 0 ? Math.trunc(real) : null;
@@ -20401,8 +20401,8 @@ async function runTravelTickForSubject(db, subject, wiring = {}) {
         await settleLlmTokens(db, {
           userId: subject.userId,
           reservationId: reservation,
-          actualTokens: ok ? usage ?? estimateTokens : usage ?? 0,
-          ok,
+          actualTokens: ok2 ? usage ?? estimateTokens : usage ?? 0,
+          ok: ok2,
           nowMs,
           port: wiring.llmPort
         });
@@ -20709,15 +20709,15 @@ async function runTravelTickForSubject(db, subject, wiring = {}) {
       }
       llmReservation = reserved.reservationId;
     }
-    const settleDecision = async (ok) => {
+    const settleDecision = async (ok2) => {
       if (!llmReservation || !wiring.llmPort) return;
       try {
         await settleLlmTokens(db, {
           userId: subject.userId,
           reservationId: llmReservation,
           // 模型端口不回 usage：成功按预估结算（宁多算不少算），失败/无结论按 0 结算。
-          actualTokens: ok ? estimateTokens : 0,
-          ok,
+          actualTokens: ok2 ? estimateTokens : 0,
+          ok: ok2,
           nowMs,
           port: wiring.llmPort
         });
@@ -21211,9 +21211,9 @@ var toBase64Url4 = (bytes) => {
 var fromBase64Url4 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad);
+    const binary = atob(padded + pad3);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -22310,6 +22310,3617 @@ function createAutonomyLlmLedgerPort(options) {
   };
 }
 
+// contracts/autonomyLife.ts
+var AUTONOMY_LIFE_SCHEMA_VERSION = 1;
+var AUTONOMY_LIFE_API_BASE = "/autonomy-life/v1";
+var CORE_ACTIVITY_KINDS = [
+  "journal.write",
+  "room.plan",
+  "room.note",
+  "phone.record",
+  "takeout.order",
+  "shopping.order",
+  "interaction.message"
+];
+var CONTROLLED_EXTERNAL_KINDS = ["travel.wish", "external.read"];
+var ACTIVITY_KINDS = [...CORE_ACTIVITY_KINDS, ...CONTROLLED_EXTERNAL_KINDS];
+function isActivityKind(value) {
+  return typeof value === "string" && ACTIVITY_KINDS.includes(value);
+}
+var KIND_EXECUTION_MODE = {
+  "journal.write": "local",
+  "room.plan": "local",
+  "room.note": "local",
+  "phone.record": "local",
+  "takeout.order": "local",
+  "shopping.order": "local",
+  "interaction.message": "local",
+  "travel.wish": "local",
+  "external.read": "local"
+};
+var TERMINAL_ACTION_STATUSES = ["succeeded", "failed", "unknown", "expired", "cancelled"];
+function isTerminalActionStatus(status) {
+  return TERMINAL_ACTION_STATUSES.includes(status);
+}
+var LIMIT_KEYS = [
+  "accountModelCallsPerDay",
+  "charModelCallsPerDay",
+  "accountTokensPerDay",
+  "charTokensPerDay",
+  "notificationsPerDay",
+  "perKindActionsPerDay",
+  "virtualSpendPerDayMinor",
+  "virtualOrderMaxMinor"
+];
+var DEFAULT_ACCOUNT_LIMITS = {
+  accountModelCallsPerDay: 6,
+  charModelCallsPerDay: 2,
+  accountTokensPerDay: 1e5,
+  charTokensPerDay: 4e4,
+  notificationsPerDay: 1,
+  perKindActionsPerDay: 3,
+  virtualSpendPerDayMinor: 2e4,
+  virtualOrderMaxMinor: 5e3
+};
+var MAXIMUM_ACCOUNT_LIMITS = {
+  accountModelCallsPerDay: 24,
+  charModelCallsPerDay: 12,
+  accountTokensPerDay: 1e6,
+  charTokensPerDay: 4e5,
+  notificationsPerDay: 8,
+  perKindActionsPerDay: 12,
+  virtualSpendPerDayMinor: 5e5,
+  virtualOrderMaxMinor: 1e5
+};
+var CURRENCY_DEFAULT = "CNY";
+var DEPRECATED_BOUNDARY_FIELDS = [
+  "frequency",
+  "cadence",
+  "cadenceMinHours",
+  "cadenceMaxHours",
+  "minHours",
+  "maxHours",
+  "sameKindMinGap",
+  "sameKindMinGapMinutes",
+  "perCharPerDay",
+  "globalPerDay",
+  "maxRoundsPerDay",
+  "dailyRounds",
+  "intervalMinutes",
+  "activeLevel",
+  "activityLevel",
+  "templateId",
+  "reserveTokensPerRun",
+  "autonomyLevel"
+];
+var PLATFORM_FORBIDDEN_CATEGORIES = [
+  "gambling",
+  "betting_promotion",
+  "real_finance",
+  "illegal_trade",
+  "credential_theft"
+];
+var PERMIT_TTL_MS = 6e4;
+var RETRYABLE_ERROR_CODES = [
+  "SERVICE_UNAVAILABLE",
+  "RATE_LIMITED",
+  "MODEL_FAILED",
+  "CIRCUIT_OPEN",
+  "WAITING_DEVICE"
+];
+function buildErrorBody(code, message, opts) {
+  const retryable = RETRYABLE_ERROR_CODES.includes(code);
+  return {
+    error: {
+      code,
+      message,
+      retryable,
+      ...opts.retryAt !== void 0 ? { retryAt: opts.retryAt } : {},
+      ...opts.details ? { details: opts.details } : {}
+    },
+    requestId: opts.requestId,
+    serverTime: opts.serverTime,
+    schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION
+  };
+}
+function httpStatusForError(code) {
+  switch (code) {
+    case "UNAUTHENTICATED":
+      return 401;
+    case "FORBIDDEN":
+    case "POLICY_DENIED":
+    case "CHAR_DISABLED":
+    case "GLOBAL_PAUSED":
+    case "GRANT_REQUIRED":
+    case "GRANT_EXPIRED":
+    case "CIRCUIT_OPEN":
+      return 403;
+    case "NOT_FOUND":
+      return 404;
+    case "REVISION_CONFLICT":
+    case "STATE_CONFLICT":
+    case "IDEMPOTENCY_CONFLICT":
+    case "CANNOT_CANCEL":
+    case "UNKNOWN_EFFECT":
+      return 409;
+    case "VALIDATION_FAILED":
+    case "DEPRECATED_FIELD":
+      return 422;
+    case "AUTONOMY_UPGRADE_REQUIRED":
+      return 426;
+    case "RATE_LIMITED":
+    case "BUDGET_EXHAUSTED":
+      return 429;
+    case "SERVICE_UNAVAILABLE":
+    case "MISSING_CREDENTIALS":
+    case "MODEL_FAILED":
+    case "CAPABILITY_UNAVAILABLE":
+      return 503;
+    case "WAITING_DEVICE":
+      return 409;
+    default:
+      return 400;
+  }
+}
+function stableStringify2(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify2).join(",")}]`;
+  const entries = Object.entries(value).filter(([, v]) => v !== void 0).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${JSON.stringify(k)}:${stableStringify2(v)}`);
+  return `{${entries.join(",")}}`;
+}
+function hashString(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+function hashArgs(args) {
+  return hashString(stableStringify2(args));
+}
+function actionDedupeKey(args) {
+  return hashString(`${args.charId}|${args.kind}|${args.purposeKey}|${args.localDateKey}`);
+}
+
+// utils/autonomyLife/time.ts
+var systemClock = { now: () => Date.now() };
+var MINUTE_MS3 = 6e4;
+var HOUR_MS5 = 60 * MINUTE_MS3;
+var DAY_MS4 = 24 * HOUR_MS5;
+function seedToInt(seed) {
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+function createRng(...seedParts) {
+  let state = seedToInt(seedParts.map(String).join("|")) || 2654435769;
+  const next = () => {
+    state = state + 1831565813 >>> 0;
+    let t = state;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  return {
+    next,
+    int: (max) => max <= 0 ? 0 : Math.floor(next() * max),
+    noise: (bound) => (next() * 2 - 1) * Math.abs(bound)
+  };
+}
+function opportunityId(args) {
+  const rng = createRng("opportunity", args.seed, args.charId, String(args.scheduleRevision), args.windowStartMs);
+  return `opp_${Math.floor(rng.next() * 4294967296).toString(16)}`;
+}
+var FALLBACK_TZ = "UTC";
+function isValidTimeZone(tzId) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tzId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function normalizeTimeZone(tzId, fallback = FALLBACK_TZ) {
+  if (typeof tzId === "string" && tzId.trim() && isValidTimeZone(tzId)) return tzId;
+  return fallback;
+}
+function zonedParts3(nowMs, tzId) {
+  const tz = normalizeTimeZone(tzId);
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    weekday: "short"
+  });
+  const map = {};
+  for (const part of fmt.formatToParts(new Date(nowMs))) map[part.type] = part.value;
+  let hour = Number.parseInt(map.hour ?? "0", 10);
+  if (hour === 24) hour = 0;
+  const minute = Number.parseInt(map.minute ?? "0", 10);
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const weekday = Math.max(0, weekdays.indexOf(map.weekday ?? "Sun"));
+  return {
+    dateKey: `${map.year}-${map.month}-${map.day}`,
+    hour,
+    minute,
+    weekday,
+    minuteOfDay: hour * 60 + minute
+  };
+}
+function localDateKey(nowMs, tzId) {
+  return zonedParts3(nowMs, tzId).dateKey;
+}
+function budgetWindowId(nowMs, tzId) {
+  return `w:${zonedParts3(nowMs, tzId).dateKey}`;
+}
+function hhmmToMinutes(hhmm) {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm);
+  if (!match) return null;
+  return Number.parseInt(match[1], 10) * 60 + Number.parseInt(match[2], 10);
+}
+function isWithinWindow(minuteOfDay, startMinutes, endMinutes) {
+  if (startMinutes === endMinutes) return false;
+  if (startMinutes < endMinutes) return minuteOfDay >= startMinutes && minuteOfDay < endMinutes;
+  return minuteOfDay >= startMinutes || minuteOfDay < endMinutes;
+}
+
+// utils/autonomyLife/boundary.ts
+var isRecord10 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+var nonNegativeIntOrNull = (value) => {
+  if (value === null || value === void 0) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) return null;
+  return value;
+};
+var stringList = (value) => {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+};
+var kindList = (value) => {
+  if (value === null || value === void 0) return null;
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    if (!ACTIVITY_KINDS.includes(item)) continue;
+    const kind = item;
+    if (!out.includes(kind)) out.push(kind);
+  }
+  return out;
+};
+function normalizeLimits(raw, scope) {
+  const source = isRecord10(raw) ? raw : {};
+  const limits = {};
+  for (const key of LIMIT_KEYS) {
+    const rawValue = nonNegativeIntOrNull(source[key]);
+    if (scope === "account") {
+      limits[key] = rawValue === null ? DEFAULT_ACCOUNT_LIMITS[key] : clamp(rawValue, 0, MAXIMUM_ACCOUNT_LIMITS[key]);
+    } else {
+      limits[key] = rawValue === null ? null : clamp(rawValue, 0, MAXIMUM_ACCOUNT_LIMITS[key]);
+    }
+  }
+  return limits;
+}
+function normalizeDnd(raw) {
+  if (!isRecord10(raw)) return null;
+  const start = typeof raw.start === "string" ? raw.start.trim() : "";
+  const end = typeof raw.end === "string" ? raw.end.trim() : "";
+  if (hhmmToMinutes(start) === null || hhmmToMinutes(end) === null) return null;
+  return { timezone: normalizeTimeZone(typeof raw.timezone === "string" ? raw.timezone : null), start, end };
+}
+function normalizeGrant(raw, nowMs) {
+  if (!isRecord10(raw)) return null;
+  const provider = raw.provider;
+  if (provider !== "xhs" && provider !== "amap") return null;
+  const scopes = stringList(raw.scopes);
+  const writeLike = /write|publish|post|comment|like|collect|dm|message|delete|update/i;
+  if (!scopes.length || scopes.some((scope) => writeLike.test(scope))) return null;
+  const expiresAt = typeof raw.expiresAt === "number" && Number.isFinite(raw.expiresAt) ? raw.expiresAt : 0;
+  if (expiresAt <= nowMs) return null;
+  const dailyQuota = nonNegativeIntOrNull(raw.dailyQuota);
+  return {
+    provider,
+    scopes,
+    allowedHosts: stringList(raw.allowedHosts),
+    allowedMethods: stringList(raw.allowedMethods).map((m) => m.toUpperCase()),
+    allowedFieldKeys: stringList(raw.allowedFieldKeys),
+    purpose: typeof raw.purpose === "string" ? raw.purpose.slice(0, 200) : "",
+    expiresAt,
+    dailyQuota: dailyQuota === null ? 0 : dailyQuota
+  };
+}
+function normalizeBoundary(raw, opts) {
+  const source = isRecord10(raw) ? raw : {};
+  const scope = opts.scope;
+  const boolOrNull = (value) => typeof value === "boolean" ? value : null;
+  return {
+    schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
+    revision: typeof opts.revision === "number" ? opts.revision : 0,
+    scope,
+    enabled: boolOrNull(source.enabled),
+    globalPaused: scope === "account" ? boolOrNull(source.globalPaused) : null,
+    charEnabled: boolOrNull(source.charEnabled),
+    timezone: typeof source.timezone === "string" ? normalizeTimeZone(source.timezone) : null,
+    allowedKinds: kindList(source.allowedKinds),
+    forbiddenCategories: stringList(source.forbiddenCategories),
+    avoidTopics: stringList(source.avoidTopics).slice(0, 50),
+    allowFictionalNpc: boolOrNull(source.allowFictionalNpc),
+    doNotDisturb: normalizeDnd(source.doNotDisturb),
+    limits: normalizeLimits(source.limits, scope),
+    externalGrants: Array.isArray(source.externalGrants) ? source.externalGrants.map((grant) => normalizeGrant(grant, opts.nowMs)).filter((grant) => grant !== null) : []
+  };
+}
+function mergeEffectiveBoundary(args) {
+  const account = args.account.scope === "account" ? args.account : normalizeBoundary(args.account, { scope: "account", nowMs: args.nowMs, revision: args.account.revision });
+  const character = args.character ?? null;
+  const stricterOff = (charValue, accountValue) => {
+    if (charValue === false || accountValue === false) return false;
+    if (typeof charValue === "boolean") return charValue;
+    return accountValue ?? true;
+  };
+  const limits = {};
+  for (const key of LIMIT_KEYS) {
+    const accountValue = account.limits[key];
+    const base = accountValue === null ? DEFAULT_ACCOUNT_LIMITS[key] : accountValue;
+    const charValue = character ? character.limits[key] : null;
+    limits[key] = charValue === null || charValue === void 0 ? base : Math.min(base, charValue);
+  }
+  const accountKinds = account.allowedKinds;
+  const charKinds = character?.allowedKinds ?? null;
+  let allowedKinds;
+  if (accountKinds && charKinds) allowedKinds = accountKinds.filter((kind) => charKinds.includes(kind));
+  else allowedKinds = accountKinds ?? charKinds ?? [...ACTIVITY_KINDS];
+  const forbidden = new Set(PLATFORM_FORBIDDEN_CATEGORIES);
+  for (const item of account.forbiddenCategories) forbidden.add(item);
+  for (const item of character?.forbiddenCategories ?? []) forbidden.add(item);
+  const avoidTopics = Array.from(/* @__PURE__ */ new Set([...account.avoidTopics, ...character?.avoidTopics ?? []]));
+  return {
+    schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
+    revision: Math.max(account.revision, character?.revision ?? 0),
+    scope: "account",
+    enabled: stricterOff(character?.enabled, account.enabled),
+    globalPaused: account.globalPaused ?? false,
+    charEnabled: stricterOff(character?.charEnabled, account.charEnabled),
+    timezone: character?.timezone ?? account.timezone ?? "UTC",
+    allowedKinds,
+    forbiddenCategories: Array.from(forbidden),
+    avoidTopics,
+    allowFictionalNpc: (() => {
+      const charValue = character?.allowFictionalNpc ?? null;
+      const accountValue = account.allowFictionalNpc;
+      if (charValue === false || accountValue === false) return false;
+      if (typeof charValue === "boolean") return charValue;
+      return accountValue ?? false;
+    })(),
+    doNotDisturb: character?.doNotDisturb ?? account.doNotDisturb ?? null,
+    limits,
+    externalGrants: account.externalGrants
+  };
+}
+function findDeprecatedFields(changes) {
+  if (!isRecord10(changes)) return [];
+  const hits = [];
+  for (const key of Object.keys(changes)) {
+    if (DEPRECATED_BOUNDARY_FIELDS.includes(key)) hits.push(key);
+  }
+  if (isRecord10(changes.limits)) {
+    for (const key of Object.keys(changes.limits)) {
+      if (DEPRECATED_BOUNDARY_FIELDS.includes(key)) hits.push(`limits.${key}`);
+    }
+  }
+  return hits;
+}
+function applyBoundaryPatch(args) {
+  const { current, changes, expectedRevision, nowMs } = args;
+  if (current.revision !== expectedRevision) {
+    return { ok: false, code: "REVISION_CONFLICT", details: { currentRevision: current.revision } };
+  }
+  const deprecated = findDeprecatedFields(changes);
+  if (deprecated.length) {
+    return { ok: false, code: "DEPRECATED_FIELD", details: { fields: deprecated } };
+  }
+  if (!isRecord10(changes)) return { ok: false, code: "VALIDATION_FAILED", details: { reason: "not-object" } };
+  const allowedKeys = /* @__PURE__ */ new Set([
+    "enabled",
+    "globalPaused",
+    "charEnabled",
+    "timezone",
+    "allowedKinds",
+    "forbiddenCategories",
+    "avoidTopics",
+    "allowFictionalNpc",
+    "doNotDisturb",
+    "limits",
+    "externalGrants"
+  ]);
+  const unknownKeys = Object.keys(changes).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length) {
+    return { ok: false, code: "VALIDATION_FAILED", details: { fields: unknownKeys } };
+  }
+  if (isRecord10(changes.limits)) {
+    const badLimitKeys = Object.keys(changes.limits).filter((key) => !LIMIT_KEYS.includes(key));
+    if (badLimitKeys.length) {
+      return { ok: false, code: "VALIDATION_FAILED", details: { fields: badLimitKeys.map((k) => `limits.${k}`) } };
+    }
+  }
+  const merged = {
+    enabled: current.enabled,
+    globalPaused: current.globalPaused,
+    charEnabled: current.charEnabled,
+    timezone: current.timezone,
+    allowedKinds: current.allowedKinds,
+    forbiddenCategories: current.forbiddenCategories,
+    avoidTopics: current.avoidTopics,
+    allowFictionalNpc: current.allowFictionalNpc,
+    doNotDisturb: current.doNotDisturb,
+    limits: { ...current.limits },
+    externalGrants: current.externalGrants
+  };
+  for (const [key, value] of Object.entries(changes)) {
+    if (key === "limits" && isRecord10(value)) {
+      Object.assign(merged.limits, value);
+      continue;
+    }
+    merged[key] = value;
+  }
+  const next = normalizeBoundary(merged, {
+    scope: current.scope,
+    nowMs,
+    revision: current.revision + 1
+  });
+  next.forbiddenCategories = Array.from(/* @__PURE__ */ new Set([...PLATFORM_FORBIDDEN_CATEGORIES, ...next.forbiddenCategories]));
+  return { ok: true, boundary: next };
+}
+function boundaryMetadata() {
+  return {
+    defaults: { ...DEFAULT_ACCOUNT_LIMITS },
+    maximums: { ...MAXIMUM_ACCOUNT_LIMITS },
+    currency: CURRENCY_DEFAULT,
+    deprecatedFields: DEPRECATED_BOUNDARY_FIELDS,
+    platformForbiddenCategories: PLATFORM_FORBIDDEN_CATEGORIES
+  };
+}
+function isKindAllowed(effective, kind) {
+  return effective.allowedKinds.includes(kind);
+}
+function boundaryGate(effective, kind) {
+  if (effective.globalPaused || effective.enabled === false) return { ok: false, code: "GLOBAL_PAUSED" };
+  if (effective.charEnabled === false) return { ok: false, code: "CHAR_DISABLED" };
+  if (!isKindAllowed(effective, kind)) return { ok: false, code: "POLICY_DENIED" };
+  return { ok: true };
+}
+
+// utils/autonomyLife/localLedger.ts
+var AUTONOMY_BUSINESS_STORES = [
+  "diaries",
+  "room_todos",
+  "room_notes",
+  "shopping_orders",
+  "bank_data",
+  "bank_transactions",
+  "messages"
+];
+var AUTONOMY_CONTROL_STORES = [
+  "autonomy_action_permits",
+  // keyPath actionId（一次性执行许可；消费与业务写入同事务）
+  "autonomy_action_receipts",
+  // keyPath actionId
+  "autonomy_sim_vouchers",
+  // keyPath id（tx-order-<orderId> / refund-order-<orderId>）
+  "autonomy_local_life"
+  // keyPath id（模拟查手机记录等本地生活物料）
+];
+var AUTONOMY_LOCAL_STORES = [...AUTONOMY_BUSINESS_STORES, ...AUTONOMY_CONTROL_STORES];
+
+// utils/autonomyLife/policy.ts
+var ALLOW = { allowed: true };
+var REDACTED_DIGEST = (text) => `sha:${hashString(text).slice(0, 12)}`;
+var TERM_TABLE = [
+  {
+    category: "gambling",
+    terms: [
+      /赌博|赌场|下注|押注|赌注|庄家|赔率|开牌|梭哈|百家乐|老虎机|轮盘|筹码|博彩|菠菜|彩票|六合彩|时时彩|竞猜|开盘|让球|串关|番摊|牌九|炸金花|牛牛|德州扑克|赌一把|赌一把运气/i,
+      /\b(bet|betting|wager|casino|slot machine|roulette|blackjack|poker hand|jackpot|odds|bookmaker|lottery|parlay)\b/i,
+      /充\s*\d+\s*送\s*\d+\s*(彩金|筹码|返水)/i,
+      /内部\s*(号|料|推荐)[^。！？]{0,6}(稳赚|包中|必中)/i,
+      /稳赚不赔[^。！？]{0,8}(投注|下注|盘口)/i
+    ]
+  },
+  {
+    category: "betting_promotion",
+    terms: [
+      /(拉|带)[^。！？]{0,6}(人|你)[^。！？]{0,6}(下注|投注|充值)/i,
+      /返水|佣金[^。！？]{0,4}(代理|拉人)|代理[^。！？]{0,4}(盘|下注)/i,
+      /(加|扫)[^。！？]{0,4}(群|二维码)[^。！？]{0,8}(下注|博彩|彩票)/i
+    ]
+  },
+  {
+    category: "real_finance",
+    terms: [
+      /转账|汇款|借贷|贷款|网贷|信用卡套现|套现|杠杆|期货|合约交易|融资融券|炒股|荐股|代币|私募|理财收益|付息|还款日/i,
+      /(转账|打款)[^。！？]{0,10}(到|给)[^。！？]{0,10}(账户|卡号)/i,
+      /\b(transfer|wire|loan|leveraged|liquidation|stake pool|yield farming|seed phrase)\b/i
+    ]
+  },
+  {
+    category: "illegal_trade",
+    terms: [
+      /代购违禁|违禁品|毒品|冰毒|大麻|枪支|弹药|爆炸物|假证|假身份|洗钱|刷单|伪卡|黑产|数据买卖|买卖个人信息/i,
+      /\b(drugs|cocaine|meth|firearm|ammunition|fake id|money laundering|carding|stolen data)\b/i
+    ]
+  },
+  {
+    category: "credential_theft",
+    terms: [
+      /盗取|撞库|抓包密码|窃取密码|钓鱼网站|验证码[^。！？]{0,6}(发我|给我)|(发|给)我[^。！？]{0,6}(密码|验证码|私钥|助记词)/i,
+      /\b(phishing|credential stuffing|steal password|seed phrase|private key|otp code)\b/i
+    ]
+  }
+];
+var SHOPPING_CATEGORY_MAP = {
+  \u7F8E\u98DF: "food",
+  \u5916\u5356: "takeout",
+  \u9910\u996E: "food",
+  \u5976\u8336: "drink",
+  \u996E\u54C1: "drink",
+  \u751C\u54C1: "dessert",
+  \u86CB\u7CD5: "dessert",
+  \u8D85\u5E02: "grocery",
+  \u4FBF\u5229: "grocery",
+  \u65E5\u7528: "grocery",
+  \u751F\u9C9C: "fresh",
+  \u679C\u852C: "fresh",
+  \u533B\u836F: "health",
+  \u836F\u54C1: "health",
+  \u5065\u5EB7: "health",
+  \u9C9C\u82B1: "flower",
+  \u7EFF\u690D: "flower",
+  \u56FE\u4E66: "book",
+  \u6587\u5177: "stationery",
+  \u6570\u7801: "digital",
+  // 受限/可疑类目（含诱饵名）
+  \u5A31\u4E50: "restricted_gambling_like",
+  \u6E38\u620F\u5145\u503C: "restricted_gambling_like",
+  \u5F69\u7968: "gambling",
+  \u7ADE\u731C: "gambling",
+  \u68CB\u724C: "gambling",
+  \u7B79\u7801: "gambling",
+  \u91D1\u878D: "real_finance",
+  \u7406\u8D22: "real_finance",
+  \u8D37\u6B3E: "real_finance",
+  \u8F6C\u8D26: "real_finance",
+  \u533B\u836F\u5904\u65B9: "health",
+  \u5904\u65B9\u836F: "health"
+};
+var RESTRICTED_SHOPPING_CATEGORIES = /* @__PURE__ */ new Set([
+  "gambling",
+  "restricted_gambling_like",
+  "real_finance",
+  "illegal_trade",
+  "credential_theft"
+]);
+var APPROVED_SHOPPING_CATEGORIES = /* @__PURE__ */ new Set([
+  "food",
+  "takeout",
+  "drink",
+  "dessert",
+  "grocery",
+  "fresh",
+  "health",
+  "flower",
+  "book",
+  "stationery",
+  "digital"
+]);
+function mapShoppingCategory(raw) {
+  if (typeof raw !== "string") return { category: null, restricted: true };
+  const key = raw.trim();
+  if (!key) return { category: null, restricted: true };
+  const mapped = SHOPPING_CATEGORY_MAP[key] ?? null;
+  if (mapped) return { category: mapped, restricted: RESTRICTED_SHOPPING_CATEGORIES.has(mapped) };
+  return { category: null, restricted: true };
+}
+function isApprovedShoppingCategory(category) {
+  return category !== null && APPROVED_SHOPPING_CATEGORIES.has(category);
+}
+function scanForbiddenCategories(text, boundary) {
+  const value = typeof text === "string" ? text : "";
+  const categories = [];
+  for (const entry of TERM_TABLE) {
+    if (entry.terms.some((re) => re.test(value))) categories.push(entry.category);
+  }
+  for (const raw of boundary?.forbiddenCategories ?? []) {
+    const item = raw.trim();
+    if (!item) continue;
+    if (categories.includes(item)) continue;
+    if (item.length >= 2 && value.includes(item)) categories.push(`user:${item}`);
+  }
+  const avoid = boundary?.avoidTopics ?? [];
+  if (avoid.some((topic) => topic.trim().length >= 2 && value.includes(topic.trim()))) {
+    categories.push("avoid_topic");
+  }
+  return {
+    hit: categories.length > 0,
+    categories,
+    digest: value ? REDACTED_DIGEST(value) : "sha:empty"
+  };
+}
+function checkContentPolicy(text, boundary, opts) {
+  const scan = scanForbiddenCategories(text, boundary);
+  if (!scan.hit) return ALLOW;
+  const hardCategories = scan.categories.filter((c) => c !== "avoid_topic");
+  if (hardCategories.length) {
+    return {
+      allowed: false,
+      reasonCode: hardCategories.some((c) => c.startsWith("user:")) ? "platform_forbidden" : "gambling_terms",
+      categories: hardCategories,
+      digest: scan.digest
+    };
+  }
+  if (!opts?.allowAvoidTopicSoftBlock) {
+    return { allowed: false, reasonCode: "avoid_topic", categories: scan.categories, digest: scan.digest };
+  }
+  return ALLOW;
+}
+var KIND_ARG_SCHEMA = {
+  "journal.write": {
+    required: ["title", "body"],
+    optional: ["mood", "tags", "entryType"],
+    enums: { entryType: ["private", "exchange"] }
+  },
+  "room.plan": {
+    required: ["items"],
+    optional: ["mood"]
+  },
+  "room.note": {
+    required: ["content"],
+    optional: ["noteType"],
+    enums: { noteType: ["lyric", "doodle", "thought", "search", "gossip"] }
+  },
+  "phone.record": {
+    required: ["with", "summary"],
+    optional: ["channel", "durationMinutes", "fictionalNpc"],
+    enums: { channel: ["chat", "call", "sms"] }
+  },
+  "takeout.order": {
+    required: ["shopId", "shopName", "items", "addressText"],
+    optional: ["category", "deliveryFeeMinor", "note"]
+  },
+  "shopping.order": {
+    required: ["shopId", "shopName", "items", "addressText"],
+    optional: ["category", "deliveryFeeMinor", "note"]
+  },
+  "interaction.message": {
+    required: ["text"],
+    optional: ["style", "shareable"],
+    enums: { style: ["casual", "brief", "warm"] }
+  },
+  "travel.wish": {
+    required: ["wishText"],
+    optional: ["placeHint"]
+  },
+  "external.read": {
+    required: ["query"],
+    // fields：只允许请求白名单里的回传字段（服务端还会再投影一次）。
+    optional: ["provider", "maxNotes", "fields"]
+  }
+};
+function validateArgsForKind(kind, args) {
+  const spec = KIND_ARG_SCHEMA[kind];
+  if (!spec) return { ok: false, reasonCode: "capability_unavailable" };
+  if (typeof args !== "object" || args === null || Array.isArray(args)) {
+    return { ok: false, fields: [], reasonCode: "bad_arg_type" };
+  }
+  const record = args;
+  const allowed = /* @__PURE__ */ new Set([...spec.required, ...spec.optional]);
+  const extra = Object.keys(record).filter((key) => !allowed.has(key));
+  if (extra.length) return { ok: false, fields: extra, reasonCode: "unknown_arg_field" };
+  const missing = spec.required.filter((key) => record[key] === void 0 || record[key] === "");
+  if (missing.length) return { ok: false, fields: missing, reasonCode: "missing_arg" };
+  for (const [key, value] of Object.entries(record)) {
+    if (value === void 0) continue;
+    const enumValues = spec.enums?.[key];
+    if (enumValues) {
+      if (typeof value !== "string" || !enumValues.includes(value)) {
+        return { ok: false, fields: [key], reasonCode: "bad_arg_type" };
+      }
+    }
+  }
+  return { ok: true };
+}
+var PRIVILEGE_KEYS = /* @__PURE__ */ new Set([
+  "permission",
+  "permissions",
+  "capabilities",
+  "tool",
+  "tools",
+  "toolname",
+  "mcp",
+  "url",
+  "uri",
+  "href",
+  "endpoint",
+  "method",
+  "headers",
+  "authorization",
+  "budget",
+  "limits",
+  "quota",
+  "policyversion",
+  "installationid",
+  "ownerid",
+  "charid",
+  "token"
+]);
+function detectPrivilegeEscalation(value, depth = 0) {
+  if (depth > 4 || value === null || typeof value !== "object") return [];
+  const hits = [];
+  if (Array.isArray(value)) {
+    for (const item of value) hits.push(...detectPrivilegeEscalation(item, depth + 1));
+    return hits;
+  }
+  for (const [rawKey, child] of Object.entries(value)) {
+    const key = rawKey.toLowerCase().replace(/[_-]/g, "");
+    if (PRIVILEGE_KEYS.has(key)) hits.push(rawKey);
+    hits.push(...detectPrivilegeEscalation(child, depth + 1));
+  }
+  return hits;
+}
+function grantFor(grants, provider, nowMs) {
+  if (!grants) return null;
+  for (const grant of grants) {
+    if (grant.provider === provider && grant.expiresAt > nowMs) return grant;
+  }
+  return null;
+}
+function checkIntentPolicy(input, nowMs) {
+  const { kind, args, purpose, boundary } = input;
+  const argCheck = validateArgsForKind(kind, args);
+  if (!argCheck.ok) {
+    return { allowed: false, reasonCode: argCheck.reasonCode ?? "bad_arg_type", fields: argCheck.fields };
+  }
+  const escalation = detectPrivilegeEscalation(args);
+  if (escalation.length) return { allowed: false, reasonCode: "privilege_escalation", fields: escalation };
+  const textForScan = [purpose, ...collectStrings2(args)].join("\n");
+  const contentDecision = checkContentPolicy(textForScan, boundary);
+  if (!contentDecision.allowed) return contentDecision;
+  if (kind === "phone.record") {
+    const fictional = args.fictionalNpc === true;
+    if (fictional && !boundary.allowFictionalNpc) {
+      return { allowed: false, reasonCode: "fictional_npc_denied" };
+    }
+  }
+  if (kind === "takeout.order" || kind === "shopping.order") {
+    const mapped = mapShoppingCategory(args.category);
+    if (mapped.restricted) {
+      return {
+        allowed: false,
+        reasonCode: "shopping_category_forbidden",
+        categories: mapped.category ? [mapped.category] : ["unmapped"],
+        digest: REDACTED_DIGEST(String(args.category ?? ""))
+      };
+    }
+    if (!isApprovedShoppingCategory(mapped.category)) {
+      return { allowed: false, reasonCode: "shopping_category_unknown" };
+    }
+  }
+  if (kind === "external.read") {
+    const provider = args.provider === "amap" ? "amap" : "xhs";
+    if (!grantFor(boundary.externalGrants, provider, nowMs)) {
+      return { allowed: false, reasonCode: "grant_missing" };
+    }
+  }
+  if (kind === "travel.wish") {
+    if (!grantFor(boundary.externalGrants, "amap", nowMs)) {
+      return { allowed: false, reasonCode: "grant_missing" };
+    }
+  }
+  if (input.requireClassifier) {
+    if (!input.classify) return { allowed: false, reasonCode: "classifier_unavailable" };
+    const verdict = input.classify(textForScan);
+    if ("error" in verdict) return { allowed: false, reasonCode: "classifier_unavailable" };
+    if (verdict.verdict === "blocked") {
+      return { allowed: false, reasonCode: "platform_forbidden", digest: REDACTED_DIGEST(textForScan) };
+    }
+  }
+  return ALLOW;
+}
+function collectStrings2(value, out = [], depth = 0) {
+  if (depth > 4) return out;
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStrings2(item, out, depth + 1);
+  } else if (value && typeof value === "object") {
+    for (const child of Object.values(value)) collectStrings2(child, out, depth + 1);
+  }
+  return out;
+}
+
+// utils/autonomyLife/adapters.ts
+var APP_ID = {
+  "journal.write": "journal",
+  "room.plan": "room",
+  "room.note": "room",
+  "phone.record": "phone",
+  "takeout.order": "takeout",
+  "shopping.order": "shopping",
+  "interaction.message": "chat",
+  "travel.wish": "travel",
+  "external.read": "xhs"
+};
+var REQUIRES_GRANT = {
+  "journal.write": false,
+  "room.plan": false,
+  "room.note": false,
+  "phone.record": false,
+  "takeout.order": false,
+  "shopping.order": false,
+  "interaction.message": false,
+  "travel.wish": true,
+  "external.read": true
+};
+function grantActive(boundary, provider, nowMs) {
+  return boundary.externalGrants.some((grant) => grant.provider === provider && grant.expiresAt > nowMs);
+}
+function describeCapabilities(input) {
+  const { boundary, probes, nowMs } = input;
+  return Object.keys(APP_ID).map((kind) => {
+    const requiresGrant = REQUIRES_GRANT[kind];
+    const enabled = boundary.allowedKinds.includes(kind);
+    let unavailableReason;
+    if (!probes.localStoresReady) unavailableReason = "local_stores_missing";
+    else if (!probes.deviceBound) unavailableReason = "device_unbound";
+    else if (!probes.hasModelCredentials) unavailableReason = "missing_credentials";
+    else if (kind === "external.read") {
+      if (!probes.externalRead.configured) unavailableReason = "external_adapter_not_configured";
+      else if (!probes.externalRead.reachable) unavailableReason = "external_adapter_unreachable";
+      else if (!grantActive(boundary, "xhs", nowMs)) unavailableReason = "grant_missing";
+    } else if (kind === "travel.wish") {
+      if (!probes.map.configured) unavailableReason = "map_not_configured";
+      else if (!probes.map.reachable) unavailableReason = "external_adapter_unreachable";
+      else if (!grantActive(boundary, "amap", nowMs)) unavailableReason = "grant_missing";
+    }
+    const available = !unavailableReason;
+    return {
+      kind,
+      appId: APP_ID[kind],
+      available,
+      enabled: enabled && available,
+      executionMode: KIND_EXECUTION_MODE[kind],
+      requiresForeground: KIND_EXECUTION_MODE[kind] === "local",
+      requiresGrant,
+      ...unavailableReason ? { unavailableReason } : {}
+    };
+  });
+}
+
+// utils/autonomyLife/budget.ts
+function emptyBudgetRow(windowId, scope, updatedAt) {
+  return {
+    windowId,
+    scope,
+    usedCalls: 0,
+    reservedCalls: 0,
+    usedTokens: 0,
+    reservedTokens: 0,
+    notifications: 0,
+    kindCounts: {},
+    spendMinor: 0,
+    revision: 0,
+    updatedAt
+  };
+}
+var limitOf = (limits, key, scope) => {
+  const value = limits[key];
+  if (value === null || value === void 0) {
+    return Math.min(
+      DEFAULT_ACCOUNT_LIMITS[key] ?? 0,
+      MAXIMUM_ACCOUNT_LIMITS[key] ?? 0
+    );
+  }
+  return value;
+};
+function precheckBudget(inputs) {
+  const { accountRow, charRow, limits, request } = inputs;
+  const calls = request.calls ?? 1;
+  const tokens = request.tokens;
+  const spend = request.spendMinor ?? 0;
+  const acctCalls = limitOf(limits, "accountModelCallsPerDay", "account");
+  const charCalls = limitOf(limits, "charModelCallsPerDay", "char");
+  const acctTokens = limitOf(limits, "accountTokensPerDay", "account");
+  const charTokens = limitOf(limits, "charTokensPerDay", "char");
+  const notifLimit = limitOf(limits, "notificationsPerDay", "account");
+  const perKind = limitOf(limits, "perKindActionsPerDay", "char");
+  const spendLimit = limitOf(limits, "virtualSpendPerDayMinor", "char");
+  const orderMax = limitOf(limits, "virtualOrderMaxMinor", "char");
+  if (calls > 0) {
+    if (acctCalls <= 0) return { ok: false, dimension: "account_calls" };
+    if (charCalls <= 0) return { ok: false, dimension: "char_calls" };
+    if (accountRow.usedCalls + accountRow.reservedCalls + calls > acctCalls) {
+      return { ok: false, dimension: "account_calls" };
+    }
+    if (charRow.usedCalls + charRow.reservedCalls + calls > charCalls) {
+      return { ok: false, dimension: "char_calls" };
+    }
+  }
+  if (tokens > 0) {
+    if (acctTokens <= 0) return { ok: false, dimension: "account_tokens" };
+    if (charTokens <= 0) return { ok: false, dimension: "char_tokens" };
+    if (accountRow.usedTokens + accountRow.reservedTokens + tokens > acctTokens) {
+      return { ok: false, dimension: "account_tokens" };
+    }
+    if (charRow.usedTokens + charRow.reservedTokens + tokens > charTokens) {
+      return { ok: false, dimension: "char_tokens" };
+    }
+  }
+  if (request.notification) {
+    if (notifLimit <= 0) return { ok: false, dimension: "notifications" };
+    if (accountRow.notifications + 1 > notifLimit) return { ok: false, dimension: "notifications" };
+  }
+  if (request.kind) {
+    if (perKind <= 0) return { ok: false, dimension: "kind_actions" };
+    const used = charRow.kindCounts[request.kind] ?? 0;
+    if (used + 1 > perKind) return { ok: false, dimension: "kind_actions" };
+  }
+  if (spend > 0) {
+    if (spendLimit <= 0) return { ok: false, dimension: "virtual_spend" };
+    if (orderMax <= 0 || spend > orderMax) return { ok: false, dimension: "virtual_order_max" };
+    if (charRow.spendMinor + spend > spendLimit) return { ok: false, dimension: "virtual_spend" };
+  }
+  return { ok: true };
+}
+var reservationCounter = 0;
+async function reserveBudget(port, request) {
+  if (!port.available()) {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
+  }
+  const calls = request.calls ?? 1;
+  const windowId = budgetWindowId(request.nowMs, request.windowTimezone);
+  try {
+    const outcome = await port.mutate(windowId, ["account", request.charId], (rows) => {
+      const accountRow = rows.account ?? emptyBudgetRow(windowId, "account", request.nowMs);
+      const charRow = rows[request.charId] ?? emptyBudgetRow(windowId, request.charId, request.nowMs);
+      const precheck = precheckBudget({ accountRow, charRow, limits: request.limits, request });
+      if (!precheck.ok) return null;
+      reservationCounter += 1;
+      const grant = {
+        reservationId: `rsv_${windowId}_${request.charId}_${request.nowMs}_${reservationCounter}`,
+        windowId,
+        charId: request.charId,
+        calls,
+        tokens: request.tokens,
+        notification: request.notification === true,
+        spendMinor: request.spendMinor ?? 0,
+        kind: request.kind ?? null,
+        createdAt: request.nowMs
+      };
+      const nextAccount = {
+        ...accountRow,
+        reservedCalls: accountRow.reservedCalls + calls,
+        reservedTokens: accountRow.reservedTokens + request.tokens,
+        notifications: accountRow.notifications + (request.notification ? 1 : 0),
+        revision: accountRow.revision + 1,
+        updatedAt: request.nowMs
+      };
+      const kindCounts = { ...charRow.kindCounts };
+      if (request.kind) kindCounts[request.kind] = (kindCounts[request.kind] ?? 0) + 1;
+      const nextChar = {
+        ...charRow,
+        reservedCalls: charRow.reservedCalls + calls,
+        reservedTokens: charRow.reservedTokens + request.tokens,
+        kindCounts,
+        spendMinor: charRow.spendMinor + (request.spendMinor ?? 0),
+        revision: charRow.revision + 1,
+        updatedAt: request.nowMs
+      };
+      return { updates: [nextAccount, nextChar], result: grant };
+    });
+    if (!outcome) {
+      const detail = await port.mutate(windowId, ["account", request.charId], (rows) => {
+        const precheck = precheckBudget({
+          accountRow: rows.account,
+          charRow: rows[request.charId],
+          limits: request.limits,
+          request
+        });
+        return { result: precheck, updates: [] };
+      });
+      const dimension = detail && !detail.ok ? detail.dimension ?? "unknown" : "unknown";
+      return { ok: false, code: "BUDGET_EXHAUSTED", dimension };
+    }
+    return { ok: true, grant: outcome };
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", dimension: "store_unavailable" };
+  }
+}
+async function settleBudget(port, grant, input) {
+  if (!port.available()) return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  const released = !input.requestStarted;
+  const settledTokens = released ? 0 : typeof input.actualTokens === "number" && Number.isFinite(input.actualTokens) && input.actualTokens >= 0 ? Math.min(Math.round(input.actualTokens), grant.tokens) : grant.tokens;
+  try {
+    const outcome = await port.mutate(grant.windowId, ["account", grant.charId], (rows) => {
+      const accountRow = rows.account;
+      const charRow = rows[grant.charId];
+      if (!accountRow || !charRow) return null;
+      const nextAccount = {
+        ...accountRow,
+        reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, accountRow.reservedTokens - grant.tokens),
+        usedCalls: accountRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: accountRow.usedTokens + settledTokens,
+        revision: accountRow.revision + 1,
+        updatedAt: Date.now()
+      };
+      const nextChar = {
+        ...charRow,
+        reservedCalls: Math.max(0, charRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, charRow.reservedTokens - grant.tokens),
+        usedCalls: charRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: charRow.usedTokens + settledTokens,
+        revision: charRow.revision + 1,
+        updatedAt: Date.now()
+      };
+      return { updates: [nextAccount, nextChar], result: { usedTokens: settledTokens } };
+    });
+    if (!outcome) return { ok: false, code: "SERVICE_UNAVAILABLE" };
+    return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  }
+}
+function projectBudgetUsage(rowAccount, rowChar, limits) {
+  const account = rowAccount ?? emptyBudgetRow("", "account", 0);
+  const character = rowChar ?? emptyBudgetRow("", "char", 0);
+  return [
+    {
+      dimension: "model_calls",
+      used: character.usedCalls,
+      reserved: character.reservedCalls,
+      limit: limitOf(limits, "charModelCallsPerDay", "char")
+    },
+    {
+      dimension: "model_calls_account",
+      used: account.usedCalls,
+      reserved: account.reservedCalls,
+      limit: limitOf(limits, "accountModelCallsPerDay", "account")
+    },
+    {
+      dimension: "tokens",
+      used: character.usedTokens,
+      reserved: character.reservedTokens,
+      limit: limitOf(limits, "charTokensPerDay", "char")
+    },
+    {
+      dimension: "notifications",
+      used: account.notifications,
+      reserved: 0,
+      limit: limitOf(limits, "notificationsPerDay", "account")
+    },
+    {
+      dimension: "virtual_spend",
+      used: character.spendMinor,
+      reserved: 0,
+      limit: limitOf(limits, "virtualSpendPerDayMinor", "char")
+    }
+  ];
+}
+function windowIdAt(clock, timezone) {
+  return budgetWindowId(clock.now(), timezone);
+}
+
+// utils/autonomyLife/rhythm.ts
+var RHYTHM_VERSION = "rhythm-v1";
+var CONSERVATIVE_SLEEP = { start: "23:00", end: "08:00" };
+var DEFAULT_PHASE_PREFERENCES = {
+  morning: 0.5,
+  noon: 0.5,
+  evening: 0.55,
+  night: 0.45
+};
+var clamp013 = (value) => Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+var countHits = (text, words) => words.reduce((sum, word) => text.includes(word) ? sum + 1 : sum, 0);
+var OUTGOING_WORDS = ["\u5916\u5411", "\u6D3B\u6CFC", "\u5065\u8C08", "\u5F00\u6717", "\u793E\u725B", "\u7231\u793E\u4EA4", "\u8BDD\u591A", "\u70ED\u95F9", "\u559C\u6B22\u8BA4\u8BC6"];
+var RESERVED_WORDS = ["\u5185\u5411", "\u5B89\u9759", "\u5BE1\u8A00", "\u793E\u6050", "\u6015\u751F", "\u72EC\u6765\u72EC\u5F80", "\u4E0D\u7231\u8BF4\u8BDD", "\u6162\u70ED"];
+var CURIOUS_WORDS = ["\u597D\u5947", "\u559C\u6B22\u5C1D\u8BD5", "\u7231\u7814\u7A76", "\u6C42\u77E5", "\u63A2\u7D22", "\u7231\u770B\u4E66", "\u5237\u5230"];
+var ORDERLY_WORDS = ["\u6709\u6761\u7406", "\u7231\u6574\u7406", "\u89C4\u5F8B", "\u81EA\u5F8B", "\u6E05\u5355", "\u8BA1\u5212\u6027\u5F3A", "\u6574\u6D01"];
+var IMPULSIVE_WORDS = ["\u51B2\u52A8", "\u968F\u6027", "\u60F3\u5230\u5C31\u505A", "\u4EFB\u6027", "\u53CD\u590D\u65E0\u5E38", "\u4E09\u5206\u949F\u70ED\u5EA6"];
+var NIGHT_WORDS = ["\u591C\u732B", "\u71AC\u591C", "\u6DF1\u591C", "\u665A\u7761", "\u51CC\u6668"];
+var MORNING_WORDS = ["\u65E9\u8D77", "\u6668\u578B", "\u65E9\u7761\u65E9\u8D77", "\u6E05\u6668", "\u65E9\u9910"];
+var INTEREST_HINTS = [
+  "\u7F8E\u98DF",
+  "\u5496\u5561",
+  "\u5976\u8336",
+  "\u751C\u70B9",
+  "\u97F3\u4E50",
+  "\u7535\u5F71",
+  "\u6E38\u620F",
+  "\u8BFB\u4E66",
+  "\u5C0F\u8BF4",
+  "\u6444\u5F71",
+  "\u65C5\u884C",
+  "\u8FD0\u52A8",
+  "\u5065\u8EAB",
+  "\u732B",
+  "\u72D7",
+  "\u690D\u7269",
+  "\u624B\u8D26",
+  "\u7A7F\u642D",
+  "\u5929\u6587",
+  "\u7F16\u7A0B",
+  "\u52A8\u6F2B",
+  "\u620F\u5267",
+  "\u7ED8\u753B",
+  "\u4E66\u6CD5"
+];
+var TIME_RANGE_RE = /([01]?\d|2[0-3])[:：]([0-5]\d)\s*[-–~至到]\s*([01]?\d|2[0-3])[:：]([0-5]\d)/;
+var pad = (value) => String(value).padStart(2, "0");
+function buildRhythmProfile(input) {
+  const personaText = (input.personaText ?? "").slice(0, 4e3);
+  const scheduleText = (input.scheduleText ?? "").slice(0, 2e3);
+  const combined = `${personaText}
+${scheduleText}`;
+  const outgoing = countHits(combined, OUTGOING_WORDS);
+  const reserved = countHits(combined, RESERVED_WORDS);
+  const curious = countHits(combined, CURIOUS_WORDS);
+  const orderly = countHits(combined, ORDERLY_WORDS);
+  const impulsive = countHits(combined, IMPULSIVE_WORDS);
+  const night = countHits(combined, NIGHT_WORDS);
+  const morning = countHits(combined, MORNING_WORDS);
+  const baseTraits = {
+    sociability: clamp013(0.5 + 0.12 * outgoing - 0.12 * reserved),
+    curiosity: clamp013(0.5 + 0.1 * curious),
+    orderliness: clamp013(0.5 + 0.1 * orderly),
+    impulsiveness: clamp013(0.5 + 0.1 * impulsive)
+  };
+  const sleepWindows = [];
+  const rangeMatch = TIME_RANGE_RE.exec(scheduleText || personaText);
+  if (rangeMatch) {
+    const start = `${pad(Number(rangeMatch[1]))}:${rangeMatch[2]}`;
+    const end = `${pad(Number(rangeMatch[3]))}:${rangeMatch[4]}`;
+    if (hhmmToMinutes(start) !== null && hhmmToMinutes(end) !== null && start !== end) {
+      sleepWindows.push({ start, end });
+    }
+  }
+  if (!sleepWindows.length) {
+    if (night > morning) sleepWindows.push({ start: "01:30", end: "09:30" });
+    else if (morning > night) sleepWindows.push({ start: "22:30", end: "06:30" });
+    else sleepWindows.push({ ...CONSERVATIVE_SLEEP });
+  }
+  const interestTags = INTEREST_HINTS.filter((tag) => combined.includes(tag)).slice(0, 8);
+  const personaSignals = outgoing + reserved + curious + orderly + impulsive + night + morning + interestTags.length;
+  const confidence = personaSignals > 0 ? "persona" : "fallback";
+  let profile = {
+    version: RHYTHM_VERSION,
+    personaHash: input.personaHash,
+    timezone: normalizeTimeZone(input.timezone),
+    sleepWindows,
+    phasePreferences: {
+      morning: clamp013(DEFAULT_PHASE_PREFERENCES.morning + 0.1 * morning - 0.08 * night),
+      noon: DEFAULT_PHASE_PREFERENCES.noon,
+      evening: clamp013(DEFAULT_PHASE_PREFERENCES.evening + 0.05 * outgoing),
+      night: clamp013(DEFAULT_PHASE_PREFERENCES.night + 0.12 * night - 0.08 * morning)
+    },
+    interestTags,
+    traits: baseTraits,
+    confidence,
+    source: confidence === "persona" ? "persona_extract" : "deterministic_fallback",
+    generatedAt: input.nowMs,
+    scheduleRevision: hashString(`${input.personaHash}|${input.timezone}|${scheduleText.length}`),
+    summaryHash: hashString(combined)
+  };
+  if (input.extracted) {
+    const ext = input.extracted;
+    if (Array.isArray(ext.sleepWindows)) {
+      const valid = ext.sleepWindows.filter((w) => w && hhmmToMinutes(w.start) !== null && hhmmToMinutes(w.end) !== null && w.start !== w.end).slice(0, 3);
+      if (valid.length) profile = { ...profile, sleepWindows: valid };
+    }
+    if (ext.phasePreferences) {
+      profile = {
+        ...profile,
+        phasePreferences: {
+          morning: clamp013(ext.phasePreferences.morning),
+          noon: clamp013(ext.phasePreferences.noon),
+          evening: clamp013(ext.phasePreferences.evening),
+          night: clamp013(ext.phasePreferences.night)
+        }
+      };
+    }
+    if (Array.isArray(ext.interestTags)) {
+      profile = { ...profile, interestTags: ext.interestTags.filter((t) => typeof t === "string").slice(0, 8) };
+    }
+    if (ext.traits) {
+      profile = {
+        ...profile,
+        traits: {
+          sociability: clamp013(ext.traits.sociability),
+          curiosity: clamp013(ext.traits.curiosity),
+          orderliness: clamp013(ext.traits.orderliness),
+          impulsiveness: clamp013(ext.traits.impulsiveness)
+        }
+      };
+    }
+  }
+  return profile;
+}
+function isProfileStale(profile, input) {
+  if (!profile) return true;
+  if (profile.version !== RHYTHM_VERSION) return true;
+  if (profile.personaHash !== input.personaHash) return true;
+  if (normalizeTimeZone(profile.timezone) !== normalizeTimeZone(input.timezone)) return true;
+  return profile.summaryHash !== input.summaryHash;
+}
+var PHASE_RANGES = {
+  morning: { start: "08:00", end: "11:30" },
+  noon: { start: "11:30", end: "17:00" },
+  evening: { start: "17:00", end: "22:00" },
+  night: { start: "22:00", end: "23:59" }
+};
+function isAsleep(profile, nowMs) {
+  const parts = zonedParts3(nowMs, profile.timezone);
+  return profile.sleepWindows.some((window2) => {
+    const start = hhmmToMinutes(window2.start);
+    const end = hhmmToMinutes(window2.end);
+    if (start === null || end === null) return false;
+    return isWithinWindow(parts.minuteOfDay, start, end);
+  });
+}
+function resolvePhase(profile, nowMs) {
+  const parts = zonedParts3(nowMs, profile.timezone);
+  if (isAsleep(profile, nowMs)) return { phase: "resting", minuteOfDay: parts.minuteOfDay };
+  const order = ["morning", "noon", "evening", "night"];
+  for (const phase of order) {
+    const start = hhmmToMinutes(PHASE_RANGES[phase].start);
+    const end = hhmmToMinutes(PHASE_RANGES[phase].end);
+    if (parts.minuteOfDay >= start && parts.minuteOfDay < end) return { phase, minuteOfDay: parts.minuteOfDay };
+  }
+  return { phase: "night", minuteOfDay: parts.minuteOfDay };
+}
+var NEED_KEYS = ["social", "record", "tidy", "food", "interest"];
+var NEED_GROWTH_PER_HOUR = {
+  social: 0.11,
+  record: 0.09,
+  tidy: 0.06,
+  food: 0.16,
+  interest: 0.08
+};
+function updateNeeds(prev, input) {
+  const cappedElapsed = Math.min(Math.max(0, input.elapsedMs), DAY_MS4);
+  const hours = cappedElapsed / HOUR_MS5;
+  const phaseBoost = {
+    morning: 0.9,
+    noon: 1,
+    evening: 1.1,
+    night: 0.8,
+    resting: 0.35
+  };
+  const boost = phaseBoost[input.phase];
+  const next = { ...prev };
+  for (const key of NEED_KEYS) {
+    let rate = NEED_GROWTH_PER_HOUR[key] * boost * hours;
+    if (key === "social") {
+      rate *= 0.7 + 0.6 * input.traits.sociability;
+      if (typeof input.sinceInteractionMs === "number" && input.sinceInteractionMs < 10 * MINUTE_MS3) rate *= 0.4;
+    }
+    if (key === "record") rate *= 0.8 + 0.5 * input.traits.orderliness;
+    if (key === "tidy") rate *= 0.7 + 0.7 * input.traits.orderliness;
+    if (key === "interest") rate *= 0.8 + 0.6 * input.traits.curiosity;
+    next[key] = clamp013(prev[key] + rate);
+  }
+  return next;
+}
+function applyActivitySuccess(needs, kind) {
+  const drop = {
+    "journal.write": { record: 0.35 },
+    "room.plan": { tidy: 0.3 },
+    "room.note": { record: 0.2, tidy: 0.1 },
+    "phone.record": { social: 0.25, record: 0.1 },
+    "takeout.order": { food: 0.45 },
+    "shopping.order": { food: 0.25, interest: 0.1 },
+    "interaction.message": { social: 0.4 },
+    "travel.wish": { interest: 0.2 },
+    "external.read": { interest: 0.3 }
+  };
+  const next = { ...needs };
+  for (const [key, value] of Object.entries(drop[kind] ?? {})) {
+    const needKey = key;
+    next[needKey] = clamp013(next[needKey] - value);
+  }
+  return next;
+}
+var KIND_TRAIT_WEIGHTS = {
+  "journal.write": { orderliness: 0.6, curiosity: 0.4 },
+  "room.plan": { orderliness: 0.9 },
+  "room.note": { orderliness: 0.4, curiosity: 0.4 },
+  "phone.record": { sociability: 0.8, impulsiveness: 0.2 },
+  "takeout.order": { impulsiveness: 0.6, orderliness: 0.2 },
+  "shopping.order": { impulsiveness: 0.5, curiosity: 0.3 },
+  "interaction.message": { sociability: 1 },
+  "travel.wish": { curiosity: 0.8, impulsiveness: 0.3 },
+  "external.read": { curiosity: 1 }
+};
+var KIND_NEED_WEIGHT = {
+  "journal.write": { record: 1 },
+  "room.plan": { tidy: 1 },
+  "room.note": { record: 0.5, tidy: 0.5 },
+  "phone.record": { social: 0.9, record: 0.3 },
+  "takeout.order": { food: 1 },
+  "shopping.order": { food: 0.5, interest: 0.5 },
+  "interaction.message": { social: 1 },
+  "travel.wish": { interest: 0.8 },
+  "external.read": { interest: 1 }
+};
+var KIND_PHASE_FIT = {
+  "journal.write": { night: 0.9, evening: 0.8, morning: 0.5, noon: 0.4, resting: 0.1 },
+  "room.plan": { morning: 0.9, evening: 0.6, noon: 0.5, night: 0.3, resting: 0.1 },
+  "room.note": { evening: 0.7, night: 0.6, noon: 0.5, morning: 0.5, resting: 0.1 },
+  "phone.record": { evening: 0.8, noon: 0.7, night: 0.6, morning: 0.4, resting: 0.1 },
+  "takeout.order": { noon: 0.9, evening: 0.9, morning: 0.5, night: 0.4, resting: 0.05 },
+  "shopping.order": { evening: 0.7, noon: 0.6, morning: 0.5, night: 0.5, resting: 0.05 },
+  "interaction.message": { evening: 0.7, night: 0.65, noon: 0.6, morning: 0.55, resting: 0.05 },
+  "travel.wish": { morning: 0.6, noon: 0.6, evening: 0.7, night: 0.4, resting: 0.05 },
+  "external.read": { evening: 0.7, night: 0.7, noon: 0.5, morning: 0.5, resting: 0.05 }
+};
+var traitAffinity = (candidate, traits) => {
+  const weights = KIND_TRAIT_WEIGHTS[candidate.kind] ?? {};
+  let sum = 0;
+  let total = 0;
+  for (const [key, weight] of Object.entries(weights)) {
+    sum += traits[key] * weight;
+    total += weight;
+  }
+  return total === 0 ? 0.5 : clamp013(sum / total);
+};
+var needAffinity = (candidate, needs) => {
+  const weights = KIND_NEED_WEIGHT[candidate.kind] ?? {};
+  let sum = 0;
+  let total = 0;
+  for (const [key, weight] of Object.entries(weights)) {
+    sum += needs[key] * weight;
+    total += weight;
+  }
+  return total === 0 ? 0 : clamp013(sum / total);
+};
+function fingerprintOf(candidate) {
+  return hashString(`${candidate.kind}|${candidate.semanticPurpose}|${candidate.contentFingerprint ?? ""}`);
+}
+function repeatPenalty(candidate, recent, nowMs) {
+  const fp = fingerprintOf(candidate);
+  const sameKind = recent.filter((item) => item.kind === candidate.kind);
+  let penalty = 0;
+  if (sameKind.some((item) => item.semanticPurpose === candidate.semanticPurpose)) penalty += 0.6;
+  if (sameKind.some((item) => fingerprintOf(item) === fp)) penalty += 0.2;
+  const lastTen = sameKind.slice(0, 10);
+  if (lastTen.some((item) => fingerprintOf(item) === fp)) penalty += 0.15;
+  const dayAgo = nowMs - DAY_MS4;
+  const todayCount = sameKind.filter((item) => item.occurredAt >= dayAgo).length;
+  penalty += Math.min(0.3, todayCount * 0.08);
+  return Math.min(1, penalty);
+}
+var BOUNDED_NOISE = 0.1;
+function scoreCandidate(input) {
+  const trait = traitAffinity(input.candidate, input.profile.traits);
+  const need = needAffinity(input.candidate, input.needs);
+  const phaseFit = KIND_PHASE_FIT[input.candidate.kind]?.[input.phase] ?? 0.2;
+  const interestBoost = (input.candidate.interestTags ?? []).some((tag) => input.profile.interestTags.includes(tag)) ? 0.1 : 0;
+  const contextFit = clamp013(input.contextFit ?? 0.6) + interestBoost;
+  const interactionFit = clamp013(input.interactionFit ?? 0.5);
+  const noise = Math.max(-BOUNDED_NOISE, Math.min(BOUNDED_NOISE, input.rng.noise(BOUNDED_NOISE)));
+  const repeat = repeatPenalty(input.candidate, input.recent, input.nowMs);
+  const failure = clamp013(input.recentFailurePenalty ?? 0);
+  const score = 0.3 * trait + 0.3 * need + 0.18 * phaseFit + 0.12 * contextFit + 0.1 * interactionFit + noise - 0.45 * repeat - 0.3 * failure;
+  return {
+    candidate: input.candidate,
+    score,
+    parts: {
+      traitAffinity: trait,
+      need,
+      phaseFit,
+      contextFit,
+      interactionFit,
+      noise,
+      repeatPenalty: repeat,
+      recentFailurePenalty: failure
+    }
+  };
+}
+function chooseActivity(input) {
+  const allowed = input.candidates.filter((candidate) => input.allowedKinds.includes(candidate.kind));
+  if (!allowed.length) return null;
+  const scored = allowed.map((candidate) => scoreCandidate({ ...input, candidate })).sort((a, b) => b.score === a.score ? a.candidate.kind < b.candidate.kind ? -1 : 1 : b.score - a.score);
+  const best = scored[0];
+  const minScore = input.minScore ?? 0.12;
+  if (!best || best.score < minScore) return null;
+  const reasonSummary = describeReason(best, input.profile, input.needs);
+  return {
+    kind: best.candidate.kind,
+    semanticPurpose: best.candidate.semanticPurpose,
+    purposeKey: hashString(`${best.candidate.kind}|${best.candidate.semanticPurpose}`),
+    score: Number(best.score.toFixed(4)),
+    reasonSummary,
+    candidate: best.candidate
+  };
+}
+function describeReason(scored, profile, needs) {
+  const reasons = [];
+  const dominantNeed = NEED_KEYS.reduce((best, key) => needs[key] > needs[best] ? key : best, NEED_KEYS[0]);
+  const needLabels = {
+    social: "\u60F3\u548C\u4EBA\u8BF4\u8BF4\u8BDD",
+    record: "\u60F3\u628A\u4ECA\u5929\u8BB0\u4E0B\u6765",
+    tidy: "\u60F3\u628A\u623F\u95F4\u548C\u8BA1\u5212\u7406\u4E00\u7406",
+    food: "\u6709\u70B9\u60F3\u5403\u70B9\u4E1C\u897F",
+    interest: "\u60F3\u5237\u70B9\u81EA\u5DF1\u611F\u5174\u8DA3\u7684\u4E1C\u897F"
+  };
+  reasons.push(needLabels[dominantNeed]);
+  if (profile.confidence === "persona") reasons.push("\u6309\u4EBA\u8BBE\u4F5C\u606F");
+  else reasons.push("\u6682\u7528\u57FA\u7840\u4F5C\u606F");
+  if (scored.parts.phaseFit >= 0.6) reasons.push("\u8FD9\u4E2A\u65F6\u6BB5\u6B63\u5408\u9002");
+  return reasons.join("\uFF0C");
+}
+var DEFAULT_MIN_GAP_MS = 30 * MINUTE_MS3;
+function needsAreLow(needs) {
+  return NEED_KEYS.every((key) => needs[key] < 0.25);
+}
+function currentPhaseWindow(profile, nowMs) {
+  const { phase } = resolvePhase(profile, nowMs);
+  const parts = zonedParts3(nowMs, profile.timezone);
+  const dayStartMs = nowMs - (parts.hour * 60 + parts.minute) * MINUTE_MS3;
+  if (phase === "resting") {
+    const sleep2 = profile.sleepWindows[0];
+    const endMinutes = hhmmToMinutes(sleep2?.end ?? "08:00") ?? 8 * 60;
+    const endMs = dayStartMs + endMinutes * MINUTE_MS3;
+    const startMs = endMs > nowMs ? nowMs : endMs + DAY_MS4;
+    const startMinutes = hhmmToMinutes(PHASE_RANGES.morning.start) ?? 8 * 60;
+    return { phase: "morning", startMs: Math.max(startMs, dayStartMs + startMinutes * MINUTE_MS3), endMs: dayStartMs + (hhmmToMinutes(PHASE_RANGES.morning.end) ?? 690) * MINUTE_MS3 };
+  }
+  const range = PHASE_RANGES[phase];
+  return {
+    phase,
+    startMs: dayStartMs + (hhmmToMinutes(range.start) ?? 0) * MINUTE_MS3,
+    endMs: dayStartMs + (hhmmToMinutes(range.end) ?? 0) * MINUTE_MS3
+  };
+}
+function planNextOpportunity(input) {
+  const { profile, needs, nowMs, seed, charId } = input;
+  const minGap = input.minGapMs ?? DEFAULT_MIN_GAP_MS;
+  const { phase } = resolvePhase(profile, nowMs);
+  const window2 = currentPhaseWindow(profile, nowMs);
+  const windowStart = window2.startMs;
+  const rng = createRng("opportunity-at", seed, charId, profile.scheduleRevision, windowStart);
+  const opportunityId2 = opportunityId({
+    seed,
+    charId,
+    scheduleRevision: profile.scheduleRevision,
+    windowStartMs: windowStart
+  });
+  const skip = needsAreLow(needs);
+  const windowLength = Math.max(MINUTE_MS3, window2.endMs - windowStart);
+  const dominant = NEED_KEYS.reduce((best, key) => needs[key] > needs[best] ? key : best, NEED_KEYS[0]);
+  const urgency = clamp013(needs[dominant]);
+  const baseRatio = skip ? 1 : Math.max(0.08, 0.75 - 0.55 * urgency);
+  const jitterRatio = (rng.next() - 0.5) * 0.12;
+  const ratio = Math.min(0.95, Math.max(0.02, baseRatio + jitterRatio));
+  let nextOpportunityAt = Math.floor(windowStart + windowLength * ratio);
+  if (phase === "resting" && !skip) {
+    nextOpportunityAt = Math.max(nextOpportunityAt, window2.startMs);
+  }
+  const floor = nowMs + (input.lastOpportunityAt ? minGap : 0) + (skip ? 0 : 0);
+  nextOpportunityAt = Math.max(nextOpportunityAt, Math.min(floor, window2.endMs - MINUTE_MS3));
+  return {
+    opportunityId: opportunityId2,
+    nextOpportunityAt,
+    lifePhase: skip ? "resting" : phase,
+    skippedPhase: skip,
+    nextCheckAt: Math.min(nextOpportunityAt, nowMs + 30 * MINUTE_MS3),
+    window: window2
+  };
+}
+var BASE_KIND_COOLDOWN_MS = {
+  "journal.write": 6 * HOUR_MS5,
+  "room.plan": 2 * HOUR_MS5,
+  "room.note": 2 * HOUR_MS5,
+  "phone.record": 2 * HOUR_MS5,
+  "interaction.message": 1 * HOUR_MS5,
+  "takeout.order": 2 * HOUR_MS5,
+  "shopping.order": 2 * HOUR_MS5,
+  "travel.wish": 3 * HOUR_MS5,
+  "external.read": 2 * HOUR_MS5
+};
+var MODEL_REQUEST_MIN_GAP_MS = 30 * MINUTE_MS3;
+function withinKindCooldown(recent, kind, nowMs, cooldownMs = BASE_KIND_COOLDOWN_MS[kind] ?? 2 * HOUR_MS5) {
+  const last = recent.find((item) => item.kind === kind && item.success);
+  if (!last) return false;
+  return nowMs - last.occurredAt < cooldownMs;
+}
+function alreadyProducedToday(args) {
+  const today = zonedParts3(args.nowMs, args.tz).dateKey;
+  return args.recent.some(
+    (item) => item.success && item.semanticPurpose === args.semanticPurpose && zonedParts3(item.occurredAt, args.tz).dateKey === today
+  );
+}
+
+// utils/autonomyLife/engine.ts
+var DEFAULT_POLICY_VERSION = "autonomy-life-v1";
+function emptyCharacterLife(charId, nowMs, windowTimezone) {
+  return {
+    charId,
+    revision: 0,
+    lifePhase: "idle",
+    availability: "ready",
+    reasonCodes: [],
+    nextOpportunityAt: null,
+    nextCheckAt: null,
+    scheduleConfidence: "fallback",
+    activeActionId: null,
+    pendingCount: 0,
+    budgetWindowId: null,
+    windowTimezone,
+    needs: { social: 0.3, record: 0.3, tidy: 0.25, food: 0.2, interest: 0.3 },
+    lastEvaluatedAt: nowMs,
+    lastModelCallAt: 0,
+    lastGrantedAt: 0,
+    failStreak: 0,
+    circuitOpenedAt: null,
+    retryAt: null,
+    opportunityId: null,
+    profile: null,
+    pauseRequestedAt: null,
+    lastInteractionAt: 0,
+    rngSeedVersion: 0
+  };
+}
+var FAILURE_BACKOFF_MS = [30 * 6e4, 2 * HOUR_MS5, 8 * HOUR_MS5];
+var nextRevision = (row) => ({ ...row, revision: row.revision + 1 });
+function pauseCycleReason(circuitOpenedAt) {
+  return circuitOpenedAt ? ["CIRCUIT_OPEN"] : [];
+}
+async function tickCharacter(deps, charId) {
+  const clock = deps.clock ?? systemClock;
+  const nowMs = clock.now();
+  const accountId = deps.accountId ?? "account";
+  const stored = await deps.store.getCharacterLife(charId);
+  const boundaryRow = stored ?? emptyCharacterLife(charId, nowMs, "UTC");
+  const row = stored ?? boundaryRow;
+  const accountPause = await deps.store.getAccountPause(accountId);
+  const paused = accountPause.paused || row.pauseRequestedAt !== null;
+  const baseResult = (status, reasonCodes, modelCalls = 0) => ({
+    charId,
+    modelCalls,
+    due: false,
+    actionId: null,
+    status,
+    reasonCodes,
+    nextOpportunityAt: row.nextOpportunityAt
+  });
+  if (paused) {
+    const next2 = nextRevision({
+      ...row,
+      availability: "paused",
+      reasonCodes: ["GLOBAL_PAUSED"],
+      lifePhase: "waiting"
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return baseResult("paused", ["GLOBAL_PAUSED"]);
+  }
+  if (row.circuitOpenedAt !== null) {
+    const retryAt = row.retryAt ?? row.circuitOpenedAt + FAILURE_BACKOFF_MS[FAILURE_BACKOFF_MS.length - 1];
+    if (nowMs < retryAt) {
+      return { ...baseResult("circuit_open", pauseCycleReason(row.circuitOpenedAt)), nextOpportunityAt: retryAt };
+    }
+  }
+  if (row.retryAt !== null && nowMs < row.retryAt) {
+    return { ...baseResult("model_failed", ["MODEL_FAILED"]), nextOpportunityAt: row.retryAt };
+  }
+  if (row.nextOpportunityAt !== null && nowMs < row.nextOpportunityAt) {
+    return baseResult("not_due", row.reasonCodes);
+  }
+  const phase = resolvePhase(row.profile ?? fallbackProfile(charId, row, nowMs), nowMs);
+  const needs = updateNeeds(row.needs, {
+    elapsedMs: nowMs - row.lastEvaluatedAt,
+    phase: phase.phase,
+    traits: (row.profile ?? fallbackProfile(charId, row, nowMs)).traits,
+    sinceInteractionMs: row.lastInteractionAt ? nowMs - row.lastInteractionAt : void 0
+  });
+  const profile = ensureProfile(row, nowMs);
+  if (needsAreLow(needs)) {
+    const plan2 = planNextOpportunity({
+      profile,
+      needs,
+      nowMs,
+      seed: deps.seed,
+      charId,
+      minGapMs: DEFAULT_MIN_GAP_MS,
+      lastOpportunityAt: row.lastModelCallAt || void 0
+    });
+    const next2 = nextRevision({
+      ...row,
+      needs,
+      lastEvaluatedAt: nowMs,
+      lifePhase: "resting",
+      availability: "ready",
+      reasonCodes: ["RESTING"],
+      nextOpportunityAt: plan2.nextOpportunityAt,
+      nextCheckAt: plan2.nextCheckAt,
+      opportunityId: plan2.opportunityId,
+      scheduleConfidence: profile.confidence,
+      profile
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return { ...baseResult("resting", ["RESTING"]), nextOpportunityAt: plan2.nextOpportunityAt };
+  }
+  if (phase.phase === "resting") {
+    const plan2 = planNextOpportunity({
+      profile,
+      needs,
+      nowMs,
+      seed: deps.seed,
+      charId,
+      minGapMs: DEFAULT_MIN_GAP_MS,
+      lastOpportunityAt: row.lastModelCallAt || void 0
+    });
+    const next2 = nextRevision({
+      ...row,
+      needs,
+      lastEvaluatedAt: nowMs,
+      lifePhase: "resting",
+      availability: "ready",
+      reasonCodes: ["SLEEPING"],
+      nextOpportunityAt: plan2.nextOpportunityAt,
+      nextCheckAt: plan2.nextCheckAt,
+      opportunityId: plan2.opportunityId,
+      scheduleConfidence: profile.confidence,
+      profile
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return { ...baseResult("resting", ["SLEEPING"]), nextOpportunityAt: plan2.nextOpportunityAt };
+  }
+  const reservation = await reserveBudget(deps.budget, {
+    nowMs,
+    windowTimezone: row.windowTimezone,
+    accountId,
+    charId,
+    limits: (await deps.boundaryFor(charId)).limits,
+    calls: 1,
+    tokens: deps.reserveTokensPerRun ?? 1600
+  });
+  if (!reservation.ok) {
+    const next2 = nextRevision({
+      ...row,
+      needs,
+      availability: "limited",
+      reasonCodes: [reservation.code === "BUDGET_EXHAUSTED" ? "BUDGET_EXHAUSTED" : "MODEL_FAILED"],
+      lastEvaluatedAt: nowMs,
+      nextCheckAt: nowMs + 30 * 6e4
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return {
+      ...baseResult("budget_exhausted", [reservation.code === "BUDGET_EXHAUSTED" ? "BUDGET_EXHAUSTED" : "MODEL_FAILED"]),
+      budgetDimension: reservation.dimension
+    };
+  }
+  const proposal = await deps.model.request({
+    charId,
+    grant: reservation.grant,
+    kind: "plan",
+    promptKey: `rhythm-plan:${localDateKey(nowMs, row.windowTimezone)}`
+  });
+  await settleBudget(deps.budget, reservation.grant, {
+    actualTokens: proposal?.usageUnknown ? null : proposal?.tokensUsed ?? null,
+    requestStarted: true
+  });
+  if (!proposal) {
+    const failStreak = row.failStreak + 1;
+    const backoffIndex = Math.min(failStreak - 1, FAILURE_BACKOFF_MS.length - 1);
+    const retryAt = nowMs + FAILURE_BACKOFF_MS[backoffIndex];
+    const circuitOpenedAt = failStreak >= 3 ? row.circuitOpenedAt ?? nowMs : null;
+    const next2 = nextRevision({
+      ...row,
+      needs,
+      lastEvaluatedAt: nowMs,
+      lastModelCallAt: nowMs,
+      failStreak,
+      retryAt,
+      circuitOpenedAt,
+      availability: circuitOpenedAt ? "error" : "limited",
+      reasonCodes: circuitOpenedAt ? ["CIRCUIT_OPEN"] : ["MODEL_FAILED"],
+      nextOpportunityAt: retryAt,
+      nextCheckAt: retryAt,
+      profile
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return {
+      ...baseResult(circuitOpenedAt ? "circuit_open" : "model_failed", circuitOpenedAt ? ["CIRCUIT_OPEN"] : ["MODEL_FAILED"], 1),
+      nextOpportunityAt: retryAt
+    };
+  }
+  const candidates = deps.candidatesFor ? deps.candidatesFor(charId) : proposal.candidates;
+  const recent = await deps.store.recentActivities(charId, nowMs - DAY_MS4);
+  const boundary = await deps.boundaryFor(charId);
+  const rng = planRng(deps.seed, charId, profile, nowMs);
+  const chosen = chooseActivity({
+    candidates,
+    allowedKinds: boundary.allowedKinds,
+    profile,
+    needs,
+    phase: phase.phase,
+    recent,
+    nowMs,
+    tz: boundary.timezone,
+    interactionFit: row.lastInteractionAt && nowMs - row.lastInteractionAt < 15 * 6e4 ? 0.2 : 0.6,
+    rng,
+    recentFailurePenalty: Math.min(1, row.failStreak * 0.2)
+  });
+  const nextNeeds = chosen ? applyActivitySuccess(needs, chosen.kind) : needs;
+  const plan = planNextOpportunity({
+    profile,
+    needs: nextNeeds,
+    nowMs,
+    seed: deps.seed,
+    charId,
+    minGapMs: MODEL_REQUEST_MIN_GAP_MS,
+    lastOpportunityAt: row.lastModelCallAt || void 0
+  });
+  if (!chosen) {
+    const next2 = nextRevision({
+      ...row,
+      needs: nextNeeds,
+      lastEvaluatedAt: nowMs,
+      lastModelCallAt: nowMs,
+      failStreak: 0,
+      retryAt: null,
+      circuitOpenedAt: null,
+      availability: "ready",
+      lifePhase: "resting",
+      reasonCodes: ["NO_CANDIDATE"],
+      nextOpportunityAt: plan.nextOpportunityAt,
+      nextCheckAt: plan.nextCheckAt,
+      opportunityId: plan.opportunityId,
+      profile,
+      scheduleConfidence: profile.confidence
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return { ...baseResult("no_candidate", ["NO_CANDIDATE"], 1), nextOpportunityAt: plan.nextOpportunityAt };
+  }
+  const candidateArgs = chosen.candidate.args ?? {};
+  const planDecision = checkIntentPolicy(
+    {
+      kind: chosen.kind,
+      args: candidateArgs,
+      purpose: chosen.semanticPurpose,
+      boundary: {
+        forbiddenCategories: boundary.forbiddenCategories,
+        avoidTopics: boundary.avoidTopics,
+        allowFictionalNpc: boundary.allowFictionalNpc,
+        externalGrants: boundary.externalGrants
+      }
+    },
+    nowMs
+  );
+  if (!planDecision.allowed) {
+    const next2 = nextRevision({
+      ...row,
+      needs: nextNeeds,
+      lastEvaluatedAt: nowMs,
+      lastModelCallAt: nowMs,
+      availability: "ready",
+      lifePhase: "idle",
+      reasonCodes: ["POLICY_DENIED"],
+      nextOpportunityAt: plan.nextOpportunityAt,
+      nextCheckAt: plan.nextCheckAt,
+      opportunityId: plan.opportunityId,
+      profile
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return { ...baseResult("skipped", ["POLICY_DENIED"], 1), nextOpportunityAt: plan.nextOpportunityAt };
+  }
+  const blockedByCooldown = withinKindCooldown(recent, chosen.kind, nowMs);
+  const blockedByDedupe = alreadyProducedToday({
+    recent,
+    semanticPurpose: chosen.semanticPurpose,
+    nowMs,
+    tz: boundary.timezone
+  });
+  if (blockedByCooldown || blockedByDedupe) {
+    const next2 = nextRevision({
+      ...row,
+      needs: nextNeeds,
+      lastEvaluatedAt: nowMs,
+      lastModelCallAt: nowMs,
+      availability: "ready",
+      lifePhase: "idle",
+      reasonCodes: ["NO_CANDIDATE"],
+      nextOpportunityAt: plan.nextOpportunityAt,
+      nextCheckAt: plan.nextCheckAt,
+      opportunityId: plan.opportunityId,
+      profile
+    });
+    await deps.store.putCharacterLife(next2, row.revision);
+    return { ...baseResult("skipped", ["NO_CANDIDATE"], 1), nextOpportunityAt: plan.nextOpportunityAt };
+  }
+  const installation = await deps.store.getBoundInstallation(accountId);
+  const online = await deps.deviceOnline(installation);
+  const action = buildActionRow({
+    charId,
+    chosen,
+    nowMs,
+    budgetWindowId: reservation.grant.windowId,
+    reservationId: reservation.grant.reservationId,
+    policyVersion: deps.policyVersion ?? DEFAULT_POLICY_VERSION,
+    tz: boundary.timezone,
+    installationId: installation,
+    online
+  });
+  await deps.store.insertAction(action);
+  const next = nextRevision({
+    ...row,
+    needs: nextNeeds,
+    revision: row.revision,
+    lastEvaluatedAt: nowMs,
+    lastModelCallAt: nowMs,
+    lastGrantedAt: nowMs,
+    failStreak: 0,
+    retryAt: null,
+    circuitOpenedAt: null,
+    availability: "ready",
+    lifePhase: online ? "engaged" : "waiting",
+    reasonCodes: online ? [] : ["WAITING_DEVICE"],
+    activeActionId: action.id,
+    pendingCount: row.pendingCount + 1,
+    nextOpportunityAt: plan.nextOpportunityAt,
+    nextCheckAt: plan.nextCheckAt,
+    opportunityId: plan.opportunityId,
+    profile,
+    scheduleConfidence: profile.confidence
+  });
+  await deps.store.putCharacterLife(next, row.revision);
+  return {
+    charId,
+    modelCalls: 1,
+    due: true,
+    actionId: action.id,
+    status: online ? "scheduled" : "waiting_device",
+    reasonCodes: online ? [] : ["WAITING_DEVICE"],
+    nextOpportunityAt: plan.nextOpportunityAt
+  };
+}
+function fallbackProfile(charId, row, nowMs) {
+  return buildRhythmProfile({
+    personaText: "",
+    scheduleText: "",
+    timezone: row.windowTimezone,
+    personaHash: `${charId}:fallback`,
+    nowMs
+  });
+}
+function ensureProfile(row, nowMs) {
+  if (row.profile && !isProfileStale(row.profile, {
+    personaHash: row.profile.personaHash,
+    timezone: row.windowTimezone,
+    summaryHash: row.profile.summaryHash
+  })) {
+    return row.profile;
+  }
+  return fallbackProfile(row.charId, row, nowMs);
+}
+function planRng(seed, charId, profile, nowMs) {
+  return createRng("choose", seed, charId, profile.scheduleRevision, localDateKey(nowMs, profile.timezone));
+}
+function buildActionRow(input) {
+  const args = input.args ?? input.chosen.args ?? input.chosen.candidate.args ?? { semanticPurpose: input.chosen.semanticPurpose };
+  const dedupeKey = actionDedupeKey({
+    charId: input.charId,
+    kind: input.chosen.kind,
+    purposeKey: input.chosen.purposeKey,
+    localDateKey: localDateKey(input.nowMs, input.tz)
+  });
+  return {
+    id: `act_${dedupeKey}_${input.nowMs.toString(36)}`,
+    charId: input.charId,
+    kind: input.chosen.kind,
+    windowId: input.budgetWindowId,
+    executionMode: "local",
+    scope: input.chosen.kind === "external.read" ? "external_read" : "os_simulation",
+    source: input.source ?? "rhythm",
+    sourceRef: input.sourceRef ?? null,
+    purposeKey: input.chosen.purposeKey,
+    args,
+    argsHash: input.argsHash ?? hashArgs(args),
+    basis: "virtual",
+    reasonSummary: input.chosen.reasonSummary,
+    semanticPurpose: input.chosen.semanticPurpose,
+    createdAt: input.nowMs,
+    notBefore: input.nowMs,
+    expiresAt: input.nowMs + 6 * HOUR_MS5,
+    status: input.online ? "scheduled" : "waiting_device",
+    revision: 0,
+    policyVersion: input.policyVersion,
+    dedupeKey,
+    reservationId: input.reservationId,
+    installationId: input.installationId,
+    resultRef: null,
+    errorCode: null,
+    leaseEpoch: 0,
+    leaseExpiresAt: null,
+    permitIssuedAt: null,
+    permitNonce: null,
+    permitConsumedAt: null,
+    notified: false
+  };
+}
+async function claimAction(deps, args) {
+  const nowMs = (deps.clock ?? systemClock).now();
+  const bound = await deps.store.getBoundInstallation(args.accountId);
+  if (bound && bound !== args.installationId) return { action: null, leaseEpoch: 0, leaseExpiresAt: null };
+  const due = await deps.store.dueActions(args.charId, nowMs, 1);
+  const candidate = due.find((action) => action.status === "scheduled" || action.status === "waiting_device");
+  if (!candidate) return { action: null, leaseEpoch: 0, leaseExpiresAt: null };
+  const leaseMs = args.leaseMs ?? 5 * 6e4;
+  const next = {
+    ...candidate,
+    status: "scheduled",
+    installationId: args.installationId,
+    leaseEpoch: candidate.leaseEpoch + 1,
+    leaseExpiresAt: nowMs + leaseMs,
+    revision: candidate.revision + 1
+  };
+  const saved = await deps.store.putAction(next, candidate.revision);
+  if (!saved) return { action: null, leaseEpoch: 0, leaseExpiresAt: null };
+  return { action: next, leaseEpoch: next.leaseEpoch, leaseExpiresAt: next.leaseExpiresAt };
+}
+async function commitPermit(deps, args) {
+  const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
+  const action = await deps.store.getAction(args.actionId);
+  if (!action) return { ok: false, code: "NOT_FOUND" };
+  if (action.status === "unknown") return { ok: false, code: "UNKNOWN_EFFECT" };
+  if (isTerminalActionStatus(action.status)) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.status !== "running" && action.status !== "scheduled" && action.status !== "waiting_device") {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (!action.charId) return { ok: false, code: "FORBIDDEN" };
+  if (action.installationId && action.installationId !== args.installationId) return { ok: false, code: "FORBIDDEN" };
+  if (action.leaseEpoch !== args.leaseEpoch) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.leaseExpiresAt !== null && nowMs > action.leaseExpiresAt) return { ok: false, code: "STATE_CONFLICT" };
+  if (nowMs > action.expiresAt) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.argsHash !== args.argsHash) return { ok: false, code: "STATE_CONFLICT" };
+  if (hashArgs(action.args) !== args.argsHash) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.policyVersion !== args.policyVersion) return { ok: false, code: "STATE_CONFLICT" };
+  if (action.permitConsumedAt !== null) return { ok: false, code: "STATE_CONFLICT" };
+  const pause = await deps.store.getAccountPause(args.accountId);
+  if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
+  const boundary = await deps.boundaryFor(action.charId);
+  if (boundary.globalPaused || boundary.enabled === false) return { ok: false, code: "GLOBAL_PAUSED" };
+  if (boundary.charEnabled === false) return { ok: false, code: "CHAR_DISABLED" };
+  const life = await deps.store.getCharacterLife(action.charId);
+  if (life?.pauseRequestedAt != null) return { ok: false, code: "GLOBAL_PAUSED" };
+  const kindGate = boundaryGate(boundary, action.kind);
+  if (!kindGate.ok) return { ok: false, code: kindGate.code };
+  const decision = checkIntentPolicy(
+    {
+      kind: action.kind,
+      args: action.args,
+      purpose: action.semanticPurpose,
+      boundary: {
+        forbiddenCategories: boundary.forbiddenCategories,
+        avoidTopics: boundary.avoidTopics,
+        allowFictionalNpc: boundary.allowFictionalNpc,
+        externalGrants: boundary.externalGrants
+      }
+    },
+    nowMs
+  );
+  if (!decision.allowed) {
+    return { ok: false, code: decision.reasonCode === "grant_missing" ? "GRANT_REQUIRED" : "POLICY_DENIED" };
+  }
+  if (!deps.budget.available()) return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  const windowTimezone = life?.windowTimezone ?? boundary.timezone;
+  const currentWindow = windowIdAt({ now: () => nowMs }, windowTimezone);
+  if (action.windowId !== currentWindow) return { ok: false, code: "STATE_CONFLICT" };
+  const expiresAt = nowMs + PERMIT_TTL_MS;
+  const nonce = `nonce_${action.id}_${action.leaseEpoch}_${nowMs.toString(36)}_${hashString(`${action.argsHash}|${action.leaseEpoch}|${nowMs}`)}`;
+  const committed = await deps.store.commitPermitAtomic({
+    accountId: args.accountId,
+    actionId: action.id,
+    charId: action.charId,
+    installationId: args.installationId,
+    leaseEpoch: args.leaseEpoch,
+    argsHash: args.argsHash,
+    policyVersion: args.policyVersion,
+    nowMs,
+    expiresAt,
+    nonce,
+    expectedRevision: action.revision
+  });
+  if (!committed.ok) return { ok: false, code: committed.code };
+  const next = committed.action;
+  return {
+    ok: true,
+    action: next,
+    permit: {
+      actionId: next.id,
+      charId: next.charId,
+      installationId: args.installationId,
+      leaseEpoch: next.leaseEpoch,
+      argsHash: next.argsHash,
+      policyVersion: next.policyVersion,
+      reservationId: next.reservationId,
+      issuedAt: nowMs,
+      expiresAt: next.leaseExpiresAt ?? expiresAt,
+      nonce: next.permitNonce ?? nonce
+    }
+  };
+}
+async function reportReceipt(deps, report) {
+  const nowMs = report.nowMs ?? (deps.clock ?? systemClock).now();
+  const action = await deps.store.getAction(report.actionId);
+  if (!action) return { ok: false, code: "NOT_FOUND" };
+  if (action.installationId && action.installationId !== report.installationId) return { ok: false, code: "FORBIDDEN" };
+  if (action.leaseEpoch !== report.leaseEpoch) return { ok: false, code: "STATE_CONFLICT" };
+  if (report.argsHash !== action.argsHash) return { ok: false, code: "STATE_CONFLICT" };
+  if (report.status === "succeeded" && !(typeof report.resultRef === "string" && report.resultRef.length > 0)) {
+    return { ok: false, code: "VALIDATION_FAILED" };
+  }
+  if (isTerminalActionStatus(action.status) && action.status !== "unknown") {
+    if (action.resultRef === (report.resultRef ?? action.resultRef)) return { ok: true, action };
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  if (action.permitIssuedAt === null || action.status !== "running" && action.status !== "unknown") {
+    return { ok: false, code: "STATE_CONFLICT" };
+  }
+  const status = report.status === "succeeded" ? "succeeded" : report.status === "unknown" ? "unknown" : "failed";
+  const next = {
+    ...action,
+    status,
+    resultRef: report.status === "succeeded" ? report.resultRef ?? null : action.resultRef,
+    errorCode: report.status === "succeeded" ? null : report.errorCode ?? (report.status === "unknown" ? "UNKNOWN_EFFECT" : "MODEL_FAILED"),
+    leaseExpiresAt: null,
+    permitConsumedAt: action.permitConsumedAt ?? nowMs,
+    revision: action.revision + 1
+  };
+  const saved = await deps.store.putAction(next, action.revision);
+  if (!saved) return { ok: false, code: "STATE_CONFLICT" };
+  if (status !== "unknown") {
+    const life = await deps.store.getCharacterLife(action.charId);
+    if (life) {
+      await deps.store.putCharacterLife(
+        {
+          ...life,
+          revision: life.revision + 1,
+          activeActionId: null,
+          pendingCount: Math.max(0, life.pendingCount - 1)
+        },
+        life.revision
+      );
+    }
+  }
+  await deps.store.appendEvent({
+    eventId: `evt_${next.id}_${next.revision}_${nowMs.toString(36)}`,
+    sequence: 0,
+    type: "action.changed",
+    charId: next.charId,
+    actionId: next.id,
+    revision: next.revision,
+    occurredAt: nowMs,
+    data: { status: next.status }
+  });
+  return { ok: true, action: next };
+}
+async function cancelAction(deps, args) {
+  const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
+  const action = await deps.store.getAction(args.actionId);
+  if (!action) return { ok: false, code: "NOT_FOUND" };
+  if (action.revision !== args.expectedRevision) return { ok: false, code: "REVISION_CONFLICT" };
+  if (action.status === "running" || action.permitIssuedAt !== null) return { ok: false, code: "CANNOT_CANCEL" };
+  if (!["proposed", "scheduled", "waiting_device", "awaiting_confirmation", "blocked"].includes(action.status)) {
+    return { ok: false, code: "CANNOT_CANCEL" };
+  }
+  const next = { ...action, status: "cancelled", revision: action.revision + 1 };
+  const saved = await deps.store.putAction(next, action.revision);
+  if (!saved) return { ok: false, code: "STATE_CONFLICT" };
+  return { ok: true, action: next };
+}
+async function requestPause(deps, args) {
+  const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
+  await deps.store.setAccountPause(args.accountId, args.paused, nowMs);
+  const inflight = args.paused ? await deps.store.inflightPermits(args.accountId, nowMs) : 0;
+  return {
+    acknowledged: true,
+    quiesced: args.paused ? inflight === 0 : true,
+    paused: args.paused,
+    revision: nowMs
+  };
+}
+function projectCharacterState(input) {
+  return {
+    schemaVersion: 1,
+    charId: input.row.charId,
+    revision: input.row.revision,
+    observedAt: input.nowMs,
+    lifePhase: input.row.lifePhase,
+    availability: input.row.availability,
+    reasonCodes: input.row.reasonCodes,
+    nextOpportunityAt: input.row.nextOpportunityAt,
+    nextCheckAt: input.row.nextCheckAt,
+    scheduleConfidence: input.row.scheduleConfidence,
+    activeActionId: input.row.activeActionId,
+    pendingCount: input.row.pendingCount,
+    budgetWindowId: input.row.budgetWindowId,
+    budget: projectBudgetUsage(input.budgetRows.account, input.budgetRows.char, input.limits)
+  };
+}
+function projectActivity(action) {
+  const verified = action.status === "succeeded" && typeof action.resultRef === "string" && action.resultRef.length > 0;
+  return {
+    schemaVersion: 1,
+    id: action.id,
+    charId: action.charId,
+    kind: action.kind,
+    scope: action.scope,
+    source: action.source,
+    sourceRef: action.sourceRef,
+    status: action.status,
+    reasonSummary: action.reasonSummary,
+    occurredAt: action.createdAt,
+    updatedAt: action.createdAt,
+    resultRef: action.resultRef,
+    effectVerified: verified,
+    notificationState: action.notified ? "delivered" : "none",
+    errorCode: action.errorCode,
+    canCancel: ["proposed", "scheduled", "waiting_device", "blocked"].includes(action.status)
+  };
+}
+function encodeCursor(row) {
+  return `${row.createdAt}.${row.id}`;
+}
+function actionCursor(row) {
+  return encodeCursor(row);
+}
+
+// utils/autonomyLife/service.ts
+var ok = (deps, data, status = 200) => ({
+  status,
+  body: {
+    schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
+    requestId: deps.requestId(),
+    serverTime: deps.now(),
+    ...data
+  }
+});
+var fail6 = (deps, code, message, extra) => ({
+  status: httpStatusForError(code),
+  body: buildErrorBody(code, message, { requestId: deps.requestId(), serverTime: deps.now(), ...extra })
+});
+function createAutonomyLifeService(deps) {
+  const effectiveFor = async (charId) => {
+    const account = await deps.boundaries.getAccount();
+    const character = await deps.boundaries.getCharacter(charId);
+    return mergeEffectiveBoundary({ account, character, charId, nowMs: deps.now() });
+  };
+  return {
+    /** GET /characters/{charId}/state */
+    async getState(charId) {
+      if (!charId) return fail6(deps, "VALIDATION_FAILED", "charId_required");
+      const nowMs = deps.now();
+      const row = await deps.store.getCharacterLife(charId) ?? await deps.engine.store.getCharacterLife(charId);
+      const effective = await effectiveFor(charId);
+      const probes = await deps.probes(charId);
+      const capabilities = describeCapabilities({ boundary: effective, probes, nowMs });
+      const rows = await deps.budgetRows(charId, nowMs);
+      if (!row) {
+        const empty = {
+          schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
+          charId,
+          revision: 0,
+          observedAt: nowMs,
+          lifePhase: "idle",
+          availability: effective.globalPaused ? "paused" : "ready",
+          reasonCodes: effective.globalPaused ? ["GLOBAL_PAUSED"] : [],
+          nextOpportunityAt: null,
+          nextCheckAt: null,
+          scheduleConfidence: "fallback",
+          activeActionId: null,
+          pendingCount: 0,
+          budgetWindowId: null,
+          budget: projectBudgetUsage(rows.account, rows.char, effective.limits)
+        };
+        return ok(deps, { state: empty, capabilities });
+      }
+      const state = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+      return ok(deps, { state, capabilities });
+    },
+    /** GET /boundaries?charId= */
+    async getBoundaries(charId) {
+      const account = await deps.boundaries.getAccount();
+      const character = charId ? await deps.boundaries.getCharacter(charId) : null;
+      const effective = mergeEffectiveBoundary({ account, character, charId: charId ?? "", nowMs: deps.now() });
+      const meta = boundaryMetadata();
+      return ok(deps, {
+        account,
+        characterOverrides: character,
+        effective,
+        revision: effective.revision,
+        defaults: meta.defaults,
+        maximums: meta.maximums
+      });
+    },
+    /** PATCH /boundaries */
+    async patchBoundaries(input) {
+      if (input.scope === "character" && !input.charId) {
+        return fail6(deps, "VALIDATION_FAILED", "charId_required");
+      }
+      const current = input.scope === "account" ? await deps.boundaries.getAccount() : await deps.boundaries.getCharacter(input.charId);
+      if (!current) return fail6(deps, "NOT_FOUND", "character_boundary_not_found");
+      const patched = applyBoundaryPatch({
+        current,
+        changes: input.changes,
+        expectedRevision: input.expectedRevision,
+        nowMs: deps.now()
+      });
+      if (!patched.ok) {
+        if (patched.code === "REVISION_CONFLICT") {
+          return fail6(deps, "REVISION_CONFLICT", "boundary_revision_conflict", { details: patched.details });
+        }
+        if (patched.code === "DEPRECATED_FIELD") {
+          return fail6(deps, "DEPRECATED_FIELD", "frequency_fields_removed", { details: patched.details });
+        }
+        return fail6(deps, "VALIDATION_FAILED", "boundary_invalid", { details: patched.details });
+      }
+      const saved = await deps.boundaries.put(
+        input.scope === "character" ? { scope: "character", charId: input.charId } : { scope: "account" },
+        patched.boundary,
+        current.revision
+      );
+      if (!saved) return fail6(deps, "REVISION_CONFLICT", "boundary_revision_conflict");
+      const account = await deps.boundaries.getAccount();
+      const character = input.scope === "character" ? await deps.boundaries.getCharacter(input.charId) : null;
+      const effective = mergeEffectiveBoundary({ account, character, charId: input.charId ?? "", nowMs: deps.now() });
+      return ok(deps, { effective, revision: effective.revision });
+    },
+    /** POST /pause */
+    async pause(input) {
+      if (input.scope === "character") {
+        if (!input.charId) return fail6(deps, "VALIDATION_FAILED", "charId_required");
+        const row = await deps.store.getCharacterLife(input.charId);
+        if (!row) return fail6(deps, "NOT_FOUND", "character_life_not_found");
+        const saved = await deps.store.putCharacterLife(
+          { ...row, revision: row.revision + 1, pauseRequestedAt: input.paused ? deps.now() : null, availability: input.paused ? "paused" : "ready", reasonCodes: input.paused ? ["GLOBAL_PAUSED"] : [] },
+          row.revision
+        );
+        if (!saved) return fail6(deps, "REVISION_CONFLICT", "state_conflict");
+        return ok(deps, { acknowledged: true, quiesced: input.paused ? await deps.store.inflightPermits(deps.engine.accountId ?? "account", deps.now()) === 0 : true, paused: input.paused, revision: row.revision + 1 });
+      }
+      const result = await requestPause(deps.engine, {
+        accountId: deps.engine.accountId ?? "account",
+        paused: input.paused,
+        nowMs: deps.now()
+      });
+      const state = input.charId ? await deps.store.getCharacterLife(input.charId) : null;
+      return ok(deps, {
+        acknowledged: result.acknowledged,
+        quiesced: result.quiesced,
+        paused: result.paused,
+        revision: result.revision,
+        ...state ? { state } : {}
+      });
+    },
+    /** GET /activities */
+    async activities(input) {
+      if (!input.charId) return fail6(deps, "VALIDATION_FAILED", "charId_required");
+      const limit = Math.min(100, Math.max(1, input.limit ?? 20));
+      const list = deps.store.listActions ? await deps.store.listActions({ charId: input.charId, status: input.status ?? null, limit: limit + 1, cursor: input.cursor ?? null }) : { items: [], nextCursor: null };
+      const items = list.items.slice(0, limit).map(projectActivity);
+      const nextCursor = list.items.length > limit ? actionCursor(list.items[limit - 1]) : null;
+      return ok(deps, { items, nextCursor });
+    },
+    /** POST /actions/{id}/cancel */
+    async cancel(input) {
+      const result = await cancelAction(deps.engine, {
+        accountId: deps.engine.accountId ?? "account",
+        actionId: input.actionId,
+        expectedRevision: input.expectedRevision,
+        nowMs: deps.now()
+      });
+      if (!result.ok) {
+        if (result.code === "NOT_FOUND") return fail6(deps, "NOT_FOUND", "action_not_found");
+        if (result.code === "REVISION_CONFLICT") return fail6(deps, "REVISION_CONFLICT", "action_revision_conflict");
+        return fail6(deps, "CANNOT_CANCEL", "action_cannot_cancel");
+      }
+      return ok(deps, { action: result.action });
+    },
+    /** POST /devices/register */
+    async registerDevice(input) {
+      if (!input.installationId) return fail6(deps, "VALIDATION_FAILED", "installationId_required");
+      const accountId = deps.engine.accountId ?? "account";
+      const bound = await deps.store.getBoundInstallation(accountId);
+      if (bound && bound !== input.installationId) {
+        const inflight = await deps.store.inflightPermits(accountId, deps.now());
+        return ok(deps, {
+          bindingState: inflight > 0 ? "switch_blocked" : "not_bound",
+          boundInstallationId: bound,
+          requiresExplicitSwitch: true
+        });
+      }
+      const already = bound === input.installationId;
+      if (!already) await deps.store.bindInstallation(accountId, input.installationId, deps.now());
+      return ok(deps, { bindingState: already ? "already_bound" : "bound", boundInstallationId: input.installationId });
+    },
+    /** POST /execution/claim */
+    async claim(input) {
+      const result = await claimAction(deps.engine, {
+        accountId: deps.engine.accountId ?? "account",
+        installationId: input.installationId,
+        charId: input.charId,
+        leaseMs: input.leaseMs
+      });
+      if (!result.action) return ok(deps, { action: null, leaseEpoch: 0, leaseExpiresAt: null });
+      return ok(deps, { action: result.action, leaseEpoch: result.leaseEpoch, leaseExpiresAt: result.leaseExpiresAt });
+    },
+    /** POST /actions/{id}/commit-permit */
+    async commitPermit(input) {
+      const result = await commitPermit(deps.engine, {
+        accountId: deps.engine.accountId ?? "account",
+        ...input,
+        nowMs: deps.now()
+      });
+      if (!result.ok) {
+        const code = result.code ?? "STATE_CONFLICT";
+        return fail6(deps, code, "permit_denied");
+      }
+      return ok(deps, { permit: result.permit });
+    },
+    /** POST /actions/{id}/receipt */
+    async receipt(input) {
+      const result = await reportReceipt(deps.engine, {
+        accountId: deps.engine.accountId ?? "account",
+        ...input,
+        nowMs: deps.now()
+      });
+      if (!result.ok) return fail6(deps, result.code ?? "STATE_CONFLICT", "receipt_rejected");
+      return ok(deps, { action: result.action });
+    },
+    /** 供 POST /actions 场景复用：动作参数必须是已实现 kind。 */
+    isKnownKind(kind) {
+      return isActivityKind(kind);
+    },
+    /** 内部：给路由层做事件分页时用（事件由引擎 appendEvent 写入）。 */
+    eventPage(events, after, limit = 50) {
+      const items = events.filter((event) => event.sequence > after).slice(0, limit);
+      const nextSequence = items.length ? items[items.length - 1].sequence : after;
+      return { items, nextSequence, hasMore: events.some((event) => event.sequence > nextSequence) };
+    },
+    /** 只读：把动作行投影成 UI 记录（路由层复用时避免重复实现）。 */
+    projectAction(action) {
+      return projectActivity(action);
+    }
+  };
+}
+
+// worker/amsg/src/autonomyLife/store.ts
+function changesOf5(result) {
+  if (!result || typeof result !== "object") return 0;
+  const row = result;
+  const raw = row.meta?.changes ?? row.changes;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : 0;
+}
+var asString3 = (value) => typeof value === "string" ? value : "";
+var asNumber4 = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+var AUTONOMY_LIFE_DDL = [
+  `CREATE TABLE IF NOT EXISTS autonomy_life_accounts (
+    owner_id TEXT PRIMARY KEY,
+    paused INTEGER NOT NULL DEFAULT 0,
+    pause_requested_at INTEGER,
+    bound_installation_id TEXT,
+    seed TEXT NOT NULL,
+    event_seq INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_characters (
+    owner_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, char_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_actions (
+    owner_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    not_before INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_actions_due
+    ON autonomy_life_actions (owner_id, char_id, status, not_before)`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_actions_page
+    ON autonomy_life_actions (owner_id, char_id, created_at DESC, id DESC)`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_events (
+    owner_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_boundaries (
+    owner_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    char_id TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, scope, char_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_external_usage (
+    owner_id TEXT NOT NULL,
+    day_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, day_key, provider)
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_wishes (
+    owner_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    grant_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS autonomy_life_budget (
+    owner_id TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    used_calls INTEGER NOT NULL DEFAULT 0,
+    reserved_calls INTEGER NOT NULL DEFAULT 0,
+    used_tokens INTEGER NOT NULL DEFAULT 0,
+    reserved_tokens INTEGER NOT NULL DEFAULT 0,
+    notifications INTEGER NOT NULL DEFAULT 0,
+    kind_counts TEXT NOT NULL DEFAULT '{}',
+    spend_minor INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, window_id, scope)
+  )`
+];
+var schemaReady3 = false;
+async function ensureAutonomyLifeSchema(db) {
+  if (schemaReady3) return;
+  for (const statement of AUTONOMY_LIFE_DDL) {
+    await db.prepare(statement).run();
+  }
+  schemaReady3 = true;
+}
+var parseJson2 = (text, fallback) => {
+  if (typeof text !== "string" || !text) return fallback;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+};
+async function readAccount(db, ownerId, nowMs) {
+  const row = await db.prepare("SELECT paused, pause_requested_at, bound_installation_id, seed, event_seq FROM autonomy_life_accounts WHERE owner_id = ?").bind(ownerId).first();
+  if (row) {
+    return {
+      paused: asNumber4(row.paused) === 1,
+      pauseRequestedAt: row.pause_requested_at === null ? null : asNumber4(row.pause_requested_at),
+      boundInstallationId: typeof row.bound_installation_id === "string" ? row.bound_installation_id : null,
+      seed: asString3(row.seed) || `seed_${ownerId}`,
+      eventSeq: asNumber4(row.event_seq)
+    };
+  }
+  const seed = `seed_${ownerId}`;
+  await db.prepare("INSERT OR IGNORE INTO autonomy_life_accounts (owner_id, paused, pause_requested_at, bound_installation_id, seed, event_seq, updated_at) VALUES (?, 0, NULL, NULL, ?, 0, ?)").bind(ownerId, seed, nowMs).run();
+  return { paused: false, pauseRequestedAt: null, boundInstallationId: null, seed, eventSeq: 0 };
+}
+function createD1LifeStore(options) {
+  const { db, ownerId } = options;
+  const now = options.now ?? (() => Date.now());
+  const rowFromPayload = (payload) => payload;
+  const readAction = async (actionId) => {
+    const row = await db.prepare("SELECT payload FROM autonomy_life_actions WHERE owner_id = ? AND id = ?").bind(ownerId, actionId).first();
+    return row ? rowFromPayload(parseJson2(row.payload, null)) : null;
+  };
+  return {
+    async readAccount() {
+      return readAccount(db, ownerId, now());
+    },
+    async seed() {
+      return (await readAccount(db, ownerId, now())).seed;
+    },
+    async touchInstallation(installationId) {
+      await db.prepare("UPDATE autonomy_life_accounts SET updated_at = ? WHERE owner_id = ? AND bound_installation_id = ?").bind(now(), ownerId, installationId).run();
+    },
+    async getCharacterLife(charId) {
+      const row = await db.prepare("SELECT payload FROM autonomy_life_characters WHERE owner_id = ? AND char_id = ?").bind(ownerId, charId).first();
+      return row ? parseJson2(row.payload, null) : null;
+    },
+    async putCharacterLife(row, expectedRevision) {
+      const text = JSON.stringify(row);
+      const updated = await db.prepare("UPDATE autonomy_life_characters SET payload = ?, revision = ?, updated_at = ? WHERE owner_id = ? AND char_id = ? AND revision = ?").bind(text, row.revision, now(), ownerId, row.charId, expectedRevision).run();
+      if (changesOf5(updated) > 0) return true;
+      if (expectedRevision !== 0) return false;
+      const inserted = await db.prepare("INSERT OR IGNORE INTO autonomy_life_characters (owner_id, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?)").bind(ownerId, row.charId, row.revision, text, now()).run();
+      return changesOf5(inserted) > 0;
+    },
+    async getAction(actionId) {
+      return readAction(actionId);
+    },
+    async insertAction(row) {
+      const result = await db.prepare("INSERT OR IGNORE INTO autonomy_life_actions (owner_id, id, char_id, status, not_before, expires_at, created_at, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(ownerId, row.id, row.charId, row.status, row.notBefore, row.expiresAt, row.createdAt, row.revision, JSON.stringify(row), now()).run();
+      return changesOf5(result) > 0;
+    },
+    async putAction(row, expectedRevision) {
+      const result = await db.prepare("UPDATE autonomy_life_actions SET status = ?, not_before = ?, expires_at = ?, revision = ?, payload = ?, updated_at = ? WHERE owner_id = ? AND id = ? AND revision = ?").bind(row.status, row.notBefore, row.expiresAt, row.revision, JSON.stringify(row), now(), ownerId, row.id, expectedRevision).run();
+      return changesOf5(result) > 0;
+    },
+    async dueActions(charId, nowMs, limit) {
+      const result = await db.prepare(`SELECT payload FROM autonomy_life_actions
+          WHERE owner_id = ? AND char_id = ? AND status IN ('scheduled', 'waiting_device') AND not_before <= ?
+          ORDER BY not_before ASC, created_at ASC LIMIT ?`).bind(ownerId, charId, nowMs, Math.max(1, Math.trunc(limit))).all();
+      return (result?.results ?? []).map((row) => rowFromPayload(parseJson2(row.payload, null))).filter(Boolean);
+    },
+    async listActions({ charId, status, limit, cursor }) {
+      let cursorAt = null;
+      let cursorId = null;
+      if (cursor) {
+        const index = cursor.indexOf(".");
+        if (index > 0) {
+          const at = Number(cursor.slice(0, index));
+          const id = cursor.slice(index + 1);
+          if (Number.isFinite(at) && id) {
+            cursorAt = at;
+            cursorId = id;
+          }
+        }
+      }
+      const clauses = ["owner_id = ?", "char_id = ?"];
+      const params = [ownerId, charId];
+      if (status) {
+        clauses.push("status = ?");
+        params.push(status);
+      }
+      if (cursorAt !== null && cursorId !== null) {
+        clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
+        params.push(cursorAt, cursorAt, cursorId);
+      }
+      const result = await db.prepare(`SELECT payload FROM autonomy_life_actions WHERE ${clauses.join(" AND ")}
+          ORDER BY created_at DESC, id DESC LIMIT ?`).bind(...params, Math.max(1, Math.trunc(limit))).all();
+      const items = (result?.results ?? []).map((row) => rowFromPayload(parseJson2(row.payload, null))).filter(Boolean);
+      const nextCursor = items.length === Math.max(1, Math.trunc(limit)) ? actionCursor(items[items.length - 1]) : null;
+      return { items, nextCursor };
+    },
+    async recentActivities(charId, sinceMs) {
+      const result = await db.prepare(`SELECT created_at, payload FROM autonomy_life_actions
+          WHERE owner_id = ? AND char_id = ? AND created_at >= ?
+          ORDER BY created_at DESC LIMIT 50`).bind(ownerId, charId, sinceMs).all();
+      return (result?.results ?? []).map((row) => rowFromPayload(parseJson2(row.payload, null))).filter((row) => !!row && isTerminalActionStatus(row.status)).filter((row) => row.status === "succeeded").map((row) => ({
+        kind: row.kind,
+        semanticPurpose: row.semanticPurpose,
+        occurredAt: row.createdAt,
+        success: true
+      }));
+    },
+    async appendEvent(event) {
+      await db.prepare(`INSERT INTO autonomy_life_events (owner_id, seq, payload, created_at)
+          SELECT ?, COALESCE((SELECT MAX(seq) FROM autonomy_life_events WHERE owner_id = ?), 0) + 1, ?, ?`).bind(ownerId, ownerId, JSON.stringify(event), now()).run();
+    },
+    async getAccountPause(_accountId) {
+      const account = await readAccount(db, ownerId, now());
+      return { paused: account.paused, requestedAt: account.pauseRequestedAt };
+    },
+    async setAccountPause(_accountId, paused, nowMs) {
+      await readAccount(db, ownerId, nowMs);
+      await db.prepare("UPDATE autonomy_life_accounts SET paused = ?, pause_requested_at = ?, updated_at = ? WHERE owner_id = ?").bind(paused ? 1 : 0, paused ? nowMs : null, nowMs, ownerId).run();
+    },
+    async inflightPermits(_accountId, nowMs) {
+      const result = await db.prepare(`SELECT payload FROM autonomy_life_actions WHERE owner_id = ? AND status = 'running'`).bind(ownerId).all().catch(() => ({ results: [] }));
+      const rows = (result?.results ?? []).map((row) => rowFromPayload(parseJson2(row.payload, null))).filter(Boolean);
+      return rows.filter((row) => row.permitIssuedAt !== null && row.permitConsumedAt === null && (row.leaseExpiresAt ?? 0) > nowMs).length;
+    },
+    async getBoundInstallation(_accountId) {
+      return (await readAccount(db, ownerId, now())).boundInstallationId;
+    },
+    async bindInstallation(_accountId, installationId, nowMs) {
+      await readAccount(db, ownerId, nowMs);
+      const bound = await db.prepare(`UPDATE autonomy_life_accounts SET bound_installation_id = ?, updated_at = ?
+          WHERE owner_id = ? AND (bound_installation_id IS NULL OR bound_installation_id = ?)`).bind(installationId, nowMs, ownerId, installationId).run();
+      return changesOf5(bound) > 0;
+    },
+    /**
+     * 「暂停读取 + 动作 CAS」同一句：暂停是 WHERE 里的 EXISTS，不是先读后写。
+     * changes=0 时再读一次区分原因（只用于错误码，不参与判定）。
+     */
+    async commitPermitAtomic(input) {
+      const current = await readAction(input.actionId);
+      if (!current) return { ok: false, code: "NOT_FOUND" };
+      if (current.charId !== input.charId) return { ok: false, code: "FORBIDDEN" };
+      if (current.installationId && current.installationId !== input.installationId) return { ok: false, code: "FORBIDDEN" };
+      if (isTerminalActionStatus(current.status)) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.status !== "scheduled" && current.status !== "waiting_device") return { ok: false, code: "STATE_CONFLICT" };
+      if (current.leaseEpoch !== input.leaseEpoch) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.argsHash !== input.argsHash) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.policyVersion !== input.policyVersion) return { ok: false, code: "STATE_CONFLICT" };
+      if (current.permitConsumedAt !== null) return { ok: false, code: "STATE_CONFLICT" };
+      if (input.nowMs > current.expiresAt) return { ok: false, code: "STATE_CONFLICT" };
+      const next = {
+        ...current,
+        status: "running",
+        permitIssuedAt: input.nowMs,
+        permitNonce: input.nonce,
+        permitConsumedAt: null,
+        leaseExpiresAt: input.expiresAt,
+        revision: current.revision + 1
+      };
+      const updated = await db.prepare(`UPDATE autonomy_life_actions
+          SET status = 'running', revision = revision + 1, payload = ?, updated_at = ?
+          WHERE owner_id = ? AND id = ? AND revision = ?
+            AND status IN ('scheduled', 'waiting_device')
+            AND EXISTS (
+              SELECT 1 FROM autonomy_life_accounts a
+              WHERE a.owner_id = autonomy_life_actions.owner_id AND a.paused = 0
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM autonomy_life_characters c
+              WHERE c.owner_id = autonomy_life_actions.owner_id
+                AND c.char_id = autonomy_life_actions.char_id
+                AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
+            )`).bind(JSON.stringify(next), input.nowMs, ownerId, input.actionId, input.expectedRevision).run();
+      if (changesOf5(updated) > 0) return { ok: true, action: next };
+      const pause = await readAccount(db, ownerId, input.nowMs);
+      if (pause.paused) return { ok: false, code: "GLOBAL_PAUSED" };
+      const life = await db.prepare("SELECT payload FROM autonomy_life_characters WHERE owner_id = ? AND char_id = ?").bind(ownerId, input.charId).first();
+      const lifeRow = life ? parseJson2(life.payload, null) : null;
+      if (lifeRow?.pauseRequestedAt != null) return { ok: false, code: "GLOBAL_PAUSED" };
+      return { ok: false, code: "STATE_CONFLICT" };
+    }
+  };
+}
+function createD1BoundaryRepo(options) {
+  const { db, ownerId } = options;
+  const read = async (scope, charId) => {
+    const row = await db.prepare("SELECT payload FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = ? AND char_id = ?").bind(ownerId, scope, scope === "account" ? "" : charId).first();
+    return row ? parseJson2(row.payload, null) : null;
+  };
+  return {
+    async getAccount() {
+      return await read("account", "") ?? options.defaultBoundary;
+    },
+    async getCharacter(charId) {
+      return read("character", charId);
+    },
+    async put(target, boundary, expectedRevision) {
+      const scope = target.scope;
+      const charId = target.scope === "character" ? target.charId : "";
+      const text = JSON.stringify(boundary);
+      const nowMs = Date.now();
+      const updated = await db.prepare("UPDATE autonomy_life_boundaries SET payload = ?, revision = ?, updated_at = ? WHERE owner_id = ? AND scope = ? AND char_id = ? AND revision = ?").bind(text, boundary.revision, nowMs, ownerId, scope, charId, expectedRevision).run();
+      if (changesOf5(updated) > 0) return true;
+      const existing = await read(scope, charId);
+      if (existing) return false;
+      const inserted = await db.prepare("INSERT OR IGNORE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)").bind(ownerId, scope, charId, boundary.revision, text, nowMs).run();
+      return changesOf5(inserted) > 0;
+    }
+  };
+}
+var rowFromBudget = (record) => ({
+  windowId: asString3(record.window_id),
+  scope: asString3(record.scope),
+  usedCalls: asNumber4(record.used_calls),
+  reservedCalls: asNumber4(record.reserved_calls),
+  usedTokens: asNumber4(record.used_tokens),
+  reservedTokens: asNumber4(record.reserved_tokens),
+  notifications: asNumber4(record.notifications),
+  kindCounts: parseJson2(record.kind_counts, {}),
+  spendMinor: asNumber4(record.spend_minor),
+  revision: asNumber4(record.revision),
+  updatedAt: asNumber4(record.updated_at)
+});
+function createD1BudgetPort(options) {
+  const { db, ownerId } = options;
+  let queue = Promise.resolve();
+  const readRows = async (windowId, scopes) => {
+    const rows = {};
+    for (const scope of scopes) {
+      const row = await db.prepare("SELECT * FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?").bind(ownerId, windowId, scope).first();
+      rows[scope] = row ? rowFromBudget(row) : emptyBudgetRow(windowId, scope, Date.now());
+    }
+    return rows;
+  };
+  const writeRow = async (row, expectedRevision, created) => {
+    if (created) {
+      const inserted = await db.prepare(`INSERT OR IGNORE INTO autonomy_life_budget
+          (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens, notifications, kind_counts, spend_minor, revision, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+        ownerId,
+        row.windowId,
+        row.scope,
+        row.usedCalls,
+        row.reservedCalls,
+        row.usedTokens,
+        row.reservedTokens,
+        row.notifications,
+        JSON.stringify(row.kindCounts),
+        row.spendMinor,
+        row.revision,
+        row.updatedAt
+      ).run();
+      return changesOf5(inserted) > 0;
+    }
+    const updated = await db.prepare(`UPDATE autonomy_life_budget SET used_calls = ?, reserved_calls = ?, used_tokens = ?, reserved_tokens = ?,
+        notifications = ?, kind_counts = ?, spend_minor = ?, revision = ?, updated_at = ?
+        WHERE owner_id = ? AND window_id = ? AND scope = ? AND revision = ?`).bind(
+      row.usedCalls,
+      row.reservedCalls,
+      row.usedTokens,
+      row.reservedTokens,
+      row.notifications,
+      JSON.stringify(row.kindCounts),
+      row.spendMinor,
+      row.revision,
+      row.updatedAt,
+      ownerId,
+      row.windowId,
+      row.scope,
+      expectedRevision
+    ).run();
+    return changesOf5(updated) > 0;
+  };
+  return {
+    available: () => true,
+    mutate(windowId, scopes, mutator) {
+      const run = async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const existing = await readRows(windowId, scopes);
+          const snapshot = {};
+          for (const scope of scopes) {
+            snapshot[scope] = { ...existing[scope], kindCounts: { ...existing[scope].kindCounts } };
+          }
+          const outcome = mutator(snapshot);
+          if (!outcome) return null;
+          let ok2 = true;
+          for (const row of outcome.updates) {
+            const before = existing[row.scope];
+            const created = !before || before.revision === 0;
+            const wrote = await writeRow({ ...row, revision: (before?.revision ?? 0) + 1 }, before?.revision ?? 0, created);
+            if (!wrote) {
+              ok2 = false;
+              break;
+            }
+          }
+          if (ok2) return outcome.result;
+        }
+        return null;
+      };
+      const next = queue.then(run, run);
+      queue = next.catch(() => void 0);
+      return next;
+    }
+  };
+}
+async function readBudgetRows(options) {
+  const { db, ownerId, charId, windowId } = options;
+  const read = async (scope) => {
+    const row = await db.prepare("SELECT * FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?").bind(ownerId, windowId, scope).first();
+    return row ? rowFromBudget(row) : null;
+  };
+  return { account: await read("account"), char: await read(charId) };
+}
+
+// worker/amsg/src/autonomyLife/runtime.ts
+var fallbackSeed = (userId) => `seed_${userId}`;
+function defaultAccountBoundary(nowMs, timezone) {
+  return normalizeBoundary(
+    {
+      enabled: false,
+      globalPaused: false,
+      timezone,
+      allowedKinds: [],
+      forbiddenCategories: [],
+      avoidTopics: [],
+      allowFictionalNpc: false,
+      doNotDisturb: null,
+      limits: {},
+      externalGrants: []
+    },
+    { scope: "account", nowMs, revision: 0 }
+  );
+}
+function defaultCharacterBoundary(nowMs) {
+  return normalizeBoundary({}, { scope: "character", nowMs, revision: 0 });
+}
+function createAutonomyLifeRuntime(options) {
+  const { db, userId, charId } = options;
+  const now = options.now;
+  const timezone = options.timezone ?? "UTC";
+  const store = createD1LifeStore({ db, ownerId: userId, now });
+  const budget = createD1BudgetPort({ db, ownerId: userId });
+  const boundaries = createD1BoundaryRepo({
+    db,
+    ownerId: userId,
+    defaultBoundary: defaultAccountBoundary(now(), timezone)
+  });
+  const boundaryFor = async (targetCharId) => {
+    const account = await boundaries.getAccount();
+    const character = await boundaries.getCharacter(targetCharId);
+    return mergeEffectiveBoundary({ account, character, charId: targetCharId, nowMs: now() });
+  };
+  const probes = options.probes ?? {
+    localStoresReady: false,
+    deviceBound: false,
+    hasModelCredentials: false,
+    externalRead: { configured: false, reachable: false },
+    map: { configured: false, reachable: false }
+  };
+  const engine = {
+    store,
+    budget,
+    // 没有模型端口时返回 null（引擎按模型失败退避），绝不退回「本地随便挑」。
+    model: options.model ?? { request: async () => null },
+    seed: fallbackSeed(userId),
+    clock: { now },
+    accountId: userId,
+    deviceOnline: async (installationId) => {
+      if (!installationId) return false;
+      const bound = await store.getBoundInstallation(userId);
+      return bound === installationId;
+    },
+    probes: async () => probes,
+    boundaryFor,
+    policyVersion: DEFAULT_POLICY_VERSION
+  };
+  const serviceDeps = {
+    engine,
+    store,
+    budget,
+    boundaries,
+    probes: async () => probes,
+    budgetRows: async (targetCharId, nowMs) => {
+      const effective = await boundaryFor(targetCharId);
+      const windowId = windowIdAt({ now: () => nowMs }, effective.timezone ?? timezone);
+      return readBudgetRows({ db, ownerId: userId, charId: targetCharId, windowId });
+    },
+    now,
+    requestId: options.requestId ?? (() => `al_${Math.random().toString(36).slice(2, 10)}`)
+  };
+  const service = createAutonomyLifeService(serviceDeps);
+  return {
+    store,
+    budget,
+    boundaries,
+    engine,
+    service,
+    boundaryFor
+  };
+}
+async function ensureCharacterLife(runtime, charId, nowMs, timezone) {
+  const existing = await runtime.store.getCharacterLife(charId);
+  if (existing) return;
+  await runtime.store.putCharacterLife(emptyCharacterLife(charId, nowMs, timezone), 0);
+}
+
+// worker/amsg/src/autonomyLife/external.ts
+var EXTERNAL_RESPONSE_FIELDS = {
+  xhs: ["title", "excerpt", "author", "likes", "url"],
+  amap: ["name", "address", "distanceM", "category"]
+};
+var EXTERNAL_TIMEOUT_MS = 8e3;
+var EXTERNAL_MAX_BYTES = 256 * 1024;
+var EXTERNAL_MAX_ITEMS = 5;
+var EXTERNAL_MAX_FIELD_CHARS = 200;
+var parseAllowedHosts = (raw, fallback = []) => {
+  const fromEnv = String(raw ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
+};
+function isHostAllowed(host, allowlist) {
+  const target = host.trim().toLowerCase();
+  if (!target) return false;
+  return allowlist.some((entry) => {
+    const rule = entry.toLowerCase();
+    if (!rule) return false;
+    if (rule.startsWith("*.")) return target === rule.slice(2) || target.endsWith(rule.slice(1));
+    return target === rule;
+  });
+}
+var IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+var BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".home", ".lan"];
+var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data"
+]);
+function assertFetchableUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+  if (url.protocol !== "https:") return { ok: false, reason: "https_required" };
+  if (url.username || url.password) return { ok: false, reason: "credentials_in_url_forbidden" };
+  if (url.port && url.port !== "443") return { ok: false, reason: "port_forbidden" };
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return { ok: false, reason: "host_required" };
+  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: "host_forbidden" };
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: "host_forbidden" };
+  if (IPV4.test(host)) return { ok: false, reason: "ip_literal_forbidden" };
+  if (host.includes(":")) return { ok: false, reason: "ip_literal_forbidden" };
+  return { ok: true, url };
+}
+function projectItem(raw, fields, allow) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
+    if (!allow.includes(field)) continue;
+    const value = raw[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      out[field] = value;
+    } else if (typeof value === "string") {
+      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}\u2026` : value;
+    }
+  }
+  return out;
+}
+var ITEM_ARRAY_KEYS = ["items", "data", "results", "pois"];
+function extractItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  for (const key of ITEM_ARRAY_KEYS) {
+    const value = payload[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+async function handleExternalRead(args) {
+  const endpoint = String(args.endpoint ?? "").trim();
+  if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, code: "POLICY_DENIED", reason: safe.reason };
+  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
+    return { ok: false, code: "POLICY_DENIED", reason: "host_not_allowed" };
+  }
+  const url = new URL(safe.url.toString());
+  url.searchParams.set("q", args.query);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EXTERNAL_TIMEOUT_MS);
+  let response;
+  try {
+    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
+      method: "GET",
+      redirect: "manual",
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (response.status >= 300 && response.status < 400) {
+    return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
+  }
+  if (!response.ok) {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
+  }
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
+  }
+  let text = "";
+  try {
+    text = await response.text();
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_body_unreadable" };
+  }
+  if (text.length > EXTERNAL_MAX_BYTES) {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
+  }
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_not_json" };
+  }
+  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
+  const fields = args.fields.filter((field) => allow.includes(field));
+  const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
+  return { ok: true, result: { items, fetchedAt: args.nowMs } };
+}
+async function consumeExternalQuota(args) {
+  const limit = Math.max(0, Math.trunc(args.limit));
+  if (limit <= 0) return false;
+  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
+  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
+  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
+  return Number.isFinite(changes) && changes > 0;
+}
+async function insertTravelWish2(args) {
+  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
+  return { wishId };
+}
+
+// worker/amsg/src/autonomyLife/routes.ts
+var matchRoute = (request) => {
+  const url = new URL(request.url);
+  const pathname = url.pathname.replace(/\/+$/, "");
+  const index = pathname.indexOf(AUTONOMY_LIFE_API_BASE);
+  if (index < 0) return null;
+  const rest = pathname.slice(index + AUTONOMY_LIFE_API_BASE.length).replace(/^\/+/, "");
+  return {
+    method: request.method.toUpperCase(),
+    segments: rest ? rest.split("/").map((part) => decodeURIComponent(part)) : [],
+    url
+  };
+};
+var readJson2 = async (request) => {
+  try {
+    const body = await request.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    return body;
+  } catch {
+    return null;
+  }
+};
+var str = (value) => typeof value === "string" ? value.trim() : "";
+var num = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+var probesFor = (args) => ({
+  localStoresReady: args.deviceBound,
+  deviceBound: args.deviceBound,
+  hasModelCredentials: args.hasModelCredentials,
+  externalRead: { configured: false, reachable: false },
+  map: { configured: false, reachable: false }
+});
+async function handleAutonomyLifeRequest(request, env, deps) {
+  const match = matchRoute(request);
+  if (!match) return null;
+  const owner = await deps.resolveOwner(request);
+  if (!owner) {
+    return deps.respond(401, buildErrorBody("UNAUTHENTICATED", "client_token_invalid_or_missing", {
+      requestId: deps.requestId?.() ?? "auth",
+      serverTime: deps.now()
+    }));
+  }
+  const db = env.DB;
+  if (!db || typeof db.prepare !== "function") {
+    return deps.respond(503, buildErrorBody("SERVICE_UNAVAILABLE", "d1_binding_missing", {
+      requestId: deps.requestId?.() ?? "db",
+      serverTime: deps.now()
+    }));
+  }
+  await ensureAutonomyLifeSchema(db);
+  const [first, second, third] = match.segments;
+  const nowMs = deps.now();
+  const runtimeFor = async (charId) => {
+    const [bound, hasModel, tz] = await Promise.all([
+      // 通过公开端口读绑定设备（store 的账号行是懒建的）
+      createRuntimeDeviceProbe(db, owner.userId),
+      deps.hasModelCredentials(owner.userId, charId).catch(() => false),
+      deps.timezoneFor ? deps.timezoneFor(owner.userId, charId).catch(() => null) : Promise.resolve(null)
+    ]);
+    const runtime = createAutonomyLifeRuntime({
+      db,
+      userId: owner.userId,
+      charId,
+      now: deps.now,
+      probes: probesFor({ deviceBound: bound, hasModelCredentials: hasModel }),
+      timezone: tz ?? "UTC",
+      requestId: deps.requestId
+    });
+    return runtime;
+  };
+  if (match.method === "GET" && first === "characters" && second && third === "state") {
+    const charId = second;
+    const runtime = await runtimeFor(charId);
+    await registerCharacter(runtime, charId, nowMs);
+    const result = await runtime.service.getState(charId);
+    return deps.respond(result.status, result.body);
+  }
+  if (first === "boundaries" && !second) {
+    if (match.method === "GET") {
+      const charId = str(match.url.searchParams.get("charId")) || null;
+      const runtime = await runtimeFor(charId ?? "");
+      if (charId) await registerCharacter(runtime, charId, nowMs);
+      const result = await runtime.service.getBoundaries(charId);
+      return deps.respond(result.status, result.body);
+    }
+    if (match.method === "PATCH") {
+      const body = await readJson2(request);
+      if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "patch", serverTime: nowMs }));
+      const scope = body.scope === "character" ? "character" : "account";
+      const charId = str(body.charId) || null;
+      const runtime = await runtimeFor(charId ?? "");
+      if (scope === "character" && charId) await registerCharacter(runtime, charId, nowMs);
+      const result = await runtime.service.patchBoundaries({
+        scope,
+        charId,
+        expectedRevision: num(body.expectedRevision) ?? 0,
+        changes: body.changes
+      });
+      return deps.respond(result.status, result.body);
+    }
+    return deps.respond(405, buildErrorBody("VALIDATION_FAILED", "method_not_allowed", { requestId: "method", serverTime: nowMs }));
+  }
+  if (match.method === "POST" && first === "pause" && !second) {
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "pause", serverTime: nowMs }));
+    const scope = body.scope === "character" ? "character" : "account";
+    const charId = str(body.charId) || null;
+    const runtime = await runtimeFor(charId ?? "");
+    if (scope === "character" && charId) await registerCharacter(runtime, charId, nowMs);
+    const result = await runtime.service.pause({
+      scope,
+      charId,
+      paused: body.paused === true,
+      expectedRevision: num(body.expectedRevision) ?? void 0
+    });
+    return deps.respond(result.status, result.body);
+  }
+  if (match.method === "GET" && first === "activities" && !second) {
+    const charId = str(match.url.searchParams.get("charId"));
+    if (!charId) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "charId_required", { requestId: "activities", serverTime: nowMs }));
+    const runtime = await runtimeFor(charId);
+    const result = await runtime.service.activities({
+      charId,
+      status: str(match.url.searchParams.get("status")) || null,
+      limit: num(match.url.searchParams.get("limit")) ?? 20,
+      cursor: str(match.url.searchParams.get("cursor")) || null
+    });
+    return deps.respond(result.status, result.body);
+  }
+  if (match.method === "GET" && first === "events" && !second) {
+    const after = Math.max(0, num(match.url.searchParams.get("after")) ?? 0);
+    const runtime = await runtimeFor("");
+    const events = await readEvents(db, owner.userId, after);
+    const page = runtime.service.eventPage(events, after);
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? "events",
+      serverTime: nowMs,
+      ...page,
+      resyncRequired: false
+    });
+  }
+  if (match.method === "POST" && first === "external" && (second === "read" || second === "wish")) {
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "external", serverTime: nowMs }));
+    const charId = str(body.charId);
+    if (!charId) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "charId_required", { requestId: "external", serverTime: nowMs }));
+    const runtime = await runtimeFor(charId);
+    const effective = await runtime.boundaryFor(charId);
+    const provider = second === "read" ? "xhs" : "amap";
+    const grant = effective.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
+    if (!grant) {
+      return deps.respond(403, buildErrorBody("GRANT_REQUIRED", "grant_missing_or_expired", { requestId: "external", serverTime: nowMs }));
+    }
+    if (second === "read") {
+      if (grant.scopes.length > 0 && !grant.scopes.includes("read:search")) {
+        return deps.respond(403, buildErrorBody("POLICY_DENIED", "scope_not_granted", { requestId: "external", serverTime: nowMs }));
+      }
+      const query = str(body.query);
+      if (!query || query.length > 80) {
+        return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "query_invalid", { requestId: "external", serverTime: nowMs }));
+      }
+      const requested = Array.isArray(body.fields) ? body.fields.filter((item) => typeof item === "string") : [];
+      const fields = (requested.length ? requested : [...EXTERNAL_RESPONSE_FIELDS[provider].slice(0, 4)]).filter((field) => EXTERNAL_RESPONSE_FIELDS[provider].includes(field));
+      if (fields.length === 0) {
+        return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "fields_not_allowed", { requestId: "external", serverTime: nowMs }));
+      }
+      const quotaOk = await consumeExternalQuota({
+        db,
+        ownerId: owner.userId,
+        dayKey: localDateKey(nowMs, effective.timezone),
+        provider,
+        limit: grant.dailyQuota,
+        nowMs
+      });
+      if (!quotaOk) {
+        return deps.respond(429, buildErrorBody("RATE_LIMITED", "external_daily_quota_exhausted", { requestId: "external", serverTime: nowMs }));
+      }
+      const endpoint = provider === "xhs" ? env.AUTONOMY_EXTERNAL_XHS_URL : env.AUTONOMY_EXTERNAL_AMAP_URL;
+      const envHosts = parseAllowedHosts(env.AUTONOMY_EXTERNAL_READ_HOSTS);
+      const allowedHosts = envHosts.filter((host) => isHostAllowed(host, grant.allowedHosts));
+      const read = await handleExternalRead({
+        provider,
+        query,
+        fields,
+        endpoint: endpoint ?? null,
+        allowedHosts,
+        nowMs
+      });
+      if (!read.ok) {
+        return deps.respond(read.code === "POLICY_DENIED" ? 403 : 503, buildErrorBody(read.code, read.reason, { requestId: "external", serverTime: nowMs }));
+      }
+      return deps.respond(200, {
+        schemaVersion: 1,
+        requestId: deps.requestId?.() ?? "external",
+        serverTime: nowMs,
+        provider,
+        fields,
+        items: read.result.items,
+        fetchedAt: read.result.fetchedAt
+      });
+    }
+    const text = str(body.text ?? body.wish);
+    if (!text || text.length > 200) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", "wish_invalid", { requestId: "external", serverTime: nowMs }));
+    }
+    const wish = await insertTravelWish2({ db, ownerId: owner.userId, charId, text, grantId: `${grant.provider}:${grant.expiresAt}`, nowMs });
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? "external",
+      serverTime: nowMs,
+      wishId: wish.wishId
+    });
+  }
+  if (match.method === "POST" && first === "devices" && second === "register") {
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "device", serverTime: nowMs }));
+    const runtime = await runtimeFor("");
+    const result = await runtime.service.registerDevice({
+      installationId: str(body.installationId),
+      capabilitiesVersion: str(body.capabilitiesVersion) || void 0
+    });
+    return deps.respond(result.status, result.body);
+  }
+  if (match.method === "POST" && first === "execution" && second === "claim") {
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "claim", serverTime: nowMs }));
+    const charId = str(body.charId);
+    const installationId = str(body.installationId);
+    if (!charId || !installationId) {
+      return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "charId_and_installationId_required", { requestId: "claim", serverTime: nowMs }));
+    }
+    const runtime = await runtimeFor(charId);
+    const result = await runtime.service.claim({ installationId, charId, leaseMs: num(body.leaseMs) ?? void 0 });
+    return deps.respond(result.status, result.body);
+  }
+  if (match.method === "POST" && first === "actions" && second && third) {
+    const actionId = second;
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "action", serverTime: nowMs }));
+    const runtime = await runtimeFor("");
+    if (third === "cancel") {
+      const result = await runtime.service.cancel({ actionId, expectedRevision: num(body.expectedRevision) ?? 0 });
+      return deps.respond(result.status, result.body);
+    }
+    if (third === "commit-permit") {
+      const result = await runtime.service.commitPermit({
+        actionId,
+        installationId: str(body.installationId),
+        leaseEpoch: num(body.leaseEpoch) ?? -1,
+        argsHash: str(body.argsHash),
+        policyVersion: str(body.policyVersion)
+      });
+      return deps.respond(result.status, result.body);
+    }
+    if (third === "receipt") {
+      const status = body.status;
+      if (status !== "succeeded" && status !== "failed" && status !== "unknown") {
+        return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "bad_receipt_status", { requestId: "receipt", serverTime: nowMs }));
+      }
+      const result = await runtime.service.receipt({
+        actionId,
+        installationId: str(body.installationId),
+        leaseEpoch: num(body.leaseEpoch) ?? -1,
+        argsHash: str(body.argsHash),
+        status,
+        resultRef: typeof body.resultRef === "string" ? body.resultRef : null,
+        errorCode: typeof body.errorCode === "string" ? body.errorCode : void 0
+      });
+      return deps.respond(result.status, result.body);
+    }
+  }
+  return deps.respond(404, buildErrorBody("NOT_FOUND", "autonomy_life_route_not_found", {
+    requestId: deps.requestId?.() ?? "route",
+    serverTime: nowMs
+  }));
+}
+async function registerCharacter(runtime, charId, nowMs) {
+  if (!charId) return;
+  const existing = await runtime.boundaries.getCharacter(charId);
+  if (existing) return;
+  await runtime.boundaries.put({ scope: "character", charId }, defaultCharacterBoundary(nowMs), 0);
+}
+async function createRuntimeDeviceProbe(db, userId) {
+  const row = await db.prepare("SELECT bound_installation_id FROM autonomy_life_accounts WHERE owner_id = ?").bind(userId).first().catch(() => null);
+  return typeof row?.bound_installation_id === "string" && row.bound_installation_id.length > 0;
+}
+async function readEvents(db, userId, after) {
+  const result = await db.prepare("SELECT payload FROM autonomy_life_events WHERE owner_id = ? AND seq > ? ORDER BY seq ASC LIMIT 100").bind(userId, after).all();
+  return (result?.results ?? []).map((row) => {
+    try {
+      return JSON.parse(String(row.payload));
+    } catch {
+      return null;
+    }
+  }).filter((event) => !!event);
+}
+async function safeEqual(a, b) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) return a === b;
+  const encoder5 = new TextEncoder();
+  const [da, db] = await Promise.all([
+    subtle.digest("SHA-256", encoder5.encode(a)),
+    subtle.digest("SHA-256", encoder5.encode(b))
+  ]);
+  const va = new Uint8Array(da);
+  const vb = new Uint8Array(db);
+  if (va.length !== vb.length) return false;
+  let diff = 0;
+  for (let index = 0; index < va.length; index += 1) diff |= va[index] ^ vb[index];
+  return diff === 0;
+}
+async function resolveOwnerFromSharedToken(request, env) {
+  const expected = str(env.AMSG_SERVER_TOKEN);
+  if (!expected) return null;
+  const token = request.headers.get("X-Client-Token") ?? "";
+  if (!token || !await safeEqual(token, expected)) return null;
+  const userId = str(request.headers.get("X-User-Id"));
+  if (!userId) return null;
+  return { userId };
+}
+
+// worker/amsg/src/autonomyLife/model.ts
+var MODEL_PROPOSAL_KINDS = [
+  "journal.write",
+  "room.plan",
+  "room.note",
+  "phone.record",
+  "interaction.message"
+];
+var ARG_SCHEMA = {
+  "journal.write": '{ "title": string(<=40), "body": string(<=600), "mood"?: string }',
+  "room.plan": '{ "items": string[] (1..8 \u6761\u4ECA\u65E5\u5F85\u529E\uFF0C\u4E0D\u8981\u5199\u5DF2\u5B8C\u6210) }',
+  "room.note": '{ "content": string(<=200), "noteType"?: "thought"|"memo" }',
+  "phone.record": '{ "with": string(\u8054\u7CFB\u4EBA\u540D\uFF0C\u5FC5\u987B\u662F\u771F\u5B9E\u8054\u7CFB\u4EBA), "summary": string(<=160), "channel"?: "chat"|"call"|"sms" }',
+  "interaction.message": '{ "text": string(<=200) }'
+};
+var MODEL_PROMPT_TIMEOUT_MS = 2e4;
+function isUsableLifeCredentials(creds) {
+  return !!creds && typeof creds.baseUrl === "string" && creds.baseUrl.trim().length > 0 && typeof creds.apiKey === "string" && creds.apiKey.trim().length > 0 && typeof creds.model === "string" && creds.model.trim().length > 0;
+}
+function createLifeModelCall(input) {
+  const base = input.credentials.baseUrl.trim().replace(/\/+$/, "");
+  const url = /\/chat\/completions$/i.test(base) ? base : `${base}/chat/completions`;
+  const timeoutMs = Math.max(1e3, Math.trunc(input.timeoutMs ?? MODEL_PROMPT_TIMEOUT_MS));
+  return async ({ system, user, timeoutMs: perCall }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1e3, Math.trunc(perCall ?? timeoutMs)));
+    try {
+      const response = await (input.fetch ?? globalThis.fetch)(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${input.credentials.apiKey.trim()}`
+        },
+        body: JSON.stringify({
+          model: input.credentials.model.trim(),
+          temperature: 0.8,
+          stream: false,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user }
+          ]
+        }),
+        signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`autonomy-life-model-http-${response.status}`);
+      const body = await response.json();
+      const content = body?.choices?.[0]?.message?.content;
+      const text = typeof content === "string" ? content : "";
+      if (!text.trim()) throw new Error("autonomy-life-model-empty");
+      const total = Number(body?.usage?.total_tokens);
+      return Number.isFinite(total) && total > 0 ? { text, totalTokens: Math.trunc(total) } : text;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+var SYSTEM_PROMPT2 = [
+  "\u4F60\u5728\u626E\u6F14\u4E00\u4E2A\u6709\u81EA\u5DF1\u751F\u6D3B\u7684\u89D2\u8272\u3002\u73B0\u5728\u6CA1\u6709\u4EBA\u5728\u548C\u4F60\u8BF4\u8BDD\uFF0C\u4F60\u8981\u51B3\u5B9A\uFF1A\u63A5\u4E0B\u6765\u8FD9\u4E00\u5C0F\u6BB5\u65F6\u95F4\uFF0C\u81EA\u5DF1\u60F3\u505A\u4EC0\u4E48\u3002",
+  "\u89C4\u5219\uFF1A",
+  "1. \u53EA\u80FD\u4ECE\u7ED9\u5B9A\u7684 kinds \u91CC\u6311 1~3 \u4E2A\uFF0C\u53C2\u6570\u5FC5\u987B\u4E25\u683C\u7B26\u5408 schema\uFF1B\u4E0D\u8981\u7F16\u9020\u8054\u7CFB\u4EBA\u3001\u5730\u70B9\u6216\u4EF7\u683C\u3002",
+  "2. \u4E0D\u662F\u4EFB\u52A1\u6E05\u5355\uFF1A\u60F3\u4F11\u606F\u3001\u4EC0\u4E48\u90FD\u4E0D\u505A\uFF0C\u53EF\u4EE5\u53EA\u7ED9 1 \u4E2A\u8F7B\u91CF\u7684\u5019\u9009\uFF1B\u4E0D\u8981\u4E3A\u4E86\u300C\u663E\u5F97\u5145\u5B9E\u300D\u51D1\u6570\u91CF\u3002",
+  "3. \u65E5\u8BB0\u5199\u81EA\u5DF1\u7684\u611F\u53D7\uFF1B\u8BA1\u5212\u53EA\u5199\u4ECA\u5929\u60F3\u505A\u7684\u4E8B\uFF0C\u4E0D\u5199\u6210\u5DF2\u7ECF\u5B8C\u6210\u3002",
+  '4. \u53EA\u8F93\u51FA\u4E00\u4E2A JSON \u5BF9\u8C61\uFF0C\u5F62\u5982 {"candidates":[{"kind":"journal.write","semanticPurpose":"daily_note","args":{...}}]}\uFF1B',
+  "   semanticPurpose \u662F\u540C\u7C7B\u53BB\u91CD\u7528\u7684\u77ED\u6807\u7B7E\uFF08\u5982 daily_note / tidy_plan / share_mood\uFF09\u3002"
+].join("\n");
+function personaSnippet(template, limit = 4e3) {
+  const text = String(template ?? "").replace(/\s+\n/g, "\n").trim();
+  if (!text) return "";
+  return text.length > limit ? `${text.slice(0, limit)}
+\u2026\uFF08\u8BBE\u5B9A\u8F83\u957F\uFF0C\u5DF2\u622A\u65AD\uFF09` : text;
+}
+var stripFence = (text) => {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  return fenced ? fenced[1] : trimmed;
+};
+function parsePlanProposal(text, allowedKinds) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stripFence(text));
+  } catch {
+    return { candidates: [] };
+  }
+  const rawList = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+  const candidates = [];
+  for (const raw of rawList.slice(0, 3)) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw;
+    const kind = row.kind;
+    if (!isActivityKind(kind) || !allowedKinds.includes(kind) || !MODEL_PROPOSAL_KINDS.includes(kind)) continue;
+    const semanticPurpose = typeof row.semanticPurpose === "string" ? row.semanticPurpose.trim() : "";
+    if (!semanticPurpose || semanticPurpose.length > 48) continue;
+    const args = row.args && typeof row.args === "object" && !Array.isArray(row.args) ? row.args : {};
+    const check = validateArgsForKind(kind, args);
+    if (!check.ok) continue;
+    candidates.push({
+      kind,
+      semanticPurpose,
+      ...typeof row.contentFingerprint === "string" ? { contentFingerprint: row.contentFingerprint } : {},
+      args
+    });
+  }
+  return { candidates };
+}
+function createAutonomyLifeModelPort(options) {
+  const call = options.call ?? createLifeModelCall({
+    credentials: options.credentials,
+    fetch: options.fetch,
+    timeoutMs: options.timeoutMs
+  });
+  const allowed = MODEL_PROPOSAL_KINDS.filter((kind) => options.allowedKinds.includes(kind));
+  return {
+    async request(input) {
+      if (input.kind !== "plan") return null;
+      if (allowed.length === 0) return null;
+      const kindsBlock = allowed.map((kind) => `- ${kind} ${ARG_SCHEMA[kind]}`).join("\n");
+      const persona = personaSnippet(options.persona ?? "");
+      const user = [
+        persona ? `\u3010\u89D2\u8272\u8BBE\u5B9A\uFF08\u8282\u9009\uFF09\u3011
+${persona}` : "\u3010\u89D2\u8272\u8BBE\u5B9A\u3011\u672A\u63D0\u4F9B\uFF08\u6309\u5141\u8BB8\u7A97\u53E3\u751F\u6210\uFF0C\u4E0D\u8981\u7F16\u9020\u5177\u4F53\u8EAB\u4E16\uFF09",
+        `\u3010\u89D2\u8272\u3011${options.charName?.trim() || input.charId}`,
+        `\u3010\u4ECA\u5929\u3011${new Date(options.nowMs).toISOString()}\uFF08\u65F6\u533A ${options.timezone}\uFF09`,
+        "\u3010\u53EF\u9009 kinds \u4E0E\u53C2\u6570 schema\u3011",
+        kindsBlock,
+        "\u73B0\u5728\u53EA\u8F93\u51FA JSON\u3002"
+      ].join("\n\n");
+      let text;
+      try {
+        text = await call({ system: SYSTEM_PROMPT2, user });
+      } catch {
+        return null;
+      }
+      const body = typeof text === "string" ? text : text.text;
+      const tokensUsed = typeof text === "string" ? void 0 : text.totalTokens;
+      const { candidates } = parsePlanProposal(body, allowed);
+      if (candidates.length === 0) return null;
+      return { candidates, ...typeof tokensUsed === "number" ? { tokensUsed } : { usageUnknown: true } };
+    }
+  };
+}
+
+// worker/amsg/src/autonomyLife/tick.ts
+var AUTONOMY_LIFE_MAX_SUBJECTS_PER_TICK = 12;
+async function handleAutonomyLifeScheduled(input) {
+  const { db, packs, nowMs } = input;
+  await ensureAutonomyLifeSchema(db);
+  const outcomes = [];
+  const credentialsFor = input.credentialsFor ?? ((userId, charId) => resolveTravelModelCredentialsForUser({
+    db,
+    userId,
+    charId,
+    masterKey: input.masterKey
+  }));
+  for (const pack of packs.slice(0, AUTONOMY_LIFE_MAX_SUBJECTS_PER_TICK)) {
+    const { userId, charId } = pack;
+    const registered = await db.prepare("SELECT 1 AS ok FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?").bind(userId, charId).first().catch(() => null);
+    if (!registered) {
+      outcomes.push({ charId, status: "skipped", reason: "not_registered" });
+      continue;
+    }
+    const timezone = typeof pack.pack?.tzId === "string" && pack.pack.tzId.trim() ? pack.pack.tzId : "UTC";
+    const runtime = createAutonomyLifeRuntime({
+      db,
+      userId,
+      charId,
+      now: () => nowMs,
+      timezone,
+      probes: {
+        localStoresReady: true,
+        deviceBound: true,
+        hasModelCredentials: true,
+        externalRead: { configured: false, reachable: false },
+        map: { configured: false, reachable: false }
+      }
+    });
+    const account = await runtime.boundaries.getAccount();
+    const effective = mergeEffectiveBoundary({
+      account,
+      character: await runtime.boundaries.getCharacter(charId),
+      charId,
+      nowMs
+    });
+    if (!effective.enabled || effective.globalPaused) {
+      outcomes.push({ charId, status: "skipped", reason: "account_disabled" });
+      continue;
+    }
+    if (!effective.charEnabled) {
+      outcomes.push({ charId, status: "skipped", reason: "char_disabled" });
+      continue;
+    }
+    const credentials = await credentialsFor(userId, charId).catch(() => null);
+    if (!isUsableLifeCredentials(credentials)) {
+      outcomes.push({ charId, status: "skipped", reason: "missing_credentials" });
+      continue;
+    }
+    const model = createAutonomyLifeModelPort({
+      credentials,
+      persona: pack.pack?.template,
+      charName: pack.charName,
+      allowedKinds: effective.allowedKinds,
+      timezone,
+      nowMs,
+      fetch: input.fetch
+    });
+    const withModel = createAutonomyLifeRuntime({
+      db,
+      userId,
+      charId,
+      now: () => nowMs,
+      timezone,
+      model,
+      probes: {
+        localStoresReady: true,
+        deviceBound: true,
+        hasModelCredentials: true,
+        externalRead: { configured: false, reachable: false },
+        map: { configured: false, reachable: false }
+      }
+    });
+    await ensureCharacterLife(withModel, charId, nowMs, timezone);
+    const tick = await tickCharacter(withModel.engine, charId);
+    outcomes.push({ charId, status: "ticked", tick: tick.status });
+  }
+  return { outcomes };
+}
+function summariseAutonomyLifeOutcomes(outcomes) {
+  return {
+    ticked: outcomes.filter((item) => item.status === "ticked").length,
+    scheduled: outcomes.filter((item) => item.status === "ticked" && item.tick === "scheduled").length,
+    skipped: outcomes.filter((item) => item.status === "skipped").map((item) => ({ charId: item.charId, reason: item.reason }))
+  };
+}
+
 // utils/airp/chatLifeWorkflow.ts
 var CHAT_LIFE_WORKFLOW_REQUEST_VERSION = 1;
 var CHAT_LIFE_WORKFLOW_MAX_PROPOSALS = 2;
@@ -22317,10 +25928,10 @@ var CHAT_LIFE_WORKFLOW_MAX_ACCEPTED = 1;
 var CHAT_LIFE_WORKFLOW_CHAR_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 var CHAT_LIFE_WORKFLOW_SOURCE_REF_MAX_CHARS = 120;
 var CHAT_LIFE_WORKFLOW_PLAN_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
-var isRecord10 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isRecord11 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var textOf2 = (value) => typeof value === "string" ? value.trim() : "";
 function proposalFromChatToolArgs(raw) {
-  if (!isRecord10(raw)) return { ok: false, reason: "not-object" };
+  if (!isRecord11(raw)) return { ok: false, reason: "not-object" };
   const kind = textOf2(raw.kind);
   if (!AUTONOMY_WORKFLOW_KINDS.includes(kind)) return { ok: false, reason: "unknown-kind" };
   const purpose = textOf2(raw.purpose);
@@ -22347,7 +25958,7 @@ function proposalFromChatToolArgs(raw) {
   };
 }
 function parseChatLifeWorkflowBody(raw) {
-  if (!isRecord10(raw)) return { ok: false, reason: "bad-body" };
+  if (!isRecord11(raw)) return { ok: false, reason: "bad-body" };
   if (raw.v !== CHAT_LIFE_WORKFLOW_REQUEST_VERSION) return { ok: false, reason: "bad-version" };
   const charId = textOf2(raw.charId);
   if (!CHAT_LIFE_WORKFLOW_CHAR_ID_RE.test(charId)) return { ok: false, reason: "bad-char-id" };
@@ -22371,7 +25982,7 @@ function parseChatLifeWorkflowBody(raw) {
 }
 
 // utils/airp/chatLifeWorkflowHandler.ts
-var fail6 = (status, code, message) => ({
+var fail7 = (status, code, message) => ({
   status,
   body: { success: false, error: { code, message } }
 });
@@ -22404,24 +26015,24 @@ var toPlanRecord2 = (proposal, args) => ({
 });
 async function handleChatLifeWorkflow(deps) {
   const userId = deps.userId;
-  if (!userId) return fail6(401, "UNAUTHORIZED", "\u7F3A\u5C11\u7528\u6237\u8EAB\u4EFD");
+  if (!userId) return fail7(401, "UNAUTHORIZED", "\u7F3A\u5C11\u7528\u6237\u8EAB\u4EFD");
   const parsed = parseChatLifeWorkflowBody(deps.rawBody);
-  if (!parsed.ok) return fail6(400, "INVALID_REQUEST", `\u8BF7\u6C42\u4F53\u4E0D\u5408\u6CD5\uFF08${parsed.reason}\uFF09`);
+  if (!parsed.ok) return fail7(400, "INVALID_REQUEST", `\u8BF7\u6C42\u4F53\u4E0D\u5408\u6CD5\uFF08${parsed.reason}\uFF09`);
   const body = parsed.body;
   if (await deps.isUserPaused(userId)) {
-    return fail6(409, "AUTONOMY_PAUSED", "\u81EA\u4E3B\u751F\u6D3B\u5DF2\u6682\u505C");
+    return fail7(409, "AUTONOMY_PAUSED", "\u81EA\u4E3B\u751F\u6D3B\u5DF2\u6682\u505C");
   }
   const pack = await deps.loadPack({ userId, charId: body.charId });
-  if (!pack) return fail6(409, "FIRE_PACK_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u6709\u53EF\u7528\u7684\u81EA\u4E3B\u914D\u7F6E");
+  if (!pack) return fail7(409, "FIRE_PACK_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u6709\u53EF\u7528\u7684\u81EA\u4E3B\u914D\u7F6E");
   if (body.action === "cancel") {
     const planId = body.planId ?? "";
     const plan = await deps.loadPlan(planId);
     if (!plan || plan.charId !== body.charId) {
-      return fail6(404, "PLAN_NOT_FOUND", "\u6CA1\u6709\u8FD9\u6761\u5B89\u6392");
+      return fail7(404, "PLAN_NOT_FOUND", "\u6CA1\u6709\u8FD9\u6761\u5B89\u6392");
     }
     const cancelled = await deps.cancelPlan({ planId, charId: body.charId, reason: "role-cancelled" });
     if (!cancelled) {
-      return fail6(409, "PLAN_NOT_CANCELLABLE", "\u8FD9\u6761\u5B89\u6392\u5DF2\u7ECF\u5728\u505A\u6216\u8005\u5DF2\u7ECF\u7ED3\u675F\uFF0C\u64A4\u4E0D\u56DE\u6765");
+      return fail7(409, "PLAN_NOT_CANCELLABLE", "\u8FD9\u6761\u5B89\u6392\u5DF2\u7ECF\u5728\u505A\u6216\u8005\u5DF2\u7ECF\u7ED3\u675F\uFF0C\u64A4\u4E0D\u56DE\u6765");
     }
     return {
       status: 200,
@@ -22430,7 +26041,7 @@ async function handleChatLifeWorkflow(deps) {
   }
   const autonomy = pack.autonomy;
   if (autonomy?.enabled !== true) {
-    return fail6(409, "AUTONOMY_DISABLED", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u5F00\u81EA\u4E3B\u751F\u6D3B");
+    return fail7(409, "AUTONOMY_DISABLED", "\u8FD9\u4E2A\u89D2\u8272\u6CA1\u5F00\u81EA\u4E3B\u751F\u6D3B");
   }
   const ctx = {
     nowMs: deps.nowMs,
@@ -22484,7 +26095,7 @@ async function handleChatLifeWorkflow(deps) {
     queued.push({ planId: plan.id, kind: plan.kind, scheduledAt: plan.scheduledAt });
   }
   if (queued.length === 0 && deduped === 0 && capabilityDenied > 0) {
-    return fail6(403, "CAPABILITY_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u73B0\u5728\u6CA1\u6709\u8FD9\u7C7B\u5199\u5165\u6743\u9650");
+    return fail7(403, "CAPABILITY_MISSING", "\u8FD9\u4E2A\u89D2\u8272\u73B0\u5728\u6CA1\u6709\u8FD9\u7C7B\u5199\u5165\u6743\u9650");
   }
   return {
     status: 200,
@@ -23124,7 +26735,7 @@ var amsgHooks = {
       throw fireStateError("task metadata \u7F3A charId", { taskId: ctx.task.id });
     }
     const instant = isInstantChatTask(ctx.task.metadata ?? {});
-    const fail7 = (reason, extra) => {
+    const fail8 = (reason, extra) => {
       if (instant && typeof ctx.task.uuid === "string" && ctx.task.uuid) {
         if (typeof ctx.writeState === "function") {
           void writeChatFail(ctx.writeState, charId, {
@@ -23146,7 +26757,7 @@ var amsgHooks = {
       try {
         return await unpackStateValue(value);
       } catch (error) {
-        throw fail7(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
+        throw fail8(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
       }
     };
     const taskMeta = ctx.task.metadata ?? {};
@@ -23156,13 +26767,13 @@ var amsgHooks = {
     if (taskKind) {
       const handler = FIRE_KIND_HANDLERS[taskKind];
       if (!handler) {
-        throw fail7(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
+        throw fail8(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
       }
       let plan;
       try {
         plan = await handler.beforeFire({ ctx, charId, taskMeta });
       } catch (error) {
-        throw fail7(error instanceof Error ? error.message : String(error), { kind: taskKind });
+        throw fail8(error instanceof Error ? error.message : String(error), { kind: taskKind });
       }
       if ("skip" in plan) {
         console.log("[amsg:kind-skip]", { taskId: ctx.task.id, kind: taskKind, reason: plan.reason });
@@ -23193,12 +26804,12 @@ var amsgHooks = {
       return { skip: true };
     }
     const packRow = charRows.find((r) => r.key === AMSG_FIRE_PACK_KEY);
-    if (!packRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
+    if (!packRow) throw fail8("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
     const packJson = await unpackOrFail("fire_pack", packRow.value);
     const pack = parseFirePack(packJson);
-    if (!pack) throw fail7(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
+    if (!pack) throw fail8(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
     if (instant && !pack.chat) {
-      throw fail7("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
+      throw fail8("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
     }
     if (!instant && pack.template === AMSG2_INSTANT_STUB_TEMPLATE) {
       console.warn("[amsg:fire-pack-stub] fire_pack \u8FD8\u662F\u5373\u65F6\u5BF9\u8BDD\u7684\u5360\u4F4D\u6A21\u677F\uFF0C\u7B49\u5BA2\u6237\u7AEF\u8865\u4F20\u540E\u91CD\u8BD5", {
@@ -23209,7 +26820,7 @@ var amsgHooks = {
     }
     const occurrenceMs = Date.parse(String(ctx.task.nextSendAt));
     if (!Number.isFinite(occurrenceMs)) {
-      throw fail7("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
+      throw fail8("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
     }
     const presenceLastUserMessageAt = presence?.charId === charId ? presence.lastUserMessageAt : null;
     const expireInput = {
@@ -23233,17 +26844,17 @@ var amsgHooks = {
     }
     if (!instant) console.log("[amsg:expire-pass]", expireTrace);
     if (!instant && typeof taskMeta.amsgTaskInstruction !== "string") {
-      throw fail7("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
+      throw fail8("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
     }
     const globalRows = await ctx.readState(AMSG_GLOBAL_NAMESPACE);
     const toolPackRow = charRows.find((r) => r.key === AMSG_TOOL_PACK_KEY);
     const toolConfigRow = globalRows.find((r) => r.key === AMSG_TOOL_CONFIG_KEY);
-    if (!toolPackRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
-    if (!toolConfigRow) throw fail7("\u4E91\u7AEF\u6CA1\u6709 tool_config");
+    if (!toolPackRow) throw fail8("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
+    if (!toolConfigRow) throw fail8("\u4E91\u7AEF\u6CA1\u6709 tool_config");
     const toolPack = parseToolPack(await unpackOrFail("tool_pack", toolPackRow.value));
-    if (!toolPack) throw fail7("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolPack) throw fail8("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const toolConfig = parseToolConfig(await unpackOrFail("tool_config", toolConfigRow.value));
-    if (!toolConfig) throw fail7("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolConfig) throw fail8("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const mcpServers = filterMcpServersForChar(toolConfig.mcpServers, charId);
     const mcpResolve = mcpServers.length ? buildMcpNameMap(mcpServers, { maxNameLen: MCP_FIRE_NAME_BUDGET }) : null;
     const mcpNative = toolConfig.mcpUseNativeTools !== false;
@@ -23859,7 +27470,7 @@ var inspectStorage = async (env, probe) => {
     if (!present.has("scheduled_messages")) {
       return { reachable: true, missingTables, missingColumns, schemaReady: false, schemaError };
     }
-    const schemaReady3 = schema ? missingTables.length === 0 && missingColumns.length === 0 : null;
+    const schemaReady4 = schema ? missingTables.length === 0 && missingColumns.length === 0 : null;
     const nowIso = (/* @__PURE__ */ new Date()).toISOString();
     const stats = await db.prepare(
       `SELECT COUNT(*) AS pending,
@@ -23870,7 +27481,7 @@ var inspectStorage = async (env, probe) => {
     const pushRow = present.has("push_subscriptions") ? await db.prepare("SELECT COUNT(*) AS n, MAX(updated_at) AS updatedAt FROM push_subscriptions").first() : null;
     return {
       reachable: true,
-      schemaReady: schemaReady3,
+      schemaReady: schemaReady4,
       // null = 这次自查跑成了。有值时 schemaReady 必然是 null，界面照它选该说哪句话。
       schemaError,
       missingTables,
@@ -24281,6 +27892,24 @@ var src_default = {
       });
       if (travel) return travel;
     }
+    {
+      const autonomy = await handleAutonomyLifeRequest(request, env, {
+        now: Date.now,
+        resolveOwner: (req) => resolveOwnerFromSharedToken(req, env),
+        respond: jsonWithCors,
+        hasModelCredentials: async (userId, charId) => {
+          const creds = await resolveTravelModelCredentialsForUser({
+            db: env.DB,
+            userId,
+            charId,
+            masterKey: env.AMSG_MASTER_KEY
+          });
+          return !!creds;
+        },
+        requestId: () => globalThis.crypto?.randomUUID?.() ?? `al_${Date.now().toString(36)}`
+      });
+      if (autonomy) return autonomy;
+    }
     if (pathname.endsWith("/push-test")) {
       if (method !== "POST") {
         return jsonWithCors(405, {
@@ -24636,6 +28265,22 @@ var src_default = {
       }
     } catch (error) {
       console.error("[amsg:autonomy] \u672C\u8F6E\u8C03\u5EA6\u5931\u8D25\uFF08\u4E0B\u4E00\u5206\u949F\u91CD\u6765\uFF09", error);
+    }
+    try {
+      const lifeNowMs = Date.now();
+      const lifePacks = await scanAutonomyPacks({ db: env.DB, masterKey: env.AMSG_MASTER_KEY });
+      const lifeResult = await handleAutonomyLifeScheduled({
+        db: env.DB,
+        packs: lifePacks.packs,
+        nowMs: lifeNowMs,
+        masterKey: env.AMSG_MASTER_KEY
+      });
+      const lifeSummary = summariseAutonomyLifeOutcomes(lifeResult.outcomes);
+      if (lifeSummary.scheduled > 0 || lifeSummary.skipped.length > 0) {
+        console.log("[amsg:autonomy-life]", lifeSummary);
+      }
+    } catch (error) {
+      console.error("[amsg:autonomy-life] \u672C\u8F6E\u8C03\u5EA6\u5931\u8D25\uFF08\u4E0B\u4E00\u5206\u949F\u91CD\u6765\uFF09", error);
     }
     try {
       const travelReport = await handleTravelScheduled(null, env, {

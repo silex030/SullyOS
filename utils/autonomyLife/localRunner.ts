@@ -19,12 +19,13 @@
 import { hashArgs, type ActivityKind, type AutonomyLifeErrorCode, type EffectiveBoundaryV1, type ExecuteContext, type ExecutionPermit } from '../../contracts/autonomyLife';
 import { executeAction, validateAndPrepare, type ExecuteOutcome, type ExecuteDeps } from './adapters';
 import { boundaryGate } from './boundary';
-import { reportReceipt, type ActionRow, type EngineDeps } from './engine';
+import { reportReceipt, type ActionRow, type EngineDeps, type ReceiptReport } from './engine';
 import { checkExecutionPermit, signedArgsHash } from './executionPermit';
 import { installLocalPermit, type LocalDbPort } from './localLedger';
 
 export interface RunLocalActionInput {
-  deps: EngineDeps;
+  /** 同进程上报用（测试/服务端）；浏览器执行器注入 `report` 时可以不传。 */
+  deps?: EngineDeps;
   /** 本地库端口；null = 没有可用本地库（能力不可用，绝不假装执行）。 */
   port: LocalDbPort | null;
   action: ActionRow;
@@ -38,8 +39,15 @@ export interface RunLocalActionInput {
    * 边界读不出来（抛错）按 fail closed 处理。
    */
   boundaryFor: (charId: string) => Promise<EffectiveBoundaryV1>;
+  /**
+   * 回执上报口。缺省走同进程的 engine.reportReceipt（测试/服务端内联）；浏览器执行器
+   * 注入 HTTP 实现，回执仍然要带 actionId/leaseEpoch/argsHash/installationId。
+   */
+  report?: (report: ReceiptReport) => Promise<{ ok: boolean; code?: AutonomyLifeErrorCode }>;
   /** 本地总暂停（UI 可以先本地停再请求云端）：为 true 时直接拒绝执行。 */
   localPaused?: boolean;
+  /** 外部窗口端口（external.read / travel.wish）；缺省 = 未配置 → 明确不可执行。 */
+  external?: ExecuteDeps['external'];
   /**
    * 可选的语义分类器。内部模拟订单靠「封闭类目白名单 + 词表」已经能拦，
    * 分类器是加分项；但一旦配置了就必须可用（否则 fail closed）。
@@ -171,15 +179,20 @@ export async function runLocalAction(input: RunLocalActionInput): Promise<RunLoc
     return { status: 'failed', code: installed.code, message: installed.reason, effectVerified: false };
   }
 
-  const deps: ExecuteDeps = { port: input.port, policyVersion: input.policyVersion, tz: boundary.timezone };
+  const deps: ExecuteDeps = {
+    port: input.port,
+    policyVersion: input.policyVersion,
+    tz: boundary.timezone,
+    external: input.external ?? null,
+  };
   const outcome = await executeAction(ctx, deps);
 
   // 回执绑定：action.id 是业务幂等键，leaseEpoch/argsHash 证明「就是这一次许可」。
   // 上报失败不回滚本地效果（效果已经落库），但把结果如实交给调用方。
   let receiptOk = true;
   try {
-    const reported = await reportReceipt(input.deps, {
-      accountId: input.deps.accountId ?? 'account',
+    const report = {
+      accountId: input.deps?.accountId ?? 'account',
       actionId: action.id,
       installationId: input.installationId,
       leaseEpoch: action.leaseEpoch,
@@ -188,7 +201,12 @@ export async function runLocalAction(input: RunLocalActionInput): Promise<RunLoc
       resultRef: outcome.status === 'succeeded' ? outcome.resultRef : null,
       errorCode: outcome.status === 'succeeded' ? undefined : outcome.code,
       nowMs: input.nowMs,
-    });
+    } as ReceiptReport;
+    const reported = input.report
+      ? await input.report(report)
+      : input.deps
+        ? await reportReceipt(input.deps, report)
+        : { ok: false };
     receiptOk = reported.ok;
   } catch {
     receiptOk = false;

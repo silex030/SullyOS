@@ -3177,9 +3177,6 @@ export interface CharacterProfile {
       simLogs?: PhoneSimLog[]; // 「生活记录」：人格模拟演出留存
       chatReadAt?: number;     // 上次打开 Messages 的时间戳，用于计算未读
       sendToChat?: boolean;    // 查手机生成的内容是否同步到私聊（默认 true）
-      autoRefresh?: boolean;            // 定时自动刷新：到间隔自动重生成聊天记录，无需手动点（默认关）
-      autoRefreshIntervalMin?: number;  // 自动刷新间隔（分钟，默认 30）
-      lastAutoRefreshAt?: number;       // 上次自动刷新时间戳（打开 App 时据此判断是否立即补刷）
       contacts?: PhoneContact[]; // 人际关系系统：机主的通讯录
       allowFictionalContacts?: boolean; // 是否允许生成虚构 NPC 联系人；false=只与神经链接里的真实角色来往（默认 true）
       aiAgent?: {                 // 智能体 App：偷看到的「AI 也在玩 AI」记录

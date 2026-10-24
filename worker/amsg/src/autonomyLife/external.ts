@@ -1,0 +1,237 @@
+/**
+ * 受控外部只读窗口（服务端唯一出口）
+ *
+ * 设计原则（安全 lane，别放宽）：
+ *   1. **没有任意 URL**：请求体只带 provider + query + fields；目标地址来自运营配置
+ *      （`AUTONOMY_EXTERNAL_<PROVIDER>_URL`），并必须同时出现在
+ *      `AUTONOMY_EXTERNAL_READ_HOSTS` 与用户授权 grant.allowedHosts 里。三者缺一就拒。
+ *   2. **SSRF 硬拦**：只允许 https、默认端口，禁止 URL 内凭据、IP 字面量、localhost /
+ *      .local / .internal / 云元数据地址；重定向一律不跟（3xx 即失败），避免被 302 带到内网。
+ *   3. **外传内容只有 query**：字段投影只在**响应**侧发生（白名单字段 + 截断），原始响应
+ *      不入库、不回包。
+ *   4. **配额**：按 (owner, 角色日, provider) 原子自增，超过 `grant.dailyQuota` 直接拒。
+ *   5. 未配置端点 = 明确 `CAPABILITY_UNAVAILABLE`，不拿 fixture/假数据冒充「读到了」。
+ */
+
+import type { AutonomyLifeErrorCode } from '../../../../contracts/autonomyLife';
+
+export interface ExternalEnv {
+  AUTONOMY_EXTERNAL_XHS_URL?: string;
+  AUTONOMY_EXTERNAL_AMAP_URL?: string;
+  AUTONOMY_EXTERNAL_READ_HOSTS?: string;
+}
+
+export type ExternalProvider = 'xhs' | 'amap';
+
+/** 平台侧响应字段白名单（与服务端投影共用；超出即丢弃）。 */
+export const EXTERNAL_RESPONSE_FIELDS: Record<ExternalProvider, readonly string[]> = {
+  xhs: ['title', 'excerpt', 'author', 'likes', 'url'],
+  amap: ['name', 'address', 'distanceM', 'category'],
+};
+
+export const EXTERNAL_TIMEOUT_MS = 8_000;
+export const EXTERNAL_MAX_BYTES = 256 * 1024;
+export const EXTERNAL_MAX_ITEMS = 5;
+export const EXTERNAL_MAX_FIELD_CHARS = 200;
+
+export const parseAllowedHosts = (raw: string | undefined, fallback: string[] = []): string[] => {
+  const fromEnv = String(raw ?? '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
+};
+
+/** 精确匹配或 `*.` 后缀匹配；不接受通配中间段。 */
+export function isHostAllowed(host: string, allowlist: readonly string[]): boolean {
+  const target = host.trim().toLowerCase();
+  if (!target) return false;
+  return allowlist.some((entry) => {
+    const rule = entry.toLowerCase();
+    if (!rule) return false;
+    if (rule.startsWith('*.')) return target === rule.slice(2) || target.endsWith(rule.slice(1));
+    return target === rule;
+  });
+}
+
+const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+const BLOCKED_HOST_SUFFIXES = ['.local', '.internal', '.localhost', '.home', '.lan'];
+const BLOCKED_HOSTS = new Set([
+  'localhost',
+  'metadata.google.internal',
+  'metadata.goog',
+  'instance-data',
+]);
+
+/**
+ * 目标 URL 的结构性安全校验（不联网）。allowlist 校验在调用方（需要 grant）。
+ * 返回 null = 通过；否则返回拒绝原因。
+ */
+export function assertFetchableUrl(raw: string): { ok: true; url: URL } | { ok: false; reason: string } {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: 'invalid_url' };
+  }
+  if (url.protocol !== 'https:') return { ok: false, reason: 'https_required' };
+  if (url.username || url.password) return { ok: false, reason: 'credentials_in_url_forbidden' };
+  if (url.port && url.port !== '443') return { ok: false, reason: 'port_forbidden' };
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return { ok: false, reason: 'host_required' };
+  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: 'host_forbidden' };
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: 'host_forbidden' };
+  if (IPV4.test(host)) return { ok: false, reason: 'ip_literal_forbidden' };
+  if (host.includes(':')) return { ok: false, reason: 'ip_literal_forbidden' };
+  return { ok: true, url };
+}
+
+/** 单条结果字段投影：白名单 + 标量 + 截断。 */
+export function projectItem(
+  raw: unknown,
+  fields: readonly string[],
+  allow: readonly string[],
+): Record<string, string | number> {
+  const out: Record<string, string | number> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
+    if (!allow.includes(field)) continue;
+    const value = (raw as Record<string, unknown>)[field];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      out[field] = value;
+    } else if (typeof value === 'string') {
+      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}…` : value;
+    }
+  }
+  return out;
+}
+
+const ITEM_ARRAY_KEYS = ['items', 'data', 'results', 'pois'];
+
+export function extractItems(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return [];
+  for (const key of ITEM_ARRAY_KEYS) {
+    const value = (payload as Record<string, unknown>)[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+export interface ExternalReadResult {
+  items: Array<Record<string, string | number>>;
+  fetchedAt: number;
+}
+
+export async function handleExternalRead(args: {
+  provider: ExternalProvider;
+  query: string;
+  fields: readonly string[];
+  endpoint: string | null;
+  allowedHosts: readonly string[];
+  fetch?: typeof globalThis.fetch;
+  nowMs: number;
+}): Promise<{ ok: true; result: ExternalReadResult } | { ok: false; code: AutonomyLifeErrorCode; reason: string }> {
+  const endpoint = String(args.endpoint ?? '').trim();
+  if (!endpoint) return { ok: false, code: 'CAPABILITY_UNAVAILABLE', reason: 'external_endpoint_unconfigured' };
+
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, code: 'POLICY_DENIED', reason: safe.reason };
+  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
+    return { ok: false, code: 'POLICY_DENIED', reason: 'host_not_allowed' };
+  }
+
+  const url = new URL(safe.url.toString());
+  url.searchParams.set('q', args.query);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EXTERNAL_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+  } catch {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'external_fetch_failed' };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // 3xx 一律不跟：重定向是绕过 allowlist 的经典手法。
+  if (response.status >= 300 && response.status < 400) {
+    return { ok: false, code: 'POLICY_DENIED', reason: 'redirect_not_followed' };
+  }
+  if (!response.ok) {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: `external_http_${response.status}` };
+  }
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'response_too_large' };
+  }
+  let text = '';
+  try {
+    text = await response.text();
+  } catch {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'external_body_unreadable' };
+  }
+  if (text.length > EXTERNAL_MAX_BYTES) {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'response_too_large' };
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'external_not_json' };
+  }
+  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
+  const fields = args.fields.filter((field) => allow.includes(field));
+  const items = extractItems(payload)
+    .slice(0, EXTERNAL_MAX_ITEMS)
+    .map((row) => projectItem(row, fields, allow))
+    .filter((row) => Object.keys(row).length > 0);
+  return { ok: true, result: { items, fetchedAt: args.nowMs } };
+}
+
+/** 配额原子自增：超限返回 false（先写 0 行再条件 UPDATE，并发不会超卖）。 */
+export async function consumeExternalQuota(args: {
+  db: { prepare(sql: string): { bind(...values: unknown[]): { run(): Promise<unknown> } } };
+  ownerId: string;
+  dayKey: string;
+  provider: ExternalProvider;
+  limit: number;
+  nowMs: number;
+}): Promise<boolean> {
+  const limit = Math.max(0, Math.trunc(args.limit));
+  if (limit <= 0) return false;
+  await args.db
+    .prepare('INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)')
+    .bind(args.ownerId, args.dayKey, args.provider, args.nowMs)
+    .run();
+  const updated = await args.db
+    .prepare('UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?')
+    .bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit)
+    .run();
+  const changes = Number((updated as { meta?: { changes?: unknown }; changes?: unknown })?.meta?.changes
+    ?? (updated as { changes?: unknown })?.changes
+    ?? 0);
+  return Number.isFinite(changes) && changes > 0;
+}
+
+export async function insertTravelWish(args: {
+  db: { prepare(sql: string): { bind(...values: unknown[]): { run(): Promise<unknown> } } };
+  ownerId: string;
+  charId: string;
+  text: string;
+  grantId: string;
+  nowMs: number;
+}): Promise<{ wishId: string }> {
+  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await args.db
+    .prepare('INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs)
+    .run();
+  return { wishId };
+}
