@@ -422,9 +422,48 @@ export interface ExecuteContext {
   argsHash: string;
   policyVersion: string;
   installationId: string;
+  /** 本次领取的租约代次（许可绑定条件之一）。 */
+  leaseEpoch: number;
   /** 本地事务提交后写入的 action receipt 主键 = actionId。 */
   nowMs: number;
+  /**
+   * 一次性执行许可。缺省 = 没有许可：执行器必须拒绝，不得「无许可先做」。
+   * 消费发生在**业务写入的同一个本地事务**里，见 utils/autonomyLife/localLedger.ts。
+   */
+  permit?: ExecutionPermit | null;
 }
+
+// ─── 执行许可（一次性、短期、绑定参数） ─────────────────────────────────────
+
+/**
+ * 服务端签发的执行许可。它回答的问题只有一个：**「这一次副作用」被允许吗**。
+ *
+ * 绑定关系（少一个都不算合法）：
+ *   - actionId + leaseEpoch：这是哪一次领取（不是同一动作的上一轮租约）；
+ *   - installationId：在哪台已绑定设备上执行（换机不带走许可）；
+ *   - argsHash：执行的正是一组被批准的参数（改一个字节即失效）；
+ *   - policyVersion：签发时的策略版本（策略升级后旧许可作废）；
+ *   - nonce：一次性令牌（服务端只在动作行里存一份，重复使用即重放）。
+ *
+ * 时限刻意很短（默认 60 秒）：许可不是「长期通行证」，过期只能重新 claim + commit。
+ */
+export interface ExecutionPermit {
+  actionId: string;
+  /** 角色归属：许可只对这一个角色生效（换 charId 即失效）。 */
+  charId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  policyVersion: string;
+  reservationId: string | null;
+  nonce: string;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+/** 许可有效期：短到足以让「先拿到许可、过一会儿再执行」失去意义。 */
+export const PERMIT_TTL_MS = 60_000;
+
 
 export interface ExecuteResult {
   status: 'succeeded' | 'failed' | 'unknown';

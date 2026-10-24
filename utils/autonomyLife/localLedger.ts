@@ -32,10 +32,32 @@ export const AUTONOMY_BUSINESS_STORES = [
 
 /** 自主生活新增的本地 store（在 utils/db.ts 的 upgrade 里建）。 */
 export const AUTONOMY_CONTROL_STORES = [
+  'autonomy_action_permits',  // keyPath actionId（一次性执行许可；消费与业务写入同事务）
   'autonomy_action_receipts', // keyPath actionId
   'autonomy_sim_vouchers',    // keyPath id（tx-order-<orderId> / refund-order-<orderId>）
   'autonomy_local_life',      // keyPath id（模拟查手机记录等本地生活物料）
 ] as const;
+
+/** 许可 store 的独立常量：commitWithReceipt 要把它并进同一个事务。 */
+export const PERMIT_STORE = 'autonomy_action_permits';
+
+/**
+ * 本地许可行：服务端签发的许可落到本机的副本。
+ * `consumedAt` 只有业务事务能写——写进去就等于「这次许可用掉了」，永不再用。
+ */
+export interface LocalPermitRecord {
+  actionId: string;
+  /** 许可绑定的角色；业务参数里的 charId 必须与它一致（换角色即失效）。 */
+  charId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  policyVersion: string;
+  nonce: string;
+  issuedAt: number;
+  expiresAt: number;
+  consumedAt: number | null;
+}
 
 export const AUTONOMY_LOCAL_STORES = [...AUTONOMY_BUSINESS_STORES, ...AUTONOMY_CONTROL_STORES] as const;
 
@@ -177,6 +199,44 @@ export async function readReceipt(port: LocalDbPort, actionId: string): Promise<
   return found;
 }
 
+// ─── 一次性执行许可 ─────────────────────────────────────────────────────────
+
+/**
+ * 把服务端签发的许可落到本机。
+ *
+ * 替换规则（只允许这一种）：同 actionId 的**未消费**旧许可可以被更高 leaseEpoch 的新许可
+ * 覆盖（崩溃后重新 claim → 新租约 → 新 nonce）。已消费的许可永不覆盖——那意味着这个
+ * actionId 的执行权已经用掉，再「补一张」就是重放。同 nonce 重复安装保持幂等。
+ */
+export async function installLocalPermit(
+  port: LocalDbPort,
+  permit: LocalPermitRecord,
+): Promise<{ ok: true } | { ok: false; code: AutonomyLifeErrorCode; reason: string }> {
+  if (!port.hasStores([PERMIT_STORE])) {
+    return { ok: false, code: 'CAPABILITY_UNAVAILABLE', reason: 'permit_store_missing' };
+  }
+  try {
+    await port.runTransaction([PERMIT_STORE], 'readwrite', async (tx) => {
+      const existing = await tx.get<LocalPermitRecord>(PERMIT_STORE, permit.actionId);
+      if (existing) {
+        if (existing.nonce === permit.nonce) return; // 同一次许可重复安装：幂等
+        if (existing.consumedAt !== null) throw new Error('permit_already_consumed');
+        if (existing.leaseEpoch >= permit.leaseEpoch) throw new Error('permit_stale_install');
+      }
+      await tx.put(PERMIT_STORE, permit);
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, code: 'STATE_CONFLICT', reason: String(error) };
+  }
+}
+
+export async function readLocalPermit(port: LocalDbPort, actionId: string): Promise<LocalPermitRecord | null> {
+  return port.runTransaction([PERMIT_STORE], 'readonly', async (tx) =>
+    (await tx.get<LocalPermitRecord>(PERMIT_STORE, actionId)) ?? null,
+  );
+}
+
 export interface FaultInjection {
   /** 在写完某个 store 之后抛错，模拟崩溃（测试用；生产不传）。 */
   throwAfterStore?: string;
@@ -190,10 +250,24 @@ interface CommonWriteArgs {
   args: Record<string, unknown>;
   nowMs: number;
   fault?: FaultInjection;
+  /**
+   * 一次性执行许可。给了就必须在**同一个事务**里核销：找不到 / 已用掉 / 参数不符 /
+   * 过期 → 整笔回滚，业务记录一条都不写。没给 → 直接拒绝（不存在「无许可执行」）。
+   */
+  permit?: LocalPermitRecord | null;
+  /** 没带许可时的强制开关：只有明确的系统内务（如退款补偿）才允许跳过。 */
+  allowPermitless?: boolean;
 }
 
+/**
+ * 业务参数的稳定哈希。**不计 top-level charId**：那一项是执行器注入的身份字段
+ * （模型/计划给的参数里没有 ownership 概念），不属于「被批准的参数」。
+ * 许可签名、回执对账、幂等判重都用同一口径，三处不会各算一套。
+ */
 function hashOf(args: Record<string, unknown>): string {
-  return hashArgs(args);
+  const { charId: _identity, ...signed } = args;
+  void _identity;
+  return hashArgs(signed);
 }
 
 function assertNoFault(fault: FaultInjection | undefined, store: string): void {
@@ -202,7 +276,7 @@ function assertNoFault(fault: FaultInjection | undefined, store: string): void {
 
 /**
  * 通用「业务写 + 回执」执行器。
- * body 只负责写业务记录并返回 receipt 的 resultRef/stores；幂等与回执由这里统一处理。
+ * body 只负责写业务记录并返回 receipt 的 resultRef/stores；幂等、许可核销与回执由这里统一处理。
  */
 async function commitWithReceipt(
   port: LocalDbPort,
@@ -211,8 +285,14 @@ async function commitWithReceipt(
   body: (tx: LocalTx, ctx: { argsHash: string }) => Promise<{ resultRef: string; stores: Array<{ store: string; key: string }> }>,
 ): Promise<LocalWriteOutcome> {
   const argsHash = hashOf(args.args);
+  // 许可核销必须和业务写在同一个事务里，所以事务范围要显式带上许可 store。
+  const txStores = args.permit ? [...stores, PERMIT_STORE] : stores;
+  if (!args.permit && !args.allowPermitless) {
+    // 没有许可 = 没有执行权。这条在进事务之前就拒，连读都不读。
+    return { status: 'failed', code: 'STATE_CONFLICT', message: 'permit_required' };
+  }
   try {
-    return await port.runTransaction<LocalWriteOutcome>(stores, 'readwrite', async (tx) => {
+    return await port.runTransaction<LocalWriteOutcome>(txStores, 'readwrite', async (tx) => {
       const existing = await tx.get<ActionReceipt>('autonomy_action_receipts', args.actionId);
       if (existing) {
         if (existing.argsHash === argsHash) {
@@ -225,8 +305,27 @@ async function commitWithReceipt(
           message: 'same actionId with different argsHash',
         };
       }
+      let storedPermit: LocalPermitRecord | null = null;
+      if (args.permit) {
+        // 事务内重新读许可：与业务写入同一快照，并发执行不可能同时消费同一份许可。
+        storedPermit = (await tx.get<LocalPermitRecord>(PERMIT_STORE, args.actionId)) ?? null;
+        if (!storedPermit) reject('STATE_CONFLICT', 'permit_missing');
+        if (storedPermit.consumedAt !== null) reject('STATE_CONFLICT', 'permit_consumed');
+        if (storedPermit.nonce !== args.permit.nonce) reject('STATE_CONFLICT', 'permit_nonce_mismatch');
+        if (storedPermit.leaseEpoch !== args.permit.leaseEpoch) reject('STATE_CONFLICT', 'permit_epoch_mismatch');
+        if (storedPermit.installationId !== args.permit.installationId) reject('FORBIDDEN', 'permit_device_mismatch');
+        if (storedPermit.charId !== args.permit.charId) reject('FORBIDDEN', 'permit_character_mismatch');
+        if (typeof args.args.charId === 'string' && args.args.charId !== storedPermit.charId) {
+          reject('FORBIDDEN', 'permit_character_mismatch');
+        }
+        if (storedPermit.argsHash !== argsHash) reject('STATE_CONFLICT', 'permit_args_mismatch');
+        if (args.nowMs > storedPermit.expiresAt) reject('STATE_CONFLICT', 'permit_expired');
+      }
       const written = await body(tx, { argsHash });
       assertNoFault(args.fault, written.stores[written.stores.length - 1]?.store ?? '');
+      if (storedPermit) {
+        await tx.put(PERMIT_STORE, { ...storedPermit, consumedAt: args.nowMs });
+      }
       const receipt: ActionReceipt = {
         actionId: args.actionId,
         kind: args.kind,
@@ -250,6 +349,8 @@ async function commitWithReceipt(
 // ─── 日记 ───────────────────────────────────────────────────────────────────
 
 export interface JournalArgs extends CommonWriteArgs {
+  /** 记录日期派生用的时区（不参与参数签名）。 */
+  tz?: string;
   args: {
     charId: string;
     title: string;
@@ -269,7 +370,7 @@ export async function writeJournalEntry(port: LocalDbPort, input: JournalArgs): 
   const { args } = input;
   const diaryId = `diary_${args.charId}_${input.actionId}`;
   return commitWithReceipt(port, input, ['diaries', 'autonomy_action_receipts'], async (tx) => {
-    const date = args.date ?? localDateKey(input.nowMs, 'UTC');
+    const date = args.date ?? localDateKey(input.nowMs, input.tz ?? 'UTC');
     const record = {
       id: diaryId,
       charId: args.charId,

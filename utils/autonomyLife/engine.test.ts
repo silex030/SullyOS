@@ -79,6 +79,27 @@ interface Harness {
   failModel: (value: boolean) => void;
 }
 
+
+/**
+ * 按「无许可不发生」的契约补齐测试路径：tick 出来的动作先 claim + commitPermit，
+ * 之后才能上报回执（没有许可的回执一律当伪造拒绝）。返回 permit 结果。
+ */
+async function permitAction(h: Harness, actionId: string, at = NOON) {
+  await h.store.bindInstallation('acct-1', 'install-1', at);
+  const claimed = await claimAction(h.deps, { accountId: 'acct-1', installationId: 'install-1', charId: 'char-1' });
+  expect(claimed.action?.id).toBe(actionId);
+  const permit = await commitPermit(h.deps, {
+    accountId: 'acct-1',
+    actionId,
+    installationId: 'install-1',
+    leaseEpoch: claimed.leaseEpoch,
+    argsHash: claimed.action!.argsHash,
+    policyVersion: claimed.action!.policyVersion,
+    nowMs: at,
+  });
+  return { permit, permitted: (await h.store.getAction(actionId))! };
+}
+
 function harness(opts?: {
   nowMs?: number;
   row?: CharacterLifeRow;
@@ -297,13 +318,13 @@ describe('引擎：去重与冷却（§3.2）', () => {
     h.deps.candidatesFor = () => [{ kind: 'journal.write', semanticPurpose: 'daily_note', args: { title: '今天', body: '傍晚的风很凉。' } }];
     const first = await tickCharacter(h.deps, 'char-1');
     expect(first.actionId).toBeTruthy();
-    const action = await h.store.getAction(first.actionId!);
+    const { permitted } = await permitAction(h, first.actionId!);
     await reportReceipt(h.deps, {
       accountId: 'acct-1',
       actionId: first.actionId!,
       installationId: 'install-1',
-      leaseEpoch: action!.leaseEpoch,
-      argsHash: action!.argsHash,
+      leaseEpoch: permitted.leaseEpoch,
+      argsHash: permitted.argsHash,
       status: 'succeeded',
       resultRef: 'diaries:1',
       nowMs: NOON,
@@ -329,13 +350,13 @@ describe('引擎：去重与冷却（§3.2）', () => {
     const h = harness({ row: dueRow() });
     h.deps.candidatesFor = () => [{ kind: 'journal.write', semanticPurpose: 'daily_note', args: { title: '今天', body: '傍晚的风很凉。' } }];
     const first = await tickCharacter(h.deps, 'char-1');
-    const action = await h.store.getAction(first.actionId!);
+    const { permitted } = await permitAction(h, first.actionId!);
     await reportReceipt(h.deps, {
       accountId: 'acct-1',
       actionId: first.actionId!,
       installationId: 'install-1',
-      leaseEpoch: action!.leaseEpoch,
-      argsHash: action!.argsHash,
+      leaseEpoch: permitted.leaseEpoch,
+      argsHash: permitted.argsHash,
       status: 'succeeded',
       resultRef: 'x:1',
       nowMs: NOON,

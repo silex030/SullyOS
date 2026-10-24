@@ -17,7 +17,9 @@
 import {
   actionDedupeKey,
   hashArgs,
+  hashString,
   isTerminalActionStatus,
+  PERMIT_TTL_MS,
   type ActivityKind,
   type ActivityRecord,
   type ActionSource,
@@ -26,16 +28,19 @@ import {
   type Capability,
   type CharacterLifeState,
   type EffectiveBoundaryV1,
+  type ExecutionPermit,
   type LifeEvent,
   type LifePhase,
   type LifeReasonCode,
 } from '../../contracts/autonomyLife';
+import { boundaryGate } from './boundary';
 import { describeCapabilities, type CapabilityProbeState } from './adapters';
 import { checkIntentPolicy } from './policy';
 import {
   projectBudgetUsage,
   reserveBudget,
   settleBudget,
+  windowIdAt,
   type BudgetGrant,
   type BudgetPort,
 } from './budget';
@@ -123,6 +128,10 @@ export interface ActionRow {
   leaseEpoch: number;
   leaseExpiresAt: number | null;
   permitIssuedAt: number | null;
+  /** 已签发的一次性许可令牌（只存一份；重复使用即重放）。null = 从未签发。 */
+  permitNonce: string | null;
+  /** 许可被本地事务消费的时刻。非 null = 该许可已用掉，永不再用。 */
+  permitConsumedAt: number | null;
   notified: boolean;
 }
 
@@ -153,7 +162,37 @@ export interface LifeStorePort {
   /** 执行设备绑定：一个账号一个 installationId。 */
   getBoundInstallation(accountId: string): Promise<string | null>;
   bindInstallation(accountId: string, installationId: string, nowMs: number): Promise<boolean>;
+  /**
+   * 一次性许可的**条件提交**：读账号暂停 + 读角色暂停 + 条件写动作行（running + 许可）
+   * 必须在同一个事务里完成。任一条不满足 → 返回失败码，一个字节都不写。
+   *
+   * 为什么必须是端口方法而不是引擎里拼几个 await：这就是并发线性化点。D1 侧用单条
+   * 条件 UPDATE（带 EXISTS 子查询）实现，内存实现用同步临界区；两边语义一致，
+   * 引擎不各自近似「差不多原子」。
+   */
+  commitPermitAtomic(input: AtomicPermitCommit): Promise<AtomicPermitResult>;
 }
+
+/** 许可条件提交的输入：所有字段都是 CAS 条件的一部分。 */
+export interface AtomicPermitCommit {
+  accountId: string;
+  actionId: string;
+  charId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  policyVersion: string;
+  nowMs: number;
+  /** 许可到期时刻（短期一次性令牌）。 */
+  expiresAt: number;
+  nonce: string;
+  /** claim 之后读到的动作 revision：并发领取代次已变就失败。 */
+  expectedRevision: number;
+}
+
+export type AtomicPermitResult =
+  | { ok: true; action: ActionRow }
+  | { ok: false; code: AutonomyLifeErrorCode; detail?: string };
 
 export const DEFAULT_POLICY_VERSION = 'autonomy-life-v1';
 
@@ -671,6 +710,8 @@ export function buildActionRow(input: BuildActionInput): ActionRow {
     leaseEpoch: 0,
     leaseExpiresAt: null,
     permitIssuedAt: null,
+    permitNonce: null,
+    permitConsumedAt: null,
     notified: false,
   };
 }
@@ -713,20 +754,20 @@ export async function claimAction(deps: EngineDeps, args: {
 export interface PermitResult {
   ok: boolean;
   code?: AutonomyLifeErrorCode;
-  permit?: {
-    actionId: string;
-    installationId: string;
-    leaseEpoch: number;
-    argsHash: string;
-    policyVersion: string;
-    reservationId: string | null;
-    expiresAt: number;
-    nonce: string;
-  };
+  permit?: ExecutionPermit;
+  /** 条件提交后的动作行（status=running + 许可字段）。执行器必须用这一份，不能用 claim 时的旧快照。 */
+  action?: ActionRow;
 }
 
 /**
- * commit-permit：暂停/策略/租约/预留的**服务端条件提交**是并发线性化点。
+ * commit-permit：暂停/策略/租约/参数/预算的**服务端条件提交**是并发线性化点。
+ *
+ * 这里做两件事，顺序不能换：
+ *   1. 先用当前读到的状态给出精确失败原因（哪个门拒的），非破坏性、无写入；
+ *   2. 把最终写入交给 `store.commitPermitAtomic`——它在同一个事务里再读一次账号暂停、
+ *      角色暂停，并对动作行做 CAS；期间用户按了暂停就整笔失败，不会出现
+ *      「看着没暂停就发了许可、发完才发现刚暂停」的时序洞。
+ *
  * 暂停之后不再发新许可；在途许可（已发出）不回收，如实显示「正在停止」。
  */
 export async function commitPermit(deps: EngineDeps, args: {
@@ -739,39 +780,93 @@ export async function commitPermit(deps: EngineDeps, args: {
   nowMs?: number;
 }): Promise<PermitResult> {
   const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
-  const pause = await deps.store.getAccountPause(args.accountId);
-  if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' };
   const action = await deps.store.getAction(args.actionId);
   if (!action) return { ok: false, code: 'NOT_FOUND' };
   if (action.status === 'unknown') return { ok: false, code: 'UNKNOWN_EFFECT' };
   if (isTerminalActionStatus(action.status)) return { ok: false, code: 'STATE_CONFLICT' };
+  if (action.status !== 'running' && action.status !== 'scheduled' && action.status !== 'waiting_device') {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  // 身份：只有该动作的 charId 才谈得上「执行谁的动作」。
+  if (!action.charId) return { ok: false, code: 'FORBIDDEN' };
   if (action.installationId && action.installationId !== args.installationId) return { ok: false, code: 'FORBIDDEN' };
   if (action.leaseEpoch !== args.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' };
   if (action.leaseExpiresAt !== null && nowMs > action.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' };
-  if (action.argsHash !== args.argsHash && action.argsHash !== 'pending') return { ok: false, code: 'STATE_CONFLICT' };
+  if (nowMs > action.expiresAt) return { ok: false, code: 'STATE_CONFLICT' };
+  if (action.argsHash !== args.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
+  // 参数自证：动作行里的参数与被批准的 hash 必须一致（防止只换参数不换 hash）。
+  if (hashArgs(action.args) !== args.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
   if (action.policyVersion !== args.policyVersion) return { ok: false, code: 'STATE_CONFLICT' };
+  // 许可不许「转发式复用」：已被别的租约/已消费过的许可不能再发。
+  if (action.permitConsumedAt !== null) return { ok: false, code: 'STATE_CONFLICT' };
 
-  const next: ActionRow = {
-    ...action,
-    status: 'running',
+  // 暂停：账号层 + 角色层都要看，且原因分开报。
+  const pause = await deps.store.getAccountPause(args.accountId);
+  if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' };
+  const boundary = await deps.boundaryFor(action.charId);
+  if (boundary.globalPaused || boundary.enabled === false) return { ok: false, code: 'GLOBAL_PAUSED' };
+  if (boundary.charEnabled === false) return { ok: false, code: 'CHAR_DISABLED' };
+  const life = await deps.store.getCharacterLife(action.charId);
+  if (life?.pauseRequestedAt != null) return { ok: false, code: 'GLOBAL_PAUSED' };
+  const kindGate = boundaryGate(boundary, action.kind);
+  if (!kindGate.ok) return { ok: false, code: kindGate.code };
+
+  // 策略：签发前再跑一次第一道判定（禁止方向 / PII / 外部授权）。
+  const decision = checkIntentPolicy(
+    {
+      kind: action.kind,
+      args: action.args,
+      purpose: action.semanticPurpose,
+      boundary: {
+        forbiddenCategories: boundary.forbiddenCategories,
+        avoidTopics: boundary.avoidTopics,
+        allowFictionalNpc: boundary.allowFictionalNpc,
+        externalGrants: boundary.externalGrants,
+      },
+    },
+    nowMs,
+  );
+  if (!decision.allowed) {
+    return { ok: false, code: decision.reasonCode === 'grant_missing' ? 'GRANT_REQUIRED' : 'POLICY_DENIED' };
+  }
+
+  // 预算：端口不可用 → fail closed；预留必须仍属于当前窗口（过期窗口里的预留不再有效）。
+  if (!deps.budget.available()) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+  const windowTimezone = life?.windowTimezone ?? boundary.timezone;
+  const currentWindow = windowIdAt({ now: () => nowMs }, windowTimezone);
+  if (action.windowId !== currentWindow) return { ok: false, code: 'STATE_CONFLICT' };
+
+  const expiresAt = nowMs + PERMIT_TTL_MS;
+  const nonce = `nonce_${action.id}_${action.leaseEpoch}_${nowMs.toString(36)}_${hashString(`${action.argsHash}|${action.leaseEpoch}|${nowMs}`)}`;
+  const committed = await deps.store.commitPermitAtomic({
+    accountId: args.accountId,
+    actionId: action.id,
+    charId: action.charId,
+    installationId: args.installationId,
+    leaseEpoch: args.leaseEpoch,
     argsHash: args.argsHash,
-    permitIssuedAt: nowMs,
-    leaseExpiresAt: nowMs + 60_000, // 短期一次性 token：60 秒
-    revision: action.revision + 1,
-  };
-  const saved = await deps.store.putAction(next, action.revision);
-  if (!saved) return { ok: false, code: 'STATE_CONFLICT' };
+    policyVersion: args.policyVersion,
+    nowMs,
+    expiresAt,
+    nonce,
+    expectedRevision: action.revision,
+  });
+  if (!committed.ok) return { ok: false, code: committed.code };
+  const next = committed.action;
   return {
     ok: true,
+    action: next,
     permit: {
       actionId: next.id,
+      charId: next.charId,
       installationId: args.installationId,
       leaseEpoch: next.leaseEpoch,
-      argsHash: args.argsHash,
+      argsHash: next.argsHash,
       policyVersion: next.policyVersion,
       reservationId: next.reservationId,
-      expiresAt: next.leaseExpiresAt!,
-      nonce: `nonce_${next.id}_${next.leaseEpoch}_${nowMs.toString(36)}`,
+      issuedAt: nowMs,
+      expiresAt: next.leaseExpiresAt ?? expiresAt,
+      nonce: next.permitNonce ?? nonce,
     },
   };
 }
@@ -788,16 +883,34 @@ export interface ReceiptReport {
   nowMs?: number;
 }
 
-/** 回执上报：只有 succeeded 才写 resultRef + effectVerified 依据。 */
+/**
+ * 回执上报：只有「已发许可 + 同一个 argsHash + 同一安装」的回执才被接受。
+ *
+ * 三条硬条件，缺一条就整笔拒绝（一个字节都不写）：
+ *   1. `action.permitIssuedAt !== null` 且 `action.status === 'running'`：没发过许可的动作
+ *      不存在「已完成」，先报 succeeded 的一律当伪造；
+ *   2. `report.argsHash === action.argsHash`：回执必须对齐**已发许可的那组参数**，
+ *      不然就是拿另一个动作的结果来顶账；
+ *   3. 安装 id 与动作行一致：换了设备不能替别人收尾。
+ * succeeded 还要求非空 resultRef —— 没有本地回执就别声称效果已验证。
+ */
 export async function reportReceipt(deps: EngineDeps, report: ReceiptReport): Promise<{ ok: boolean; code?: AutonomyLifeErrorCode; action?: ActionRow }> {
   const nowMs = report.nowMs ?? (deps.clock ?? systemClock).now();
   const action = await deps.store.getAction(report.actionId);
   if (!action) return { ok: false, code: 'NOT_FOUND' };
   if (action.installationId && action.installationId !== report.installationId) return { ok: false, code: 'FORBIDDEN' };
   if (action.leaseEpoch !== report.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' };
+  if (report.argsHash !== action.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
+  if (report.status === 'succeeded' && !(typeof report.resultRef === 'string' && report.resultRef.length > 0)) {
+    return { ok: false, code: 'VALIDATION_FAILED' };
+  }
   if (isTerminalActionStatus(action.status) && action.status !== 'unknown') {
     // 回执幂等：同一结果重复上报返回原动作。
     if (action.resultRef === (report.resultRef ?? action.resultRef)) return { ok: true, action };
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  if (action.permitIssuedAt === null || (action.status !== 'running' && action.status !== 'unknown')) {
+    // 没有许可就不存在「执行过」：这是伪造回执，不是晚到的回执。
     return { ok: false, code: 'STATE_CONFLICT' };
   }
   const status: ActionStatus = report.status === 'succeeded' ? 'succeeded' : report.status === 'unknown' ? 'unknown' : 'failed';
@@ -807,6 +920,7 @@ export async function reportReceipt(deps: EngineDeps, report: ReceiptReport): Pr
     resultRef: report.status === 'succeeded' ? report.resultRef ?? null : action.resultRef,
     errorCode: report.status === 'succeeded' ? null : report.errorCode ?? (report.status === 'unknown' ? 'UNKNOWN_EFFECT' : 'MODEL_FAILED'),
     leaseExpiresAt: null,
+    permitConsumedAt: action.permitConsumedAt ?? nowMs,
     revision: action.revision + 1,
   };
   const saved = await deps.store.putAction(next, action.revision);
@@ -1118,6 +1232,43 @@ export function createInMemoryLifeStore(): LifeStorePort & {
     async bindInstallation(accountId, installationId) {
       bound.set(accountId, installationId);
       return true;
+    },
+    /**
+     * 内存实现的「原子」许可提交：JS 单线程 + 这里没有任何 await 夹在读与写之间，
+     * 因此检查与写入不会被别的 tick 插进来（与 D1 的条件 UPDATE 语义一致）。
+     */
+    async commitPermitAtomic(input) {
+      const pause = accountPause.get(input.accountId) ?? { paused: false, requestedAt: null };
+      if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' as const };
+      const life = characters.get(input.charId);
+      if (life && life.pauseRequestedAt !== null) return { ok: false, code: 'GLOBAL_PAUSED' as const };
+      const current = actions.get(input.actionId);
+      if (!current) return { ok: false, code: 'NOT_FOUND' as const };
+      if (current.revision !== input.expectedRevision) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.charId !== input.charId) return { ok: false, code: 'FORBIDDEN' as const };
+      if (current.installationId && current.installationId !== input.installationId) return { ok: false, code: 'FORBIDDEN' as const };
+      if (isTerminalActionStatus(current.status)) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.status !== 'scheduled' && current.status !== 'waiting_device') {
+        // 只有「已领到但还没发许可」的动作能发许可；running 已发过，其它状态先对账。
+        return { ok: false, code: 'STATE_CONFLICT' as const };
+      }
+      if (current.leaseEpoch !== input.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.leaseExpiresAt !== null && input.nowMs > current.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (input.nowMs > current.expiresAt) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.argsHash !== input.argsHash) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.policyVersion !== input.policyVersion) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.permitConsumedAt !== null) return { ok: false, code: 'STATE_CONFLICT' as const };
+      const next: ActionRow = {
+        ...current,
+        status: 'running',
+        permitIssuedAt: input.nowMs,
+        permitNonce: input.nonce,
+        permitConsumedAt: null,
+        leaseExpiresAt: input.expiresAt,
+        revision: current.revision + 1,
+      };
+      actions.set(next.id, next);
+      return { ok: true, action: { ...next } };
     },
   };
 }

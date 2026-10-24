@@ -26,6 +26,7 @@ import {
   type PreparedEffect,
 } from '../../contracts/autonomyLife';
 import { boundaryGate } from './boundary';
+import { toLocalPermit } from './executionPermit';
 import {
   placeSimulatedOrder,
   refundSimulatedOrder,
@@ -43,7 +44,6 @@ import {
   validateArgsForKind,
   type PolicyBoundaryView,
 } from './policy';
-import { localDateKey } from './time';
 
 export interface CapabilityProbeState {
   localStoresReady: boolean;
@@ -280,18 +280,35 @@ function fromLocalWrite(outcome: LocalWriteOutcome): ExecuteOutcome {
 }
 
 /**
- * execute：只接受已核验执行上下文和原 actionId。
- * 所有副作用都在本地事务里；回执写入成功才算 succeeded。
+ * execute：只接受「已核验执行上下文 + 一次性许可 + 原 actionId」。
+ * 所有副作用都在本地事务里；许可在同一个事务里核销，回执写入成功才算 succeeded。
+ *
+ * 许可门放在这里而不是只放 runLocalAction：这是**最后一个**可达的副作用入口，
+ * 任何新调用点（比如未来的 worker 端执行器）都会被同一道门拦。
  */
 export async function executeAction(
   ctx: ExecuteContext,
   deps: ExecuteDeps,
 ): Promise<ExecuteOutcome> {
+  if (!ctx.permit) {
+    return { status: 'failed', code: 'STATE_CONFLICT', message: 'permit_required', effectVerified: false };
+  }
+  if (
+    ctx.permit.actionId !== ctx.actionId
+    || ctx.permit.argsHash !== ctx.argsHash
+    || ctx.permit.leaseEpoch !== ctx.leaseEpoch
+    || ctx.permit.installationId !== ctx.installationId
+    || ctx.permit.policyVersion !== ctx.policyVersion
+  ) {
+    return { status: 'failed', code: 'STATE_CONFLICT', message: 'permit_mismatch', effectVerified: false };
+  }
   const common = {
     actionId: ctx.actionId,
     kind: ctx.kind,
     args: ctx.args,
     nowMs: ctx.nowMs,
+    // 事务内核销的凭据：动作可能写入多个 store，许可只跟着这一次执行。
+    permit: toLocalPermit(ctx.permit),
   };
   switch (ctx.kind) {
     case 'journal.write': {
@@ -300,10 +317,14 @@ export async function executeAction(
         entryType?: 'private' | 'exchange'; date?: string;
       };
       if (!args.charId) return { status: 'failed', code: 'VALIDATION_FAILED', message: 'charId_required', effectVerified: false };
+      // 不再在这里补 date：许可/回执签名的是**模型给的参数**，执行期临时补字段会让
+      // 「被批准的参数」与「写入的参数」hash 错位。日期由本地写入口按时区派生（只影响
+      // 记录内容，不参与签名）。
       const outcome = await writeJournalEntry(deps.port, {
         ...common,
         kind: ctx.kind,
-        args: { ...args, date: args.date ?? localDateKey(ctx.nowMs, deps.tz) },
+        args,
+        tz: deps.tz,
       });
       return fromLocalWrite(outcome);
     }
@@ -370,6 +391,9 @@ export async function compensateRefund(args: {
       actionId: args.actionId,
       kind: 'shopping.order',
       nowMs: args.nowMs,
+      // 退款是**用户发起**的补偿动作（取消订单/对账善后），不是自主动作：
+      // 它不复用自主动作的许可，但仍然是同事务、可审计、幂等的本地写。
+      allowPermitless: true,
       args: { charId: args.charId, orderId: args.orderId, reason: args.reason },
     }),
   );

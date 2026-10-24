@@ -40,7 +40,7 @@ const DB_NAME = 'AetherOS_Data';
 // v77：AIRP 自主生活转述账本 + 心跳（autonomous_outbox / autonomous_heartbeats）。独立 store，随备份动态枚举自动带走。
 // v78：预设套组（preset_packs + preset_pack_active）+ 正则脚本（preset_regexes）。独立 store，随备份动态枚举自动带走。
 // v79：角色自主生活工作流的可查看记录（airp_workflow_plans）。独立 store，随备份动态枚举自动带走。
-const DB_VERSION = 80; // v80: 自主生活本地回执/模拟凭证/生活物料（autonomy_action_receipts 等）
+const DB_VERSION = 81; // v81: 自主生活一次性执行许可（autonomy_action_permits，与业务写同事务核销）
 
 const STORE_CHARACTERS = 'characters';
 const STORE_CHAR_GROUPS = 'character_groups'; // 角色分组定义（角色通过 groupId 指向；与群聊 groups 无关）
@@ -430,6 +430,12 @@ export const openDB = (): Promise<IDBDatabase> => {
           const localLifeStore = db.createObjectStore('autonomy_local_life', { keyPath: 'id' });
           localLifeStore.createIndex('charId', 'charId', { unique: false });
           localLifeStore.createIndex('kind', 'kind', { unique: false });
+      }
+      // v81: 一次性执行许可。主键=actionId，`consumedAt` 只在业务写入的同一个事务里置位——
+      // 许可不是「通行证」，是**一次**执行权：用掉就作废，重放会被事务拒绝。
+      if (!db.objectStoreNames.contains('autonomy_action_permits')) {
+          const permitStore = db.createObjectStore('autonomy_action_permits', { keyPath: 'actionId' });
+          permitStore.createIndex('expiresAt', 'expiresAt', { unique: false });
       }
 
       // ─── Memory Palace (记忆宫殿) stores ───

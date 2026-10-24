@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { BoundaryV1, EffectiveBoundaryV1 } from '../../contracts/autonomyLife';
 import { normalizeBoundary } from './boundary';
+import { budgetWindowId } from './time';
 import { createMemoryBudgetPort } from './budget';
 import type { BudgetPort } from './budget';
 import { buildActionRow, createInMemoryLifeStore, emptyCharacterLife, reportReceipt, type EngineDeps } from './engine';
@@ -177,7 +178,7 @@ describe('服务：状态与边界（§7）', () => {
       charId: CHAR,
       chosen: { kind: 'journal.write', semanticPurpose: 'note', purposeKey: 'pk', args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: 'note' } },
       nowMs: NOW,
-      budgetWindowId: 'w:1',
+      budgetWindowId: budgetWindowId(NOW, TZ),
       reservationId: 'rsv',
       policyVersion: 'autonomy-life-v1',
       tz: TZ,
@@ -205,7 +206,7 @@ describe('服务：状态与边界（§7）', () => {
         charId: CHAR,
         chosen: { kind: 'journal.write', semanticPurpose: `note-${i}`, purposeKey: `pk-${i}`, args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: `note-${i}` } },
         nowMs: NOW + i * 1000,
-        budgetWindowId: 'w:1',
+        budgetWindowId: budgetWindowId(NOW, TZ),
         reservationId: `rsv-${i}`,
         policyVersion: 'autonomy-life-v1',
         tz: TZ,
@@ -233,7 +234,7 @@ describe('服务：状态与边界（§7）', () => {
       charId: CHAR,
       chosen: { kind: 'journal.write', semanticPurpose: suffix, purposeKey: `p-${suffix}`, args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: suffix } },
       nowMs: NOW,
-      budgetWindowId: 'w:1',
+      budgetWindowId: budgetWindowId(NOW, TZ),
       reservationId: 'rsv',
       policyVersion: 'autonomy-life-v1',
       tz: TZ,
@@ -260,7 +261,7 @@ describe('服务：状态与边界（§7）', () => {
       charId: CHAR,
       chosen: { kind: 'journal.write', semanticPurpose: 'c', purposeKey: 'pc', args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: 'c' } },
       nowMs: NOW,
-      budgetWindowId: 'w:1',
+      budgetWindowId: budgetWindowId(NOW, TZ),
       reservationId: 'rsv',
       policyVersion: 'autonomy-life-v1',
       tz: TZ,
