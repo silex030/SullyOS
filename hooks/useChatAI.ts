@@ -1580,6 +1580,14 @@ export const useChatAI = ({
                         { role: 'system', content: '这一轮外部工具不可用：不要声称读过分享片段，基于卡片里已有的简介回答。' },
                     ];
                 }
+                // 同一轮还注入了主动消息 2.0 排程工具时，它们也随 tools 一起被删了；按本文件既有的
+                // 「宁可它不提，也不能它用正文假装登记成功」原则补一句，别让角色在这一轮许下提醒/取消。
+                if (shareToolOnly && amsg2ToolsInjected) {
+                    fallbackBody.messages = [
+                        ...(fallbackBody.messages || []),
+                        { role: 'system', content: '这一轮排程工具不可用：不要声称已经记下、修改或撤销任何提醒/安排。' },
+                    ];
+                }
                 // 这条路把 tools 全删了，生活工作流工具也不在：明确告诉模型这一轮没有可用工具，
                 // 不要声称「已经记下/撤销」。宁可它不提，也不能让它用正文假装登记成功。
                 if (chatLifeWorkflowToolsInjected) {

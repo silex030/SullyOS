@@ -52,6 +52,11 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     expect(chatSrc).toContain('这一轮外部工具不可用：不要声称读过分享片段，基于卡片里已有的简介回答。');
     expect(chatSrc).toMatch(/if \(shareToolOnly\) \{\s*shareExcerptTurn = null;/);
   });
+
+  it('同一轮还有排程工具时，降级也要堵住「假装登记成功」', () => {
+    expect(chatSrc).toMatch(/if \(shareToolOnly && amsg2ToolsInjected\) \{/);
+    expect(chatSrc).toContain('这一轮排程工具不可用：不要声称已经记下、修改或撤销任何提醒/安排。');
+  });
 });
 
 describe('read_share_excerpts · 下一轮投影接线', () => {

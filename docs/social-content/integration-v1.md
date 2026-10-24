@@ -251,17 +251,24 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 - 服务端 `SHARE_LINKS_ENABLED=false` 时工具仍在，但调用返回 503 系错误，模型如实说片段不可用。
 - 只有模型/中转支持 function calling 时有效：中转拒绝 `tools` 的轮次会退回无工具，
   并显式告诉模型「这一轮外部工具不可用：不要声称读过分享片段」。
+- 若同一轮还注入了主动消息 2.0 排程工具，降级时这些工具也随 `tools` 一起被删；同样补一句
+  「这一轮排程工具不可用：不要声称已经记下、修改或撤销任何提醒/安排」，避免角色用正文假装登记成功。
 
 ### 8.8 本机验证（真实执行，2026-10-24）
 
 ```
 npx vitest run utils/socialShareTool.test.ts          → 22 passed
-npx vitest run utils/socialShareTool.wiring.test.ts   → 8 passed
+npx vitest run utils/socialShareTool.wiring.test.ts   → 9 passed
 npx vitest run $(ls utils/*[cC]hat*.test.ts)          → 38 files / 354 passed
 npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
   utils/socialShare utils/chatRequestPayload worker/social-content utils/socialContent
-                                                       → 29 files / 326 tests passed
+                                                       → 29 files / 330 tests passed
 ```
+
+> 验收卡 t_38463abd 于 2026-10-24 23:22 原样复跑核对上表：38 文件 354 例、29 文件 330 例全部通过
+> （执行卡当时记的 `326` 是笔误，已按复跑结果校正；330 比 329 多出的 1 例是验收补的
+> 「降级时排程工具也要禁假装登记」接线断言）。全量 `tsc` 也独立复跑：56 个既有错误、
+> 与执行卡日志逐行一致、改动文件 0 新增。
 
 覆盖点：
 
