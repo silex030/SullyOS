@@ -27,6 +27,19 @@ import { normalizeMcpToolArguments, validateMcpToolArguments } from '../utils/mc
 import { bumpMcpTurn, recordMcpResult } from '../utils/mcpResultMemory';
 import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, buildMcpTextFallbackBody, extractTextFakedMcpCalls, formatMcpToolResult, MCP_CHAT_MAX_STALLED_ROUNDS, MCP_CHAT_MAX_TOOL_LOOPS, sanitizeMcpLeadInText, shouldRetryMcpWithoutTools, stripTextFakedMcpCalls, type FakedMcpCall } from '../utils/mcpToolBridge';import { buildToolResultMessage, normalizeToolCallsForCompat } from '../utils/toolCallCompat';
 import { toolCallFingerprint } from '../utils/agenticToolFeedback';
+// 链接分享按需读片段（执行卡 t_75dd49a5）：分享卡在场 + 总开关开着时把 read_share_excerpts
+// 注入本轮工具清单；执行/预算/落历史的逻辑都在 socialShareTool（独立模块，别往本文件加逻辑）。
+import { isSocialShareEnabled, readSocialShareConfig, resolveShareEndpoint } from '../utils/socialShare';
+import {
+    attachShareExcerptPairs,
+    buildShareExcerptsTool,
+    createShareExcerptTurn,
+    executeShareExcerptToolCall,
+    hasReadableShareExcerptTarget,
+    pickShareExcerptAnchor,
+    SHARE_EXCERPTS_TOOL_NAME,
+    type ShareExcerptTurn,
+} from '../utils/socialShareTool';
 import { buildChatRequestPayload } from '../utils/chatRequestPayload';
 import {
     isInstantConfigReady,
@@ -1200,6 +1213,22 @@ export const useChatAI = ({
                     }
                 }
             }
+            // 链接分享「按需读片段」（执行卡 t_75dd49a5）：只有「本轮上下文里真有分享卡」+「前端总开关
+            // 开着」才注入 read_share_excerpts。模型能看到的卡片集合就是这里从 contextMsgs 推出来的那份，
+            // 执行时也只认这份集合（不接受模型指定的任意 URL/contentId）。
+            // 关掉时（默认）什么都不做：工具清单与集成前一致。
+            const shareCfg = readSocialShareConfig();
+            const shareEndpoint = isSocialShareEnabled(shareCfg) ? resolveShareEndpoint(shareCfg) : null;
+            // 预算对象跟着这一轮走：工具循环里多次模型迭代、同批多个调用共享同一份，不重置。
+            let shareExcerptTurn: ShareExcerptTurn | null = shareEndpoint
+                ? createShareExcerptTurn(contextMsgs, { endpoint: shareEndpoint })
+                : null;
+            // 一张能读的卡都没有（全是解析中/失败）时不注入：只给一个注定报错的工具没有意义。
+            if (shareExcerptTurn && !hasReadableShareExcerptTarget(shareExcerptTurn)) shareExcerptTurn = null;
+            if (shareExcerptTurn) {
+                baseReqBody.tools = [...(baseReqBody.tools || []), buildShareExcerptsTool()];
+                if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
+            }
             // 主动消息 2.0 本地工具：worker 已配置 + 角色没关掉时注入 schedule/cancel/renew/list，
             // 并注入「排程现状」背景块（常驻能力简介 + 进行中任务 + 作废待处理，角色自行判断怎么接）。
             // 是否注入在上面 thinking 门那里就算好了（amsg2ToolsInjected）。
@@ -1481,6 +1510,7 @@ export const useChatAI = ({
             }
 
             let data: any;
+            const turnStartedAt = Date.now();
             try {
                 spendLlmCall();
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -1518,16 +1548,38 @@ export const useChatAI = ({
                 // 仅通用 MCP、且没有和其他工具模式混用时降级。部分 OpenAI 兼容中转
                 // 会对携带 tools 的请求直接回 4xx，而不是忽略参数；去掉 tools 后让
                 // 现有正文假调用容错接手。真实鉴权失败会在这次重试中再次抛出原样错误。
-                const mcpOnly = payload.flags.mcpChatActive
+                // 「只有 MCP」还要求真的注入了 MCP 工具（mcpToolResolve）：只开了开关但没配服务器时
+                // 这一轮实际只有别的工具在场，不能按 MCP 兼容模式处理。
+                const mcpOnly = payload.flags.mcpChatActive && !!mcpToolResolve
                     && !payload.flags.luckinChatActive && !payload.flags.mcdActive && !payload.flags.luckinActive;
-                if (!mcpOnly || !baseReqBody.tools?.length || !shouldRetryMcpWithoutTools(requestError)) throw requestError;
-                console.warn('🔌 [MCP] 当前中转拒绝 tools 请求，降级为正文工具调用兼容模式');
+                // 只注入了分享片段工具的轮次同理：中转不认 tools 时这一轮退回无工具继续聊，
+                // 别让整轮回复因为多了一个工具直接 400。
+                const shareToolOnly = !mcpOnly && !!shareExcerptTurn
+                    && !payload.flags.luckinChatActive && !payload.flags.mcdActive && !payload.flags.luckinActive;
+                const toolsRejected = !!baseReqBody.tools?.length && shouldRetryMcpWithoutTools(requestError);
+                if ((!mcpOnly && !shareToolOnly) || !toolsRejected) throw requestError;
+                console.warn(mcpOnly
+                    ? '🔌 [MCP] 当前中转拒绝 tools 请求，降级为正文工具调用兼容模式'
+                    : '🔗 [分享] 当前中转拒绝 tools 请求，这一轮不注入 read_share_excerpts');
                 // 这条路把 tools 全删了，角色排不了新任务；排程现状照样要带——它得知道
                 // 自己名下已经有哪些承诺，否则又会在正文里许一遍。
-                const fallbackBody = buildMcpRejectedToolsFallbackBody({
-                    ...baseReqBody,
-                    messages: withAmsg2TaskContext(baseReqBody.messages),
-                });
+                const fallbackBody = mcpOnly
+                    ? buildMcpRejectedToolsFallbackBody({
+                        ...baseReqBody,
+                        messages: withAmsg2TaskContext(baseReqBody.messages),
+                    })
+                    : buildMcpTextFallbackBody(
+                        { ...baseReqBody, messages: withAmsg2TaskContext(baseReqBody.messages) },
+                        withAmsg2TaskContext(baseReqBody.messages),
+                    );
+                // 这一轮没有分享片段工具了：明确告诉模型不要假装读过片段，只基于卡片简介回答。
+                if (shareToolOnly) {
+                    shareExcerptTurn = null;
+                    fallbackBody.messages = [
+                        ...(fallbackBody.messages || []),
+                        { role: 'system', content: '这一轮外部工具不可用：不要声称读过分享片段，基于卡片里已有的简介回答。' },
+                    ];
+                }
                 // 这条路把 tools 全删了，生活工作流工具也不在：明确告诉模型这一轮没有可用工具，
                 // 不要声称「已经记下/撤销」。宁可它不提，也不能让它用正文假装登记成功。
                 if (chatLifeWorkflowToolsInjected) {
@@ -1795,9 +1847,12 @@ export const useChatAI = ({
             //       createOrder 被拦截 —— 下单付款必须用户在结账卡上点。
             //     · 通用 MCP: 工具名命中 mcpToolResolve 映射就分发给对应服务器 (utils/mcpClient),
             //       结果只回填循环不落卡片。两类工具可同时在场, 按名字各走各的。
-            if ((payload.flags.luckinChatActive || mcpToolResolve || amsg2ToolsInjected || btToolsInjected || chatLifeWorkflowToolsInjected) && data.choices?.[0]?.message?.tool_calls?.length) {
+            if ((payload.flags.luckinChatActive || mcpToolResolve || amsg2ToolsInjected || btToolsInjected || chatLifeWorkflowToolsInjected || shareExcerptTurn) && data.choices?.[0]?.message?.tool_calls?.length) {
                 // 每轮工具轮数上限：优先用户设置；接通用 MCP 时取两者较大值，保证 master 侧 12 轮预算。
-                const MAX_LOOPS = mcpToolResolve ? Math.max(mcpSettings.maxToolLoops, MCP_CHAT_MAX_TOOL_LOOPS) : mcpSettings.maxToolLoops;
+                // 只有分享片段工具时不需要那么多轮（预算最多撑两次满额读），给 4 轮就够纠错。
+                const MAX_LOOPS = mcpToolResolve
+                    ? Math.max(mcpSettings.maxToolLoops, MCP_CHAT_MAX_TOOL_LOOPS)
+                    : shareExcerptTurn ? 4 : mcpSettings.maxToolLoops;
                 // 懒加载展开重填（二次请求）的预算：与主循环共享 maxToolLoops 上限，防死循环
                 let mcpRefillsUsed = 0;                let loopMessages = [...baseReqBody.messages];
                 const loc = luckinChatRef?.current;
@@ -1946,6 +2001,15 @@ export const useChatAI = ({
                                 mcpProgressThisRound = true;
                             }
                             loopMessages.push(buildToolResultMessage(tc, mcpMsg) as any);
+                            continue;
+                        }
+                        // 链接分享按需读片段（执行卡 t_75dd49a5）：只读 HTTP，预算挂在 turn 上（整个
+                        // 工具循环共享）；成功/超限/失败都回结构化文本，交给模型自己决定如实怎么说。
+                        // 参数不在这里二次解析：executor 内部统一清洗（拒绝 URL/token/scope，限制字段与额度）。
+                        if (shareExcerptTurn && fname === SHARE_EXCERPTS_TOOL_NAME) {
+                            setSearchStatus('正在读取分享片段...');
+                            const excerptOutcome = await executeShareExcerptToolCall({ toolCall: tc, turn: shareExcerptTurn });
+                            loopMessages.push(buildToolResultMessage(tc, excerptOutcome.text) as any);
                             continue;
                         }
                         // 主动消息 2.0 工具
@@ -2253,6 +2317,24 @@ export const useChatAI = ({
                 // 自主生活转述记账输入（C2）：本轮转述块里出现过的账本条目 id。
                 autonomyToldIds: payload.autonomyToldIds,
             });
+
+            // 链接分享按需读片段：把本轮真实的 call/result 成对挂到刚落库的那条助手消息上。
+            // 这样下一轮投影（messageFormat）能成对回放「问什么→读到什么」，片段确实会占未来
+            // 上下文（不承诺它们不占），但成对有界，不会只剩孤立片段让模型误以为读过更多。
+            // 只挂时间上属于本轮的那条 assistant；找不到就不挂（不往别的消息上硬塞）。
+            if (shareExcerptTurn && shareExcerptTurn.calls.length > 0) {
+                try {
+                    const recentAfterTurn = await DB.getRecentMessagesByCharId(char.id, 30);
+                    const anchorId = pickShareExcerptAnchor(recentAfterTurn as any[], turnStartedAt);
+                    if (anchorId != null) {
+                        const records = [...shareExcerptTurn.calls];
+                        await DB.updateMessageMetadata(anchorId, (prev: any) => attachShareExcerptPairs(prev, records));
+                    }
+                } catch (e) {
+                    // 记历史失败不影响这轮回复（片段已经是真实结果，只是下一轮回放会缺这对记录）。
+                    console.warn('[share-excerpt] 工具记录落历史失败:', e);
+                }
+            }
 
             // B2 空回复可见化：正文空 + 无工具调用 + 漏斗没产出过可见消息时，
             // 落一条可重发的系统提示，而不是静默结束（用户看到"停了但没消息"）。

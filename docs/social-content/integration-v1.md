@@ -4,6 +4,7 @@
 > 契约来源：`share-contract-v1.txt`（t_6bca2291 附件）。
 > 父卡交付：`utils/socialContent/*`、`worker/social-content/*`（识别器、适配器、SSRF 抓取、状态机）。
 > 本卡新增：服务宿主装配、持久化、反代、客户端投影/卡片/发送链路、回归与体检。
+> 后续执行卡 t_75dd49a5：把按需检索（excerpts）接入聊天工具循环 `read_share_excerpts`，见 §8。
 
 ## 0. 一句话交付
 
@@ -141,7 +142,7 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
   外部文本纯文本渲染 + 转义、跳转仅 https、服务令牌不进 `/health`。
 - **凭据**：服务端不接受请求体里的 baseUrl/token/账号；XHS 不读 Cookie；反代不透传客户端 token。
 
-未覆盖的验证：全量 `tsc -p tsconfig.json` 与 `vite build` 在本机未作为发布门禁证据（见 §8）。
+未覆盖的验证：全量 `tsc -p tsconfig.json` 与 `vite build` 在本机未作为发布门禁证据（见 §10）。
 
 ### 6.1 联调实测（本机两进程：main-agent 18830 → social-content 18842，真实外网 + 真实 SQLite）
 
@@ -180,13 +181,121 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 - **缓存命中率：not_provided** —— 本机没有供应商 prompt-cache usage 字段，不虚构命中率；
   上线后应看 `promptCacheDiagnostics` / `llmUsage` 的真实 usage 再谈收益。
 
-## 8. 已知限制（必须带着交付）
+## 8. 工具接入与预算（执行卡 t_75dd49a5）
+
+> 状态：**本机实现 + 测试通过；未部署，未在真实供应商模型上跑过，也没有新的平台真实内容读取。**
+> 本节只把「按需读片段」从 HTTP 接口接到聊天工具循环里；§5 的真实平台结论不变。
+
+### 8.1 一句话
+
+分享卡在本轮上下文里、且前端总开关打开时，角色能在**真实工具循环**里调用
+`read_share_excerpts`，按需读正文 / 字幕 / 评论片段：单次 ≤1200 token、一个用户轮次
+累计 ≤2400 token；超限或失败一律给结构化结果，并要求角色「基于已有简介回答、不要声称读过」。
+
+### 8.2 接在哪（最小集成，逻辑不放进热点文件）
+
+| 位置 | 改动 |
+| --- | --- |
+| `utils/socialShareTool.ts`（新） | 工具 schema、可读集合、预算、执行、成对记录与投影 —— 纯逻辑，可单测 |
+| `hooks/useChatAI.ts` | 四处接线：注入工具、工具循环入口、按名分发、回复落库后挂记录 |
+| `utils/messageFormat.ts` | `normalizeMessageContent` 把 `metadata.shareExcerpts` 成对投影进下一轮 |
+| `utils/socialShare.ts` | 复用 `fetchShareExcerpts`（未改动）；没有新造抓取/URL 接口 |
+
+### 8.3 权限与入参边界
+
+- 入参只有：`shareRef` 或 `contentId`（至少一个）、`query`、`fields`、`partKey`、`cursor`、
+  `maxTokens`，外加仅作提示的 `contentRevision`（实际版本用卡片自己的）。
+- 传 `url` / `baseUrl` / `token` / `scope` / `headers` / `cookie` 等 → `ARGUMENT_NOT_ALLOWED`，
+  **一次请求都不发**（授权 scope 仍由服务端决定，客户端不传）。
+- 可读集合只来自**本轮真正进上下文的消息** `metadata.shares`（服务端落过库的卡）。
+  集合外的 shareRef/contentId → `SHARE_NOT_IN_CONTEXT`；两者指向不同卡 → `SHARE_TARGET_MISMATCH`。
+- 卡片状态不是 `ready`/`partial`、或没有 `contentId`/版本 → `SHARE_CONTENT_NOT_READY`，不读。
+- 只读：不写服务端、不改配置、不落业务数据；唯一副作用是本轮预算记账。
+
+### 8.4 预算口径（硬约束）
+
+- 单次 1200 / 轮次 2400，直接复用 `SHARE_BUDGETS.excerptsPerCallTokens / excerptsPerUserTurnTokens`。
+- 预算对象**一轮一个**，工具循环里多次模型迭代、同批多个调用共享同一份，不随 handler 重置。
+- 并发调用先「预留」再发请求：同一批 tool_calls 不会各自按剩余额度算全额（不超卖）。
+- 不信任模型传的 `maxTokens`（夹紧），也不信任响应自报的 `tokenEstimate`：按仓库既有保守口径
+  （每 Unicode 码点 ≈1 token）重算，并把交给模型的文本夹进额度。
+- 请求服务端时先扣掉「结果信封 + 服务端可能多回的那一条切片」（单条上限 400 字符），
+  避免为了砍溢出片段而丢掉 `nextCursor`；真溢出时由客户端截断并在结果里说明。
+- 剩余额度连一条切片都放不下（<320）→ `TURN_BUDGET_EXHAUSTED`，不发请求。
+- 同参重复调用 → `DUPLICATE_TOOL_CALL`（不再打网络、不再扣额度）；一轮最多 8 次调用（`TOOL_CALL_LIMIT`）。
+
+### 8.5 结果语义（模型看到什么）
+
+| code | 含义 | 模型被要求怎么做 |
+| --- | --- | --- |
+| `OK` | 读到了片段（带 `cursor` 可续读） | 用片段内容回答 |
+| `NO_SEGMENTS` | 请求成功但该字段/关键词没匹配到 | 别把「没匹配到」说成「读过了」 |
+| `SHARE_NOT_IN_CONTEXT` / `SHARE_CONTENT_NOT_READY` / `MISSING_TARGET` / `SHARE_TARGET_MISMATCH` | 目标不合法或没内容 | 基于已有简介回答 |
+| `TURN_BUDGET_EXHAUSTED` / `TOOL_CALL_LIMIT` / `DUPLICATE_TOOL_CALL` | 超预算/超次数/复读 | 基于已有简介回答 |
+| `VERSION_UNAVAILABLE` / `CONTENT_NOT_FOUND` / `TIMEOUT` / `NETWORK_ERROR` / `SHARE_LINKS_DISABLED` | 服务端透传的真实失败 | 如实说明片段不可用 |
+
+每种失败文本都带同一句收口：「片段没有读到……不要声称自己读过原文/字幕/评论」。
+
+### 8.6 历史与下一轮投影
+
+- **实际历史**（请求里）：`assistant(tool_calls)` + `role:tool`（`tool_call_id` 相同）成对进消息数组，
+  下一跳请求与最终回复都基于这份成对记录。
+- **落库**：回复落库后把本轮 call/result 成对写进该条助手消息的 `metadata.shareExcerpts`；
+  下一轮 `normalizeMessageContent` 渲染成 `[上轮 read_share_excerpts 记录 · N 次调用]`（≤600 token）。
+- **明确**：片段会占未来上下文（不承诺它们不占），只是有界且成对，不会只剩一段孤立片段
+  让模型误以为自己读过更多。
+
+### 8.7 开关与回滚
+
+- 默认关：不注入工具，行为与集成前完全一致（清掉 `os_social_share_config` 即回滚）。
+- 服务端 `SHARE_LINKS_ENABLED=false` 时工具仍在，但调用返回 503 系错误，模型如实说片段不可用。
+- 只有模型/中转支持 function calling 时有效：中转拒绝 `tools` 的轮次会退回无工具，
+  并显式告诉模型「这一轮外部工具不可用：不要声称读过分享片段」。
+
+### 8.8 本机验证（真实执行，2026-10-24）
+
+```
+npx vitest run utils/socialShareTool.test.ts          → 22 passed
+npx vitest run utils/socialShareTool.wiring.test.ts   → 8 passed
+npx vitest run $(ls utils/*[cC]hat*.test.ts)          → 38 files / 354 passed
+npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
+  utils/socialShare utils/chatRequestPayload worker/social-content utils/socialContent
+                                                       → 29 files / 326 tests passed
+```
+
+覆盖点：
+
+- **真实代码链路**：分享卡在上下文 → 工具 schema → 模型 `tool_calls`（fixture 模型）→ 执行器 →
+  `fetchShareExcerpts` 的 HTTP 契约 → 服务端真实 `buildExcerpts`（fixture 内容记录）生成响应 →
+  `role:tool` 结果 → 下一跳请求成对 → 最终回复 → 落 metadata → 下一轮投影读得回来。
+  桩只在 `fetch` 与模型输出上；响应体不是手写 JSON，是仓库真实服务端函数算出来的。
+- 预算：单次夹紧、轮次累计、并发不超卖、小额直接拒绝、同参去重、次数上限、收费按自身重算。
+- 权限：URL/baseUrl/token/scope 拒绝且不发请求；集合外 shareRef/contentId 拒绝；状态不符拒绝；
+  cursor 格式校验；shareRef/contentId 映射与错配。
+- 失败：`VERSION_UNAVAILABLE`、`CONTENT_NOT_FOUND`、`NO_SEGMENTS`；失败文本都要求如实说没读到。
+- 历史：call/result 成对落 metadata、投影有界、只对助手消息生效、锚点只挑本轮之后的消息。
+
+### 8.9 未验证 / 未部署（必须带着交付）
+
+1. **真实模型是否会用这个工具**未验证：工具描述是按模型能否自解释写的，但没有真实供应商+真实账号的灰度数据。
+2. **平台真实内容仍未打通**（同 §9 第 1 条）：工具读得到的前提是内容库里真有内容；B站 412、抖音登录墙、
+   XHS 会话停用的现状不变，`read_share_excerpts` 只会如实返回失败。
+3. **未部署**：前端与 worker 都没发布；`SHARE_LINKS_ENABLED` 仍按 §4 的灰度流程走。
+4. **发布门禁**：定向 vitest 已跑（见 §8.8）；全量 `tsc` / `vite build` 结果见本卡交付 metadata。
+5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
+   `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
+   （模型看不到 ref，实际不可达）。属已知边界，未额外收紧。
+6. **片段是外部内容，未做提示注入消毒**：字幕/正文/评论样本由平台提供，可能夹带「忽略以上指令」
+   之类文本。本卡只保证它是纯文本、有界、来源可追溯（shareRef + contentRevision），与旧链路
+   直接注入字幕全文同级；没有额外过滤，也没有让模型据此获得任何工具/权限。
+
+## 9. 已知限制（必须带着交付）
 
 1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
    `failed/partial` + 结构化错误，不编造内容。
-2. **按需检索只有 HTTP API，没有注册成模型工具**：`POST /items/:id/excerpts` 已实现并测试
-   （1200 token 夹紧、cursor 续读、`VERSION_UNAVAILABLE`），但 v1 没有把它接进聊天工具循环，
-   所以“角色主动翻字幕/评论”这一档目前做不到，只做到“简介进上下文”。这是本卡明确未覆盖的一项。
+2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**
+   （`read_share_excerpts`，见 §8）：单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、
+   失败如实返回。仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
 3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
    各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。
 4. **内容表是最小实现**：`social_content_items` 一行存整条 ContentRecord（JSON），没有拆
@@ -198,7 +307,7 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
    自包含 data:URL 加载已由本卡宿主脚本在本地验证（bundle 可加载、health 200），但线上 8842
    的 Caddy/health 读回未做。
 
-## 9. 发布步骤（本卡未执行，交发布流程）
+## 10. 发布步骤（本卡未执行，交发布流程）
 
 1. `pnpm run build`（含 `build:workers`，产出 `worker/social-content/worker.bundle.js`）。
 2. 定向门禁：本文件 §6 的 vitest 命令 + `pnpm run check:workers`。

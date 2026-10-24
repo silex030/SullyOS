@@ -17,6 +17,7 @@ import { formatQixiEventCardForContext, tryParseQixiEventChatCard } from './qixi
 import { formatTransferRecord } from './transferFormat';
 import { formatStatCount } from './videoParser';
 import { buildShareMessageProjection, shareAttachmentsOf } from './socialShare';
+import { renderShareExcerptPairProjection } from './socialShareTool';
 
 /**
  * 表情包消息的 content 存的是图床 URL，本身不带名字。拼上下文时要靠这个反查出
@@ -97,8 +98,25 @@ export function theaterWhenPhrase(dateStr?: string, slotTime?: string): string {
 /** B站字幕全文注入的保险上限：正常视频碰不到，只防多小时讲座撑爆上下文。 */
 export const BILIBILI_SUBTITLE_SAFETY_CAP = 100000;
 
-/** 仅返回内容体（不加 sender / timestamp）。调用方自行拼外层。 */
+/**
+ * 仅返回内容体（不加 sender / timestamp）。调用方自行拼外层。
+ *
+ * 链接分享工具（执行卡 t_75dd49a5）：助手消息 metadata.shareExcerpts 里成对存着上一轮
+ * read_share_excerpts 的 call/result，这里把它成对投影进下一轮上下文 —— 片段会占未来上下文
+ * （不承诺它们不占），但有界（≤600 token）且成对，不会只剩孤立片段。
+ */
 export function normalizeMessageContent(
+    msg: Message,
+    charName: string,
+    userName: string,
+): string {
+    const body = normalizeMessageBody(msg, charName, userName);
+    const excerptProjection = renderShareExcerptPairProjection(msg.metadata, msg.role);
+    return excerptProjection ? `${body}\n\n${excerptProjection}` : body;
+}
+
+/** 历史投影主体（不含 read_share_excerpts 的工具记录投影）。 */
+function normalizeMessageBody(
     msg: Message,
     charName: string,
     userName: string,
