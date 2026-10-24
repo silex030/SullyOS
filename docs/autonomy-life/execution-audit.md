@@ -113,3 +113,25 @@ $ grep -rn "external_window_not_implemented" --include=*.ts . | grep -v node_mod
    触发一次 tick 后 claim → 本地日记可见）。
 4. **`putCharacterLife` 首次插入**：D1 实现在 `expectedRevision===0` 时 INSERT，若两个
    isolate 同时首插会有一方 changes=0 → 引擎下次 tick 重新读；不会双写，但会多一跳。
+
+## 7. 验证日志（本机真实输出，日志随任务附件 `autonomy-evidence/`）
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 自主生活相关用例 | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife components/autonomy-life` | **17 文件 / 228 用例全通过**（`focused-tests.log`，EXIT 0） |
+| 全量用例（机器空闲时） | `npx vitest run` | **621 文件 / 7541 用例全通过**（`vitest-full-first.log`，EXIT 0） |
+| 全量用例（机器 load≈26 时重跑） | `npx vitest run --testTimeout=180000 --hookTimeout=180000` | 7539/7541；失败两条都是**与本卡无关的时序敏感用例**（见下），单独跑均通过（`vitest-full-load.log`） |
+| 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **56 条错误，与基线 `f7f040c7` 同集合；本卡新增 0 条，改动文件零错误**（`tsc.log`） |
+| 构建 | `pnpm run build` | **EXIT 0**（7 个 worker bundle + vite build 5m36s，`build.log`） |
+| 旧入口 grep | `grep -rn …` | 旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client` 均 **0 命中**；`autoRefresh*` 只剩退役清理代码与其测试（`legacy-grep.log`） |
+
+两条负载敏感用例（本次重跑的失败项，均与自主生活无关、代码未改）：
+
+```bash
+$ npx vitest run utils/backupRoundtrip.test.ts
+✓ 22 tests  — 4500×1024 真 ZIP 用例 13686ms（用例自带 30s 上限；并发跑时被挤到 >30s）
+$ npx vitest run utils/activeMsgRuntime.test.ts
+✓ 140 tests  — 失败项是「补收该跳过打字延迟」的 <400ms 断言，负载下实测 568ms
+```
+
+机器是共享主机（本卡运行期间 load average 19–26，另有其它 workspace 的 `tsc` 在跑）。
