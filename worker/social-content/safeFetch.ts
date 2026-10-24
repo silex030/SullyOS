@@ -16,6 +16,10 @@
  *  - 同一笔预算按阶段扣减：DNS 花掉的时间从连接预算里扣掉（连接 timer 只拿剩余），
  *    正文再扣掉 DNS+响应头的时间；任何一段到期都 abort 并释放底层连接，
  *    不会出现“DNS 慢 + 响应头慢”两段各自领满预算、加起来越过 deadline 的情况。
+ *  - 到期来源只有一个：响应头一到，连接 timer 立刻 `clearTimeout` 并把剩余预算**移交**给
+ *    正文 helper。若两个 timer 同时活着，连接 timer（先注册）通常先触发，它只会 abort 而
+ *    不设正文 helper 的 `timedOut`，正文因 abort 拒绝时就会被误判成 NETWORK_ERROR；
+ *    因此不允许两段 timer 重叠。
  *  - 没有 deadline 时退化为 perRequestTimeoutMs 的逐跳预算（行为与旧版大致等价，
  *    但正文读取也被预算约束，不再无限等待）。
  *  - 所有分支（重定向、非 2xx、超时、正文读取异步拒绝或同步抛出）都在 try/finally 里清定时器；
@@ -122,6 +126,9 @@ function mapBodyError(err: unknown, timedOut: boolean): SocialError {
  *    bodyTimer 会一直活到期限才触发，等于给一个已失败的调用留下延迟副作用。这里显式 catch。
  *  - 读取成功：不 discard（正文已读完，连接可复用）。
  * 定时器与释放都收在同一个 try/finally 里，失败路径额外做一次释放，两次释放是幂等的（见 released 标记）。
+ *
+ * 调用约定：进入本函数时**连接阶段的 timer 必须已经清掉**（safeGet 在响应头到达后做移交），
+ * 因此这里自己的 timer 是本阶段唯一的到期来源——`timedOut` 不会因为别的 timer abort 而漏设。
  */
 async function readBodyWithinBudget(
   res: TransportResponse,
@@ -249,7 +256,7 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
       1,
       Math.min(hopBudget - (afterDns - hopStart), deadline == null ? Number.POSITIVE_INFINITY : deadline - afterDns),
     );
-    const timer = setTimeout(() => controller.abort(), connectBudget);
+    let connectTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => controller.abort(), connectBudget);
     try {
       let res: TransportResponse;
       try {
@@ -264,6 +271,12 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
       } catch {
         if (controller.signal.aborted) throw new SocialError('TIMEOUT', 'upstream_timeout', { autoRetryable: true });
         throw new SocialError('NETWORK_ERROR', 'transport_failed', { autoRetryable: true });
+      }
+
+      // transport 若忽略 signal 在到期后才把响应头交出来，也不能再读正文：按到期处理并释放。
+      if (controller.signal.aborted) {
+        res.discard?.();
+        throw new SocialError('TIMEOUT', 'upstream_timeout', { autoRetryable: true });
       }
 
       audit.push({ host, addresses, status: res.status });
@@ -302,6 +315,12 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
         1,
         Math.min(hopBudget - consumed, deadline == null ? Number.POSITIVE_INFINITY : deadline - now()),
       );
+      // 交接：响应头已到，连接 timer 的职责结束，剩余预算交给正文 helper 自己的 timer。
+      // 留着它（旧实现）它会先于正文 timer 触发，只 abort、不设 helper 的 `timedOut`；
+      // 凡是「正文响应 AbortSignal 并同步/异步拒绝」的 transport（合法实现）就会让真正的
+      // 期限到期被 mapBodyError 判成 NETWORK_ERROR/body_read_failed，或透传 transport 自己的码。
+      clearTimeout(connectTimer);
+      connectTimer = undefined;
       const body = await readBodyWithinBudget(res, maxBytes, bodyBudget, controller);
 
       return {
@@ -315,7 +334,7 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
         audit,
       };
     } finally {
-      clearTimeout(timer);
+      if (connectTimer !== undefined) clearTimeout(connectTimer);
     }
   }
 }

@@ -395,6 +395,14 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 本轮改动文件：`worker/social-content/safeFetch.ts`、`worker/social-content/safeFetch.test.ts`、本文。
 （`worker/social-content/worker.bundle.js` 由 `safeFetch.ts` 变化需重建，已重建并在门禁里核对一致。）
 
+### 10.3 复审返工（arch-reviewer comment #84）：到期来源统一（连接 timer 移交正文 timer）
+
+| # | 复审意见 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| 1 | `safeFetch.ts` 的连接 timer 在进入正文读取后仍存活到外层 `finally` 才清；到期时它只 `controller.abort()`、不设正文 helper 的 `timedOut`，于是「响应头立即返回 + 正文响应 `AbortSignal` 并拒绝」的合法 transport 会把真正的期限到期映射成 `NETWORK_ERROR/body_read_failed`（或透传 transport 自己的码），而不是 `TIMEOUT/body_timeout` | `safeFetch.ts`：响应头到达、算完剩余 `bodyBudget` 后**先 `clearTimeout(connectTimer)` 再进入 `readBodyWithinBudget`**，把该跳剩余预算的到期责任整体移交给正文 helper（任一时刻只有一个 timer 是本阶段的到期来源，`timedOut` 不会因别的 timer abort 而漏设）；另加一道防御：transport 忽略 `signal` 在到期后才交出响应头时，直接 `discard()` 并按 `TIMEOUT/upstream_timeout` 结束，不再读正文 | `safeFetch.test.ts` 新增 2 例（describe「期限来源统一（响应头后连接 timer 移交正文 timer）」）：① 响应头立即返回、`readBody` 只在 `abort` 事件里同步以 `AbortError` 拒绝 → `TIMEOUT/body_timeout`、`readBody` 调用 1 次、abort/discard 各恰好 1 次、`vi.getTimerCount()===0`、推进 2s 无二次副作用；② 忽略 signal 的 transport 在预算后 resolve → `TIMEOUT/upstream_timeout`、`readBody` 0 次、discard 1 次。**RED 证据**：把 `safeFetch.ts` 退回 `57f05a9c`、保留新测试 → `2 failed | 33 passed`（`safeFetch-red-r84.log`，RED_EXIT=1），失败正是 `NETWORK_ERROR/body_read_failed` 与「迟到响应被当成 200 成功」 |
+
+本轮改动文件：`worker/social-content/safeFetch.ts`、`worker/social-content/safeFetch.test.ts`、`worker/social-content/worker.bundle.js`（重建）、本文。
+
 ## 11. 发布步骤（本卡未执行，交发布流程）
 
 1. `pnpm run build`（含 `build:workers`，产出 `worker/social-content/worker.bundle.js`）。

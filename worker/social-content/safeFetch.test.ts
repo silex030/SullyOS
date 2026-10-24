@@ -547,3 +547,111 @@ describe('正文读取异常路径的资源释放', () => {
     }
   });
 });
+
+/**
+ * 复审 #84 的回归：连接 timer 与正文 timer **不允许重叠**。
+ * 旧实现在拿到响应头后仍把连接 timer 留到外层 finally 才清；它先于正文 timer 注册、通常同一截止点
+ * 先触发，只 `controller.abort()` 而不设正文 helper 的 `timedOut`，于是「正文响应 AbortSignal 并拒绝」
+ * 的 transport（合法实现）会把真正的期限到期映射成 NETWORK_ERROR/body_read_failed。
+ * 这里用 fake timers 把「响应头立即返回 + 正文只在 abort 时拒绝」钉死。
+ */
+describe('期限来源统一（响应头后连接 timer 移交正文 timer）', () => {
+  const URL_X = 'https://www.bilibili.com/x';
+  type Body = { text: string; bytes: number; truncated: boolean };
+  type Recorder = { discarded: number; aborts: number };
+
+  it('响应头已回、正文在 abort 时同步拒绝 → 仍是 TIMEOUT/body_timeout，且即时释放、无残留 timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const rec: Recorder = { discarded: 0, aborts: 0 };
+      let readBodyCalls = 0;
+      let bodySawAbort = false;
+      const deps: SafeFetchDeps = {
+        resolve: async () => ['93.184.216.34'],
+        transport: async (req: TransportRequest): Promise<TransportResponse> => {
+          req.signal.addEventListener('abort', () => {
+            rec.aborts += 1;
+          });
+          return {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+            discard: () => {
+              rec.discarded += 1;
+            },
+            // 合法 transport 的形态：正文挂在连接上，signal abort 时立刻以 AbortError 拒绝
+            readBody: () => {
+              readBodyCalls += 1;
+              return new Promise<Body>((_resolve, reject) => {
+                req.signal.addEventListener('abort', () => {
+                  bodySawAbort = true;
+                  const err = new Error('The operation was aborted');
+                  err.name = 'AbortError';
+                  reject(err);
+                });
+              });
+            },
+          };
+        },
+      };
+
+      const pending = safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 });
+      const assertion = expect(pending).rejects.toMatchObject({ code: 'TIMEOUT', reason: 'body_timeout' });
+      await vi.advanceTimersByTimeAsync(600);
+      await assertion;
+
+      expect(readBodyCalls).toBe(1);
+      expect(bodySawAbort).toBe(true);
+      // 到期一次释放：abort 触发 transport 的监听，discard 释放底层连接，各恰好 1 次
+      expect(rec).toEqual({ discarded: 1, aborts: 1 });
+      expect(vi.getTimerCount()).toBe(0);
+      // 推进到远超预算：没有二次 abort/discard（旧的残留连接 timer 会在这里再来一次）
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(rec).toEqual({ discarded: 1, aborts: 1 });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('transport 不理会 signal、到期后才交出响应头 → 直接 TIMEOUT/upstream_timeout，不读正文', async () => {
+    vi.useFakeTimers();
+    try {
+      const rec: Recorder = { discarded: 0, aborts: 0 };
+      let readBodyCalls = 0;
+      const deps: SafeFetchDeps = {
+        resolve: async () => ['93.184.216.34'],
+        transport: async (req: TransportRequest): Promise<TransportResponse> => {
+          req.signal.addEventListener('abort', () => {
+            rec.aborts += 1;
+          });
+          // 失约的 transport：忽略 signal，预算到期之后才 resolve
+          await new Promise((r) => setTimeout(r, 700));
+          return {
+            status: 200,
+            headers: {},
+            discard: () => {
+              rec.discarded += 1;
+            },
+            readBody: () => {
+              readBodyCalls += 1;
+              return Promise.resolve<Body>({ text: 'late', bytes: 4, truncated: false });
+            },
+          };
+        },
+      };
+
+      const pending = safeGet(URL_X, deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 500 });
+      const assertion = expect(pending).rejects.toMatchObject({ code: 'TIMEOUT', reason: 'upstream_timeout' });
+      await vi.advanceTimersByTimeAsync(900);
+      await assertion;
+
+      expect(rec.aborts).toBe(1);
+      expect(readBodyCalls).toBe(0);
+      expect(rec.discarded).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+

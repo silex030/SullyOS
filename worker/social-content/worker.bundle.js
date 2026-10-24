@@ -890,7 +890,7 @@ async function safeGet(rawUrl, deps, policy) {
       1,
       Math.min(hopBudget - (afterDns - hopStart), deadline == null ? Number.POSITIVE_INFINITY : deadline - afterDns)
     );
-    const timer = setTimeout(() => controller.abort(), connectBudget);
+    let connectTimer = setTimeout(() => controller.abort(), connectBudget);
     try {
       let res;
       try {
@@ -905,6 +905,10 @@ async function safeGet(rawUrl, deps, policy) {
       } catch {
         if (controller.signal.aborted) throw new SocialError("TIMEOUT", "upstream_timeout", { autoRetryable: true });
         throw new SocialError("NETWORK_ERROR", "transport_failed", { autoRetryable: true });
+      }
+      if (controller.signal.aborted) {
+        res.discard?.();
+        throw new SocialError("TIMEOUT", "upstream_timeout", { autoRetryable: true });
       }
       audit.push({ host, addresses, status: res.status });
       if (REDIRECT_STATUS.has(res.status)) {
@@ -936,6 +940,8 @@ async function safeGet(rawUrl, deps, policy) {
         1,
         Math.min(hopBudget - consumed, deadline == null ? Number.POSITIVE_INFINITY : deadline - now())
       );
+      clearTimeout(connectTimer);
+      connectTimer = void 0;
       const body = await readBodyWithinBudget(res, maxBytes, bodyBudget, controller);
       return {
         status: res.status,
@@ -948,7 +954,7 @@ async function safeGet(rawUrl, deps, policy) {
         audit
       };
     } finally {
-      clearTimeout(timer);
+      if (connectTimer !== void 0) clearTimeout(connectTimer);
     }
   }
 }
