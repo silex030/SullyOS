@@ -38,7 +38,7 @@
 - **设置页可测试生图**：「设置 → AI 生图」一键用固定测试词真跑一张方图，内联预览并显示实际 prompt（含质量词）与 seed；只预览、不存相册不进聊天，会消耗一次生图额度，用来验证 Key、代理通道和出图效果。
 - **每个角色一份外貌档案**（danbooru 风格 tag）：首次生图自动从角色人设提取；一张图里可以 @ 同场的其他角色，系统会换成各自的外貌描述，保证画对人。
 - **聊天加号面板「相册」按钮 = 上传 / 生成二选一**（原聊天楼层长按的生图入口已取消，独立相册 App 也不再有生成入口）：生成只填一句画面描述，模型先分析成 danbooru tag 并按构图自选画幅（竖/横/方），出图后作为「我发的图」上屏、自动存相册、角色照常回应（与上传同一条路）。
-- **画风 / 性别在神经链接角色页配**：画风（画师 tag）+ 质量词对生图**通用注入**（含纯景色、聊天自动配图、主动消息、Spark 首图）；性别**只在画面里出现该角色（prompt 含 @角色名）时注入**，并把模型认错的 `1girl/1boy/male/female/male focus/female focus` 全部剔除。四层 tag 统一去重，不会打架或重复。
+- **画风 / 性别在神经链接角色页配**：画风（画师 tag）+ 质量词对生图**通用注入**（含纯景色、聊天自动配图、主动消息、朋友圈封面）；性别**只在画面里出现该角色（prompt 含 @角色名）时注入**，并把模型认错的 `1girl/1boy/male/female/male focus/female focus` 全部剔除。四层 tag 统一去重，不会打架或重复。
 - **聊天设置里可按角色开关「角色生图」**：缺省开；关掉后该角色自己写的生图标签只剥离不执行（不影响用户在相册里的手动生成，也不影响总开关与其它角色）。
 - **生图静默失败可查**：三类情形都留痕（devDebug + console）——已触发 / 被拦下（开关没开、缺 Key、角色开关关，带原因）/ **模型没写标签**（用户这条像是在要图、回复里却没有生图标签时点名）；被拦下时本地路径每 10 分钟节流提示一次去哪开。
 - **生图期间聊天页显示「正在加载图片…」**：角色发图后、图片落地前，消息列表末尾挂一条角色头像气泡（口吻是"图片加载中"，不暴露生图属性，像对方在传图）；成功/失败/取消都自动熄灭，刷新页面不残留（见 `utils/imageGenPending.ts`）。
@@ -46,10 +46,9 @@
 - 外貌提示词编辑已迁到**角色 App（神经链接）设定页**，支持「从角色设定提取」和「上传参考图解析」（识图模型直接输出 tag）两种自动解析。
 - **主动消息、云端即时对话也能发图**：云端只回传「想发图」的请求（不碰 Key、不烧云端额度），图片在手机本地生成，页面开着时即时补上、关着则下次打开补上。
 - **发图意图直接触发生图**：提示词明确「想发照片 / 自拍 / 画画 / 分享画面时都要真的生图」，并点名「不要只嘴上说『给你看张照片』却什么都没发」。
-- **Spark（社交 App）角色帖首图**：角色发「晒图 / 自拍 / 画画」类帖子时会生成一张 AI 首图当封面（不再是 emoji 大字卡）；与聊天生图共用同一套外貌档案和串行排队，路人帖不配图、每轮刷新最多 2 张。开关关着或没 Key 时提示词里不提配图，模型也不会写。
 - 数据源：**latent.moe**（公益免费生图站，按周配额，用完会提示下周再来）。
 - 状态说明：聊天内生图已提交入库；主动消息发图和角色页设定迁移于 2026-09-12 完成（写此记录时这批改动尚未提交入库，后续提交后此行可删）。
-- **聊天图片工作室（2026-09-22 收尾入库）**：聊天加号面板「相册」= 上传/生成二选一（楼层长按旧入口与独立相册生成入口移除，相册 App 回归纯浏览）；单聊/群聊图片点开展全屏灯箱（`ImageLightbox`，blobref 经 TokenImg 解析，不再开新标签页）；生图期间挂「正在加载图片…」占位气泡（`imageGenPending` 订阅式内存态）；画风/性别按角色页外貌档案注入（画风通用、性别只在 prompt 含 @角色名时注入）；静默失败三分类留痕（已触发/被拦下/模型没写标签）；Spark 角色帖配图（每轮最多 2 张，fire-and-forget 出图后原地更新）；设置页「测试生图」固定词真跑一张（只预览不落库）。latent 采样器/调度器/步数可配（默认 12/er_sde/linear_quadratic 不变，超上限 422 自动降级重提）。
+- **聊天图片工作室（2026-09-22 收尾入库）**：聊天加号面板「相册」= 上传/生成二选一（楼层长按旧入口与独立相册生成入口移除，相册 App 回归纯浏览）；单聊/群聊图片点开展全屏灯箱（`ImageLightbox`，blobref 经 TokenImg 解析，不再开新标签页）；生图期间挂「正在加载图片…」占位气泡（`imageGenPending` 订阅式内存态）；画风/性别按角色页外貌档案注入（画风通用、性别只在 prompt 含 @角色名时注入）；静默失败三分类留痕（已触发/被拦下/模型没写标签）；设置页「测试生图」固定词真跑一张（只预览不落库）。latent 采样器/调度器/步数可配（默认 12/er_sde/linear_quadratic 不变，超上限 422 自动降级重提）。
 
 ## 四、MCP 与网络体验
 
@@ -133,7 +132,7 @@
 
 - 聊天里的 **B站 / 豆瓣 / 小红书 / 普通网页**链接会生成内容卡片，能读取字幕、正文、热评并喂给角色。
 - **B站**：走官方公开接口（稿件信息、CC 字幕、预览帧、素材代理），全程不需要登录、不需要账号。
-- **豆瓣**：走 m 站的匿名接口（小组话题、详情、评论），用 iPhone UA + 豆瓣 Referer 过风控，列表 120 秒内存缓存；图片只放行豆瓣自家图床。Spark 社区据此混入豆瓣小组真实帖子，预置了多个实测活跃小组。
+- **豆瓣**：豆瓣小组匿名接口（m 站 rexxar、iPhone UA + Referer、120s 列表缓存、`doubanio.com` 图片白名单）**已随 Spark 于 2026-10-24 一起退役**——`worker/index.js` 的 `/social/douban/*` + `/social/img` 与 `utils/doubanSource.ts` 全删。聊天里发豆瓣链接走通用 `/fetch-webpage` 抓取（`webpage_card`），不受影响。
 - **小红书**：走用户自己配置的 xhs-lite 服务，正文全量抓取、评论按赞排序。
 - **小红书 VPS 会话桥（2026-09-22 代码入库、部署待做）**：VPS 常驻 camofox 浏览器维护登录态，cookie 加密只存 VPS；前端/主动消息切「VPS 托管」后只带随机 token 调用（cookie 永不上云、不进 localStorage）；失效扫一次码即可。实现 `vps-backend/src/xhs/`（store/bridge/collector/run）+ systemd/Caddy 部署件；运维手册 `docs/xhs-vps-session.md`。
 - **识图策略**：以上卡片如果需要看图，遵守「零额外 LLM 调用」红线——多帧拼成一张图、只调一次、结果永久缓存。
@@ -204,6 +203,7 @@
 ## 十六、减法项（退役与移除）
 
 - **外部 agent 桥（终端 App + opencode 遥控）整块删除**（2026-10-22）：桌面「终端」App、`components/terminal/*`、`components/settings/OpencodeConnectionConsole`、`utils/opencodeClient.ts`、两条代理（`scripts/opencode-proxy.mjs` / `worker/opencode-proxy/`）与 `docs/opencode-terminal.md` 全部下线；`AppID.Terminal`、`Opencode*` 类型、备份字段 `opencodeLocal` 与旧连接的本机键（`aetheros.opencode.connection`，含明文 Basic 密码）一并清理（启动期一次性迁移 `utils/retiredExternalAgent.ts`）。**保留** `opencode.ai` 作为聊天模型供应商的兼容层（`utils/llmIdentity.ts` 身份头 + `/models` 中转）——同名不同物，别顺手删。不要重新加回终端 App。
+- **Spark（社交 App）整块退役**（2026-10-24，用户明确不需要）：`apps/SocialApp.tsx`、`utils/doubanSource.ts`（+测试）、`utils/socialAppBlobRefs.test.ts`、`worker/doubanProxy.test.ts` 删除；`AppID.Social`、`INSTALLED_APPS`/`Icons.Social`/`DOCK_APPS`/桌面 Dock（动森风）/`appPreload`/`safeAreaApps`/`PhoneShell` 懒加载与 render case、`promptCallRegistry` 的 `social-feed`、`utils/momentsFeed.ts` 的 `visibleInSpark`、`utils/airp/projection.ts` 的 `selectMomentsMaterial` 与 `worker/index.js` 的 `/social/douban/*` + `/social/img`（含 `doubanListCache`）全部下线。**刻意保留**：`social_posts` 表与 `SocialPost` 类型（朋友圈共用 + 已落库数据）、`spark_char_handles`（朋友圈与聊天提示词共读）、历史 `social_card` 消息的渲染与提示词分支、`socialAppData` 备份字段（老用户资料/背景图不因减法丢出备份）、`storageOptimize`/`blobGc` 对 `social_*` 的既有处理。Spark 独占的本机键（`spark_douban_groups` / `spark_douban_hidden` / `spark_user_id`）由启动期一次性迁移 `utils/retiredSpark.ts` 精确清理。详见 `notes/spark-removal-2026-10-24.md`。不要重新加回 Spark。
 - Instant Push UI 整体退役，主动消息收拢为 amsg2 唯一模块；VAPID 凭据面板退役。
 - 移除 umami 统计（含残留 `trackEvent` 引用与注释）；移除 Capacitor 安卓壳与整套原生推送 fallback（含 APK 流水线）；移除桌面 PiP 投屏按钮；应用内更新提示下线。
 - 塔罗牌图转 webp 并删 mediapipe nosimd fallback，首屏资源减肥。

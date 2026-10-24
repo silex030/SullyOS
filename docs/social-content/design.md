@@ -21,7 +21,7 @@ SPARK 推荐流使用可合法使用的真实图文，不再让模型生成帖�
 | 评论/回复 | SocialApp.tsx:786、:887 | 删伪造生成，仅真实评论或本地用户注释，明确不已发布 |
 | 首图 | SocialApp.tsx:639-704 → utils/imageGenFlow.ts → utils/latentImageGen.ts | 切断此入口；保留其他 App 通用能力 |
 | 隐含外貌提取 | imageGenFlow.ts:111-176 | 不再由推荐刷新触发 |
-| 真实豆瓣 | utils/doubanSource.ts → worker/index.js:2951-3100 | 复用归一化和图片安全策略，端点权限/稳定性由来源评估确认 |
+| 真实豆瓣 | utils/doubanSource.ts → worker/index.js:2951-3100 | 复用归一化和图片安全策略，端点权限/稳定性由来源评估确认。（**2026-10-24 起此实现已随 Spark 删除**：`utils/doubanSource.ts` 与 `/social/*` 路由都不在了，若真做本方案需另建来源适配器） |
 | 自由活动 | XhsFreeRoamApp.tsx:150 → utils/xhsFreeRoam.ts:463；:497 决策，:620/:741/:365 反应 | 只读 browse/search/detail 接 shared client；不再为取内容运行这几轮模型 |
 | 真实外部写入 | xhsFreeRoam.ts:541 发布、:438/:409 评论/回复 | 与只读服务隔离，不自动调用，不增加发布授权 |
 | 活动与主页 | utils/db.ts xhs_activities/xhs_owned_posts | 保留主页归属，新增内容引用，不重复持久化全文 |
