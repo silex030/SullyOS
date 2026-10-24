@@ -165,8 +165,9 @@ SOCIAL_REAL_NETWORK=1 npx vitest run worker/social-content/realNetwork.probe.tes
 npx tsc -p tsconfig.json --noEmit        → TSC_EXIT=2；56 个错误，与返工前基线**逐条相同**
                                            （vps-backend/mastodon-mcp、components/os、utils/* 等），
                                            本次改动/新增文件 0 个错误（附件 tsc-full.log）
-npx vite build                           → VITE_EXIT=0，built in 7m 43s（附件 vite-build.log）
-npx node scripts/build-workers.mjs       → 8 个 bundle 重建；只有 social-content/worker.bundle.js 变化
+npx vite build                           → VITE_EXIT=0，built in 5m 31s（复审返工轮重跑；附件 vite-build.log）
+node scripts/build-workers.mjs           → 8 个 bundle 重建；只有 social-content/worker.bundle.js 变化
+node scripts/check-worker-bundles.mjs    → CHECK_EXIT=0「worker bundle 与源码一致」（附件 check-workers.log）
 ```
 
 覆盖点（与验收矩阵对应）：
@@ -327,7 +328,8 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 4. **发布门禁**：定向 vitest 已跑（见 §8.8）。全量 `tsc -p tsconfig.json --noEmit` 与
    `npx vite build` 本机都跑过 —— `tsc` 报 56 个错误、**全部是本次改动之外的既有错误**
    （vps-backend / worker/instant-push 等），改动文件 0 错误；`vite build` EXIT=0（1m47s，
-   产物在 gitignore 的 `dist/`）。仍不等于发布验收：没有跑 `pnpm run check:workers`，也没有部署。
+   产物在 gitignore 的 `dist/`）。`pnpm run check:workers` 在复审返工轮已通过（bundle 与源码一致）；
+   仍不等于发布验收：没有部署。
 5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
    `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
    （模型看不到 ref，实际不可达）。属已知边界，未额外收紧。
