@@ -958,22 +958,56 @@ export function renderShareExcerptPairProjection(
  * 模型失败/用户取消/后处理异常时就无锚可挂，记录直接丢（返工卡 t_38463abd P1 第 2 条）。
  * 触发消息在发请求前就已经在库里、id 确定，逐次落库不依赖后续任何一步成功，
  * 也不可能挂到并发的其它轮次上（id 来自本轮 contextMsgs 快照，不是时间戳扫库）。
+ *
+ * 反向扫描的边界（返工第 5 轮 P1）：**只认最后一条非背景消息本身**。
+ *  - 尾部 `system` 背景项（本轮拼进去的提示块）不是触发消息，可以跳过；
+ *  - 跳过之后遇到的那条就是触发消息，它的 id 必须可持久化；**不合法就返回 null**，
+ *    绝不继续往前找「上一条有 id 的 user/assistant」——那会把本轮记录健康地写进
+ *    另一个轮次的消息（committed saver 会成功、unsaved=false，门形同虚设）。
+ *  - `tool` 等中间态角色不是触发消息，同样返回 null（不是跳到更早的消息）。
  */
 export function pickShareExcerptTurnAnchor(
   messages: readonly { id?: unknown; role?: unknown }[] | null | undefined,
 ): number | null {
-  let byRole: number | null = null;
-  let any: number | null = null;
-  for (const msg of messages ?? []) {
-    const id = (msg as { id?: unknown })?.id;
-    if (typeof id !== 'number' || !Number.isFinite(id) || id <= 0) continue;
-    any = id;
-    // 只有 user/assistant 消息会被投影（system/tool 不背记录）——优先锚在它们身上，
-    // 免得记录落在一个下一轮根本不会被渲染的消息上。
-    const role = (msg as { role?: unknown })?.role;
-    if (role === 'user' || role === 'assistant') byRole = id;
+  const list = messages ?? [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const msg = list[i] as { id?: unknown; role?: unknown } | null | undefined;
+    const role = msg?.role;
+    // 尾部系统提示（本轮拼的背景块）不是触发消息，可跳过。
+    if (role === 'system') continue;
+    // 触发消息只可能是 user/assistant；无 role 的裸对象（旧导入/测试）按触发消息处理。
+    if (role !== undefined && role !== 'user' && role !== 'assistant') return null;
+    const id = msg?.id;
+    return typeof id === 'number' && Number.isFinite(id) && Number.isInteger(id) && id > 0 ? id : null;
   }
-  return byRole ?? any;
+  return null;
+}
+
+/**
+ * 一轮「分享片段工具」的准备结果：可注入的 turn + 确定的本轮锚点。
+ *
+ * 单独抽出来是为了让 hook 与测试走**同一口径**：卡片集合、可读性、触发消息 id 三道门
+ * 都在这里判定，任何一道不过就 `turn: null`（不注入工具）+ `anchorId: null`
+ * （dispatch 侧还会再拒一次 `HISTORY_UNAVAILABLE`）。
+ */
+export interface ShareExcerptTurnPrep {
+  turn: ShareExcerptTurn | null;
+  anchorId: number | null;
+  reason: 'ok' | 'no_target' | 'no_readable_target' | 'no_anchor';
+}
+
+export function prepareShareExcerptTurn(
+  messages: readonly { id?: unknown; role?: unknown; metadata?: any }[] | null | undefined,
+  opts: ShareExcerptTurnOptions = {},
+): ShareExcerptTurnPrep {
+  const turn = createShareExcerptTurn(messages, opts);
+  if (!turn) return { turn: null, anchorId: null, reason: 'no_target' };
+  // 一张能读的卡都没有（全是解析中/失败）时不注入：只给一个注定报错的工具没有意义。
+  if (!hasReadableShareExcerptTarget(turn)) return { turn: null, anchorId: null, reason: 'no_readable_target' };
+  // 历史必须成对留存：拿不到本轮触发消息的持久化 id 就**不读**（连工具都不注入）。
+  const anchorId = pickShareExcerptTurnAnchor(messages);
+  if (anchorId == null) return { turn: null, anchorId: null, reason: 'no_anchor' };
+  return { turn, anchorId, reason: 'ok' };
 }
 
 /** 成对记录写库的回调（测试注入；生产是 DB.updateMessageMetadata + attachShareExcerptPairs）。 */

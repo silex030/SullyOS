@@ -16,7 +16,7 @@ describe('read_share_excerpts · useChatAI 接线', () => {
   it('引的是独立模块（逻辑不在 hook 里重写）', () => {
     expect(chatSrc).toContain("from '../utils/socialShareTool'");
     expect(chatSrc).toContain('buildShareExcerptsTool');
-    expect(chatSrc).toContain('createShareExcerptTurn');
+    expect(chatSrc).toContain('prepareShareExcerptTurn');
     expect(chatSrc).toContain('dispatchShareExcerptToolCall');
     expect(chatSrc).toContain('ShareExcerptPairRecorder');
     expect(chatSrc).toContain('SHARE_EXCERPTS_TOOL_NAME');
@@ -24,12 +24,16 @@ describe('read_share_excerpts · useChatAI 接线', () => {
 
   it('只有总开关开着 + 有主代理地址 + 分享卡在场才注入工具', () => {
     expect(chatSrc).toMatch(/isSocialShareEnabled\(shareCfg\)\s*\?\s*resolveShareEndpoint\(shareCfg\)\s*:\s*null/);
-    expect(chatSrc).toMatch(/createShareExcerptTurn\(contextMsgs,\s*\{\s*endpoint:\s*shareEndpoint\s*\}\)/);
+    expect(chatSrc).toMatch(/prepareShareExcerptTurn\(contextMsgs,\s*\{\s*endpoint:\s*shareEndpoint\s*\}\)/);
     expect(chatSrc).toMatch(/if\s*\(shareExcerptTurn\)\s*\{[\s\S]{0,220}baseReqBody\.tools\s*=\s*\[\.\.\.\(baseReqBody\.tools\s*\|\|\s*\[\]\),\s*buildShareExcerptsTool\(\)\]/);
   });
 
   it('一张能读的卡都没有时不注入（失败卡不该换来一个注定报错的工具）', () => {
-    expect(chatSrc).toMatch(/if \(shareExcerptTurn && !hasReadableShareExcerptTarget\(shareExcerptTurn\)\) shareExcerptTurn = null;/);
+    // 这道门现在长在 socialShareTool.prepareShareExcerptTurn 里（运行时行为见
+    // socialShareTool.test.ts 的 no_readable_target 用例）；hook 只消费它的结果。
+    const toolSrc = readFileSync(fileURLToPath(new URL('./socialShareTool.ts', import.meta.url)), 'utf8');
+    expect(toolSrc).toMatch(/if \(!hasReadableShareExcerptTarget\(turn\)\) return \{ turn: null, anchorId: null, reason: 'no_readable_target' \};/);
+    expect(chatSrc).not.toContain('hasReadableShareExcerptTarget(');
   });
 
   it('工具循环的入口把分享工具也算进去（不是只有 MCP 才进循环）', () => {
@@ -83,8 +87,13 @@ describe('read_share_excerpts · useChatAI 接线', () => {
   });
 
   it('拿不到本轮持久化锚点时不注入工具（读完却没地方落库的调用不该存在）', () => {
-    expect(chatSrc).toMatch(/const shareExcerptAnchorId = pickShareExcerptTurnAnchor\(contextMsgs\);/);
-    expect(chatSrc).toMatch(/if \(shareExcerptTurn && shareExcerptAnchorId == null\) shareExcerptTurn = null;/);
+    // 三道门（有卡 / 卡可读 / 触发消息有可持久化 id）统一走 prepareShareExcerptTurn，
+    // hook 不再自己拼判定——两处口径分叉正是上一轮 P1 的来源。
+    expect(chatSrc).toContain('prepareShareExcerptTurn(contextMsgs, { endpoint: shareEndpoint })');
+    expect(chatSrc).toMatch(/let shareExcerptTurn: ShareExcerptTurn \| null = sharePrep\.turn;/);
+    expect(chatSrc).toMatch(/const shareExcerptAnchorId = sharePrep\.anchorId;/);
+    expect(chatSrc).not.toMatch(/pickShareExcerptTurnAnchor\(contextMsgs\)/);
+    expect(chatSrc).not.toMatch(/hasReadableShareExcerptTarget\(shareExcerptTurn\)/);
   });
 
   it('中转拒绝 tools 时这一轮退回无工具且明确不许假装读过', () => {

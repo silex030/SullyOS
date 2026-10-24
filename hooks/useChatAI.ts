@@ -34,14 +34,13 @@ import { isSocialShareEnabled, readSocialShareConfig, resolveShareEndpoint } fro
 import {
     attachShareExcerptPairs,
     buildShareExcerptsTool,
-    createShareExcerptTurn,
     dispatchShareExcerptToolCall,
-    hasReadableShareExcerptTarget,
-    pickShareExcerptTurnAnchor,
+    prepareShareExcerptTurn,
     ShareExcerptPairRecorder,
     SHARE_EXCERPT_OUTBOX,
     SHARE_EXCERPTS_TOOL_NAME,
     type ShareExcerptTurn,
+    type ShareExcerptTurnPrep,
 } from '../utils/socialShareTool';
 import { buildChatRequestPayload } from '../utils/chatRequestPayload';
 import {
@@ -1227,16 +1226,16 @@ export const useChatAI = ({
             const shareCfg = readSocialShareConfig();
             const shareEndpoint = isSocialShareEnabled(shareCfg) ? resolveShareEndpoint(shareCfg) : null;
             // 预算对象跟着这一轮走：工具循环里多次模型迭代、同批多个调用共享同一份，不重置。
-            let shareExcerptTurn: ShareExcerptTurn | null = shareEndpoint
-                ? createShareExcerptTurn(contextMsgs, { endpoint: shareEndpoint })
-                : null;
-            // 一张能读的卡都没有（全是解析中/失败）时不注入：只给一个注定报错的工具没有意义。
-            if (shareExcerptTurn && !hasReadableShareExcerptTarget(shareExcerptTurn)) shareExcerptTurn = null;
-            // 历史必须成对留存（卡片第 3 条）：拿不到本轮触发消息 id 时**连工具都不注入**。
-            // 读到的片段没有确定的落库位置，就只能「读过却没有记录」；宁可不给这个工具。
+            // 三道门在 prepareShareExcerptTurn 里一次判定（与测试同口径）：
+            //  ① 本轮上下文里真有分享卡；② 至少一张卡可读；③ 本轮触发消息有可持久化的 id。
+            // 任何一道不过 → turn=null（**不注入工具**）。历史必须成对留存（卡片第 3 条）：
+            // 读到的片段没有确定落库位置，就是「读过却没有记录」；宁可不给这个工具。
             // （dispatch 侧还有一道同口径的拒绝，防止将来别处绕过这里直接调用。）
-            const shareExcerptAnchorId = pickShareExcerptTurnAnchor(contextMsgs);
-            if (shareExcerptTurn && shareExcerptAnchorId == null) shareExcerptTurn = null;
+            const sharePrep: ShareExcerptTurnPrep = shareEndpoint
+                ? prepareShareExcerptTurn(contextMsgs, { endpoint: shareEndpoint })
+                : { turn: null, anchorId: null, reason: 'no_target' };
+            let shareExcerptTurn: ShareExcerptTurn | null = sharePrep.turn;
+            const shareExcerptAnchorId = sharePrep.anchorId;
             if (shareExcerptTurn) {
                 baseReqBody.tools = [...(baseReqBody.tools || []), buildShareExcerptsTool()];
                 if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';

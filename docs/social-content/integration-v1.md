@@ -271,11 +271,17 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
   下一跳请求与最终回复都基于这份成对记录。
 - **落库时机**：每执行完一次工具就成对写一次（`dispatchShareExcerptToolCall` → `ShareExcerptPairRecorder.record`），**不等**最终自然语言回复、也不等后处理成功。
   模型失败 / 用户取消 / 空回复 / 后处理抛错时，已经读过的调用都已经在库里。
-- **落库位置**：**本轮触发消息**（`contextMsgs` 最后一条，发送前就已落库、id 确定）的
-  `metadata.shareExcerpts`。不用「生成开始后最近 30 条里找 assistant」这种时间戳猜锚点，
-  因此也不会挂到并发的其它轮次上。
-- **无锚不读**（返工第 2 轮）：拿不到触发消息 id 时**不读**——`useChatAI` 直接不注入工具，
-  `dispatchShareExcerptToolCall` 也返回 `HISTORY_UNAVAILABLE` 且一次请求都不发。
+- **落库位置**：**本轮触发消息**（`contextMsgs` 里的最后一条**非 `system` 背景**消息；正常情况下就是
+  发送前刚落库的那条用户消息）的 `metadata.shareExcerpts`。不用「生成开始后最近 30 条里找 assistant」
+  这种时间戳猜锚点，因此也不会挂到并发的其它轮次上。
+  锚点判定（第 5 轮校正）：从尾部反向扫描，只跳过 `system` 背景项；跳过后遇到的那条**就是**触发消息，
+  它的 `id` 必须是合法的正整数字面量，**否则返回 `null`**，绝不继续往前找「上一条有 id 的 user/assistant」
+  （`tool` 等中间态角色同样 `null`）。所以「最后一条是没 id 的新用户消息、历史里还有一条有 id 的旧消息」
+  不会被悄悄写进旧消息——那是「健康提交到别的轮次」的静默串轮，比不落库更难发现。
+  三道门（有卡 / 卡可读 / 触发消息有可持久化 id）统一在 `prepareShareExcerptTurn()` 里判定，
+  hook 与测试走同一份实现，不再各写一遍。
+- **无锚不读**（返工第 2 轮，第 5 轮收紧到「不许回退」）：拿不到**本轮触发消息**的 id 时**不读**——
+  `useChatAI` 直接不注入工具，`dispatchShareExcerptToolCall` 也返回 `HISTORY_UNAVAILABLE` 且一次请求都不发。
   理由：读到了却没有确定落库位置，就是「读过却没有记录」，下一轮回放不出来，模型只能凭记忆复述，
   等于给了一个无法追溯的来源。宁可不给片段，也不给不留痕的片段。
 - **幂等与串行（第 3 轮校正）**：去重键是 **（锚点, toolCallId）**，且去重状态放在**共享的待补偿队列**里
@@ -325,20 +331,21 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 
 ```
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
-  utils/chatToolLoopBudget.test.ts          → 3 files / 73 passed（45 + 17 + 11）
+  utils/chatToolLoopBudget.test.ts          → 3 files / 79 passed（51 + 17 + 11）
 npx vitest run $(ls utils/*[cC]hat*.test.ts) → 39 files / 365 passed
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
   utils/chatToolLoopBudget.test.ts utils/mcpToolBridge utils/agenticTools \
   utils/messageFormat utils/socialShare utils/chatRequestPayload \
-  worker/social-content utils/socialContent  → 30 files / 372 passed
+  worker/social-content utils/socialContent  → 30 files / 378 passed
 ```
 
-> 计数口径：返工第 4 轮（2026-10-25，按 arch-reviewer 第 4 次复核意见）为 73 / 365 / 372；
-> 第 3 轮为 56 / 354 / 355，第 2 轮为 51 / 354 / 350，第 1 轮为 45 / 354 / 344。
-> 第 4 轮新增 17 例（分享工具 3 例：>8 条批次历史保留、12 条不截断、待补偿上限；
-> 轮数口径 11 例；接线 3 例）。执行卡最初记的 22 + 8 = 30 例、定向 329 例是更早的数字，
+> 计数口径：返工第 5 轮（2026-10-25，按 arch-reviewer 第 5 次复核意见）为 79 / 365 / 378；
+> 第 4 轮为 73 / 365 / 372，第 3 轮为 56 / 354 / 355，第 2 轮为 51 / 354 / 350，第 1 轮为 45 / 354 / 344。
+> 第 5 轮新增 6 例（锚点不回退：picker 反例、`prepareShareExcerptTurn` 三道门、真实 DB 的
+> 「旧消息在库 + 最新触发消息没 id」零读、非法 id 零读、有效新 id 只写新消息、两轮并发不串）。
+> 执行卡最初记的 22 + 8 = 30 例、定向 329 例是更早的数字，
 > 旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在 `evidence/`（提交内），
-> 第 4 轮为 `evidence/*-r4.log`。
+> 第 5 轮为 `evidence/*-r5.log`。
 
 覆盖点：
 
@@ -485,6 +492,34 @@ arch-reviewer 在 `86c67854` 上复核，第 3 轮两项修复（共享 outbox �
   （仓库 vitest 是纯 Node，`useChatAI` 绑死 React）。wiring 测试钉住传参形状，行为测试钉住决策函数。
 
 
+### 8.14 返工记录（第 5 轮，2026-10-25）
+
+arch-reviewer 在 `6178e166` 上复核，第 4 轮两项（成对历史不按条数截断、工具循环轮数不被分享卡压低）
+核验通过；仍判一处 P1：**锚点选择会回退到旧历史**，`pickShareExcerptTurnAnchor` 跳过最新触发消息的
+无效/缺失 id 后返回「整个历史里最后一个有效 user/assistant id」。确定性输入
+`[{id:101,role:'user'}, {role:'user',metadata:{本轮卡}}]` 会返回 101 → hook 的门不生效，
+`committed saver` 把本轮读取**健康地**写进另一个轮次的消息，`unsaved=false`、没有任何告警
+（比「没落库」更难发现：记录在、位置错）。现有零锚用例只覆盖「所有消息都没 id」。
+
+| # | 问题 | 修法 | 复验（真实执行） |
+| --- | --- | --- | --- |
+| P1 | `pickShareExcerptTurnAnchor` 回退到历史里较早的有效 id → 记录挂到别的轮次，门形同虚设 | 改为**反向扫描、只跳过 `system` 背景项**；跳过后遇到的那条就是本轮触发消息，其 id 必须是正整数，否则返回 `null`，**不再继续往前找**（`tool` 等中间态角色也返回 `null`）。同时把「有卡 / 卡可读 / 触发消息有可持久化 id」三道门收进新导出 `prepareShareExcerptTurn()`（返回 `{turn, anchorId, reason}`），`useChatAI` 只消费它，hook 不再自己拼判定（两处口径分叉正是本轮缺陷来源）；dispatch 侧原有的 `HISTORY_UNAVAILABLE` 拒绝（在预算/网络之前）保留 | 新增 6 例（`utils/socialShareTool.test.ts`）：① picker 覆盖「缺 id / 0 / 负数 / 非数字 / 小数 / null / 尾部 system 后可疑 / tool 角色」全部 `null`、而合法新 id 只认它；② `prepareShareExcerptTurn` 的 `ok / no_target / no_readable_target / no_anchor`；③ **真实 DB + 生产 committed saver**：旧消息在库里 + 最新触发消息没 id → `no_anchor`、零 HTTP 请求、旧消息 metadata 逐字节不变；④ 最新触发消息 id 为 `0` / `'oops'` 同样零请求、旧消息不变；⑤ 最新触发消息有有效新 id → 只写新消息（旧消息仍是原 metadata，没多 `shareExcerpts`）、提交后读回成对记录；⑥ 两轮**并发**各写各自触发消息（A/B 卡字幕互不串，`unsaved=false`）。判别性证据：把 picker 临时改回「跳过无效 id 继续往前找」（mutation）→ 新增用例 4 条立刻失败（`47 passed / 4 failed`），恢复后 51 passed |
+
+本轮改动文件（实现提交）：`utils/socialShareTool.ts`（picker + `prepareShareExcerptTurn`）、
+`hooks/useChatAI.ts`（改调 `prepareShareExcerptTurn`，删掉本地分步判定与相应 import）、
+`utils/socialShareTool.test.ts`（+6 例）、`utils/socialShareTool.wiring.test.ts`（接线断言改为
+钉「统一走 prepare」且旧分步判定已消失）。
+
+本轮**未**改模型 / provider / 配置 / 审批 / 权限，未启动任何消息网关，未部署、未合并。
+边界材料更新在 `evidence/EXECUTION-AUDIT.md §11`。
+
+新增残余风险（写进 §8.9 之外单独列出）：
+
+- 锚点语义现在**依赖调用方传的是「本轮真正发给模型的消息数组」**：如果将来某处传入的是「裁剪后的历史」，
+  最后一条可能不是触发消息。这是接口契约（`prepareShareExcerptTurn(messages)` 的输入定义），
+  目前唯一生产调用点是 `useChatAI` 的 `contextMsgs` 快照；没有在真实 React 运行里端到端跑过。
+
+
 ## 9. 已知限制（必须带着交付）
 
 1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
@@ -492,10 +527,10 @@ arch-reviewer 在 `86c67854` 上复核，第 3 轮两项修复（共享 outbox �
 2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**，
    并由返工卡 t_38463abd 修掉「可见引用不可执行」「记录只靠最终回复落库」「写库失败无补偿」
    「无锚点仍返回片段」（§8.6 / §8.10 / §8.11）以及「历史被 8 条截断」「分享卡压低其它工具轮数」
-   （§8.13）六处缺陷：
+   （§8.13）「锚点回退到旧历史、记录写进别的轮次」（§8.14）七处缺陷：
    单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、引用歧义即拒绝、每次调用即时成对落库且**不按条数截断**、
-   写库失败有界重试并在失败时明确「未保存·待补偿」、无锚点不读、失败如实返回、
-   工具循环轮数只在自己是唯一工具时收紧。
+   写库失败有界重试并在失败时明确「未保存·待补偿」、拿不到**本轮触发消息**的 id 就不读且**不回退到更早消息**、
+   失败如实返回、工具循环轮数只在自己是唯一工具时收紧。
    仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
 3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
    各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。

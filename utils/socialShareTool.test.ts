@@ -22,6 +22,7 @@ import {
   dispatchShareExcerptToolCall,
   executeShareExcerptToolCall,
   pickShareExcerptTurnAnchor,
+  prepareShareExcerptTurn,
   renderShareExcerptPairProjection,
   resolveShareExcerptTarget,
   SHARE_EXCERPT_LIMITS,
@@ -1531,5 +1532,223 @@ describe('read_share_excerpts · 一批 >8 个不同 id 的成对历史（返工
     }));
     outbox.add(101, records);
     expect(outbox.pendingCount(101)).toBe(20);
+  });
+});
+
+
+/**
+ * 返工第 5 轮 P1：锚点必须是**本轮触发消息**，不能回退到历史里任何有 id 的旧消息。
+ *
+ * 旧实现从后往前「跳过无效 id 继续找」，于是
+ * `[{id:101,role:'user'}, {role:'user',metadata:{本轮卡}}]`（最新触发消息还没落库/没 id）
+ * 会返回 101：hook 的门形同虚设，本轮读到的片段被 health 地写进另一个轮次的消息，
+ * committed saver 照样成功、`unsaved=false`。门必须只认最后一条非背景消息本身。
+ *
+ * 下半部分走真实 DB + 生产 committed saver（`updateMessageMetadataCommitted`）：
+ * 旧消息在库里、最新触发消息无 id/非法 id → 零 excerpts 请求且旧消息 metadata 一字不改；
+ * 最新触发消息有有效 id → 只写新消息；两轮并发各写各的、不串轮。
+ */
+describe('read_share_excerpts · 本轮触发消息锚点（返工第 5 轮 P1）', () => {
+  async function clearMessages(): Promise<void> {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('messages', 'readwrite');
+      tx.objectStore('messages').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function seedShareMessage(att: ShareAttachment, content = '看这个链接'): Promise<number> {
+    return DB.saveMessage({
+      charId: 'char-anchor',
+      role: 'user',
+      type: 'text',
+      content,
+      timestamp: 10,
+      metadata: { shares: { version: 1, attachments: [att] } },
+    } as any);
+  }
+
+  const committedSaver = (messageId: number, records: readonly any[]) =>
+    DB.updateMessageMetadataCommitted(messageId, (prev: any) => attachShareExcerptPairs(prev, records));
+
+  function cardAttachment(shareRef: string, contentId: string, url: string): ShareAttachment {
+    return attachment({
+      shareRef,
+      contentId,
+      messageId: String(shareRef.slice(-4)),
+      originalUrl: url,
+      resolvedUrl: url,
+      canonicalUrl: url,
+      openUrl: url,
+      contextProjection: { ...attachment().contextProjection!, shareRef, contentId, contentRevision: 3 },
+    });
+  }
+
+  it('picker：最新触发消息缺 id / id 非法 → null，绝不回退到更早的有 id 消息', () => {
+    // 审查给出的确定性反例：旧消息 101 + 最新 user 没有 id
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { role: 'user' }])).toBeNull();
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 0, role: 'user' }])).toBeNull();
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: -3, role: 'user' }])).toBeNull();
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 'oops', role: 'user' }])).toBeNull();
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 2.5, role: 'user' }])).toBeNull();
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: null, role: 'user' }])).toBeNull();
+    // 尾部 system 背景项可跳过；跳过后遇到的就是触发消息本身，它没 id 仍然 null（不是 101）
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { role: 'user' }, { id: 9, role: 'system' }])).toBeNull();
+    // tool 中间态不是触发消息，同样不回退
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 55, role: 'tool' }])).toBeNull();
+    // 有效的新 id：只认它
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 404, role: 'user' }])).toBe(404);
+    expect(pickShareExcerptTurnAnchor([{ id: 101, role: 'user' }, { id: 404, role: 'user' }, { id: 9, role: 'system' }])).toBe(404);
+  });
+
+  it('prepare（hook 用的同一道门）：无锚点 / 无卡分别落 no_anchor / no_target，都不给 turn', () => {
+    const card = dualCardMessage();
+    const opts = { endpoint, now: () => 1_000 };
+    const noAnchor = prepareShareExcerptTurn([{ ...card, id: 101 }, { role: 'user', metadata: card.metadata }], opts);
+    expect(noAnchor).toMatchObject({ turn: null, anchorId: null, reason: 'no_anchor' });
+    const ok = prepareShareExcerptTurn([{ ...card, id: 303, role: 'user' }], opts);
+    expect(ok.reason).toBe('ok');
+    expect(ok.anchorId).toBe(303);
+    expect(ok.turn).not.toBeNull();
+    expect(prepareShareExcerptTurn([{ id: 1, role: 'user' }], opts))
+      .toMatchObject({ turn: null, anchorId: null, reason: 'no_target' });
+    const pending = attachment({ state: 'queued' });
+    expect(prepareShareExcerptTurn([{ id: 2, role: 'user', metadata: { shares: { version: 1, attachments: [pending] } } }], opts))
+      .toMatchObject({ turn: null, anchorId: null, reason: 'no_readable_target' });
+  });
+
+  it('旧消息在库里、最新触发消息没 id：不注入、零请求、旧消息 metadata 一字不改', async () => {
+    await clearMessages();
+    const { calls } = stubShareServer();
+    const oldId = await seedShareMessage(attachment(), '第一轮');
+    const old = await DB.getMessageById(oldId);
+    const beforeMeta = JSON.stringify(old!.metadata);
+    const newest = { role: 'user' as const, content: '再读一次这个', metadata: old!.metadata };
+    const messages = [{ ...old, role: 'user' }, newest];
+
+    const prep = prepareShareExcerptTurn(messages, { endpoint, now: () => 1_000 });
+    expect(prep).toMatchObject({ turn: null, anchorId: null, reason: 'no_anchor' });
+    // hook 同口径：turn 为 null → 不注入工具、不建落库器
+    const recorder = prep.turn
+      ? new ShareExcerptPairRecorder({ anchorId: prep.anchorId, savePairs: committedSaver, outbox: new ShareExcerptPairOutbox() })
+      : null;
+    expect(recorder).toBeNull();
+
+    // 就算有人绕过门拿 turn 直接 dispatch：零请求、零落库，旧消息不变
+    const bypassTurn = createShareExcerptTurn(messages, { endpoint, now: () => 1_000 })!;
+    expect(bypassTurn).not.toBeNull();
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn: bypassTurn,
+      recorder: new ShareExcerptPairRecorder({ anchorId: prep.anchorId, savePairs: committedSaver, outbox: new ShareExcerptPairOutbox() }),
+    });
+    expect(outcome.code).toBe('HISTORY_UNAVAILABLE');
+    expect(outcome.chargedTokens).toBe(0);
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify((await DB.getMessageById(oldId))!.metadata)).toBe(beforeMeta);
+    expect((await DB.getMessageById(oldId))!.metadata?.[SHARE_EXCERPT_META_KEY]).toBeUndefined();
+  });
+
+  it('最新触发消息 id 非法（0 / 非数字）：同样不读，不挂到旧消息', async () => {
+    await clearMessages();
+    const { calls } = stubShareServer();
+    const oldId = await seedShareMessage(attachment(), '第一轮');
+    const old = await DB.getMessageById(oldId);
+    const beforeMeta = JSON.stringify(old!.metadata);
+
+    for (const badId of [0, 'oops'] as const) {
+      const messages = [{ ...old, role: 'user' }, { id: badId, role: 'user', content: '第二轮', metadata: old!.metadata }];
+      const prep = prepareShareExcerptTurn(messages, { endpoint, now: () => 1_000 });
+      expect(prep).toMatchObject({ turn: null, anchorId: null, reason: 'no_anchor' });
+      const outcome = await dispatchShareExcerptToolCall({
+        toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+        turn: createShareExcerptTurn(messages, { endpoint, now: () => 1_000 })!,
+        recorder: new ShareExcerptPairRecorder({ anchorId: prep.anchorId, savePairs: committedSaver, outbox: new ShareExcerptPairOutbox() }),
+      });
+      expect(outcome.code).toBe('HISTORY_UNAVAILABLE');
+      expect(JSON.stringify((await DB.getMessageById(oldId))!.metadata)).toBe(beforeMeta);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('最新触发消息有有效新 id：只写新消息，旧消息不动', async () => {
+    await clearMessages();
+    const { calls } = stubShareServer();
+    const oldId = await seedShareMessage(attachment(), '第一轮');
+    const newId = await seedShareMessage(attachment(), '第二轮：再看一次');
+    const old = await DB.getMessageById(oldId);
+    const neu = await DB.getMessageById(newId);
+    const beforeOld = JSON.stringify(old!.metadata);
+    const messages = [{ ...old, role: 'user' }, { ...neu, role: 'user' }];
+
+    const prep = prepareShareExcerptTurn(messages, { endpoint, now: () => 1_000 });
+    expect(prep.reason).toBe('ok');
+    expect(prep.anchorId).toBe(newId);
+    expect(prep.anchorId).not.toBe(oldId);
+
+    const recorder = new ShareExcerptPairRecorder({
+      anchorId: prep.anchorId,
+      savePairs: committedSaver,
+      outbox: new ShareExcerptPairOutbox(),
+    });
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn: prep.turn!,
+      recorder,
+    });
+    await recorder.flush();
+
+    expect(outcome.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    const pairs = (await DB.getMessageById(newId))!.metadata[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    // 旧消息：metadata 逐字节不变，没有多出 shareExcerpts
+    expect(JSON.stringify((await DB.getMessageById(oldId))!.metadata)).toBe(beforeOld);
+    expect((await DB.getMessageById(oldId))!.metadata?.[SHARE_EXCERPT_META_KEY]).toBeUndefined();
+    expect(recorder.snapshot()).toMatchObject({ recorded: 1, pendingRecords: 0, outboxPending: 0, unsaved: false });
+  });
+
+  it('两轮并发：各写各自触发消息，不串轮', async () => {
+    await clearMessages();
+    stubShareServer(null, { [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'), [DUAL.idB]: cardRecord(DUAL.idB, 'B卡') });
+    const idA = await seedShareMessage(cardAttachment(DUAL.refA, DUAL.idA, DUAL.urlA), 'A 轮');
+    const idB = await seedShareMessage(cardAttachment(DUAL.refB, DUAL.idB, DUAL.urlB), 'B 轮');
+    const msgA = await DB.getMessageById(idA);
+    const msgB = await DB.getMessageById(idB);
+
+    const prepA = prepareShareExcerptTurn([{ ...msgA, role: 'user' }], { endpoint, now: () => 1_000 });
+    const prepB = prepareShareExcerptTurn([{ ...msgB, role: 'user' }], { endpoint, now: () => 1_000 });
+    expect(prepA.reason).toBe('ok');
+    expect(prepB.reason).toBe('ok');
+    expect([prepA.anchorId, prepB.anchorId]).toEqual([idA, idB]);
+
+    const outbox = new ShareExcerptPairOutbox();
+    const recA = new ShareExcerptPairRecorder({ anchorId: prepA.anchorId, savePairs: committedSaver, outbox });
+    const recB = new ShareExcerptPairRecorder({ anchorId: prepB.anchorId, savePairs: committedSaver, outbox });
+
+    const [outA, outB] = await Promise.all([
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_A'), turn: prepA.turn!, recorder: recA }),
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refB, fields: ['transcript'] }, 'call_B'), turn: prepB.turn!, recorder: recB }),
+    ]);
+    await Promise.all([recA.flush(), recB.flush()]);
+
+    expect(outA.ok).toBe(true);
+    expect(outB.ok).toBe(true);
+    const pairsA = (await DB.getMessageById(idA))!.metadata[SHARE_EXCERPT_META_KEY].pairs;
+    const pairsB = (await DB.getMessageById(idB))!.metadata[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairsA).toHaveLength(1);
+    expect(pairsB).toHaveLength(1);
+    expect(pairsA[0].call.args.shareRef).toBe(DUAL.refA);
+    expect(pairsA[0].result.text).toContain('A卡字幕片段内容');
+    expect(pairsA[0].result.text).not.toContain('B卡字幕片段内容');
+    expect(pairsB[0].call.args.shareRef).toBe(DUAL.refB);
+    expect(pairsB[0].result.text).toContain('B卡字幕片段内容');
+    expect(pairsB[0].result.text).not.toContain('A卡字幕片段内容');
+    expect(recA.snapshot()).toMatchObject({ recorded: 1, outboxPending: 0, unsaved: false });
+    expect(recB.snapshot()).toMatchObject({ recorded: 1, outboxPending: 0, unsaved: false });
   });
 });
