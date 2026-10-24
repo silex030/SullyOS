@@ -3376,7 +3376,7 @@ export interface CharacterProfile {
   imageGenProfile?: string;
   /**
    * AI 生图固定注入的画风 / 画师 tag（per-character，**通用**注入）。
-   * 该角色所有生图都带上：聊天自动配图、主动消息、Spark 首图、聊天相册手动生成；
+   * 该角色所有生图都带上：聊天自动配图、主动消息、朋友圈封面、聊天相册手动生成；
    * 纯景色生成也注入。逗号分隔，英文 danbooru 风格（如 "by wlop, watercolor"）。
    * 在哪里改：神经链接（角色 App）→ 角色 → 设定 → AI 生图 · 外貌提示词。
    */

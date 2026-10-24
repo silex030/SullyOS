@@ -97,8 +97,99 @@ Spark（`AppID.Social`，UI 名「Spark」，实现 `apps/SocialApp.tsx`）在**
 
 ## 6. 验证证据
 
-见第 7 节「执行记录」（命令 + 真实输出摘要）。
+全部命令都在 `/root/SullyOS-spark-removal`（分支 `spark-removal/t_995b91f3`）里实跑，原始日志作为任务附件提交（`evidence/`）。
 
-## 7. 执行记录（本轮实测）
+### 6.1 类型检查：与基线错误集**完全一致**
 
-（下节由执行者按实际命令输出填写）
+```
+npx tsc --noEmit -p tsconfig.json
+```
+
+| 时点 | 结果 |
+|---|---|
+| 改动前（`f7f040c7` 干净工作树） | `EXIT:2`，55 条 `error TS`（全部是存量：`vps-backend/*`、`CompanionHome`、`builtinSullyLive2D` 等） |
+| 改动后 | `EXIT:2`，55 条，**与基线逐行 diff 完全一致**（`diff` 空输出） |
+
+→ 本次改动**没有新增任何类型错误**，也没有把任何存量错误「顺手修掉」；被改文件在 tsc 输出里零命中。
+（原样保留：`evidence/tsc-baseline.log`、`evidence/tsc-after.log`、`*-norm.txt` 两份归一化列表）
+
+### 6.2 构建：可用
+
+```
+pnpm build            # = build:workers + vite build
+```
+
+- `build:workers`：7 个 worker bundle 全部重建成功（instant-push / amsg / main-agent / …
+  + `worker/heartbeat`、`worker/wake-bridge`）
+- `vite build`：`✓ built in 5m 3s`，`EXIT:0`（产物含 `dist/assets/*`，`dist/` 是 gitignore，不入库）
+- `node --check worker/index.js` → `SYNTAX_OK`（删除 163 行后的单文件 worker 语法有效）
+
+**一处必须交代的既有问题（与本次改动无关）**：`pnpm build` 会同时重写
+`worker/instant-push/worker.bundle.js`、`worker/instant-push/worker.deno.bundle.js`、
+`public/instant-worker.deno.bundle.js`，内容是把 `@rei-standard/amsg-shared` 从 `0.4.0-next.8`
+换回 `0.2.0`（`worker/instant-push/package.json` 里钉的就是 `0.2.0`）。
+为证明这是**既有漂移**而不是 Spark 改动导致，我在 `f7f040c7` 的**干净 worktree**（无任何本次改动）里
+只跑 `node scripts/build-workers.mjs`，同样得到 3 个 bundle 被重写（`evidence/build-workers-clean-HEAD.log`）。
+因此这 3 个文件**已还原、未提交**；是否单独修 bundle 漂移属于另一件事，不夹带进本卡。
+
+### 6.3 全量单测：两次运行，失败项全部与本次改动无关
+
+```
+pnpm vitest run
+```
+
+| 轮次 | 文件 | 用例 | 失败 |
+|---|---|---|---|
+| 第 1 轮 | 606 passed / 2 failed（608） | 7349 passed / 3 failed（7352） | `storageOptimize`（2，分页/限流相关）、`TravelSettings`（1） |
+| 第 2 轮 | 605 passed / 3 failed（608） | 7345 passed / 7 failed（7352） | `storageOptimize`（5）、`storageStats`（1）、`corsContract`（1） |
+
+**被改动文件相关的测试，两轮都 100% 通过**（零失败）：
+
+```
+utils/retiredSpark.test.ts            6 tests   ← 新增
+utils/airp/projection.test.ts        70 tests
+utils/momentsFeed.test.ts            11 tests
+utils/promptCallRegistry.test.ts      3 tests
+utils/appPreload.test.ts              5 tests
+utils/safeAreaApps.test.ts            3 tests
+utils/launcherLayout.test.ts         16 tests
+utils/socialFeedMerge.test.ts         4 tests
+utils/backupCoverage.test.ts         11 tests
+utils/apiCallLog.test.ts             37 tests
+utils/companionHomeRuntimeReferences.test.ts 20 tests
+utils/tarotWiring.test.ts             5 tests
+utils/mojibakeGuard.test.ts           1 test
+components/settings/TravelSettings.test.tsx  8 tests（第 2 轮）
+```
+
+失败项定性（逐条实跑，均证明与本次改动无关）：
+
+| 失败文件 | 单跑结果（本分支） | 干净 `HEAD` 对照 | 结论 |
+|---|---|---|---|
+| `utils/storageOptimize.test.ts` | 84/84 通过（15.7s） | 在 `TravelSettings + storageOptimize` 组合下**同样失败** | 既有并发/超时抖动（`另一项存储维护正在进行` / hook 10s 超时），与被改文件无关 |
+| `worker/corsContract.test.ts` | 38/38 通过（7.5s） | 在 `storageOptimize + storageStats + corsContract` 组合下**同样失败 2 条** | 同上（amsg worker 冷启动慢） |
+| `utils/storageStats.test.ts` | 通过 | 组合下通过 | 抖动 |
+| `components/settings/TravelSettings.test.tsx` | 8/8 通过 | —— | 抖动 |
+
+两轮全量运行的失败集合**互不相同**（rerun 会漂移），是典型的负载相关抖动；本机同时在跑构建/浏览器冒烟。
+
+### 6.4 浏览器冒烟（升级后首次启动的真实路径）
+
+用 `pnpm build` 产物起 `vite preview`，全新 profile 打开 → 解锁 → 点 App。详见
+`evidence/smoke-notes.md` 与截图 `evidence/smoke-launcher.png`：
+
+- 预置 `spark_douban_groups` / `spark_douban_hidden` / `spark_user_id` 后 reload：三者**被启动期清理**，
+  `spark_char_handles` **保留**；
+- `window.__errs`（error / unhandledrejection / console.error）**全程为空**；
+- 桌面网格无 `Spark` 字样，「朋友圈」仍在，点开朋友圈/购物/查手机均正常渲染。
+
+## 7. 未覆盖与风险（如实）
+
+1. **worker 未部署**：`/social/*` 是先在源码删除；公共实例要重新部署 `worker/index.js` 才会消失。未部署期间旧路由仍可匿名只读访问（无鉴权面、无写操作），不影响新前端。
+2. **老用户 `theme.launcherDockOrder` 里的 `'social'`**：由 `normalizeDockOrder` 按可用 id 过滤（有单测），但没有真实「带旧布局升级」的端到端验证。
+3. **`DOCK_APPS` 现为 3 项**，第 4 格由 `normalizeDockOrder` 按 `INSTALLED_APPS` 顺序补齐。默认第 4 格放什么属于 UI 决策，已留给 UI 卡 `t_c621b16a`（已在卡片下留评论说明）。
+4. **历史数据不删**：`social_posts` 里 `origin:'gen'|'douban'` 的旧帖、`spark_social_profile` / `spark_user_bg` 两个 assets 行都保留，当前无入口可见。要不要做「历史帖导出/清理」是后续决定，本卡刻意不做破坏性删除。
+5. **`socialAppData` 备份字段仍保留**（Spark 独占部分）：为了让老备份继续带走资料/背景图。等确认全量用户都换过一版备份后才可删，这个判断不在本卡范围。
+6. **`docs/social-content/design.md` 的「复用 doubanSource」**：该设计若真要做，需要另建豆瓣适配器（已在文档里加注）。
+7. **`spark_char_handles` 键名仍带 `spark_` 前缀**：它是 Spark/Moments 共用键，改名要写迁移且会波及 `chatPrompts`；本卡按「不动共享键」处理。
+
