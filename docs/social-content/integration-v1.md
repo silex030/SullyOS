@@ -147,8 +147,8 @@ curl -A "SullyOS/1.0 (...)"  → HTTP 200 {"code":0,...}
 npx vitest run worker/social-content utils/socialContent utils/socialShare.test.ts \
   utils/messageFormat.share.test.ts utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
   worker/main-agent/src/socialProxy.test.ts components/chat/SocialShareCard.test.tsx
-→ Test Files 18 passed | 1 skipped (19)
-→ Tests      258 passed | 1 skipped (259)
+→ Test Files 19 passed | 1 skipped (20)
+→ Tests      263 passed | 1 skipped (264)
 （跳过的那 1 个是真实网络探针：只有 SOCIAL_REAL_NETWORK=1 才跑，避免把真网络混进默认 CI）
 ```
 
@@ -331,9 +331,11 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
    `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
    （模型看不到 ref，实际不可达）。属已知边界，未额外收紧。
-6. **片段是外部内容，未做提示注入消毒**：字幕/正文/评论样本由平台提供，可能夹带「忽略以上指令」
-   之类文本。本卡只保证它是纯文本、有界、来源可追溯（shareRef + contentRevision），与旧链路
-   直接注入字幕全文同级；没有额外过滤，也没有让模型据此获得任何工具/权限。
+6. **片段是外部内容**：字幕/正文/评论样本由平台提供，可能夹带「忽略以上指令」之类文本。
+   现在工具结果与卡片简介都包进 `<<<EXTERNAL_CONTENT>>>` 低信任块、内容里伪造的边界标记会被中和
+   （返工 t_42231e16 缺陷 3，见 §10），但这只是**结构护栏**，不是语义级注入检测（见 §9 第 8 条）。
+   没有额外语义过滤，也没有让模型据此获得任何工具/权限；真实供应商模型面对精心构造的注入是否
+   仍会服从，仍属未验证项。
 
 ## 9. 已知限制（必须带着交付）
 
@@ -367,6 +369,19 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 | 3 | 内容理解未闭环（字幕语义、按需检索工具、外部内容低信任隔离） | 字幕：`stateFromRecord` 产出 `transcriptState`，`resolveShares`/`service.resolveOne` 写进 `contextProjection`，`renderShareCardProjection` 对 failed/not_available/not_requested/absent 显式降级；工具：`utils/socialShareTool.ts`（cherry-pick t_75dd49a5，未重做）；低信任：`utils/socialShare.ts` 的 `EXTERNAL_UNTRUSTED_NOTICE` / `externalBlockOpen` / `sanitizeExternalText` / `wrapUntrustedContent`，`buildShareMessageProjection` 每卡包块，工具片段同样包块 | `utils/socialShare.test.ts` 新增 8 例（3 例注入边界 + 5 例字幕五态）；`utils/socialShareTool.test.ts` 新增 1 例（片段包块 + 伪造标记中和 + 预算不超卖）；`src/service.test.ts`/`chain.test.ts` 断言投影含字幕降级说明 |
 | 4 | `socialShare.ts` A-B-A 交错重复链接的 span 替换偏移 | `buildShareMessageProjection`：全局按起点升序做合法性/重叠裁剪，再**倒序一次性替换**（不再按卡片分组） | `utils/socialShare.test.ts` 新增 2 例：A-B-A 精确输出（`先看[分享 a]，再看[分享 b]，最后回到[分享 a]。`，a 出现 3 次、b 2 次）、越界/重叠 span 跳过不写错位置 |
 | 5 | 证据不完整（无类型检查/构建原始日志；真实网络与 mock 不分；无三平台真实证据） | 新增 `worker/social-content/realNetwork.probe.test.ts`（仅 `SOCIAL_REAL_NETWORK=1` 跑）、B 站 UA 修复（中性 UA，见 §5.1） | 附件 `tsc-full.log`、`vite-build.log`、`real-network-probe.log`；本文 §5/§6 引用。三平台里 B 站真实成功，抖音/XHS 如实失败并说明原因 |
+
+### 10.1 复审返工（arch-reviewer comment #51）：两条 P1 阻断项
+
+| # | 复审意见 | 修复 | 证据 |
+| --- | --- | --- | --- |
+| A | 内容理解真实链路被 `light()` 截断：`service.ts` 把所有响应卡的 `contextProjection` 清成 null，Chat 存进 `metadata.shares` 后丢 `contentRevision`/`transcriptState`，`socialShareTool` 把真实成功卡判为 unreadable、投影写成“解析中/字幕未取得”。测试直接手造完整卡不能证明聊天工具真实可用 | 新增 `worker/social-content/src/delivery.ts`：`boundedProjection()` 交付**有界**冻结投影（summary ≤400 字符、coverage ≤8 项 ×24 字符、reason ≤200，不补造缺失的 transcriptState），`lightAttachment()` 由 `service.ts`（resolve/list/get/retry）与 `handlers.ts` 共用；完整正文仍只在内容库，经 excerpts 按需取 | `src/delivery.test.ts`（新增 3 例）走真实 service（真实 SQLite）→ 真实客户端 `resolveSharesForMessage`（真实 `shareRequest` 拼 URL/header/JSON）→ Chat 同款 `metadata.shares` → `buildShareMessageProjection` → `createShareExcerptTurn`/`hasReadableShareExcerptTarget` → `executeShareExcerptToolCall` → 真实 `buildExcerpts`：断言投影带 contentRevision=1 与 transcriptState、响应不含正文深处标记、工具可注入、片段带低信任块、预算不超卖；字幕五态（available/failed/not_available/not_requested/absent）逐态断言投影文案；有界投影对脏数据夹紧 |
+| B | `safeFetch` 总期限没覆盖 DNS 后的连接阶段：DNS 花掉预算后 transport 又领一份完整 `hopBudget`，慢 DNS + 慢响应头可越过 absolute deadline（外层 resolver 的竞速不取消底层连接） | `safeFetch.ts`：连接/响应头 timer 只用 `min(hopBudget - DNS耗时, deadline - now)` 的**剩余**预算；正文到期时除 abort 外显式 `discard()` 释放底层连接；头注释写清按阶段扣减的语义 | `safeFetch.test.ts` 新增 2 例：慢 DNS(200ms)+慢响应头在总预算 300ms 内 TIMEOUT 且断言 abort 发生时刻不越过 deadline（旧实现 ≈500ms，测试会失败）、正文到期 discard 记录 `['200']`；原有 DNS/正文/慢重定向链/SSRF/discard 回归全保留 |
+
+本轮改动文件：
+`worker/social-content/src/delivery.ts`(新)、`src/delivery.test.ts`(新)、`src/service.ts`、`src/service.test.ts`、
+`handlers.ts`、`handlers.test.ts`、`safeFetch.ts`、`safeFetch.test.ts`、`worker/social-content/worker.bundle.js`(重建)、本文。
+
+模型/provider 与边界审计：见附件 `model-boundary-audit.log`（脱敏；未读取任何密钥）。
 
 ## 11. 发布步骤（本卡未执行，交发布流程）
 

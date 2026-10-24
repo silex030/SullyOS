@@ -11,12 +11,13 @@
  *  - 401/403/404/409/422/429/503 一律如实返回，不伪装成功。
  */
 
-import type { ContentRecord, ExcerptsRequest, ShareAttachment } from '../../utils/socialContent/types';
+import type { ContentRecord, ExcerptsRequest } from '../../utils/socialContent/types';
 import { SHARE_REQUEST_LIMITS } from '../../utils/socialContent/types';
 import type { ResolveDeps, ShareStore } from './resolver';
 import { planRetry, resolveShares } from './resolver';
 import { buildExcerpts } from './excerpts';
 import { asSocialError, RevisionConflictError, SocialError, VersionUnavailableError } from './errors';
+import { lightAttachment } from './src/delivery';
 
 export interface HandlerDeps extends ResolveDeps {
   store: ShareStore;
@@ -66,10 +67,7 @@ function fail(err: unknown): HandlerResult {
   };
 }
 
-/** 只回轻量字段：GET /shares 不返回正文（契约 4.2）。 */
-function lightAttachment(a: ShareAttachment): ShareAttachment {
-  return { ...a, contextProjection: null };
-}
+/** 轻量响应口径与 src/delivery.ts 共用：不返回正文，但保留有界冻结投影（返工 P1）。 */
 
 export function createSocialHandlers(deps: HandlerDeps) {
   const now = deps.now ?? (() => Date.now());

@@ -154,12 +154,29 @@ describe('GET /shares', () => {
     expect((await handlers.get('public', 'shr_missing')).status).toBe(404);
   });
 
-  it('列表不返回 contextProjection（只轻量字段）', async () => {
+  it('列表不返回正文，但保留有界冻结投影（版本/字幕语义随响应到达客户端）', async () => {
     const { handlers } = setup();
     await handlers.resolve('public', resolveBody(`https://www.bilibili.com/video/${BV}`));
     const listed = await handlers.list('public', 'conv-1', 'msg-1');
     const att = (listed.body as { attachments: ShareAttachment[] }).attachments[0];
-    expect(att.contextProjection).toBeNull();
+    // 返工 P1：投影不再被清成 null——客户端要靠它注入 read_share_excerpts / 渲染字幕降级。
+    expect(att.contextProjection).not.toBeNull();
+    expect(att.contextProjection?.contentRevision).toBe(1);
+    expect(att.contextProjection?.summaryText ?? '').toContain('夹具标题');
+    // 仍然轻量：只有投影字段（简介是有界的本地摘录），没有正文/内容记录本身
+    expect(Object.keys(att.contextProjection!).sort()).toEqual([
+      'contentId',
+      'contentRevision',
+      'evidenceCoverage',
+      'frozenAt',
+      'projectionVersion',
+      'reason',
+      'shareRef',
+      'stateAtFreeze',
+      'summaryText',
+      'transcriptState',
+    ]);
+    expect(JSON.stringify(att.contextProjection).length).toBeLessThan(600);
   });
 });
 

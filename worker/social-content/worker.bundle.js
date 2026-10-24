@@ -837,7 +837,12 @@ async function safeGet(rawUrl, deps, policy) {
     const ipCheck = checkResolvedAddresses(addresses);
     if (!ipCheck.ok) throw new SocialError("UNSAFE_URL", `dns_${ipCheck.reason}`);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), hopBudget);
+    const afterDns = now();
+    const connectBudget = Math.max(
+      1,
+      Math.min(hopBudget - (afterDns - hopStart), deadline == null ? Number.POSITIVE_INFINITY : deadline - afterDns)
+    );
+    const timer = setTimeout(() => controller.abort(), connectBudget);
     try {
       let res;
       try {
@@ -886,6 +891,10 @@ async function safeGet(rawUrl, deps, policy) {
       const body = await new Promise((resolve, reject2) => {
         const bodyTimer = setTimeout(() => {
           controller.abort();
+          try {
+            res.discard?.();
+          } catch {
+          }
           reject2(new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true }));
         }, bodyBudget);
         res.readBody(maxBytes).then(
@@ -2458,6 +2467,52 @@ function planRetry(existing, expectedRevision, now) {
   };
 }
 
+// worker/social-content/src/delivery.ts
+var PROJECTION_DELIVERY_LIMITS = {
+  summaryChars: 400,
+  coverageEntries: 8,
+  coverageEntryChars: 24,
+  reasonChars: 200
+};
+var TRANSCRIPT_STATES = /* @__PURE__ */ new Set([
+  "available",
+  "failed",
+  "not_available",
+  "not_requested",
+  "absent"
+]);
+function clip(value, maxChars) {
+  if (typeof value !== "string") return "";
+  return Array.from(value).slice(0, maxChars).join("");
+}
+function finiteNumberOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function boundedProjection(attachment) {
+  const projection = attachment?.contextProjection;
+  if (!projection) return null;
+  const contentRevision = typeof projection.contentRevision === "number" && Number.isFinite(projection.contentRevision) ? projection.contentRevision : null;
+  const coverage = Array.isArray(projection.evidenceCoverage) ? projection.evidenceCoverage : [];
+  const delivered = {
+    projectionVersion: finiteNumberOr(projection.projectionVersion, 1),
+    shareRef: attachment.shareRef,
+    contentId: typeof projection.contentId === "string" ? projection.contentId : attachment.contentId,
+    contentRevision,
+    stateAtFreeze: projection.stateAtFreeze ?? attachment.state,
+    summaryText: clip(projection.summaryText, PROJECTION_DELIVERY_LIMITS.summaryChars),
+    evidenceCoverage: coverage.slice(0, PROJECTION_DELIVERY_LIMITS.coverageEntries).map((entry) => clip(entry, PROJECTION_DELIVERY_LIMITS.coverageEntryChars)).filter(Boolean),
+    reason: projection.reason ? clip(projection.reason, PROJECTION_DELIVERY_LIMITS.reasonChars) : null,
+    frozenAt: finiteNumberOr(projection.frozenAt, 0)
+  };
+  if (typeof projection.transcriptState === "string" && TRANSCRIPT_STATES.has(projection.transcriptState)) {
+    delivered.transcriptState = projection.transcriptState;
+  }
+  return delivered;
+}
+function lightAttachment(attachment) {
+  return { ...attachment, contextProjection: boundedProjection(attachment) };
+}
+
 // worker/social-content/handlers.ts
 var HTTP_BY_CODE = {
   INVALID_URL: 422,
@@ -2500,9 +2555,6 @@ function fail(err) {
       retryable: !["AUTH_REQUIRED", "SOURCE_NOT_CONFIGURED", "SHARE_LINKS_DISABLED"].includes(social.code)
     }
   };
-}
-function light(a) {
-  return { ...a, contextProjection: null };
 }
 function createSocialService(deps) {
   const now = deps.now ?? (() => Date.now());
@@ -2557,7 +2609,7 @@ function createSocialService(deps) {
             status: 503,
             body: {
               error: "PERSISTENCE_UNAVAILABLE",
-              attachments: result.attachments.map(light),
+              attachments: result.attachments.map(lightAttachment),
               pollAfterMs: result.pollAfterMs
             }
           };
@@ -2565,7 +2617,7 @@ function createSocialService(deps) {
         return {
           status: 202,
           body: {
-            attachments: result.attachments.map(light),
+            attachments: result.attachments.map(lightAttachment),
             pollAfterMs: result.pollAfterMs,
             droppedOverLimit: result.droppedOverLimit
           }
@@ -2582,7 +2634,7 @@ function createSocialService(deps) {
         if (!conversationId || !messageId) throw new SocialError("INVALID_URL", "missing_ids");
         const attachments = await scoped(scope).listByMessage(messageId);
         const filtered = attachments.filter((a) => a.conversationId === conversationId);
-        return { status: 200, body: { attachments: filtered.map(light) } };
+        return { status: 200, body: { attachments: filtered.map(lightAttachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -2594,7 +2646,7 @@ function createSocialService(deps) {
       try {
         const attachment = await scoped(scope).get(shareRef);
         if (!attachment) return { status: 404, body: { error: "CONTENT_NOT_FOUND" } };
-        return { status: 200, body: { attachment: light(attachment) } };
+        return { status: 200, body: { attachment: lightAttachment(attachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -2628,7 +2680,7 @@ function createSocialService(deps) {
         } catch {
         }
         const resolved = await resolveOne(st, planned, scope, baseRevision);
-        return { status: 202, body: { attachment: light(resolved) } };
+        return { status: 202, body: { attachment: lightAttachment(resolved) } };
       } catch (err) {
         return fail(err);
       }

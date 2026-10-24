@@ -13,6 +13,9 @@
  *  - policy.deadline 是**整条链路**的绝对截止时间（DNS + 连接 + 每跳 + 读完正文）。
  *    旧实现只给 transport 挂定时器，DNS 解析和 readBody 完全在预算之外，一个慢 DNS
  *    或慢速滴流的正文就能把 20s 的 resolve 拖过期限。
+ *  - 同一笔预算按阶段扣减：DNS 花掉的时间从连接预算里扣掉（连接 timer 只拿剩余），
+ *    正文再扣掉 DNS+响应头的时间；任何一段到期都 abort 并释放底层连接，
+ *    不会出现“DNS 慢 + 响应头慢”两段各自领满预算、加起来越过 deadline 的情况。
  *  - 没有 deadline 时退化为 perRequestTimeoutMs 的逐跳预算（行为与旧版大致等价，
  *    但正文读取也被预算约束，不再无限等待）。
  *  - 所有分支（重定向、非 2xx、超时、抛错）都在 finally 里清定时器；需要丢弃响应体时
@@ -159,7 +162,15 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
     if (!ipCheck.ok) throw new SocialError('UNSAFE_URL', `dns_${ipCheck.reason}`);
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), hopBudget);
+    // 连接/响应头阶段只能花 DNS 之后**剩余**的预算：不能重新领一份 hopBudget。
+    // 旧实现这里又给了一个完整 hopBudget 的 timer，慢 DNS（比如 12s）+ 慢响应头（8s）
+    // 就能越过 absolute deadline，而外层 resolver 的 Promise 竞速并不会取消这条连接。
+    const afterDns = now();
+    const connectBudget = Math.max(
+      1,
+      Math.min(hopBudget - (afterDns - hopStart), deadline == null ? Number.POSITIVE_INFINITY : deadline - afterDns),
+    );
+    const timer = setTimeout(() => controller.abort(), connectBudget);
     try {
       let res: TransportResponse;
       try {
@@ -215,6 +226,13 @@ export async function safeGet(rawUrl: string, deps: SafeFetchDeps, policy: SafeF
       const body = await new Promise<{ text: string; bytes: number; truncated: boolean }>((resolve, reject) => {
         const bodyTimer = setTimeout(() => {
           controller.abort();
+          // 到期就释放底层连接：transport 未必理会 signal（测试桩/第三方实现），
+          // 不主动 discard 会让一条半读的 keep-alive socket 活到进程退出。
+          try {
+            res.discard?.();
+          } catch {
+            /* 释放失败不影响超时语义 */
+          }
           reject(new SocialError('TIMEOUT', 'body_timeout', { autoRetryable: true }));
         }, bodyBudget);
         res.readBody(maxBytes).then(

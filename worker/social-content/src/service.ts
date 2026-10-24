@@ -27,6 +27,7 @@ import { HTTP_BY_CODE } from '../handlers';
 import { buildLocalSummary, planRetry, resolveShares, stateFromRecord } from '../resolver';
 import type { ScopedSocialStore, SocialStoreRoot } from './store';
 import { PersistenceUnavailable } from './store';
+import { lightAttachment } from './delivery';
 import type { SocialServiceConfig } from './config';
 import { SHARE_SCHEMA_VERSION } from '../../../utils/socialContent/types';
 
@@ -65,10 +66,11 @@ function fail(err: unknown): ServiceResult {
   };
 }
 
-/** 只回轻量字段：列表/单卡不返回投影正文（契约 4.2）。 */
-function light(a: ShareAttachment): ShareAttachment {
-  return { ...a, contextProjection: null };
-}
+/**
+ * 轻量响应的口径：不返回正文/完整材料，但**必须**带回有界冻结投影（见 src/delivery.ts）。
+ * 投影不是正文——它是版本号 + 字幕语义 + 一句简介；客户端要靠它注入 read_share_excerpts
+ * 并渲染“字幕未提供/获取失败”的降级说明。清成 null 会让所有真实成功卡变成“不可读”。
+ */
 
 export function createSocialService(deps: SocialServiceDeps) {
   const now = deps.now ?? (() => Date.now());
@@ -130,7 +132,7 @@ export function createSocialService(deps: SocialServiceDeps) {
             status: 503,
             body: {
               error: 'PERSISTENCE_UNAVAILABLE',
-              attachments: result.attachments.map(light),
+              attachments: result.attachments.map(lightAttachment),
               pollAfterMs: result.pollAfterMs,
             },
           };
@@ -140,7 +142,7 @@ export function createSocialService(deps: SocialServiceDeps) {
         return {
           status: 202,
           body: {
-            attachments: result.attachments.map(light),
+            attachments: result.attachments.map(lightAttachment),
             pollAfterMs: result.pollAfterMs,
             droppedOverLimit: result.droppedOverLimit,
           },
@@ -158,7 +160,7 @@ export function createSocialService(deps: SocialServiceDeps) {
         if (!conversationId || !messageId) throw new SocialError('INVALID_URL', 'missing_ids');
         const attachments = await scoped(scope).listByMessage(messageId);
         const filtered = attachments.filter((a) => a.conversationId === conversationId);
-        return { status: 200, body: { attachments: filtered.map(light) } };
+        return { status: 200, body: { attachments: filtered.map(lightAttachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -171,7 +173,7 @@ export function createSocialService(deps: SocialServiceDeps) {
       try {
         const attachment = await scoped(scope).get(shareRef);
         if (!attachment) return { status: 404, body: { error: 'CONTENT_NOT_FOUND' } };
-        return { status: 200, body: { attachment: light(attachment) } };
+        return { status: 200, body: { attachment: lightAttachment(attachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -209,7 +211,7 @@ export function createSocialService(deps: SocialServiceDeps) {
           // 租约不可用（存储异常）：照旧按 revision CAS 重跑，最坏是重复抓一次
         }
         const resolved = await resolveOne(st, planned, scope, baseRevision);
-        return { status: 202, body: { attachment: light(resolved) } };
+        return { status: 202, body: { attachment: lightAttachment(resolved) } };
       } catch (err) {
         return fail(err);
       }

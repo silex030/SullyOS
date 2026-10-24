@@ -162,8 +162,12 @@ describe('social-content service', () => {
     expect(att.state).toBe('ready');
     expect(att.contentId).toBe('bilibili:public:BV1xx411c7mD');
     expect(att.openUrl).toBe('https://www.bilibili.com/video/BV1xx411c7mD');
-    // 列表接口不回投影正文（轻量），但库里必须有冻结投影
-    expect(att.contextProjection).toBeNull();
+    // 轻量响应（不返正文）但必须带回有界冻结投影：客户端靠 contentRevision 注入工具、
+    // 靠 transcriptState 渲染“字幕未提供”。（返工 P1）
+    expect(att.contextProjection).not.toBeNull();
+    expect(att.contextProjection.contentRevision).toBe(1);
+    expect(att.contextProjection.transcriptState).toBe('available');
+    expect(JSON.stringify(att.contextProjection)).not.toContain('第一句字幕'); // 正文/字幕正文不进响应
     const stored = await new D1SocialStore(db as never).forScope('deployment').get(att.shareRef);
     expect(stored?.contextProjection?.summaryText).toContain('UP主');
     expect(stored?.contextProjection?.evidenceCoverage).toContain('transcript');

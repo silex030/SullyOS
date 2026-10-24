@@ -341,4 +341,74 @@ describe('全链路期限（DNS + 连接 + 正文）', () => {
     });
     expect(res.text).toBe('ok');
   });
+
+  /**
+   * 返工 P1 的组合慢路径：旧实现先给 DNS 一份 hopBudget，DNS 之后再给 transport
+   * 一份**完整**的 hopBudget，两段各自合法、加起来越过 absolute deadline。
+   * 现在连接阶段的 timer 只拿 DNS 之后的剩余预算，到期 abort（释放底层连接）。
+   */
+  it('慢 DNS + 慢响应头：连接阶段只用剩余预算，总耗时在 absolute deadline 附近 TIMEOUT', async () => {
+    const TOTAL = 300;
+    const DNS_MS = 200;
+    const started = Date.now();
+    let abortedAt = 0;
+    let transportCalls = 0;
+    const deps: SafeFetchDeps = {
+      resolve: async () => {
+        await new Promise((r) => setTimeout(r, DNS_MS));
+        return ['93.184.216.34'];
+      },
+      transport: (req) =>
+        new Promise<TransportResponse>((_resolve, reject) => {
+          transportCalls += 1;
+          req.signal.addEventListener('abort', () => {
+            abortedAt = Date.now();
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+          // 永远不返回响应头：旧实现会在这里再等满一个 hopBudget（300ms）
+        }),
+    };
+
+    await expect(
+      safeGet('https://www.bilibili.com/x', deps, {
+        allowedHosts: HOSTS,
+        perRequestTimeoutMs: TOTAL,
+        deadline: started + TOTAL,
+      }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT' });
+
+    const elapsed = Date.now() - started;
+    expect(transportCalls).toBe(1);
+    // 到期真的 abort 了底层连接（不是只 reject 外层 Promise 把 socket 留着）
+    expect(abortedAt).toBeGreaterThan(0);
+    // 新实现 ≈ DNS(200) + 剩余连接预算(100) = 300ms；旧实现 ≈ 500ms（200 + 完整 300）
+    expect(abortedAt - started).toBeLessThan(TOTAL + 80);
+    expect(elapsed).toBeLessThan(TOTAL + 80);
+    // 也不能提前误杀：必须给到接近 deadline 的时间
+    expect(elapsed).toBeGreaterThanOrEqual(TOTAL - 60);
+  });
+
+  it('正文到期中止并显式 discard，释放底层连接', async () => {
+    const discarded: string[] = [];
+    const deps: SafeFetchDeps = {
+      resolve: async () => ['93.184.216.34'],
+      transport: async (): Promise<TransportResponse> => ({
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+        discard: () => {
+          discarded.push('200');
+        },
+        // 正文永远读不完（慢速滴流的极端形态）
+        readBody: () => new Promise<{ text: string; bytes: number; truncated: boolean }>(() => {}),
+      }),
+    };
+    const started = Date.now();
+    await expect(
+      safeGet('https://www.bilibili.com/x', deps, { allowedHosts: HOSTS, deadline: started + 60 }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT', reason: 'body_timeout' });
+    expect(discarded).toEqual(['200']);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
 });
