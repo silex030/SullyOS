@@ -775,10 +775,26 @@ const Settings: React.FC = () => {
   }, []);
   useEffect(() => {
       if (!showRealtimeModal || !realtimeMapFocus) return;
-      const el = realtimeMapGroupRef.current;
-      try { el?.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { /* jsdom 无布局，忽略 */ }
-      const timer = setTimeout(() => setRealtimeMapFocus(false), 1500);
-      return () => clearTimeout(timer);
+      // 弹窗自己的滚动容器不一定是 window：先找最近的纵向滚动父级，直接改 scrollTop；
+      // 找不到才退回 scrollIntoView。等两帧，避开弹窗首帧高度未定的抖动。
+      const scrollToGroup = () => {
+          const el = realtimeMapGroupRef.current;
+          if (!el) return;
+          let parent: HTMLElement | null = el.parentElement;
+          while (parent) {
+              const style = window.getComputedStyle(parent);
+              if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 8) {
+                  parent.scrollTop = el.offsetTop - parent.clientTop - 24;
+                  return;
+              }
+              parent = parent.parentElement;
+          }
+          try { el.scrollIntoView({ block: 'center' }); } catch { /* jsdom 无布局，忽略 */ }
+      };
+      let inner = 0;
+      const outer = requestAnimationFrame(() => { inner = requestAnimationFrame(scrollToGroup); });
+      const timer = setTimeout(() => setRealtimeMapFocus(false), 1600);
+      return () => { cancelAnimationFrame(outer); cancelAnimationFrame(inner); clearTimeout(timer); };
   }, [showRealtimeModal, realtimeMapFocus]);
   const [showMcpModal, setShowMcpModal] = useState(false);
   const [showMcpHelp, setShowMcpHelp] = useState(false);
@@ -3864,7 +3880,7 @@ const Settings: React.FC = () => {
                             tabIndex={isMap ? 0 : undefined}
                             onClick={isMap ? () => { setRealtimeMapFocus(true); setShowRealtimeModal(true); } : undefined}
                             title={isMap
-                                ? `${cap.label}：${mapReadiness.detail}（点开可填写服务端凭据）`
+                                ? `${cap.label} · ${mapReadiness.detail}（点开可填写服务端凭据）`
                                 : `${cap.label}：${cap.description}${st === 'pending' ? '（已启用但未配置完成）' : ''}`}
                             className={`py-3 rounded-xl text-xs font-bold flex flex-col items-center justify-center gap-0.5 ${st === 'on' ? cap.tint : cap.tintIdle}${isMap ? ' cursor-pointer active:scale-95 transition-transform' : ''}`}
                         >
