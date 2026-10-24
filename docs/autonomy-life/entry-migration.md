@@ -60,8 +60,8 @@ components/autonomy-life/*         入口卡 + 工作区三个 tab + 账号总�
 ```bash
 cd /root/SullyOS-autonomy-ui
 
-# 组件/状态测试
-./node_modules/.bin/vitest run components/autonomy-life
+# 组件/状态测试 + 客户端契约测试
+./node_modules/.bin/vitest run components/autonomy-life utils/autonomyLife
 
 # 截图壳（只在 dev 下按路径访问，不进构建产物）
 ./node_modules/.bin/vite --port 5199 --host 127.0.0.1
@@ -105,3 +105,17 @@ cd /root/SullyOS-autonomy-ui
    本卡用的是 `utils/autonomyLife/api.ts`。合并后应保留 `api.ts` 并删除未被引用的 `client.ts`，
    否则同一契约出现两个 SDK。
 4. **截图只覆盖 fixture 状态**：真实账号数据（含多角色、真实 worker）未验证。
+
+## 7. 本次验证记录（在本机真实执行）
+
+| 项 | 命令 | 结果 |
+| --- | --- | --- |
+| 组件/页面/客户端测试 | `vitest run components/autonomy-life utils/autonomyLife` | **3 文件 / 37 用例全绿** |
+| 相关既有测试（airp / wiring / 设置） | `vitest run components/autonomy-life utils/airp utils/activeMsgClient.wiring.test.ts utils/exportShareAudit.test.ts utils/apiPresetSwitch.wiring.test.ts utils/settingsLocalVoiceLabel.test.ts utils/amsgStateSync.wiring.test.ts utils/journalAppearance.test.ts` | **39 文件 / 794 用例全绿** |
+| 类型检查（全仓） | `tsc --noEmit -p tsconfig.json` | 56 条错误，**与基线（`f7f040c7` 干净副本）逐行同集合，本卡新增 0 条** |
+| 生产构建 | `vite build` | 见本次提交说明/日志；`docs/autonomy-life/preview/` 不是入口，不进产物 |
+
+客户端测试覆盖的是「失败时怎么办」而不是后端语义：未配置不发请求、缺信封/形状不符/串号
+一律 `MALFORMED_RESPONSE`、401/429 原样透传、旧频率字段本地拒发、写请求带 `expectedRevision`
+与幂等键。其中一条测试当场暴露了 `isBudgetUsage` 只校验 `typeof dimension === 'string'` 的漏洞
+（未知维度会一路传到展示层），已改为白名单校验。
