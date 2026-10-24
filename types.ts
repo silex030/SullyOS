@@ -20,7 +20,6 @@ export enum AppID {
   Schedule = 'schedule',
   Room = 'room',
   CheckPhone = 'check_phone',
-  Social = 'social',
   Moments = 'moments',
   Study = 'study',
   FAQ = 'faq',
@@ -4025,7 +4024,7 @@ export interface SocialPost {
     bgStyle?: string;
     authorType?: 'user' | 'character' | 'stranger';
     authorCharId?: string;
-    /** 帖子来源：'gen'（默认，AI 生成/用户发布）| 'douban'（豆瓣小组真实帖子）| 'mastodon'（读回来的 toot / 同步出去且有远端 id 的帖子）| 'moments'（朋友圈手发本地帖，不进 Spark 广场） */
+    /** 帖子来源：'gen'（默认，AI 生成/用户发布）| 'douban'（豆瓣小组真实帖子，2026-10-24 起不再新增，仅历史数据）| 'mastodon'（读回来的 toot / 同步出去且有远端 id 的帖子）| 'moments'（朋友圈手发本地帖） */
     origin?: 'gen' | 'douban' | 'mastodon' | 'moments';
     /** Mastodon 远端 status id（双向去重键，读回/发出都要写） */
     mastodonStatusId?: string;

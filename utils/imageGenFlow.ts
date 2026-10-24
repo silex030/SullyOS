@@ -62,7 +62,7 @@ export interface ImageGenFlowDeps {
 
 /**
  * 生图内核的依赖子集：只关心「按谁的外貌画 / 怎么调 latent / 档案改完写哪」。
- * Spark 帖子首图这类不落聊天消息的场景传这一份就够。
+ * 不落聊天消息的场景（例如朋友圈封面）传这一份就够。
  */
 export interface ImageGenCoreDeps {
     apiConfig: APIConfig;
@@ -84,7 +84,7 @@ export interface ImageGenCoreResult {
 const DEFAULT_NEGATIVE_PROMPT = 'lowres, blurry, watermark, text, deformed, worst quality';
 
 /**
- * 默认质量提示词：**所有**生图（聊天自动 / 主动消息 / Spark 首图 / 相册）统一前置，
+ * 默认质量提示词：**所有**生图（聊天自动 / 主动消息 / 动态封面 / 相册）统一前置，
  * 见 generateImageBlobOnly —— 那是全项目唯一的生图入口，别在别的路径上再拼一次。
  */
 export const DEFAULT_QUALITY_PROMPT = 'masterpiece, best quality, amazing quality, very aesthetic, absurdres';
@@ -268,7 +268,7 @@ function buildGalleryChatContext(char: CharacterProfile, userName: string, conte
 
 /**
  * 只生成一张图并落 Blob（返回 blobref 令牌），不写聊天记录、不进相册——
- * Spark 帖子首图这类场景复用。与 runImageGenReply 共用同一套外貌档案替换 /
+ * 动态封面这类场景复用。与 runImageGenReply 共用同一套外貌档案替换 /
  * 串行排队 / 默认负面词；缺 Key 直接抛错（提示语与聊天路径一致，可直接 toast）。
  */
 export async function generateImageBlobOnly(

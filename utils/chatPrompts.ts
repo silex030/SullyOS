@@ -1579,7 +1579,7 @@ ${(await resolveVoiceActingGuide()) ?? ''}`;
                 }
                 else if (m.type === 'social_card') {
                     const post = m.metadata?.post || {};
-                    // Look up this character's own Spark handles (sub-accounts) so the model can
+                    // Look up this character's own feed handles (sub-accounts) so the model can
                     // recognise when a post or comment in the shared card was authored by itself.
                     let myHandles: string[] = [];
                     try {
@@ -1605,15 +1605,15 @@ ${(await resolveVoiceActingGuide()) ?? ''}`;
 
                     let identityHint = '';
                     if (myHandles.length > 0) {
-                        identityHint = `\n(你在 Spark 上的马甲: ${myHandles.map(h => `"${h}"`).join(', ')}。如果上面的楼主或评论作者出现这些名字，那就是你自己发的，请按此自洽回应，不要把自己的马甲当陌生人。)`;
+                        identityHint = `\n(你在动态里的马甲: ${myHandles.map(h => `"${h}"`).join(', ')}。如果上面的楼主或评论作者出现这些名字，那就是你自己发的，请按此自洽回应，不要把自己的马甲当陌生人。)`;
                     }
                     const authoredByChar = myHandleSet.has(post.authorName);
                     const authoredByUser = (post.authorName || '') === userName;
                     let authorshipLine = '';
-                    if (authoredByChar) authorshipLine = '\n(注意：这条 Spark 笔记的楼主是你自己的马甲，用户在向你转发你自己发的帖子。)';
-                    else if (authoredByUser) authorshipLine = '\n(注意：这条 Spark 笔记是用户本人发的。)';
+                    if (authoredByChar) authorshipLine = '\n(注意：这条笔记的楼主是你自己的马甲，用户在向你转发你自己发的帖子。)';
+                    else if (authoredByUser) authorshipLine = '\n(注意：这条笔记是用户本人发的。)';
 
-                    content = `${timeStr} [用户分享了 Spark 笔记]\n楼主: ${postAuthorTag}\n标题: ${post.title}\n内容: ${post.content}\n热评: ${commentsSample}${identityHint}${authorshipLine}\n(请根据你的性格对这个帖子发表看法，比如吐槽、感兴趣或者不屑)`;
+                    content = `${timeStr} [用户分享了笔记]\n楼主: ${postAuthorTag}\n标题: ${post.title}\n内容: ${post.content}\n热评: ${commentsSample}${identityHint}${authorshipLine}\n(请根据你的性格对这个帖子发表看法，比如吐槽、感兴趣或者不屑)`;
                 }
                 else if ((m.type as string) === 'xhs_card') {
                     const note = m.metadata?.xhsNote || {};
