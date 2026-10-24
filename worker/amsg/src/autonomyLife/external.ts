@@ -123,6 +123,59 @@ export interface ExternalReadResult {
   fetchedAt: number;
 }
 
+/** 提前拒绝时把响应体关掉，不让慢流继续占着连接与内存。 */
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    /* 已经消费/已关闭：没有可清理的 */
+  }
+}
+
+/**
+ * 流式读响应体，按**字节**计数（不是 JS 字符数）。
+ *
+ * 为什么不用 `response.text()`：那是一次性全量缓冲，Content-Length 缺失（chunked）时
+ * 攻击者/异常上游可以用一个超大响应先把内存吃满，事后再判断长度已经来不及。这里每次
+ * `read()` 累加 `byteLength`，一超上限立刻 cancel reader 并拒绝。
+ *
+ * 超时由调用方的 AbortController 覆盖整个 fetch + body（计时器在读完 body 之后才清），
+ * 所以「响应头立刻回来、body 永远不来」也会在 EXTERNAL_TIMEOUT_MS 内被 abort。
+ */
+export async function readBodyLimited(args: {
+  response: Response;
+  signal: AbortSignal;
+  maxBytes: number;
+}): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+  const body = args.response.body;
+  if (!body) return { ok: false, reason: 'external_body_unreadable' };
+  const reader = body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let text = '';
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > args.maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, reason: 'response_too_large' };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return {
+      ok: false,
+      reason: args.signal.aborted ? 'external_timeout' : 'external_body_unreadable',
+    };
+  }
+  return { ok: true, text };
+}
+
 export async function handleExternalRead(args: {
   provider: ExternalProvider;
   query: string;
@@ -131,6 +184,8 @@ export async function handleExternalRead(args: {
   allowedHosts: readonly string[];
   fetch?: typeof globalThis.fetch;
   nowMs: number;
+  /** 测试可覆盖；默认 EXTERNAL_TIMEOUT_MS。 */
+  timeoutMs?: number;
 }): Promise<{ ok: true; result: ExternalReadResult } | { ok: false; code: AutonomyLifeErrorCode; reason: string }> {
   const endpoint = String(args.endpoint ?? '').trim();
   if (!endpoint) return { ok: false, code: 'CAPABILITY_UNAVAILABLE', reason: 'external_endpoint_unconfigured' };
@@ -144,8 +199,9 @@ export async function handleExternalRead(args: {
   const url = new URL(safe.url.toString());
   url.searchParams.set('q', args.query);
 
+  // 计时器覆盖 fetch + body 全程（只在整段结束后清），否则「头到了 body 不来」会挂死。
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), EXTERNAL_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
   let response: Response;
   try {
     response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
@@ -155,31 +211,46 @@ export async function handleExternalRead(args: {
       signal: controller.signal,
     });
   } catch {
+    clearTimeout(timer);
     return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'external_fetch_failed' };
+  }
+
+  try {
+    // 3xx 一律不跟：重定向是绕过 allowlist 的经典手法。
+    if (response.status >= 300 && response.status < 400) {
+      await discardBody(response);
+      return { ok: false, code: 'POLICY_DENIED', reason: 'redirect_not_followed' };
+    }
+    if (!response.ok) {
+      await discardBody(response);
+      return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: `external_http_${response.status}` };
+    }
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+      await discardBody(response);
+      return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'response_too_large' };
+    }
+    const limited = await readBodyLimited({
+      response,
+      signal: controller.signal,
+      maxBytes: EXTERNAL_MAX_BYTES,
+    });
+    if (!limited.ok) {
+      return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: limited.reason };
+    }
+    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
   } finally {
     clearTimeout(timer);
   }
+}
 
-  // 3xx 一律不跟：重定向是绕过 allowlist 的经典手法。
-  if (response.status >= 300 && response.status < 400) {
-    return { ok: false, code: 'POLICY_DENIED', reason: 'redirect_not_followed' };
-  }
-  if (!response.ok) {
-    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: `external_http_${response.status}` };
-  }
-  const declared = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
-    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'response_too_large' };
-  }
-  let text = '';
-  try {
-    text = await response.text();
-  } catch {
-    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'external_body_unreadable' };
-  }
-  if (text.length > EXTERNAL_MAX_BYTES) {
-    return { ok: false, code: 'SERVICE_UNAVAILABLE', reason: 'response_too_large' };
-  }
+function finishRead(args: {
+  text: string;
+  provider: ExternalProvider;
+  fields: readonly string[];
+  nowMs: number;
+}): { ok: true; result: ExternalReadResult } | { ok: false; code: AutonomyLifeErrorCode; reason: string } {
+  const text = args.text;
   let payload: unknown;
   try {
     payload = JSON.parse(text);
