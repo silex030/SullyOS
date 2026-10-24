@@ -286,6 +286,8 @@ worker/amsg/src/autonomyScheduler.test.ts
    `amap` / `xhs` grant。出行 tick 的 `travelModelAccess`、旧回合的 `reserveLegacyRoundCall`
    （`kind` 参数）与 `reserveLegacyEffect` 都走这道闸；`reserveLegacyEffect` 另外用
    `consumeExternalQuota` 原子扣授权窗口的 `dailyQuota`（0 / 耗尽 → 拒）。
+   授权窗口的当日额度用完时，`travelModelAccess` 在**建 wiring 时**就直接不装 `decisionPort`
+   ——连模型都不问（问了也落不了愿望，白烧一次调用）。
 2. **出行模型返回后的当前效果门**（`travelGate.ts` 的 `gated`）：
    预留 → 调模型 → 结算（`settleLegacyRoundCall`，被拒即抛错）→ 现读边界 + 授权复核 →
    一次性效果核销（意图探针走 `reserveLegacyEffect` 占 kind 配额；选点/分段走
