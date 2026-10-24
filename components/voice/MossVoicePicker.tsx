@@ -18,6 +18,13 @@ export interface MossVoicePickerProps {
   status: MossVoiceStatus | null;
   /** 全局音色 ID，用于「继承全局（当前：…）」的说明。 */
   globalVoiceId?: string;
+  /**
+   * 探活是否成功（null/undefined = 还没探测完）。
+   * 用来区分「连不上主代理」和「连上了但服务端没注册音色」——两种空态要用户做的事完全不同。
+   */
+  reachable?: boolean | null;
+  /** 探活失败的原因（人话，不含地址/令牌原值）。 */
+  probeError?: string;
   showInherit?: boolean;
   onRefresh?: () => void;
   refreshing?: boolean;
@@ -37,6 +44,8 @@ export default function MossVoicePicker({
   onChange,
   status,
   globalVoiceId = '',
+  reachable = null,
+  probeError = '',
   showInherit = false,
   onRefresh,
   refreshing = false,
@@ -104,6 +113,12 @@ export default function MossVoicePicker({
     : '当前：服务端默认音色';
 
   if (options.length === 0) {
+    // 三种空态必须分开说，否则用户无法判断该去改地址/令牌、还是去注册参考音频：
+    //   1. 还在探测（status 为空）      → 正在检测
+    //   2. 探活失败（reachable=false）  → 连不上主代理，给原因 + 重新检测
+    //   3. 探活成功但没有音色           → 服务端没注册参考音频（不是网络问题）
+    const probing = status === null && reachable === null;
+    const unreachable = reachable === false;
     return (
       <div className="space-y-2">
         <div className="flex items-center gap-2 flex-wrap">
@@ -120,8 +135,12 @@ export default function MossVoicePicker({
           )}
         </div>
         <p className="text-[11px] text-slate-500 leading-relaxed">
-          还没有可选音色：主代理没连上、本机语音未就绪，或服务端没有注册任何参考音频。
-          这一步不会自己编一个音色出来。
+          {probing
+            ? '正在检测本机音色…（读取主代理的音色目录，不跑模型）'
+            : unreachable
+              ? `读不到本机音色目录：${probeError || '连不上主代理'}。点「重新检测」重试；仍不行就去「设置 → 其他 API → 主代理中转」核对地址与令牌。`
+              : '已连上主代理，但服务端还没有注册任何参考音频：把 3-15 秒干净中文 WAV 放到本机音色的参考目录后，点「重新检测」。'}
+          {!probing && !unreachable && ' 这一步不会自己编一个音色出来。'}
         </p>
       </div>
     );

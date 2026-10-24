@@ -98,14 +98,28 @@ describe('MossVoicePicker：角色/全局共用的音色列表与 2 秒试听', 
     unmount();
   });
 
-  it('空目录 / 未探到时给清晰空态，不出现任何前端硬编码音色', () => {
+  it('空态分三种：探测中 / 连不上（带原因与重试）/ 连上但没注册音色', () => {
     const empty = normalizeMossVoiceHealth({ ready: false });
-    const { host, unmount } = mount(
-      <MossVoicePicker value="" onChange={() => {}} status={empty} showInherit />,
+    // 1) 还在探测
+    const a = mount(<MossVoicePicker value="" onChange={() => {}} status={null} showInherit />);
+    expect(a.host.textContent).toContain('正在检测本机音色');
+    a.unmount();
+    // 2) 连不上：必须给出原因，并指到设置里该核对的地方
+    const b = mount(
+      <MossVoicePicker value="" onChange={() => {}} status={empty} showInherit reachable={false} probeError="主代理返回 403" onRefresh={() => {}} />,
     );
-    expect(host.textContent).toContain('还没有可选音色');
-    expect(host.textContent).not.toContain('ether');
-    unmount();
+    expect(b.host.textContent).toContain('读不到本机音色目录');
+    expect(b.host.textContent).toContain('主代理返回 403');
+    expect(b.host.textContent).toContain('重新检测');
+    b.unmount();
+    // 3) 连上了但目录为空：不能再说「主代理没连上」
+    const c = mount(
+      <MossVoicePicker value="" onChange={() => {}} status={empty} showInherit reachable onRefresh={() => {}} />,
+    );
+    expect(c.host.textContent).toContain('已连上主代理');
+    expect(c.host.textContent).not.toContain('读不到本机音色目录');
+    expect(c.host.textContent).not.toContain('ether');
+    c.unmount();
   });
 
   it('播放失败给出明确文案，且不会自动重试或改选别的音色', async () => {

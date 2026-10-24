@@ -75,10 +75,10 @@ async function postGenie(text: string, demo: boolean, voice: string, timeoutMs: 
   const spoken = cleanTextForTtsGenie(text);
   if (!spoken) throw new Error('没有可朗读的文字');
 
-  const { agentUrl, agentToken } = readAgentRoutingConfig();
-  if (!agentUrl) throw new Error('未配置主代理地址，无法使用本机语音');
-  // agentRouting 只 trim 不剥尾斜杠，这里自己处理。
-  const base = agentUrl.replace(/\/+$/, '');
+  const { agentToken } = readAgentRoutingConfig();
+  // 基址统一走候选解析：剥掉误粘的 `/agent` 前缀，没填时回落到同源反代。
+  // 合成是 POST，只挑一个基址，绝不为了兜底把同一段话合成两次。
+  const base = mossAgentBaseForWrite();
 
   const controller = new AbortController();
   // 本地 CPU 合成比云慢，但仍要快速失败：超过 75 秒基本是卡死或排队积压。
@@ -149,9 +149,22 @@ export async function fetchMossVoicePreview(voiceId: string, timeoutMs = 15_000)
   const id = typeof voiceId === 'string' ? voiceId.trim() : '';
   if (!MOSS_VOICE_ID_RE.test(id)) throw new Error('音色 ID 不合法，无法试听');
 
-  const { agentUrl, agentToken } = readAgentRoutingConfig();
-  if (!agentUrl) throw new Error('未配置主代理地址，无法试听本机音色');
-  const base = agentUrl.replace(/\/+$/, '');
+  const { agentToken } = readAgentRoutingConfig();
+  // 试听是 GET，按候选逐个试不会产生副作用（失败只换下一个基址）。
+  const bases = mossAgentBaseCandidates();
+  if (bases.length === 0) throw new Error('未配置主代理地址，无法试听本机音色');
+  let lastError: Error | null = null;
+  for (const base of bases) {
+    try {
+      return await fetchPreviewFrom(base, id, agentToken, timeoutMs);
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  throw lastError ?? new Error('试听暂时不可用，请稍后再试');
+}
+
+async function fetchPreviewFrom(base: string, id: string, agentToken: string, timeoutMs: number): Promise<TtsResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -188,6 +201,45 @@ export interface MossVoiceProbe {
   reachable: boolean;
   status: MossVoiceStatus;
   error?: string;
+  /** 实际探通的那个基址（'' / '同源' = 同源兜底）；仅用于诊断展示，不含令牌。 */
+  base?: string;
+}
+
+/**
+ * 主代理基址候选：配置优先，同源兜底。
+ *
+ * 2026-10-24 线上反馈（本地语音已选 → 一直「已选·未连接」+ 音色列表空）复核：
+ * `/agent/*` 由托管前端的同一台机器反代，所以**页面同源本身就是一条可用通道**；
+ * 而 `agentUrl` 要用户手填，一旦留空 / 填成网站根 / 把文档里的 `/agent` 前缀一起
+ * 粘进来，拼出来就是 `.../agent/agent/v1/tts/health` —— 主代理在路由前先鉴权，
+ * 所以这种情况和「令牌错」一样只回 403，UI 无从区分，用户只能反复重填令牌。
+ *
+ * 这不是该让用户修的配置，所以探活/试听/合成按顺序试候选，并在失败时给出
+ * 「是网页不是接口 / 令牌被拒 / 连不上」三种不同的说法。只影响本机语音这条路，
+ * 不改任何其他请求的中转路由，也不改用户选的服务商。
+ */
+export function mossAgentBaseCandidates(): string[] {
+  const { agentUrl } = readAgentRoutingConfig();
+  // 用户可能把 `/agent` 或 `/agent/v1` 一起粘进来（文档里的接口路径就带这个前缀）。
+  const base = String(agentUrl || '')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/agent(\/v1)?$/, '')
+    .replace(/\/+$/, '');
+  const out: string[] = [];
+  if (base) out.push(base);
+  // '' = 相对当前站点。只在 http(s) 页面里加，jsdom/本地文件不参与。
+  if (typeof window !== 'undefined' && /^https?:$/.test(String(window.location?.protocol || ''))) {
+    out.push('');
+  }
+  return [...new Set(out)];
+}
+
+/** 写入类请求（POST 合成）只挑一个基址：不能为了兜底把同一段话合成两次。 */
+export function mossAgentBaseForWrite(): string {
+  const bases = mossAgentBaseCandidates();
+  if (bases.length === 0) throw new Error('未配置主代理地址，无法使用本机语音');
+  return bases[0];
 }
 
 /**
@@ -225,28 +277,70 @@ export async function refreshMossVoiceStatus(maxAgeMs = 30_000): Promise<MossVoi
 export async function probeMossVoiceStatus(_apiConfig?: APIConfig): Promise<MossVoiceProbe> {
   const offline: MossVoiceProbe = { reachable: false, status: normalizeMossVoiceHealth(null) };
   // 与合成同一套路由读取（localStorage 里的 agentUrl/agentToken），设置改了立即生效。
-  const { agentUrl, agentToken } = readAgentRoutingConfig();
-  if (!agentUrl) return { ...offline, status: cacheMossStatus({ ...offline.status, state: 'offline' }) };
-  const base = agentUrl.replace(/\/+$/, '');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5_000);
-  try {
-    const headers: Record<string, string> = {};
-    if (agentToken) headers['X-Client-Token'] = agentToken;
-    const res = await fetch(`${base}/agent/v1/tts/health`, { headers, signal: controller.signal });
-    if (!res.ok) return { reachable: false, status: cacheMossStatus({ ...offline.status, state: 'offline' }) };
-    let raw: unknown = null;
-    try {
-      raw = await res.json();
-    } catch {
-      raw = null;
-    }
-    return { reachable: true, status: cacheMossStatus(normalizeMossVoiceHealth(raw)) };
-  } catch {
-    return { reachable: false, status: cacheMossStatus({ ...offline.status, state: 'offline' }) };
-  } finally {
-    clearTimeout(timer);
+  const { agentToken } = readAgentRoutingConfig();
+  const bases = mossAgentBaseCandidates();
+  if (bases.length === 0) {
+    return { ...offline, error: '还没填主代理地址', status: cacheMossStatus({ ...offline.status, state: 'offline' }) };
   }
+
+  let lastError = '';
+  // 逐个候选试：配置的那条失败时同源可能仍然可用（前端就托管在反代这台机器上）。
+  for (const base of bases) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const headers: Record<string, string> = {};
+      if (agentToken) headers['X-Client-Token'] = agentToken;
+      const res = await fetch(`${base}/agent/v1/tts/health`, { headers, signal: controller.signal });
+      if (!res.ok) {
+        lastError = await classifyProbeFailure(res);
+        continue;
+      }
+      // 静态站对未知路径会回 index.html（200 + text/html）。那不是健康数据，
+      // 之前会被当成 reachable=true + 空音色目录，UI 于是说「服务端没注册音色」，
+      // 把用户引到完全错误的排查方向。这里必须先确认拿到的是 JSON。
+      const ctype = String(res.headers.get('content-type') || '').toLowerCase();
+      let raw: unknown = null;
+      try {
+        raw = await res.json();
+      } catch {
+        raw = null;
+      }
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        lastError = ctype.includes('html')
+          ? '这个地址返回的是网页，不是主代理接口：检查是否填成了网站地址，或少了 /agent 前缀'
+          : '这个地址返回的不是主代理健康数据';
+        continue;
+      }
+      return {
+        reachable: true,
+        base: base || '同源',
+        status: cacheMossStatus(normalizeMossVoiceHealth(raw)),
+      };
+    } catch (e) {
+      const aborted = e instanceof DOMException && e.name === 'AbortError';
+      lastError = aborted ? '主代理 5 秒内没有响应' : '连不上主代理（网络错误或跨域被拦）';
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return { ...offline, error: lastError || '连不上主代理', status: cacheMossStatus({ ...offline.status, state: 'offline' }) };
+}
+
+/**
+ * 探活失败的原因分类。只给结论，不回显地址或令牌本身。
+ *
+ * 403 有两种完全不同的原因，而主代理在路由前就鉴权，所以**路径写错也报 403**：
+ * 只能说「令牌不对，或地址里多带了 /agent」，不能断言是令牌。
+ */
+async function classifyProbeFailure(res: Response): Promise<string> {
+  if (res.status === 401 || res.status === 403) {
+    return '主代理拒绝了访问：令牌不对，或地址里多带了 /agent';
+  }
+  if (res.status === 404) return '主代理没有这个接口（地址可能少了 /agent）';
+  if (res.status >= 500) return `主代理出错了（${res.status}）`;
+  return `主代理返回 ${res.status}`;
 }
 
 async function readErrorText(res: Response): Promise<string> {

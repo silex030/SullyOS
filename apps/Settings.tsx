@@ -693,6 +693,9 @@ const Settings: React.FC = () => {
   const [localMossVoiceId, setLocalMossVoiceId] = useState(apiConfig.mossVoiceId || '');
   // 本机 MOSS-TTS-Nano 的真实状态：null = 还没探到（显示检测中），不预置「可用」。
   const [localMossStatus, setLocalMossStatus] = useState<MossVoiceStatus | null>(null);
+  // 探活是否连上 / 失败原因：决定空态是说「连不上」还是「没注册音色」（2026-10-24 用户反馈修复）。
+  const [localMossReachable, setLocalMossReachable] = useState<boolean | null>(null);
+  const [localMossError, setLocalMossError] = useState('');
   const [localMossProbing, setLocalMossProbing] = useState(false);
   const [localFishModel, setLocalFishModel] = useState(apiConfig.fishAudioModel || 's2.1-pro');
   const [localElevenLabsKey, setLocalElevenLabsKey] = useState(apiConfig.elevenLabsApiKey || '');
@@ -717,6 +720,8 @@ const Settings: React.FC = () => {
     try {
       const probe = await probeMossVoiceStatus();
       setLocalMossStatus(probe.status);
+      setLocalMossReachable(probe.reachable);
+      setLocalMossError(probe.error || '');
     } finally {
       setLocalMossProbing(false);
     }
@@ -3281,6 +3286,13 @@ const Settings: React.FC = () => {
         {/* 其他 API 区域 — 非 LLM 类（语音、写歌等），不会跟随预设切换 */}
         <SettingsSection
             title="其他 API"
+            badge={
+                // 折叠时也要看得见「语音用的是哪家」——用户反馈里最常见的就是
+                // 根本不知道本机语音藏在这张默认折叠的卡片里（2026-10-24）。
+                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md shrink-0 ${localGenieEnabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                    {localGenieEnabled ? '语音：本地语音' : '语音：云端'}
+                </span>
+            }
             icon={
                 <div className="p-2 bg-amber-100/50 rounded-xl text-amber-600">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
@@ -3295,10 +3307,12 @@ const Settings: React.FC = () => {
 
             <div className="space-y-4">
                 <p className="text-[11px] text-slate-400 -mt-1 pl-1 leading-relaxed">
-                    🎙️ 语音生成支持 <span className="font-semibold text-slate-500">MiniMax</span>、<span className="font-semibold text-slate-500">鱼声 Fish</span> 和 <span className="font-semibold text-slate-500">ElevenLabs</span>。三家的配置都会保留，最后在底部选择当前引擎。
+                    🎙️ 语音生成支持 <span className="font-semibold text-slate-500">本地语音（MOSS-TTS-Nano，本机 CPU）</span>、<span className="font-semibold text-slate-500">MiniMax</span>、<span className="font-semibold text-slate-500">鱼声 Fish</span> 和 <span className="font-semibold text-slate-500">ElevenLabs</span>。四家的配置都会保留，先选「本机」还是「云端」，再在底部选择具体引擎。
                 </p>
 
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0.5 block">语音引擎位置（二选一）</label>
+                    <p className="text-[11px] text-slate-400 mb-2.5">选「本地语音」= 用本机 CPU 跑 MOSS-TTS-Nano，下面会直接出现可选的<span className="font-semibold text-slate-500">具体音色</span>；选「语音合成 API」= 用云端三家。</p>
                     <div className="space-y-2">
                         {([
                             // 本机 MOSS-TTS-Nano（CPU，仅中文）。**不写死状态**：option 徽标由
@@ -3352,6 +3366,8 @@ const Settings: React.FC = () => {
                             value={localMossVoiceId}
                             onChange={setLocalMossVoiceId}
                             status={localMossStatus}
+                            reachable={localMossReachable}
+                            probeError={localMossError}
                             onRefresh={() => { void refreshLocalMossStatus(); }}
                             refreshing={localMossProbing}
                             showLabel={false}
@@ -3494,10 +3510,13 @@ const Settings: React.FC = () => {
                     </details>
                 </div>
 
-                {/* 底部：当前语音引擎三选一 —— radio 样式（配置都在上面，这里只挑用哪家） */}
+                {/* 底部：云端语音引擎三选一 —— radio 样式（配置都在上面，这里只挑用哪家） */}
                 <div className="group rounded-2xl border border-slate-200/70 bg-slate-50/60 p-3">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0.5 block">当前语音引擎（三选一）</label>
-                    <p className="text-[11px] text-slate-400 mb-2.5">聊天语音条 / 约会 / 电话用哪一家。上面三家的配置都会保留，这里只切换当前生效的。</p>
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0.5 block">云端语音引擎（三选一）</label>
+                    <p className="text-[11px] text-slate-400 mb-2.5">
+                        聊天语音条 / 约会 / 电话用哪一家云端服务。上面三家的配置都会保留，这里只切换当前生效的。
+                        想用<span className="font-semibold text-slate-500">本机语音</span>？点上方的「本地语音（MOSS-TTS-Nano）」，选中后这里会收起，并出现可选的<b>具体音色</b>。
+                    </p>
                     <div className="space-y-2">
                         {([
                             ['minimax', 'MiniMax', '国内可直连，默认推荐'],

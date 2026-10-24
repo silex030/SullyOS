@@ -1932,6 +1932,13 @@ ${isInitialGeneration ? `
                                    </div>
                                </div>
                                <p className="text-[11px] text-slate-500">已有 voice_id 可直接填，不依赖查询。聊天角色配置后，后续接 TTS 可直接读取。</p>
+                               {!isMossProvider && (
+                                   <p className="text-[10px] text-slate-400 leading-relaxed">
+                                       想给这个角色单独选<span className="font-semibold text-slate-500">本机语音音色</span>？
+                                       先到「设置 → 其他 API → 语音引擎位置」选「本地语音（MOSS-TTS-Nano）」并保存，
+                                       回到这里就会出现可选的多个音色（含「继承全局音色」）。
+                                   </p>
+                               )}
 
                                <div className="rounded-2xl border border-violet-200/60 bg-violet-50/40 p-2.5 space-y-2">
                                    <div className="flex items-center justify-between gap-2">
@@ -2051,6 +2058,8 @@ ${isInitialGeneration ? `
                                                handleChange('voiceProfile', next);
                                            }}
                                            status={mossCatalog.status}
+                                           reachable={mossCatalog.reachable}
+                                           probeError={mossCatalog.error}
                                            globalVoiceId={apiConfig.mossVoiceId || ''}
                                            showInherit
                                            onRefresh={() => { void mossCatalog.refresh(); }}
