@@ -68,7 +68,9 @@ describe('地图服务 · 新手填写帮助', () => {
     expect(html).toContain('同一个应用');
     expect(html).toContain('Web端(JS API)');
     expect(html).toContain('web 平台（JS API）'); // 官方原文标签
-    expect(html).toContain('link.ethernet.bot.cd');
+    // 白名单文案跟当前 host 走：独立部署后自动是自己的域名，不再写死任何人的站点。
+    expect(html).toContain(window.location.host);
+    expect(html).not.toContain('link.ethernet.bot.cd');
     expect(html).toContain('公开配置');
   });
 
@@ -85,6 +87,21 @@ describe('地图服务 · 新手填写帮助', () => {
     expect(html).toContain('pk.');
     expect(html).toContain('sk.');
     expect(html).toContain('不承诺永久免费');
+  });
+
+  it('独立部署说明：本机脚本用法准确、多设备是次入口、不冒充自助注册、不引导找原作者', () => {
+    expect(html).toContain('data-testid="map-self-host"');
+    expect(html).toContain('本人独立部署');
+    // 脚本用法必须和 scripts/travel-pair-admin.mjs 的真实子命令一致
+    expect(html).toContain('travel-pair-admin.mjs list');
+    expect(html).toContain('travel-pair-admin.mjs approve');
+    expect(html).toContain('requestId');
+    expect(html).toContain('userId');
+    // 边界：不冒充已有自助登录，也不让用户去求人
+    expect(html).toContain('不提供匿名自助注册');
+    expect(html).toContain('多设备');
+    expect(html).not.toContain('小何');
+    expect(html).not.toContain('原作者');
   });
 
   it('保存 ≠ 已出图/已获许可；测试连接可能耗额度', () => {

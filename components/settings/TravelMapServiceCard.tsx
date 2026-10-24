@@ -26,6 +26,29 @@ import {
   type PairRequestState,
 } from '../../utils/travel/pairingClient';
 import { ensureTravelSession, readTravelOwnerCredential, saveTravelOwnerCredential } from '../../utils/travel/session';
+import {
+  getMapReadinessSnapshot,
+  refreshMapReadiness,
+  setMapPairPending,
+  subscribeMapReadiness,
+  type MapReadinessPhase,
+} from '../../utils/travel/mapReadiness';
+
+/** 当前站点域名：独立部署后就是用户自己的域名，文案不能写死任何人的家域名。 */
+const useSiteHost = (): string => {
+  try { return window.location.host || ''; } catch { return ''; }
+};
+
+const SITE_HOST_FALLBACK = '你的站点域名';
+
+const PHASE_TEXT: Record<MapReadinessPhase, string> = {
+  'pending-approval': '等待批准',
+  unconnected: '未连接',
+  error: '读取失败',
+  unconfigured: '未配置',
+  partial: '部分就绪',
+  ready: '已加密保存',
+};
 
 export interface TravelMapServiceCardProps {
   runtime?: TravelRuntime;
@@ -128,9 +151,13 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
   className = '',
 }) => {
   const runtime = injected ?? getTravelRuntime();
-  const [cred, setCred] = useState<TravelMapCredentialView | null>(null);
-  const [known, setKnown] = useState(false);
-  const [credError, setCredError] = useState<string | null>(null);
+  // 就绪只有一份权威：父宫格与这张卡订阅同一份快照（utils/travel/mapReadiness），
+  // 卡片自己不再另发一次后端读回，也不会出现「宫格就绪、卡片未配置」。
+  const snapshot = React.useSyncExternalStore(subscribeMapReadiness, getMapReadinessSnapshot, getMapReadinessSnapshot);
+  const cred: TravelMapCredentialView | null = snapshot.credentials;
+  const known = snapshot.known;
+  const credError = snapshot.error;
+  const siteHost = useSiteHost();
   const [webKey, setWebKey] = useState('');
   const [jsKey, setJsKey] = useState('');
   const [jsCode, setJsCode] = useState('');
@@ -144,13 +171,14 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
   const [paired, setPaired] = useState(() => !!readTravelOwnerCredential());
 
   const loadCredentials = useCallback(async () => {
-    const res = await runtime.readMapCredentials();
-    setKnown(res.known);
-    setCred(res.known ? res.credentials : null);
-    setCredError(res.known ? null : res.error ?? 'UNKNOWN');
+    await refreshMapReadiness(runtime);
   }, [runtime]);
 
-  useEffect(() => { void loadCredentials(); }, [loadCredentials]);
+  useEffect(() => {
+    // 父层首屏已读过就复用（30 秒内不重复打后端）；只有读不到时才补一次。
+    const current = getMapReadinessSnapshot();
+    if (!current.refreshedAt || Date.now() - current.refreshedAt > 30_000) void loadCredentials();
+  }, [loadCredentials]);
 
   const writeCredentials = useCallback(async (patch: Record<string, string>, clear?: string[]) => {
     setBusy(true);
@@ -165,8 +193,6 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
         : '没写进服务端，原配置未被覆盖');
       return false;
     }
-    setCred(res.credentials ?? null);
-    setKnown(!!res.credentials);
     await loadCredentials();
     return true;
   }, [runtime, loadCredentials]);
@@ -223,6 +249,7 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
     }
     saveTravelOwnerCredential({ userId: claimed.userId, ownerKey: claimed.ownerKey });
     setPaired(true);
+    setMapPairPending(false);
     await ensureTravelSession({});
     setPair(null);
     setPairBusy(false);
@@ -239,6 +266,8 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
       return;
     }
     setPair(created.state);
+    // 父宫格同步显示「待批准」，不必等卡片回传或刷新。
+    setMapPairPending(true);
     setNote('把下面的短码交给已授权管理员批准；批准前这里不会变成已连接');
   }, []);
 
@@ -251,6 +280,7 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
       if (status.status === 'approved') { void handleClaim(pair); return; }
       if (status.status === 'expired' || status.status === 'invalid') {
         setPair(null);
+        setMapPairPending(false);
         setNote('申请已过期或被撤销，请重新申请连接');
       }
     }, 3000);
@@ -262,8 +292,8 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
       <div className="flex items-center gap-1.5">
         <MapTrifold size={12} weight="bold" className="text-teal-600" aria-hidden />
         <div className="text-[11px] font-medium text-slate-700">地图服务（高德 / Mapbox）</div>
-        <span className="ml-auto text-[9px] text-slate-500">
-          {!known ? '未确认' : cred?.configured ? '已加密保存' : '未配置'}
+        <span data-testid="map-service-status" className="ml-auto text-[9px] text-slate-500">
+          {PHASE_TEXT[snapshot.phase] ?? '未确认'}
         </span>
       </div>
       <p className="mt-0.5 text-[9px] leading-relaxed text-slate-500">
@@ -284,14 +314,14 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
         <div className="mt-2 rounded-xl bg-teal-50/70 p-2">
           <div className="flex items-center gap-1.5">
             <Key size={11} weight="bold" className="text-teal-700" aria-hidden />
-            <span className="text-[10px] font-medium text-teal-800">首次连接</span>
-            <span className="ml-auto text-[9px] text-teal-700">{pair ? '等待管理员批准' : '未连接'}</span>
+            <span className="text-[10px] font-medium text-teal-800">连接本实例</span>
+            <span className="ml-auto text-[9px] text-teal-700">{pair ? '等待批准' : '未连接'}</span>
           </div>
           {pair ? (
             <div className="mt-1" data-testid="pair-pending">
               <div className="text-[10px] text-slate-600">把短码发给已授权管理员批准（10 分钟内有效）：</div>
               <div data-testid="pair-code" className="mt-1 font-mono text-lg font-bold tracking-[0.2em] text-teal-800">{pair.code}</div>
-              <div className="text-[9px] text-slate-500">批准前不会注册任何账号，也不需要你登录服务器或找文件。</div>
+              <div className="text-[9px] text-slate-500">批准前不会注册任何账号；批准这一步由部署这个实例的人（你本人）在服务器本机点一次，见下方「本人独立部署」。</div>
             </div>
           ) : (
             <button
@@ -304,6 +334,31 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
           )}
         </div>
       )}
+
+      {/* 独立部署：这是用户自己的实例，owner 在本机初始化；不引导去找原作者或第三方。 */}
+      <details data-testid="map-self-host" className="mt-2 rounded-xl bg-slate-50 px-2 py-1.5">
+        <summary className="cursor-pointer text-[10px] font-bold text-slate-700">本人独立部署（这是你自己的实例）</summary>
+        <div className="mt-1 space-y-1 text-[9px] leading-relaxed text-slate-600">
+          <p>
+            这个站点跑在你自己的机器或服务器上（当前域名 <span className="font-mono">{siteHost || SITE_HOST_FALLBACK}</span>），
+            没有人替你托管，也不需要联系别人：地图凭据、本机连接和 owner 密钥都只属于这个实例。
+          </p>
+          <p>
+            上面的「申请连接」同时是<b>多设备 / 新浏览器</b>的次入口。第一台设备由你（或帮你部署的 AI）在
+            <b>服务器本机</b>批准一次，用的就是仓库里现成的脚本，不用装新东西：
+          </p>
+          <ol className="list-decimal space-y-0.5 pl-4">
+            <li>在仓库目录看有哪些申请：<code className="font-mono">node scripts/travel-pair-admin.mjs list</code>（只输出 requestId 短前缀、状态、时间）。</li>
+            <li>批准这次申请：<code className="font-mono">node scripts/travel-pair-admin.mjs approve &lt;requestId&gt; &lt;userId&gt;</code>；userId 就是本卡片展示的账号 ID，不是密钥；短码也别发到群里。</li>
+            <li>批准后回到本页，几秒内自动连接（服务端只存 owner 密钥的哈希，认领时才在你浏览器里生成）。</li>
+          </ol>
+          <p>
+            脚本只读本机数据库，没有公网入口，也不提供匿名自助注册；需要清理过期申请时用
+            <code className="font-mono">purge</code>。完整步骤（主密钥、数据库路径、迁移旧 Key）见仓库文档
+            <code className="font-mono">docs/travel-map-credentials.md</code> 的「本人独立部署」一节。
+          </p>
+        </div>
+      </details>
 
       {/* 第一次填写顺序：用户「不会填」时的总入口。申请连接是本站自己的按钮，和高德无关。 */}
       <details data-testid="map-help-order" className="mt-2 rounded-xl bg-white/70 px-2 py-1.5">
@@ -324,7 +379,7 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
           <li>
             填<b>「JS API Key」和「安全密钥 jscode」</b>：在<b>同一个应用</b>里再添加一个 key，服务平台选
             <b>「Web端(JS API)」</b>（官方文档写作 web 平台（JS API）），添加后把 key 和安全密钥（jscode）一起复制过来。
-            正式域名白名单填 <span className="font-mono">link.ethernet.bot.cd</span>。
+            正式域名白名单填 <span className="font-mono">{siteHost || SITE_HOST_FALLBACK}</span>（就是你此刻访问的这个域名，换域名后要回来改一次）。
           </li>
           <li>
             <b>Mapbox 只给国外用</b>：不做国外就留空，不影响国内。它不是必须项，也不用为了它去付费。
@@ -364,7 +419,7 @@ const TravelMapServiceCard: React.FC<TravelMapServiceCardProps> = ({
               testid="map-js-key-help"
               steps={[
                 <>在<b>同一个应用</b>里点「添加」新建一个 Key，「服务平台」选 <b>Web端(JS API)</b>（官方原文：web 平台（JS API））。</>,
-                <>域名白名单填 <span className="font-mono">link.ethernet.bot.cd</span>（正式站点）；不要用 <span className="font-mono">*</span> 当正式配置。</>,
+                <>域名白名单填 <span className="font-mono">{siteHost || SITE_HOST_FALLBACK}</span>（当前访问的域名）；不要用 <span className="font-mono">*</span> 当正式配置。</>,
                 <>复制的是这个 Key 本身，<b>不是</b>安全密钥、不是应用名、不是链接。</>,
                 <>这个 Key 是<b>公开配置</b>：浏览器本来就要拿到它；真正需要保密的是下面的安全密钥。</>,
               ]}

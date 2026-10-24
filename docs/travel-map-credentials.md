@@ -96,4 +96,29 @@ pnpm vitest run worker/amsg/src/travel/mapCredentials.test.ts worker/amsg/src/tr
   - `https://lbs.amap.com/api/javascript-api-v2/guide/abc/prepare`（JS API 的 key 与安全密钥，官方："web 平台（JS API）"）
   - `https://account.mapbox.com/access-tokens/`（Mapbox `pk.` token，可选）
 - 文案护栏：密钥只粘进输入框，禁止发聊天/截图；Web 服务 Key 与 JS Key 类型不混；jscode 只存服务端；Mapbox 可选、不承诺永久免费；保存 ≠ 已出图或已开通高德权限，测试连接可能耗额度。
-- 回归：`pnpm vitest run components/settings/TravelMapServiceCard.help.test.tsx`（12 例，含 host 白名单与 `rel` 属性）。
+- 域名白名单文案取运行时 `window.location.host`（独立部署后自动显示自己的域名），不写死任何人的站点域名。
+- 回归：`pnpm vitest run components/settings/TravelMapServiceCard.help.test.tsx`（含外链 host 白名单与 `rel` 属性）。
+
+## 九、本人独立部署（自己的实例）
+
+自部署实例没有「找原作者」这一步：站点跑在谁的机器上，owner 就由谁在这台机器上初始化。
+本批**不提供匿名自助 bootstrap**，也不要求你去翻未知的 secret；第一台设备的连接由本机脚本批准一次：
+
+```bash
+# 1) 看有哪些待批准的连接申请（只输出 requestId 短前缀 / 状态 / 时间）
+node scripts/travel-pair-admin.mjs list
+
+# 2) 批准一次：<userId> 是设置页卡片上展示的账号 ID，不是密钥
+node scripts/travel-pair-admin.mjs approve <requestId> <userId>
+
+# 3) 清理过期申请（可选）
+node scripts/travel-pair-admin.mjs purge
+```
+
+- 批准只是 `pending → approved` 并绑定 userId；真正的 owner 密钥在用户浏览器的**一次性 claim**
+  里生成，服务端只存哈希。脚本只读本机 SQLite（`AMSG_DB_PATH`，默认 `/opt/sullyos/data/amsg.sqlite`），
+  不监听端口、不开放公网接口。
+- 之后换设备 / 新浏览器，用户在设置页点「申请连接」（次入口）再批准一次即可；不需要重新部署。
+- 服务端还需要 `AMSG_MASTER_KEY`（每用户密钥派生用）；没有它时卡片会显示「读取失败」，保存会被拒绝。
+- 未来的完整自助初始化（部署 AI 一条命令完成 owner + 凭据初始化）仍未提供，别在文案里承诺已有。
+
