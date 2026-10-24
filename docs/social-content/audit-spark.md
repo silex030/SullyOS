@@ -1,5 +1,10 @@
 # SullyOS · Spark（社交 App）只读审计报告
 
+> **历史文档（2026-10-24 更新）**：Spark 已按用户要求整块退役，本报告中的代码路径多数已不存在
+> （`apps/SocialApp.tsx`、`utils/doubanSource.ts`、`worker/index.js` 的 `/social/*`、`visibleInSpark`、
+> `selectMomentsMaterial` 等全部删除）。本文件只作**盘点留档**，别再按它去改代码；
+> 退役清单、刻意保留项与迁移说明见 `notes/spark-removal-2026-10-24.md`。
+
 - 审计对象：`/root/SullyOS`，分支 `ethernet`，HEAD `30df593c`（2026-10-23 22:34:56 +0800，`feat(tts): MOSS-TTS-Nano local voice end-to-end (v3.21)`）
 - 工作树状态：`git status` 有 12 个已改 + 6 个未跟踪文件，全部属于 TTS/语音/worker bundle/文档那条线（`CLAUDE.md`、`notes/*`、`apps/Character.tsx`、`apps/Settings.tsx`、`utils/*tts*`、`worker/main-agent/*`、`components/voice/MossVoicePicker*`）；**Spark 相关文件（`apps/SocialApp.tsx` / `utils/doubanSource.ts` / `utils/socialFeedMerge.ts` / `utils/momentsFeed.ts` / `worker/index.js` / `utils/db.ts`）对 HEAD 零差异**，本报告描述的就是可提交内容。
 - 只读约束执行：未改任何源码/配置/数据，未跑全量测试、`tsc`、`build`，未请求真实豆瓣 / LLM / latent.moe / VPS，未读取或输出任何密钥。仓库里的 `latentImageKey`、`apiKey` 只按字段名引用。

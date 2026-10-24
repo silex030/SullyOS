@@ -3091,7 +3091,8 @@ const MessageItem = React.memo(({
                     </div>
                     <p className="text-xs text-slate-600 line-clamp-2 leading-relaxed">{post.content}</p>
                     <div className="mt-2 pt-2 border-t border-slate-50 flex items-center gap-1 text-[10px] text-slate-400">
-                        <span className="text-red-400">Spark</span> • 笔记分享
+                        {/* Spark 已下线，历史 social_card 消息仍按原样渲染（数据兼容） */}
+                        <span className="text-slate-400">笔记分享</span>
                     </div>
                 </div>
             </div>

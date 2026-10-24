@@ -1,5 +1,9 @@
 # SullyOS 自由活动 / 社交内容生成 · 只读审计报告
 
+> **历史文档（2026-10-24 更新）**：其中的 Spark / SocialApp 相关路径已整块删除
+> （见 `notes/spark-removal-2026-10-24.md`），涉及 Spark 的调用点与成本口径不再成立；
+> 自由活动（XhsFreeRoam）与本报告其它部分仍有效。
+
 - 仓库：`/root/SullyOS`（分支 `ethernet`，HEAD `30df593c`，工作区有未提交改动，本报告未触碰）
 - 工作区：`/root/.hermes/kanban/workspaces/t_1964e5f8`
 - 方式：纯静态阅读（file:line）+ 15 个既有定向单测实跑（无网络、无生产库、无真实 LLM）

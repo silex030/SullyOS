@@ -49,14 +49,13 @@ describe('moments feed', () => {
     ];
     expect(dedupeByRemoteId(local as never, fresh as never).map((p: { id: string }) => p.id)).toEqual(['y']);
   });
-  it('朋友圈/Spark 可见性划分（互不影响）', async () => {
-    const { visibleInMoments, visibleInSpark } = await import('./momentsFeed.js');
+  it('朋友圈可见性只收熟人线（mastodon / 本地手发）', async () => {
+    const { visibleInMoments } = await import('./momentsFeed.js');
     expect(visibleInMoments({ origin: 'mastodon' } as never)).toBe(true);
     expect(visibleInMoments({ origin: 'moments' } as never)).toBe(true);
+    // Spark 移除后遗留的旧帖来源（douban / gen）一律不进朋友圈，旧库数据不会突然冒出来
     expect(visibleInMoments({ origin: 'douban' } as never)).toBe(false);
-    expect(visibleInSpark({ origin: 'mastodon' } as never)).toBe(false);
-    expect(visibleInSpark({ origin: 'moments' } as never)).toBe(false);
-    expect(visibleInSpark({ origin: 'gen' } as never)).toBe(true);
+    expect(visibleInMoments({ origin: 'gen' } as never)).toBe(false);
   });
 });
 describe('extractStatuses', () => {

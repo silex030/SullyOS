@@ -5,7 +5,6 @@ import {
   selectEventsByVisibility,
   selectEventsByType,
   selectUnprojectedEvents,
-  selectMomentsMaterial,
   selectCheckPhoneMaterial,
   renderCheckPhoneMaterialSection,
   CHECK_PHONE_PURCHASE_DISCIPLINE,
@@ -228,85 +227,6 @@ describe('selectUnprojectedEvents', () => {
   it('keeps the original event objects (no cloning / extra-property loss)', () => {
     const rich = [{ id: 'a', summary: 'hi' }];
     expect(selectUnprojectedEvents(rich, [])[0]).toBe(rich[0]);
-  });
-});
-
-describe('selectMomentsMaterial', () => {
-  const told = (at: number, id: string, extra: Partial<AirpCommittedEvent> = {}) =>
-    makeEvent({ id, at, type: 'activity', impact: 'minor', disclosedToUser: true, ...extra });
-
-  it('keeps public + disclosed events, newest first', () => {
-    const events = [told(100, 'old'), told(300, 'new'), told(200, 'mid')];
-    expect(selectMomentsMaterial(events, []).map((e) => e.id)).toEqual(['new', 'mid', 'old']);
-  });
-
-  it('drops public events that were never disclosed to the user', () => {
-    const events = [
-      told(100, 'told'),
-      makeEvent({ id: 'untold', at: 200, type: 'movement', impact: 'trace' }),
-    ];
-    expect(selectMomentsMaterial(events, []).map((e) => e.id)).toEqual(['told']);
-  });
-
-  it('drops undisclosed private events', () => {
-    const events = [
-      makeEvent({ id: 'p', at: 100, type: 'conversation', impact: 'minor' }),
-    ];
-    expect(selectMomentsMaterial(events, [])).toEqual([]);
-  });
-
-  it('drops private events even when disclosed (told) — no leakage', () => {
-    const events = [
-      makeEvent({ id: 'c', at: 100, type: 'conversation', impact: 'trace', disclosedToUser: true }),
-      makeEvent({ id: 'r', at: 200, type: 'relationship', impact: 'minor', disclosedToUser: true }),
-      makeEvent({ id: 'm', at: 300, type: 'activity', impact: 'major', disclosedToUser: true }),
-    ];
-    expect(selectMomentsMaterial(events, [])).toEqual([]);
-  });
-
-  it('drops trace events even when disclosed (told)', () => {
-    const events = [
-      makeEvent({ id: 'st', at: 100, type: 'social_trace', impact: 'trace', disclosedToUser: true }),
-      makeEvent({ id: 'st2', at: 200, type: 'social_trace', impact: 'minor', disclosedToUser: true }),
-    ];
-    expect(selectMomentsMaterial(events, [])).toEqual([]);
-  });
-
-  it('dedupes against already projected ids (Set and array forms)', () => {
-    const events = [told(100, 'a'), told(200, 'b'), told(300, 'c')];
-    expect(selectMomentsMaterial(events, new Set(['b'])).map((e) => e.id)).toEqual(['c', 'a']);
-    expect(selectMomentsMaterial(events, ['a', 'c']).map((e) => e.id)).toEqual(['b']);
-  });
-
-  it('caps at 3 by default (snippet-sized), newest first', () => {
-    const events = [1, 2, 3, 4, 5].map((n) => told(n * 100, `e${n}`));
-    expect(selectMomentsMaterial(events, []).map((e) => e.id)).toEqual(['e5', 'e4', 'e3']);
-  });
-
-  it('honours a custom limit and returns [] for limit <= 0', () => {
-    const events = [1, 2, 3, 4, 5].map((n) => told(n * 100, `e${n}`));
-    expect(selectMomentsMaterial(events, [], 2).map((e) => e.id)).toEqual(['e5', 'e4']);
-    expect(selectMomentsMaterial(events, [], 0)).toEqual([]);
-    expect(selectMomentsMaterial(events, [], -1)).toEqual([]);
-  });
-
-  it('returns [] for empty / fully filtered input', () => {
-    expect(selectMomentsMaterial([], [])).toEqual([]);
-    expect(selectMomentsMaterial([makeEvent({ at: 1 })], [])).toEqual([]);
-  });
-
-  it('tolerates a missing events array (defensive guard)', () => {
-    expect(
-      selectMomentsMaterial(undefined as unknown as AirpCommittedEvent[], []),
-    ).toEqual([]);
-  });
-
-  it('does not mutate the input and keeps the original event objects', () => {
-    const events = [told(100, 'a'), told(200, 'b')];
-    const snapshot = events.map((e) => e.id);
-    const picked = selectMomentsMaterial(events, []);
-    expect(events.map((e) => e.id)).toEqual(snapshot);
-    expect(picked[0]).toBe(events[1]);
   });
 });
 

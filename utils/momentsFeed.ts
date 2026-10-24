@@ -30,12 +30,9 @@ export function toMastodonVisibility(local: string | undefined): 'public' | 'unl
   return 'private';
 }
 
-// 朋友圈/Spark 互不影响：熟人线只看 mastodon 同步帖 + 朋友圈手发帖；广场看不到这两类。
+// 朋友圈只看熟人线：mastodon 同步帖 + 朋友圈手发帖，别的来源一律不进（Spark 已于 2026-10-24 移除）。
 export function visibleInMoments(p: SocialPost): boolean {
   return p.origin === 'mastodon' || p.origin === 'moments';
-}
-export function visibleInSpark(p: SocialPost): boolean {
-  return p.origin !== 'mastodon' && p.origin !== 'moments';
 }
 // MCP 返回形态不固定（data / rawText / content 文本块），尽量宽地抽出 status 数组
 export function extractStatuses(payload: any, structuredContent?: any): any[] {

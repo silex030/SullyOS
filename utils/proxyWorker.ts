@@ -11,7 +11,6 @@
  *   - 麦当劳 / 瑞幸 点单 MCP                   → /mcp/mcd /mcp/luckin
  *   - 高德 Web 服务透传（地理编码/POI，浏览器无 CORS 头） → /amap/*
  *   - B站视频内容（元数据/字幕/预览帧，无需登录） → /bilibili/*
- *   - 豆瓣小组内容（Spark 发现页混入真实帖子，无需登录） → /social/douban/* + /social/img
  *   - Cloudflare API 中转（一键部署后端用）    → /cf-api
  *
  * 默认指向作者部署的公共实例。如果作者哪天不再维护、或你想完全自托管，
