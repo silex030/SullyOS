@@ -356,3 +356,74 @@ git -C /opt/sullyos/sullyos-repo rev-parse --short HEAD → 259626ae
 2. 真实供应商模型是否会主动调用该工具（fixture 模型链路）。
 3. 真实平台内容（B 站 412 / 抖音登录墙 / XHS 停用）。
 4. 未部署、未合并。
+
+---
+
+## 9. 第 3 轮返工（run 82，2026-10-25 02:17 起）
+
+### 9.1 本 run 的模型 / provider（只读查询，命令可复跑）
+
+```bash
+env | grep HERMES_SESSION_ID        # → 20261025_021714_c5e427
+python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect('file:/root/.hermes/profiles/ds-executor/state.db?mode=ro', uri=True)
+print(list(c.execute("select session_id, model, billing_provider, billing_base_url, api_call_count"
+                     " from session_model_usage where session_id='20261025_021714_c5e427'")))
+PY
+```
+
+输出（本 session 仅 1 行，即全程未换模型）：
+
+```
+[('20261025_021714_c5e427', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 76, ...)]
+```
+
+- 本卡 run = 82（`task_runs` 只读查询：`select id, profile, status, started_at from task_runs where task_id='t_38463abd'`
+  → `(82, 'ds-executor', 'running', 1792865825)`，即 2026-10-25 02:17:05）。
+- 本 agent 进程由 dispatcher 以 profile 默认配置拉起，未使用 `--model/--provider`，未改 MoA / profile / 权限。
+
+### 9.2 配置与仓库边界
+
+```bash
+sha256sum /root/.hermes/profiles/ds-executor/config.yaml
+stat -c '%y %n' /root/.hermes/profiles/ds-executor/config.yaml
+git -C /opt/sullyos/sullyos-repo rev-parse HEAD && git -C /opt/sullyos/sullyos-repo status --porcelain | wc -l
+ps -eo pid,lstart,cmd | grep -i gateway | grep -v grep
+```
+
+- `config.yaml` sha256 = `6b005711624c4adfd6d64bd77833c8e2d993e92967d926b5744c173a40176113`，
+  mtime `2026-10-24 16:35:36 +0800` —— 早于本 run（02:17:05），即本轮未改配置。
+- 主仓库 `/opt/sullyos/sullyos-repo`：HEAD `259626ae`，`status --porcelain` 0 行（clean）。
+  本卡改动只在 worktree `/root/.hermes/kanban/workspaces/t_75dd49a5/repo` 内。
+- 网关进程只有既存的 PID 1664081，起始时间 `Sat Oct 24 10:12:57 2026`（早于本 run 16h+）；
+  本轮没有启动任何消息网关，没有改 approvals/delegation/kanban 配置，diff 内无密钥形状字符串。
+- 未部署：无 `dist/` 发布、无 worker 重建、无服务重启。
+
+### 9.3 本 run 改动范围（相对上一轮 HEAD 62569fd1）
+
+```
+utils/socialShareTool.ts              （outbox 去重键改 (anchorId, toolCallId) + 已写集合；snapshot/has 按锚点）
+utils/db.ts                           （新增 updateMessageMetadataCommitted：以 transaction.oncomplete 为成功）
+hooks/useChatAI.ts                    （saver 改走 committed 入口；unsaved 日志措辞按新语义）
+utils/socialShareTool.test.ts         （+2 跨锚点补偿用例、+2 真实 IndexedDB 事务用例；并发用例改共享 outbox）
+utils/socialShareTool.wiring.test.ts  （committed 入口 + 事务三件套 + 新日志/文档断言）
+docs/social-content/integration-v1.md （§8.6 幂等/事务提交、§8.8 计数、§8.12 第 3 轮返工记录）
+evidence/*-r3.log + 本文件 §9          （原始日志与边界材料）
+```
+
+### 9.4 本 run 实际跑过的命令类别
+
+- 只读：`kanban_show`、`read_file`/`sed`/`grep`、`git status/diff/log/rev-parse`、`sha256sum`、`stat`、`ps`、
+  `python3` 以 `mode=ro` 读 `state.db` 与 `kanban.db`。
+- 写路径（仅本 worktree 内）：`patch` 改代码/测试/文档、`npx vitest run ... > evidence/*-r3.log`、
+  `npx tsc -p tsconfig.json --noEmit > evidence/tsc-full-r3.log`、`npx vite build > evidence/vite-build-r3.log`。
+- 两处**临时 mutation 验证**（跑完立刻从备份恢复，未留在提交里）：把 outbox key 改回裸 id、
+  把 saver 改回旧 `updateMessageMetadata`，各自让对应用例失败，作为「测试真的能抓住这两个缺陷」的判别性证据。
+
+### 9.5 仍然无法自证的项（与第 1/2 轮一致）
+
+1. provider 侧计费/受理回执（本机拿不到）。
+2. 真实供应商模型是否会主动调用该工具（fixture 模型链路，无灰度数据）。
+3. 真实平台内容（B 站 412 / 抖音登录墙 / XHS 停用）。
+4. 未部署、未合并。
