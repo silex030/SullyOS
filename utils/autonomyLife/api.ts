@@ -209,6 +209,15 @@ export interface ExternalReadPayload {
   fetchedAt: number;
 }
 
+/** 外部窗口请求里的许可绑定（与 ExecutionPermit 的字段同名）。 */
+export interface ExternalPermitWire {
+  actionId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  nonce: string;
+}
+
 export interface AutonomyLifeApi {
   readLife: (charId: string) => Promise<AutonomyLifeApiResult<LifeStatePayload>>;
   readBoundaries: (charId?: string) => Promise<AutonomyLifeApiResult<LifeBoundaryPayload>>;
@@ -257,9 +266,16 @@ export interface AutonomyLifeApi {
     charId: string;
     query: string;
     fields?: string[];
+    /** 一次性许可绑定（服务端核销后才能出网）。 */
+    permit: ExternalPermitWire;
   }) => Promise<AutonomyLifeApiResult<ExternalReadPayload>>;
   /** 出行愿望：落到出行状态机的待选池（不是外部写）。 */
-  submitWish: (input: { charId: string; text: string }) => Promise<AutonomyLifeApiResult<{ wishId: string }>>;
+  submitWish: (input: {
+    charId: string;
+    text: string;
+    /** 一次性许可绑定（服务端核销后才能落库）。 */
+    permit: ExternalPermitWire;
+  }) => Promise<AutonomyLifeApiResult<{ wishId: string }>>;
 }
 
 // ── 形状校验 ────────────────────────────────────────────────────────────────
@@ -817,9 +833,15 @@ export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeAp
       const charId = String(input.charId ?? '').trim();
       const query = String(input.query ?? '').trim();
       if (!charId || !query) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_and_query_required' };
+      if (!input.permit) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'permit_required' };
       const raw = await request(AUTONOMY_LIFE_PATHS.externalRead(), {
         method: 'POST',
-        body: { charId, query, ...(input.fields ? { fields: input.fields } : {}) },
+        body: {
+          charId,
+          query,
+          ...(input.fields ? { fields: input.fields } : {}),
+          ...input.permit,
+        },
         purpose: '外部只读检索',
       });
       if (!raw.ok) return raw;
@@ -845,9 +867,10 @@ export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeAp
       const charId = String(input.charId ?? '').trim();
       const text = String(input.text ?? '').trim();
       if (!charId || !text) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_and_text_required' };
+      if (!input.permit) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'permit_required' };
       const raw = await request(AUTONOMY_LIFE_PATHS.externalWish(), {
         method: 'POST',
-        body: { charId, text },
+        body: { charId, text, ...input.permit },
         purpose: '提交出行愿望',
       });
       if (!raw.ok) return raw;

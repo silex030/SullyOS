@@ -312,6 +312,18 @@ export type ExternalProvider = keyof typeof EXTERNAL_FIELD_ALLOWLIST;
  *   - 浏览器执行器通过 worker 的 `/external/read` 走服务端白名单 fetch（SSRF 防线在服务端）；
  *   - 本接口只负责「把投影后的结果拿回来」，不接触 URL，也没有任意抓取能力。
  */
+/**
+ * 请求必须携带的许可绑定：服务端用它核销一次性许可。
+ * 没有它，服务端只会把它当「裸调用」拒绝（不会出网、不会落愿望）。
+ */
+export interface ExternalPermitBinding {
+  actionId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  nonce: string;
+}
+
 export interface ExternalWindowPort {
   read(input: {
     provider: ExternalProvider;
@@ -320,6 +332,7 @@ export interface ExternalWindowPort {
     charId: string;
     grantId: string;
     nowMs: number;
+    permit: ExternalPermitBinding;
   }): Promise<
     | { ok: true; items: Array<Record<string, string | number>>; fetchedAt: number }
     | { ok: false; code: AutonomyLifeErrorCode; reason: string }
@@ -329,6 +342,7 @@ export interface ExternalWindowPort {
     text: string;
     grantId: string;
     nowMs: number;
+    permit: ExternalPermitBinding;
   }): Promise<{ ok: true; wishId: string } | { ok: false; code: AutonomyLifeErrorCode; reason: string }>;
 }
 
@@ -364,6 +378,21 @@ function fromLocalWrite(outcome: LocalWriteOutcome): ExecuteOutcome {
  * 许可门放在这里而不是只放 runLocalAction：这是**最后一个**可达的副作用入口，
  * 任何新调用点（比如未来的 worker 端执行器）都会被同一道门拦。
  */
+/** 许可 → 外部窗口请求的绑定字段（缺一不可；服务端会逐条核对）。 */
+export function permitBindingOf(ctx: ExecuteContext): ExternalPermitBinding | null {
+  const permit = ctx.permit;
+  if (!permit) return null;
+  if (!permit.actionId || !permit.installationId || !permit.argsHash || !permit.nonce) return null;
+  if (!Number.isInteger(permit.leaseEpoch) || permit.leaseEpoch < 1) return null;
+  return {
+    actionId: permit.actionId,
+    installationId: permit.installationId,
+    leaseEpoch: permit.leaseEpoch,
+    argsHash: permit.argsHash,
+    nonce: permit.nonce,
+  };
+}
+
 export async function executeAction(
   ctx: ExecuteContext,
   deps: ExecuteDeps,
@@ -453,6 +482,10 @@ export async function executeAction(
       const requested = Array.isArray(args.fields) ? args.fields : [];
       const fields = (requested.length ? requested : [...EXTERNAL_FIELD_ALLOWLIST[provider].slice(0, 4)])
         .filter((field) => (EXTERNAL_FIELD_ALLOWLIST[provider] as readonly string[]).includes(field));
+      const binding = permitBindingOf(ctx);
+      if (!binding) {
+        return { status: 'failed', code: 'STATE_CONFLICT', message: 'permit_missing', effectVerified: false };
+      }
       const read = await deps.external.read({
         provider,
         query: args.query,
@@ -461,6 +494,7 @@ export async function executeAction(
         // 授权 id 只作审计提示：真正的授权校验在 validateAndPrepare（现读边界）与服务端。
         grantId: `grant:${provider}:${ctx.nowMs}`,
         nowMs: ctx.nowMs,
+        permit: binding,
       });
       if (!read.ok) {
         return { status: 'failed', code: read.code, message: read.reason, effectVerified: false };
@@ -489,11 +523,16 @@ export async function executeAction(
       if (!args.charId || !text) {
         return { status: 'failed', code: 'VALIDATION_FAILED', message: 'wish_args_missing', effectVerified: false };
       }
+      const binding = permitBindingOf(ctx);
+      if (!binding) {
+        return { status: 'failed', code: 'STATE_CONFLICT', message: 'permit_missing', effectVerified: false };
+      }
       const wish = await deps.external.submitWish({
         charId: args.charId,
         text,
         grantId: `grant:amap:${ctx.nowMs}`,
         nowMs: ctx.nowMs,
+        permit: binding,
       });
       if (!wish.ok) {
         return { status: 'failed', code: wish.code, message: wish.reason, effectVerified: false };

@@ -529,6 +529,128 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
 }
 
 /* ------------------------------------------------------------------ *
+ * 外部窗口：服务端核销一次性许可（副作用只在这里发生）
+ * ------------------------------------------------------------------ */
+
+export interface ConsumeExternalPermitInput {
+  actionId: string;
+  charId: string;
+  installationId: string;
+  leaseEpoch: number;
+  argsHash: string;
+  nonce: string;
+  kind: 'external.read' | 'travel.wish';
+  nowMs: number;
+  expectedRevision: number;
+  expectedWindowId: string;
+  expectedAccountBoundaryRevision: number | null;
+  expectedCharacterBoundaryRevision: number | null;
+}
+
+/**
+ * 外部副作用（出网读 / 落出行愿望）之前**服务端**核销一次性许可。
+ *
+ * 为什么要在服务端核销：这两类动作的副作用不在浏览器里——授权、白名单、配额、出网
+ * 都在 worker。如果只在浏览器侧核销本地许可，重放同一个请求就能重复出网/重复落愿望。
+ * 这里用一条条件 UPDATE 同时校验：动作 CAS、kind、设备、租约、参数 hash、nonce、
+ * 未消费、未过期、预算窗口、账号暂停、角色暂停、两层边界 revision（撤销授权会变）。
+ * changes=0 = 一个字节都不写。
+ */
+export async function consumeExternalPermitAtomic(
+  options: { db: LifeDb; ownerId: string },
+  input: ConsumeExternalPermitInput,
+): Promise<{ ok: true; action: ActionRow } | { ok: false; code: AutonomyLifeErrorCode }> {
+  const { db, ownerId } = options;
+  const current = await db
+    .prepare('SELECT payload FROM autonomy_life_actions WHERE owner_id = ? AND id = ?')
+    .bind(ownerId, input.actionId)
+    .first()
+    .catch(() => null);
+  const row = current ? (parseJson(current.payload, null) as ActionRow | null) : null;
+  if (!row) return { ok: false, code: 'NOT_FOUND' };
+  if (row.charId !== input.charId || row.kind !== input.kind) return { ok: false, code: 'FORBIDDEN' };
+  if (!input.installationId || !row.installationId || row.installationId !== input.installationId) {
+    return { ok: false, code: 'FORBIDDEN' };
+  }
+  if (row.leaseEpoch !== input.leaseEpoch || row.argsHash !== input.argsHash) {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  if (!row.permitNonce || !input.nonce || row.permitNonce !== input.nonce) {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  if (row.permitIssuedAt === null || row.status !== 'running' || row.permitConsumedAt !== null) {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  if (row.leaseExpiresAt === null || input.nowMs > row.leaseExpiresAt) {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
+  if (row.windowId !== input.expectedWindowId) return { ok: false, code: 'STATE_CONFLICT' };
+
+  const next: ActionRow = { ...row, permitConsumedAt: input.nowMs, revision: row.revision + 1 };
+  const updated = await db
+    .prepare(`UPDATE autonomy_life_actions
+      SET revision = revision + 1, payload = ?, updated_at = ?
+      WHERE owner_id = ? AND id = ? AND revision = ?
+        AND status = 'running'
+        AND json_extract(payload, '$.kind') = ?
+        AND json_extract(payload, '$.installationId') = ?
+        AND json_extract(payload, '$.leaseEpoch') = ?
+        AND json_extract(payload, '$.argsHash') = ?
+        AND json_extract(payload, '$.permitNonce') = ?
+        AND json_extract(payload, '$.permitIssuedAt') IS NOT NULL
+        AND json_extract(payload, '$.permitConsumedAt') IS NULL
+        AND COALESCE(json_extract(payload, '$.leaseExpiresAt'), -1) >= ?
+        AND json_extract(payload, '$.windowId') = ?
+        AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''), -1) = ?
+        AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+              WHERE owner_id = ? AND scope = 'character' AND char_id = ?), -1) = ?
+        AND EXISTS (
+          SELECT 1 FROM autonomy_life_accounts a
+          WHERE a.owner_id = autonomy_life_actions.owner_id AND a.paused = 0
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_characters c
+          WHERE c.owner_id = autonomy_life_actions.owner_id
+            AND c.char_id = autonomy_life_actions.char_id
+            AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
+        )`)
+    .bind(
+      JSON.stringify(next),
+      input.nowMs,
+      ownerId,
+      input.actionId,
+      input.expectedRevision,
+      input.kind,
+      input.installationId,
+      input.leaseEpoch,
+      input.argsHash,
+      input.nonce,
+      input.nowMs,
+      input.expectedWindowId,
+      ownerId,
+      input.expectedAccountBoundaryRevision ?? null,
+      ownerId,
+      input.charId,
+      input.expectedCharacterBoundaryRevision ?? -1,
+    )
+    .run();
+
+  if (changesOf(updated) > 0) return { ok: true, action: next };
+
+  // 失败原因（非原子，只用于把错误说准）。
+  const pause = await readAccount(db, ownerId, input.nowMs);
+  if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' };
+  const life = await db
+    .prepare('SELECT payload FROM autonomy_life_characters WHERE owner_id = ? AND char_id = ?')
+    .bind(ownerId, input.charId)
+    .first();
+  const lifeRow = life ? (parseJson(life.payload, null) as CharacterLifeRow | null) : null;
+  if (lifeRow?.pauseRequestedAt != null) return { ok: false, code: 'GLOBAL_PAUSED' };
+  return { ok: false, code: 'STATE_CONFLICT' };
+}
+
+/* ------------------------------------------------------------------ *
  * 边界仓库
  * ------------------------------------------------------------------ */
 

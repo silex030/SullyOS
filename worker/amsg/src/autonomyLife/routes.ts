@@ -19,6 +19,10 @@ import {
   type ActivityKind,
 } from '../../../../contracts/autonomyLife';
 import type { CapabilityProbeState } from '../../../../utils/autonomyLife/adapters';
+import { boundaryGate } from '../../../../utils/autonomyLife/boundary';
+import { verifyReservationHold, windowIdAt } from '../../../../utils/autonomyLife/budget';
+import { hashArgs } from '../../../../contracts/autonomyLife';
+import type { ActionRow } from '../../../../utils/autonomyLife/engine';
 import { createAutonomyLifeRuntime, defaultCharacterBoundary, type AutonomyLifeRuntime } from './runtime';
 import { ensureAutonomyLifeSchema, type LifeDb } from './store';
 import {
@@ -30,6 +34,7 @@ import {
   parseAllowedHosts,
 } from './external';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
+import { consumeExternalPermitAtomic } from './store';
 
 export const AUTONOMY_LIFE_REQUIRED_TOKEN_ENV = 'AMSG_SERVER_TOKEN';
 
@@ -233,82 +238,20 @@ export async function handleAutonomyLifeRequest(
   }
 
   // ── POST /external/read | /external/wish（受控只读窗口）─────────────────
+  // 这是**唯一的出网/落库副作用入口**：必须绑定一个已 claim、已签一次性许可的动作。
+  // 只带 grant 的裸调用一律拒（以前就是这条绕过线）。
   if (match.method === 'POST' && first === 'external' && (second === 'read' || second === 'wish')) {
     const body = await readJson(request);
     if (!body) return deps.respond(400, buildErrorBody('VALIDATION_FAILED', 'body_required', { requestId: 'external', serverTime: nowMs }));
-    const charId = str(body.charId);
-    if (!charId) return deps.respond(400, buildErrorBody('VALIDATION_FAILED', 'charId_required', { requestId: 'external', serverTime: nowMs }));
-    const runtime = await runtimeFor(charId);
-    const effective = await runtime.boundaryFor(charId);
-    const provider = second === 'read' ? 'xhs' : 'amap';
-    const grant = effective.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
-    if (!grant) {
-      return deps.respond(403, buildErrorBody('GRANT_REQUIRED', 'grant_missing_or_expired', { requestId: 'external', serverTime: nowMs }));
-    }
-
-    if (second === 'read') {
-      if (grant.scopes.length > 0 && !grant.scopes.includes('read:search')) {
-        return deps.respond(403, buildErrorBody('POLICY_DENIED', 'scope_not_granted', { requestId: 'external', serverTime: nowMs }));
-      }
-      const query = str(body.query);
-      if (!query || query.length > 80) {
-        return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'query_invalid', { requestId: 'external', serverTime: nowMs }));
-      }
-      const requested = Array.isArray(body.fields)
-        ? (body.fields as unknown[]).filter((item): item is string => typeof item === 'string')
-        : [];
-      const fields = (requested.length ? requested : [...EXTERNAL_RESPONSE_FIELDS[provider].slice(0, 4)])
-        .filter((field) => (EXTERNAL_RESPONSE_FIELDS[provider] as readonly string[]).includes(field));
-      if (fields.length === 0) {
-        return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'fields_not_allowed', { requestId: 'external', serverTime: nowMs }));
-      }
-      const quotaOk = await consumeExternalQuota({
-        db,
-        ownerId: owner.userId,
-        dayKey: localDateKey(nowMs, effective.timezone),
-        provider,
-        limit: grant.dailyQuota,
-        nowMs,
-      });
-      if (!quotaOk) {
-        return deps.respond(429, buildErrorBody('RATE_LIMITED', 'external_daily_quota_exhausted', { requestId: 'external', serverTime: nowMs }));
-      }
-      const endpoint = provider === 'xhs' ? env.AUTONOMY_EXTERNAL_XHS_URL : env.AUTONOMY_EXTERNAL_AMAP_URL;
-      const envHosts = parseAllowedHosts(env.AUTONOMY_EXTERNAL_READ_HOSTS);
-      // 两把锁同时成立才发请求：运营白名单 ∩ 用户授权的主机。
-      const allowedHosts = envHosts.filter((host) => isHostAllowed(host, grant.allowedHosts));
-      const read = await handleExternalRead({
-        provider,
-        query,
-        fields,
-        endpoint: endpoint ?? null,
-        allowedHosts,
-        nowMs,
-      });
-      if (!read.ok) {
-        return deps.respond(read.code === 'POLICY_DENIED' ? 403 : 503, buildErrorBody(read.code, read.reason, { requestId: 'external', serverTime: nowMs }));
-      }
-      return deps.respond(200, {
-        schemaVersion: 1,
-        requestId: deps.requestId?.() ?? 'external',
-        serverTime: nowMs,
-        provider,
-        fields,
-        items: read.result.items,
-        fetchedAt: read.result.fetchedAt,
-      });
-    }
-
-    const text = str(body.text ?? body.wish);
-    if (!text || text.length > 200) {
-      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'wish_invalid', { requestId: 'external', serverTime: nowMs }));
-    }
-    const wish = await insertTravelWish({ db, ownerId: owner.userId, charId, text, grantId: `${grant.provider}:${grant.expiresAt}`, nowMs });
-    return deps.respond(200, {
-      schemaVersion: 1,
-      requestId: deps.requestId?.() ?? 'external',
-      serverTime: nowMs,
-      wishId: wish.wishId,
+    return handleExternalWindowAction({
+      db,
+      env,
+      deps,
+      ownerId: owner.userId,
+      mode: second,
+      body,
+      nowMs,
+      runtimeFor,
     });
   }
 
@@ -381,6 +324,226 @@ export async function handleAutonomyLifeRequest(
     requestId: deps.requestId?.() ?? 'route',
     serverTime: nowMs,
   }));
+}
+
+
+/** 外部窗口动作 ↔ provider / kind 的固定映射（请求体不能改）。 */
+const EXTERNAL_MODE = {
+  read: { kind: 'external.read' as const, provider: 'xhs' as const },
+  wish: { kind: 'travel.wish' as const, provider: 'amap' as const },
+} as const;
+
+type ExternalMode = keyof typeof EXTERNAL_MODE;
+
+const isExternalMode = (value: string | undefined): value is ExternalMode => value === 'read' || value === 'wish';
+
+/**
+ * 受控外部窗口：服务端唯一副作用入口。
+ *
+ * 旧实现只校验 grant，于是任何人都能直接 POST /external/read 出网、/external/wish 落愿望。
+ * 现在请求必须带「已 claim 动作 + 已签发一次性许可」的完整绑定，并且在**出网/落库之前**
+ * 逐层校验：动作归属与终态、设备/租约/epoch、argsHash 与动作参数、nonce、当前生效边界
+ * （暂停/开关/角色禁用/allowedKinds）、授权与到期、请求参数必须等于被批准的参数、
+ * 预算窗口与预留依据、每日配额；最后用一条条件 UPDATE 在服务端核销许可（重放不会再
+ * 出网或落第二行）。
+ */
+async function handleExternalWindowAction(args: {
+  db: LifeDb;
+  env: AutonomyLifeEnv;
+  deps: AutonomyLifeRouteDeps;
+  ownerId: string;
+  mode: string | undefined;
+  body: Record<string, unknown>;
+  nowMs: number;
+  runtimeFor: (charId: string) => Promise<AutonomyLifeRuntime>;
+}): Promise<Response> {
+  const { db, deps, ownerId, body, nowMs, runtimeFor } = args;
+  if (!isExternalMode(args.mode)) {
+    return deps.respond(404, buildErrorBody('NOT_FOUND', 'external_route_not_found', { requestId: 'external', serverTime: nowMs }));
+  }
+  const mode = args.mode;
+  const { kind, provider } = EXTERNAL_MODE[mode];
+
+  const charId = str(body.charId);
+  const actionId = str(body.actionId);
+  const installationId = str(body.installationId);
+  const leaseEpoch = num(body.leaseEpoch);
+  const argsHash = str(body.argsHash);
+  const nonce = str(body.nonce);
+  if (!charId || !actionId || !installationId || leaseEpoch === null || !argsHash || !nonce) {
+    return deps.respond(400, buildErrorBody('VALIDATION_FAILED', 'permit_binding_required', { requestId: 'external', serverTime: nowMs }));
+  }
+  if (body.provider !== undefined && str(body.provider) !== provider) {
+    return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'provider_mismatch', { requestId: 'external', serverTime: nowMs }));
+  }
+
+  const runtime = await runtimeFor(charId);
+  const action = await runtime.store.getAction(actionId);
+  if (!action) {
+    return deps.respond(404, buildErrorBody('NOT_FOUND', 'action_not_found', { requestId: 'external', serverTime: nowMs }));
+  }
+  const conflict = (reason: string, code: 'FORBIDDEN' | 'STATE_CONFLICT' = 'STATE_CONFLICT') =>
+    deps.respond(code === 'FORBIDDEN' ? 403 : 409, buildErrorBody(code, reason, { requestId: 'external', serverTime: nowMs }));
+
+  // 动作归属与执行状态：必须是这个角色、这个 kind、已领到、已签许可、未消费、未过期。
+  if (action.charId !== charId || action.kind !== kind) return conflict('action_scope_mismatch', 'FORBIDDEN');
+  if (!action.installationId || action.installationId !== installationId) return conflict('device_mismatch', 'FORBIDDEN');
+  if (action.status !== 'running' || action.permitIssuedAt === null) return conflict('action_not_permitted');
+  if (action.permitConsumedAt !== null) return conflict('permit_consumed');
+  if (action.leaseEpoch !== leaseEpoch) return conflict('lease_epoch_mismatch');
+  if (action.leaseExpiresAt === null || nowMs > action.leaseExpiresAt) return conflict('permit_expired');
+  if (!action.permitNonce || action.permitNonce !== nonce) return conflict('permit_nonce_mismatch');
+  if (action.argsHash !== argsHash || hashArgs(action.args) !== argsHash) return conflict('args_hash_mismatch');
+
+  // 当前生效边界（现读）：暂停/关总开关/角色禁用/kind 白名单都算拒绝。
+  const effective = await runtime.boundaryFor(charId);
+  if (effective.globalPaused || effective.enabled === false) {
+    return deps.respond(409, buildErrorBody('GLOBAL_PAUSED', 'paused', { requestId: 'external', serverTime: nowMs }));
+  }
+  if (effective.charEnabled === false) {
+    return deps.respond(403, buildErrorBody('CHAR_DISABLED', 'character_disabled', { requestId: 'external', serverTime: nowMs }));
+  }
+  const gate = boundaryGate(effective, kind);
+  if (!gate.ok) return deps.respond(403, buildErrorBody(gate.code, 'kind_not_allowed', { requestId: 'external', serverTime: nowMs }));
+
+  const grant = effective.externalGrants.find((item) => item.provider === provider && item.expiresAt > nowMs);
+  if (!grant) {
+    return deps.respond(403, buildErrorBody('GRANT_REQUIRED', 'grant_missing_or_expired', { requestId: 'external', serverTime: nowMs }));
+  }
+  if (mode === 'read' && grant.scopes.length > 0 && !grant.scopes.includes('read:search')) {
+    return deps.respond(403, buildErrorBody('POLICY_DENIED', 'scope_not_granted', { requestId: 'external', serverTime: nowMs }));
+  }
+
+  // 请求参数必须**就是**被批准的那一组（不能拿一个许可换 query/正文）。
+  let query = '';
+  let fields: string[] = [];
+  let wishText = '';
+  if (mode === 'read') {
+    query = str(body.query);
+    const approved = String((action.args as Record<string, unknown>).query ?? '').trim();
+    if (!query || query !== approved) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'query_not_approved', { requestId: 'external', serverTime: nowMs }));
+    }
+    const approvedFields = Array.isArray((action.args as Record<string, unknown>).fields)
+      ? ((action.args as Record<string, unknown>).fields as unknown[]).filter((item): item is string => typeof item === 'string')
+      : [];
+    const requested = Array.isArray(body.fields)
+      ? (body.fields as unknown[]).filter((item): item is string => typeof item === 'string')
+      : [];
+    const source = requested.length ? requested : (approvedFields.length
+      ? approvedFields
+      : [...EXTERNAL_RESPONSE_FIELDS[provider].slice(0, 4)]);
+    fields = source.filter((field) => (EXTERNAL_RESPONSE_FIELDS[provider] as readonly string[]).includes(field));
+    // 只能在被批准字段范围内取子集；越界字段直接拒（不是悄悄丢掉）。
+    if (requested.some((field) => !(EXTERNAL_RESPONSE_FIELDS[provider] as readonly string[]).includes(field))) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'fields_not_allowed', { requestId: 'external', serverTime: nowMs }));
+    }
+    if (approvedFields.length && requested.some((field) => !approvedFields.includes(field))) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'fields_not_approved', { requestId: 'external', serverTime: nowMs }));
+    }
+    if (fields.length === 0) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'fields_not_allowed', { requestId: 'external', serverTime: nowMs }));
+    }
+  } else {
+    const text = str(body.text ?? body.wish);
+    const approved = String((action.args as Record<string, unknown>).wishText ?? '').trim();
+    if (!text || text !== approved) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', 'wish_not_approved', { requestId: 'external', serverTime: nowMs }));
+    }
+    wishText = text;
+  }
+
+  // 预算窗口 + 预留依据（与 commit-permit 同一套判定）。
+  const windowId = windowIdAt({ now: () => nowMs }, effective.timezone);
+  if (action.windowId !== windowId) return conflict('window_mismatch');
+  const budgetRows = await runtime.budget
+    .mutate(windowId, ['account', charId], (snapshot) => ({ updates: [], result: snapshot }))
+    .catch(() => null);
+  const hold = verifyReservationHold({
+    reservationId: action.reservationId,
+    windowId,
+    charId,
+    nowMs,
+    timezone: effective.timezone,
+    rows: { account: budgetRows?.account ?? null, char: budgetRows ? budgetRows[charId] ?? null : null },
+  });
+  if (!hold.ok) return conflict(hold.reason ?? 'reservation_not_held');
+
+  // 一次性许可在服务端核销：重放会在这里被拒，后面的出网/落库都不会发生。
+  const consumed = await consumeExternalPermitAtomic({ db: args.db, ownerId }, {
+    actionId,
+    charId,
+    installationId,
+    leaseEpoch,
+    argsHash,
+    nonce,
+    kind,
+    nowMs,
+    expectedRevision: action.revision,
+    expectedWindowId: windowId,
+    expectedAccountBoundaryRevision: effective.accountRevision ?? null,
+    expectedCharacterBoundaryRevision: effective.characterRevision ?? null,
+  });
+  if (!consumed.ok) {
+    const status = consumed.code === 'NOT_FOUND' ? 404 : consumed.code === 'FORBIDDEN' ? 403 : consumed.code === 'GLOBAL_PAUSED' ? 409 : 409;
+    return deps.respond(status, buildErrorBody(consumed.code, 'permit_not_consumable', { requestId: 'external', serverTime: nowMs }));
+  }
+
+  // 每日配额：核销之后扣（核销失败不浪费额度；重放在核销那一步就被拒）。
+  const quotaOk = await consumeExternalQuota({
+    db: args.db,
+    ownerId,
+    dayKey: localDateKey(nowMs, effective.timezone),
+    provider,
+    limit: grant.dailyQuota,
+    nowMs,
+  });
+  if (!quotaOk) {
+    return deps.respond(429, buildErrorBody('RATE_LIMITED', 'external_daily_quota_exhausted', { requestId: 'external', serverTime: nowMs }));
+  }
+
+  if (mode === 'wish') {
+    const wish = await insertTravelWish({
+      db: args.db,
+      ownerId,
+      charId,
+      text: wishText,
+      grantId: `${grant.provider}:${grant.expiresAt}`,
+      nowMs,
+    });
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? 'external',
+      serverTime: nowMs,
+      provider,
+      wishId: wish.wishId,
+    });
+  }
+
+  const endpoint = provider === 'xhs' ? args.env.AUTONOMY_EXTERNAL_XHS_URL : args.env.AUTONOMY_EXTERNAL_AMAP_URL;
+  const envHosts = parseAllowedHosts(args.env.AUTONOMY_EXTERNAL_READ_HOSTS);
+  // 两把锁同时成立才发请求：运营白名单 ∩ 用户授权的主机。
+  const allowedHosts = envHosts.filter((host) => isHostAllowed(host, grant.allowedHosts));
+  const read = await handleExternalRead({
+    provider,
+    query,
+    fields,
+    endpoint: endpoint ?? null,
+    allowedHosts,
+    nowMs,
+  });
+  if (!read.ok) {
+    return deps.respond(read.code === 'POLICY_DENIED' ? 403 : 503, buildErrorBody(read.code, read.reason, { requestId: 'external', serverTime: nowMs }));
+  }
+  return deps.respond(200, {
+    schemaVersion: 1,
+    requestId: deps.requestId?.() ?? 'external',
+    serverTime: nowMs,
+    provider,
+    fields,
+    items: read.result.items,
+    fetchedAt: read.result.fetchedAt,
+  });
 }
 
 /** 首个请求即登记角色（只建一行全 null 的角色边界：继承账号层，不扩权）。 */

@@ -12,7 +12,13 @@ import type { ExternalProvider, ExternalWindowPort } from './adapters';
 export function createWorkerExternalWindowPort(api: AutonomyLifeApi): ExternalWindowPort {
   return {
     async read(input) {
-      const res = await api.externalRead({ charId: input.charId, query: input.query, fields: [...input.fields] });
+      // 许可绑定一并交给服务端：worker 在出网前用它核销一次性许可（重放不会再出网）。
+      const res = await api.externalRead({
+        charId: input.charId,
+        query: input.query,
+        fields: [...input.fields],
+        permit: input.permit,
+      });
       if (!res.ok) {
         // 客户端错误码（NOT_CONFIGURED/NETWORK/…）映射成「能力不可用」，不伪装成成功。
         return { ok: false, code: 'CAPABILITY_UNAVAILABLE', reason: String(res.code) };
@@ -23,7 +29,7 @@ export function createWorkerExternalWindowPort(api: AutonomyLifeApi): ExternalWi
       return { ok: true, items: res.data.items, fetchedAt: res.data.fetchedAt };
     },
     async submitWish(input) {
-      const res = await api.submitWish({ charId: input.charId, text: input.text });
+      const res = await api.submitWish({ charId: input.charId, text: input.text, permit: input.permit });
       if (!res.ok) return { ok: false, code: 'CAPABILITY_UNAVAILABLE', reason: String(res.code) };
       return { ok: true, wishId: res.data.wishId };
     },

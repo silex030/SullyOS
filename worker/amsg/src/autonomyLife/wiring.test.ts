@@ -8,7 +8,7 @@
  *   3. HTTP 层：共享口令缺失/错误 401、角色按 owner 隔离、claim→commit→receipt 全链路；
  *   4. cron：未登记角色不 tick、账号关着不调模型、真实模型返回的候选能落成 scheduled 动作。
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqlite';
 import { commitPermit, claimAction, emptyCharacterLife, reportReceipt, tickCharacter } from '../../../../utils/autonomyLife/engine';
@@ -91,11 +91,19 @@ async function registerCharacter(charId = CHAR) {
 }
 
 /** 直接造一个 due 的动作行（等价于 cron tick 产出的结果）。 */
-async function insertAction(actionId: string, options: { charId?: string; installationId?: string | null } = {}) {
+async function insertAction(
+  actionId: string,
+  options: {
+    charId?: string;
+    installationId?: string | null;
+    kind?: 'journal.write' | 'external.read' | 'travel.wish';
+    args?: Record<string, unknown>;
+  } = {},
+) {
   const row = {
     id: actionId,
     charId: options.charId ?? CHAR,
-    kind: 'journal.write' as const,
+    kind: (options.kind ?? 'journal.write') as 'journal.write' | 'external.read' | 'travel.wish',
     windowId: 'w:2026-10-24',
     executionMode: 'local' as const,
     scope: 'os_simulation' as const,
@@ -103,7 +111,7 @@ async function insertAction(actionId: string, options: { charId?: string; instal
     sourceRef: null,
     purposeKey: 'purpose-journal',
     semanticPurpose: 'daily_note',
-    args: { title: '今天', body: '雨停之后去楼下走了走。' },
+    args: options.args ?? { title: '今天', body: '雨停之后去楼下走了走。' },
     argsHash: '',
     basis: 'virtual' as const,
     reasonSummary: '想把今天记下来',
@@ -632,7 +640,7 @@ describe('cron：只推进已登记且开着的角色', () => {
   });
 });
 
-describe('HTTP 路由：受控外部只读窗口', () => {
+describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一次性许可）', () => {
   const env = (extra: Record<string, unknown> = {}) => ({
     DB: db,
     AMSG_SERVER_TOKEN: TOKEN,
@@ -651,12 +659,17 @@ describe('HTTP 路由：受控外部只读窗口', () => {
     ...over,
   });
 
-  const call = (path: string, body: unknown, extraEnv: Record<string, unknown> = {}, token = TOKEN) => {
+  const call = (
+    path: string,
+    body: unknown,
+    extraEnv: Record<string, unknown> = {},
+    opts: { token?: string; nowMs?: number } = {},
+  ) => {
     const headers = new Headers({ 'Content-Type': 'application/json', 'X-User-Id': USER });
-    if (token) headers.set('X-Client-Token', token);
+    if (opts.token !== null) headers.set('X-Client-Token', opts.token ?? TOKEN);
     const request = new Request(`https://worker.example${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
     return handleAutonomyLifeRequest(request, env(extraEnv), {
-      now: () => NOW,
+      now: () => opts.nowMs ?? NOW,
       resolveOwner: (req) => resolveOwnerFromSharedToken(req, env(extraEnv)),
       respond: (status, payload) => new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } }),
       hasModelCredentials: async () => true,
@@ -664,44 +677,181 @@ describe('HTTP 路由：受控外部只读窗口', () => {
     });
   };
 
-  it('没有授权 → 403 GRANT_REQUIRED（连外部端点都不看）', async () => {
-    await seedAccountBoundary({ allowedKinds: ['external.read'] });
-    const res = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡' });
-    expect(res?.status).toBe(403);
-    const body = await res!.json() as any;
-    expect(body.error.code).toBe('GRANT_REQUIRED');
+  /** 造一个已 claim + 已签许可的外部动作，返回请求时要带的绑定。 */
+  async function prepareExternalAction(input: {
+    kind: 'external.read' | 'travel.wish';
+    args: Record<string, unknown>;
+    actionId: string;
+    grantOverrides?: Record<string, unknown>;
+    seedGrant?: boolean;
+  }) {
+    await seedAccountBoundary({
+      allowedKinds: [input.kind],
+      externalGrants: input.seedGrant === false
+        ? []
+        : [grant(input.kind === 'external.read' ? 'xhs' : 'amap', input.grantOverrides)],
+    });
+    await registerCharacter();
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).bindInstallation(USER, 'install-1', NOW);
+    const row = await insertAction(input.actionId, { kind: input.kind, args: input.args });
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const claimed = await claimAction(runtime.engine, { accountId: USER, installationId: 'install-1', charId: CHAR });
+    expect(claimed.action?.id).toBe(input.actionId);
+    const permit = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: input.actionId,
+      installationId: 'install-1',
+      leaseEpoch: claimed.leaseEpoch,
+      argsHash: row.argsHash,
+      policyVersion: row.policyVersion,
+      nowMs: NOW,
+    });
+    expect(permit.ok).toBe(true);
+    return {
+      actionId: input.actionId,
+      installationId: 'install-1',
+      leaseEpoch: claimed.leaseEpoch,
+      argsHash: row.argsHash,
+      nonce: permit.permit!.nonce,
+    };
+  }
+
+  const readArgs = { query: '咖啡', fields: ['title', 'author'] };
+  const wishArgs = { wishText: '想去海边看一次日出' };
+
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // 默认：任何出网都算失败（负面用例要求 fetch 零调用）。
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('不该出网');
+    }) as never;
+    // vi.spyOn 会让上面的 mock 成为实现；计数从 0 开始。
+    fetchSpy.mockClear();
   });
 
-  it('授权有效但端点未配置 → 503 CAPABILITY_UNAVAILABLE（不编造结果）', async () => {
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it('裸调用（没有动作/许可绑定）→ 400，零出网、零落库', async () => {
+    await seedAccountBoundary({ allowedKinds: ['external.read'], externalGrants: [grant('xhs')] });
+    const res = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡' });
+    expect(res?.status).toBe(400);
+    expect((await res!.json() as any).error.message).toBe('permit_binding_required');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('直接调用编造 actionId → 404；未 claim/未签许可 → 409；两种情况都不出网', async () => {
     await seedAccountBoundary({ allowedKinds: ['external.read'], externalGrants: [grant('xhs')] });
     await registerCharacter();
-    const res = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡' });
-    expect(res?.status).toBe(503);
+    const fabricated = { charId: CHAR, query: '咖啡', actionId: 'act_nope', installationId: 'install-1', leaseEpoch: 1, argsHash: 'x', nonce: 'n' };
+    expect((await call('/autonomy-life/v1/external/read', fabricated))?.status).toBe(404);
+
+    // 只建行、不 claim、不签许可：状态是 scheduled，permitIssuedAt=null。
+    await insertAction('act-unpermitted', { kind: 'external.read', args: readArgs });
+    const unpermitted = await call('/autonomy-life/v1/external/read', {
+      charId: CHAR, query: '咖啡', actionId: 'act-unpermitted', installationId: 'install-1', leaseEpoch: 1, argsHash: 'x', nonce: 'n',
+    });
+    expect(unpermitted?.status).toBe(409);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('错 argsHash / 错 nonce / 过期许可 / 请求参数不是被批准的那一组 → 拒绝且不出网', async () => {
+    const binding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-neg' });
+    const base = { charId: CHAR, query: '咖啡', fields: ['title'], ...binding };
+
+    const wrongHash = await call('/autonomy-life/v1/external/read', { ...base, argsHash: 'deadbeef' });
+    expect(wrongHash?.status).toBe(409);
+
+    const wrongNonce = await call('/autonomy-life/v1/external/read', { ...base, nonce: 'nonce_forged' });
+    expect(wrongNonce?.status).toBe(409);
+
+    const wrongQuery = await call('/autonomy-life/v1/external/read', { ...base, query: '别的关键词' });
+    expect(wrongQuery?.status).toBe(422);
+    expect((await wrongQuery!.json() as any).error.message).toBe('query_not_approved');
+
+    const expired = await call('/autonomy-life/v1/external/read', base, { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read' }, { nowMs: NOW + 10 * 60_000 });
+    expect(expired?.status).toBe(409);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('授权被撤销/过期、账号暂停、角色暂停 → 403/409，仍不出网', async () => {
+    // 许可先正常签出来（签发时有授权），随后用户撤销授权：路由必须按**现读边界**拒。
+    const revoked = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-revoked' });
+    await seedAccountBoundary({ allowedKinds: ['external.read'], externalGrants: [] });
+    const revokedRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...revoked });
+    expect(revokedRes?.status).toBe(403);
+    expect((await revokedRes!.json() as any).error.code).toBe('GRANT_REQUIRED');
+
+    const expiredGrant = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-expired-grant' });
+    await seedAccountBoundary({ allowedKinds: ['external.read'], externalGrants: [grant('xhs', { expiresAt: NOW - 1 })] });
+    const expiredRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...expiredGrant });
+    expect(expiredRes?.status).toBe(403);
+
+    const accountPaused = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-account-paused' });
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).setAccountPause(USER, true, NOW);
+    const pausedRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...accountPaused });
+    expect(pausedRes?.status).toBe(409);
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).setAccountPause(USER, false, NOW);
+
+    const charPaused = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-char-paused' });
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const life = (await runtime.store.getCharacterLife(CHAR)) ?? emptyCharacterLife(CHAR, NOW, 'Asia/Shanghai');
+    await runtime.store.putCharacterLife({ ...life, pauseRequestedAt: NOW, revision: life.revision + 1 }, life.revision);
+    const charPausedRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...charPaused });
+    expect(charPausedRes?.status).toBe(409);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('正向：绑定许可后只出网一次、只回白名单字段；重放被拒且不再出网', async () => {
+    const binding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-ext-ok' });
+    fetchSpy.mockImplementation(async () => new Response(JSON.stringify({
+      items: [{ title: '咖啡地图', author: 'a', excerpt: 'e', likes: 3, secret: 'token' }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }) as never);
+
+    const res = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title', 'author'], ...binding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(res?.status).toBe(200);
     const body = await res!.json() as any;
-    expect(body.error.code).toBe('CAPABILITY_UNAVAILABLE');
+    expect(body.items).toEqual([{ title: '咖啡地图', author: 'a' }]);
+    expect(JSON.stringify(body)).not.toContain('token');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const calledUrl = String((fetchSpy.mock.calls[0] as unknown[])[0]);
+    expect(calledUrl).toContain('q=%E5%92%96%E5%95%A1');
+
+    // 重放同一个请求：permit 已在服务端核销 → 409，且再次出网不会发生。
+    const replay = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title', 'author'], ...binding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(replay?.status).toBe(409);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const after = await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).getAction('act-ext-ok');
+    expect(after?.permitConsumedAt).not.toBeNull();
   });
 
-  it('配额按 grant.dailyQuota 原子扣减：第二次 429', async () => {
-    await seedAccountBoundary({ allowedKinds: ['external.read'], externalGrants: [grant('xhs')] });
-    await registerCharacter();
-    const first = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡' });
-    // 第一次通过授权与配额，卡在「端点未配置」。
-    expect(first?.status).toBe(503);
-    const second = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡' });
-    expect(second?.status).toBe(429);
-  });
-
-  it('出行愿望：有 amap 授权就落库并返回 wishId', async () => {
-    await seedAccountBoundary({ allowedKinds: ['travel.wish'], externalGrants: [grant('amap')] });
-    await registerCharacter();
-    const res = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出' });
+  it('出行愿望：绑定许可落一行；重放不出第二行；配额耗尽 → 429 且零落库', async () => {
+    const binding = await prepareExternalAction({ kind: 'travel.wish', args: wishArgs, actionId: 'act-wish-ok' });
+    const res = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...binding });
     expect(res?.status).toBe(200);
     const body = await res!.json() as any;
     expect(body.wishId).toMatch(/^wish_/);
-    const row = await db
-      .prepare('SELECT text FROM autonomy_life_wishes WHERE owner_id = ? AND id = ?')
-      .bind(USER, body.wishId)
-      .first();
-    expect(row?.text).toBe('想去海边看一次日出');
+    const count = async () => Number((await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_wishes WHERE owner_id = ?').bind(USER).first())?.n ?? 0);
+    expect(await count()).toBe(1);
+
+    const replay = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...binding });
+    expect(replay?.status).toBe(409);
+    expect(await count()).toBe(1);
+
+    // 第二条动作：grant.dailyQuota=1 已耗尽 → 429，且不会落第二行。
+    const second = await prepareExternalAction({ kind: 'travel.wish', args: wishArgs, actionId: 'act-wish-quota' });
+    const quota = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...second });
+    expect(quota?.status).toBe(429);
+    expect(await count()).toBe(1);
   });
 });
