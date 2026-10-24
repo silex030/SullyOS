@@ -168,7 +168,9 @@ export function gateTravelDecisionPort(
     try {
       value = await run();
     } catch (error) {
-      // 请求没成功回来：证明发出去了就按上界记账，否则释放（交给结算的既有语义）。
+      // 端口抛错时无法证明请求**没有**发出 → 按「已发出」结算（与旧行为一致的保守口径：
+      // 宁可多记一次消耗，也不让一次真实调用白嫖额度）。结算失败也只影响账本，错误继续往外抛，
+      // 本轮不产生任何业务效果。
       await settleLegacyRoundCall({
         db: deps.db,
         permit: reserved.permit,
