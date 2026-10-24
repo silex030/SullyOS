@@ -332,3 +332,9 @@
     `/travel/map/rest` 无会话 401、`/travel/pair/approve` 404；合成主体走完 申请→拒绝未批准→本机批准→
     一次 claim→session→凭据 all-false→中转 503→重放 409，数据已清（owner/pair/map 均 0 行）。
   - 仍缺：真实用户的公开短码 + userId（设置页「申请连接」自带），未拿到前不宣称本人已连接。
+- 2026-10-24：**地图服务填写帮助（中文步骤 + 官方入口）**——用户「不会填」，在设置 → 实时感知 →「真实地点」的地图服务卡片里补了新手路径（单 owner：`components/settings/TravelMapServiceCard.tsx`，不新增设置参数、不动鉴权/后端）：
+  - 卡片内新增总「第一次填写顺序」折叠块（申请连接 → 短码交管理员 → 复用已有 Web 服务 Key → 同一应用加 Web端(JS API) Key + 安全密钥 → Mapbox 可留空 → 保存/测试）。
+  - 四个 Key 字段各自「不会填？查看步骤」折叠块，只放核实过的四个官方入口（`TRAVEL_MAP_HELP_LINKS`：`console.amap.com/dev/key/app`、`lbs.amap.com/api/webservice/get-key`、`lbs.amap.com/api/javascript-api-v2/guide/abc/prepare`、`account.mapbox.com/access-tokens/`），全部 `target="_blank" rel="noopener noreferrer"`。
+  - 文案边界：申请连接是本站按钮（不在高德找配对码）、短码 `XXXX-XXXX` 交管理员一次批准后本浏览器自动连接、`clientSecret`/`ownerKey`/API Key 禁止发聊天；Web 服务 Key 可复用并按官方平台名「Web服务」、JS Key 平台「Web端(JS API)」（官方原文 web 平台（JS API））+ 白名单 `link.ethernet.bot.cd`；jscode 存服务端不回显；Mapbox 可选留空、`pk.` 与 `sk.` 区分、不承诺永久免费；保存≠已出图/已开通权限，测试连接可能耗额度。
+  - 固定地点卡（`TravelAnchorCard`）补「先填城市再搜」；角色卡（`TravelCharCard`）补「去向由角色决定，用户只给总授权」。
+  - 测试 `components/settings/TravelMapServiceCard.help.test.tsx`（12 例）：帮助文案、四个外链 host 白名单、`target`/`rel`、未配对只有申请连接、Mapbox 可选。

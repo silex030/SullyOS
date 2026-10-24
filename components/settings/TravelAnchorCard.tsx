@@ -92,7 +92,7 @@ const TravelAnchorCard: React.FC<TravelAnchorCardProps> = ({ runtime, disabled =
                 <span className="text-[12px] font-medium text-slate-800">固定地点（用户住处 / 常去地点）</span>
             </div>
             <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
-                只填到小区或公共地点名；不填门牌、楼栋、单元、房号。这是你确认的固定地址，不是设备定位，也不是角色当前在哪。
+                先填城市，再搜小区或公共地点并点「确认」；只填到小区或公共地点名，不填门牌、楼栋、单元、房号。这是你确认的固定地址，不是设备定位，也不是角色当前在哪。
             </p>
 
             <div className="mt-2 space-y-1.5">

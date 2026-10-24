@@ -84,3 +84,16 @@ pnpm vitest run worker/amsg/src/travel/mapCredentials.test.ts worker/amsg/src/tr
 3. 刷新页面 / 重开面板 → 凭据仍在（服务端解密），无需重填。
 4. 打开行程地图 → 底图出现且 jscode 在浏览器 Network 里不可见（只有 `/_AMapService/...` 请求）。
 5. 点某个字段「清除」→ 状态变未保存，地图相应降级；刷新后不会恢复。
+
+## 八、页面里的填写帮助（新手步骤）
+
+用户不会填时，帮助就在同一张卡片里（`components/settings/TravelMapServiceCard.tsx`，唯一 owner；别处不再加外站链接）：
+
+- 总「第一次填写顺序」：申请连接（本站按钮，不在高德找配对码）→ 短码 `XXXX-XXXX` + userId 交管理员批准 → 复用已有 Web 服务 Key → 同一应用加「Web端(JS API)」Key + 安全密钥 → Mapbox 可留空 → 保存 / 测试。
+- 每个 Key 字段下「不会填？查看步骤」折叠块，官方入口只这四个（`TRAVEL_MAP_HELP_LINKS`，均 `target="_blank" rel="noopener noreferrer"`）：
+  - `https://console.amap.com/dev/key/app`（控制台 · 我的应用）
+  - `https://lbs.amap.com/api/webservice/get-key`（Web 服务 Key 申请，官方："需要申请应用Key"）
+  - `https://lbs.amap.com/api/javascript-api-v2/guide/abc/prepare`（JS API 的 key 与安全密钥，官方："web 平台（JS API）"）
+  - `https://account.mapbox.com/access-tokens/`（Mapbox `pk.` token，可选）
+- 文案护栏：密钥只粘进输入框，禁止发聊天/截图；Web 服务 Key 与 JS Key 类型不混；jscode 只存服务端；Mapbox 可选、不承诺永久免费；保存 ≠ 已出图或已开通高德权限，测试连接可能耗额度。
+- 回归：`pnpm vitest run components/settings/TravelMapServiceCard.help.test.tsx`（12 例，含 host 白名单与 `rel` 属性）。

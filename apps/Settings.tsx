@@ -4580,6 +4580,9 @@ const Settings: React.FC = () => {
                       <span className="text-sm font-bold text-teal-700">真实地点</span>
                   </div>
                   <div className="space-y-2">
+                      <p className="text-[10px] leading-relaxed text-teal-700/80">
+                          不会填？卡片里有「第一次填写顺序」和官网链接；「申请连接」就在本页，不用去高德找配对码。
+                      </p>
                       <div>
                           <TravelMapServiceCard
                               legacyKey={rtAmapKey}

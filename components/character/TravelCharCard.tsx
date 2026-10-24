@@ -83,6 +83,9 @@ const TravelCharCard: React.FC<TravelCharCardProps> = ({ charId, runtime: inject
             ? 'TA 可以自己出门、中途改主意、自己回家；地图服务由全局那一份凭据提供。'
             : '当前暂停。开启后 TA 会按自己的作息与心情决定是否出门。'}
       </div>
+      <div data-testid="travel-char-authorization" className="mt-0.5 text-[9px] leading-relaxed text-slate-400">
+        去哪、什么时候出门由 TA 自己决定；你只在这里给一个总授权，不需要逐次批准。
+      </div>
       {unpaired && (
         <div data-testid="travel-char-needs-connect" className="mt-1 text-[9px] text-amber-700">
           还没连接账号：到设置 → 实时感知 →「地图服务」点「申请连接」。
