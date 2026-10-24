@@ -224,6 +224,7 @@ import type { TravelPlaceAnchor, TravelCoordSys } from '../../../contracts/trave
 import type { TravelTickSubject } from './travel/tick';
 import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './autonomyLife/routes';
 import { handleAutonomyLifeScheduled, summariseAutonomyLifeOutcomes } from './autonomyLife/tick';
+import { gateLegacyAutonomyPacks } from './autonomyLife/legacyGate';
 import { AUTONOMY_DAILY_TOKEN_BUDGET } from '../../../utils/airp/autonomySettings';
 import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
 import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
@@ -4065,10 +4066,18 @@ export default {
         return;
       }
       const scanned = await scanAutonomyPacks({ db, masterKey: env.AMSG_MASTER_KEY });
+      // **统一边界闸**：旧 AIRP 回合自己的护栏不看新边界，必须在建任务之前按新边界再筛一遍
+      // （暂停 / 关角色 / allowedKinds / 未验证禁区 / 预算耗尽 → 整包跳过）。这样「旧配置」
+      // 不能再绕过设置页里的暂停与额度；没有新边界的存量用户默认不跑。
+      const legacyGate = await gateLegacyAutonomyPacks({
+        db: env.DB as unknown as Parameters<typeof gateLegacyAutonomyPacks>[0]['db'],
+        packs: scanned.packs,
+        nowMs,
+      });
       const result = await runAutonomyTick({
         nowMs,
         db,
-        packs: scanned.packs,
+        packs: legacyGate.allowed,
         // 扫描与 tick 内的兜底读取必须同一把钥：缺了它护栏只能按「读不出来」暂停，
         // 而以前是把用户的总暂停静默降级成「未暂停 + 默认 6 次/天」。
         masterKey: env.AMSG_MASTER_KEY,
@@ -4083,10 +4092,17 @@ export default {
       const notableSkips = result.skipped.filter(
         (entry) => entry.reason !== AUTONOMY_SKIP_REASONS.disabled,
       );
-      if (result.built.length > 0 || notableSkips.length > 0 || scanned.skipped.length > 0) {
+      if (
+        result.built.length > 0
+        || notableSkips.length > 0
+        || scanned.skipped.length > 0
+        || legacyGate.skipped.length > 0
+      ) {
         console.log('[amsg:autonomy]', {
           built: result.built,
           skipped: result.skipped,
+          // 新边界闸拦下来的（旧链路旁路证据）。
+          gated: legacyGate.skipped,
           unreadable: scanned.skipped,
         });
       }
