@@ -97,6 +97,14 @@ import { parseTravelIntent, recordTravelIntent } from './travel/intent';
 import { ensureTravelSchema } from './travel/store';
 import type { ResolvedAirpAutonomy } from '../../../utils/airp/autonomySettings';
 import { resolveScheduleSlots } from '../../../utils/scheduleInjection';
+import {
+  LEGACY_AUTONOMY_KIND,
+  legacyRoundStillAllowed,
+  reserveLegacyRoundCall,
+  settleLegacyRoundCall,
+  type LegacyRoundPermit,
+} from './autonomyLife/legacyGate';
+import type { LifeDb } from './autonomyLife/store';
 
 /** 只为单测导出：让测试能不经 index.ts 直接喂一份 ctx。 */
 export type { KindFireCtx, KindSessionCtx };
@@ -138,6 +146,10 @@ export const AUTONOMY_FIRE_SKIP = {
   ownerUnresolved: 'autonomy-owner-unresolved',
   /** 用户在我们建任务之后、到点之前按了总暂停。 */
   pausedByUser: 'autonomy-paused-by-user',
+  /** 统一边界门拒绝（总开关/角色/kind/未验证禁区）：fail-closed。 */
+  governanceDenied: 'autonomy-governance-denied',
+  /** 统一预算门拒绝（账号/角色额度已满，或账本不可用）。 */
+  budgetExhausted: 'autonomy-budget-exhausted',
 } as const;
 
 export const AUTONOMY_BAD_OUTPUT_REASON = 'autonomy-bad-output';
@@ -942,6 +954,10 @@ interface AutonomyFireState {
   workflowKind?: AutonomyWorkflowKind;
   planMaxChars?: number;
   idempotencyKey?: string;
+  /** 统一预算预留凭据（beforeFire 预留 → llmOutput 结算/复核）。 */
+  budgetPermit?: LegacyRoundPermit | null;
+  /** 认得出的 owner（统一边界/预算都按 owner 读数；空 = 不允许继续）。 */
+  ownerUserId?: string | null;
 }
 
 const readCarriedState = (state: unknown): AutonomyFireState | null => {
@@ -970,6 +986,8 @@ const readCarriedState = (state: unknown): AutonomyFireState | null => {
       ? { workflowKind: state.workflowKind as AutonomyWorkflowKind } : {}),
     ...(typeof state.planMaxChars === 'number' ? { planMaxChars: state.planMaxChars } : {}),
     ...(typeof state.idempotencyKey === 'string' ? { idempotencyKey: state.idempotencyKey } : {}),
+    ...(isRecord(state.budgetPermit) ? { budgetPermit: state.budgetPermit as unknown as LegacyRoundPermit } : {}),
+    ...(typeof state.ownerUserId === 'string' ? { ownerUserId: state.ownerUserId } : {}),
   };
 };
 
@@ -1349,6 +1367,31 @@ export const autonomyRoundHandler: FireKindHandler = {
         },
         perceptionBlock,
       });
+      // 统一边界 + 统一预算：**真正调模型之前**按当前生效边界重判并原子预留下一次调用。
+      // 排在这里而不是建任务前：用户可能在排队之后暂停/关角色/改额度，只读筛包挡不住。
+      const reserved = await reserveLegacyRoundCall({
+        db: db as unknown as LifeDb,
+        ownerId: ownerUserId,
+        charId,
+        nowMs,
+        kind: LEGACY_AUTONOMY_KIND,
+      });
+      if (!reserved.ok) {
+        try {
+          await settleAutonomyPlan(db, {
+            planId: plan.id,
+            status: 'failed',
+            nowMs,
+            error: reserved.reason,
+          });
+        } catch { /* 下一跳再收 */ }
+        return {
+          skip: true,
+          reason: reserved.reason === 'budget_exhausted'
+            ? AUTONOMY_FIRE_SKIP.budgetExhausted
+            : AUTONOMY_FIRE_SKIP.governanceDenied,
+        };
+      }
       return {
         messages: [{ role: 'user', content: prompt }],
         state: {
@@ -1367,6 +1410,8 @@ export const autonomyRoundHandler: FireKindHandler = {
           workflowKind: plan.kind,
           planMaxChars: plan.maxChars,
           idempotencyKey: `plan:${plan.id}`,
+          budgetPermit: reserved.permit,
+          ownerUserId,
         } satisfies AutonomyFireState,
       };
     }
@@ -1379,6 +1424,24 @@ export const autonomyRoundHandler: FireKindHandler = {
     const state = await getAutonomyState(db, charId);
     // P4：只把本地过滤后的相关小快照放进动态尾段（没有就不占位）。
     const perceptionBlock = await buildAutonomyPerceptionBlock({ db, charId, pack, nowMs });
+
+    // 统一边界 + 统一预算：到点这一跳**真正调模型之前**的硬门。
+    const reserved = await reserveLegacyRoundCall({
+      db: db as unknown as LifeDb,
+      ownerId: ownerUserId,
+      charId,
+      nowMs,
+      kind: LEGACY_AUTONOMY_KIND,
+    });
+    if (!reserved.ok) {
+      console.warn('[amsg:autonomy] 统一边界/预算拒绝，这一轮不调模型', charId, reserved.reason);
+      return {
+        skip: true,
+        reason: reserved.reason === 'budget_exhausted'
+          ? AUTONOMY_FIRE_SKIP.budgetExhausted
+          : AUTONOMY_FIRE_SKIP.governanceDenied,
+      };
+    }
 
     return {
       messages: [{ role: 'user', content: buildAutonomyRoundPrompt({ pack, nowMs, pages, autonomy, perceptionBlock }) }],
@@ -1393,6 +1456,8 @@ export const autonomyRoundHandler: FireKindHandler = {
         nowMs,
         roundRef: `round:${crypto.randomUUID()}`,
         lastUserMessageAt: typeof pack.lastUserMessageAt === 'number' ? pack.lastUserMessageAt : null,
+        budgetPermit: reserved.permit,
+        ownerUserId,
       } satisfies AutonomyFireState,
     };
   },
@@ -1402,6 +1467,35 @@ export const autonomyRoundHandler: FireKindHandler = {
     if (!db) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.dbUnavailable };
     const carried = readCarriedState(state);
     if (!carried) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.stateMissing };
+
+    // 统一预算结算：这一次模型请求**真的发出去了**（llmOutput 只在上游回来后才调），
+    // 按真实 usage 结算；usage 不明就按预留上界（不猜零）。旧链路的消耗从这一刻起
+    // 记进新预算——以前只写旧 autonomy_state，新预算永远看不到。
+    if (carried.budgetPermit) {
+      const usageForBudget = readUsage(ctx);
+      const settled = await settleLegacyRoundCall({
+        db: db as unknown as LifeDb,
+        permit: carried.budgetPermit,
+        actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
+        requestStarted: true,
+      });
+      if (!settled) console.warn('[amsg:autonomy] 预算结算失败（记录留给对账）', carried.charId);
+    }
+
+    // 执行期复核：模型跑的这一小段时间里用户可能按了暂停 / 关了角色 / 加了禁区。
+    // 拒了就只结算、不写任何业务产物（经历/愿望/计划都不落）。
+    if (carried.ownerUserId) {
+      const denial = await legacyRoundStillAllowed({
+        db: db as unknown as LifeDb,
+        ownerId: carried.ownerUserId,
+        charId: carried.charId,
+        nowMs: carried.nowMs,
+      });
+      if (denial) {
+        console.warn('[amsg:autonomy] 执行期边界已变，这一轮不落业务产物', carried.charId, denial);
+        return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+      }
+    }
 
     // P5：计划到点执行走独立分支——不产出经历列表/反刍闸/推送，只落一条虚拟经历并结算计划。
     if (carried.mode === 'workflow') return handleWorkflowOutput(db, ctx, carried);

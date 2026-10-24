@@ -82,6 +82,19 @@ async function seedBudgetHold(charId = CHAR) {
   }
 }
 
+/**
+ * 预留凭据：与 `insertAction` 一起落，模拟「引擎 reserveBudget 写了记录 → 绑定到动作」。
+ * 之后许可签发/外部副作用会按 id 查这一条（不再靠预算行的历史用量）。
+ */
+let reservationSeq = 0;
+async function seedReservationRow(charId: string, reservationId: string, actionId: string | null, counter: number) {
+  await db.prepare(`INSERT OR REPLACE INTO autonomy_life_budget_reservations
+    (owner_id, reservation_id, window_id, char_id, counter, kind, plan_ref, calls, tokens, state, action_id, created_at, expires_at, settled_at, revision)
+    VALUES (?, ?, ?, ?, ?, NULL, ?, 1, 10, 'settled', ?, ?, ?, ?, 1)`)
+    .bind(USER, reservationId, WINDOW, charId, counter, `rhythm-plan:${charId}`, actionId, NOW, NOW + 6 * 60 * 60_000, NOW)
+    .run();
+}
+
 /** 登记角色边界（客户端打开过该角色的自主生活）。 */
 async function registerCharacter(charId = CHAR) {
   const row = normalizeBoundary({}, { scope: 'character', nowMs: NOW, revision: 0 });
@@ -133,6 +146,11 @@ async function insertAction(
     permitConsumedAt: null,
     notified: false,
   };
+  // 每条动作一张独立凭据（同一测试里可能有多条动作，共用一个 id 会互相借走）。
+  reservationSeq += 1;
+  const counter = 1000 + reservationSeq;
+  row.reservationId = `rsv_${WINDOW}_${row.charId}_${NOW}_${counter}`;
+  await seedReservationRow(row.charId, row.reservationId, actionId, counter);
   const { hashArgs } = await import('../../../../contracts/autonomyLife');
   row.argsHash = hashArgs(row.args);
   const store = createD1LifeStore({ db, ownerId: USER, now: () => NOW });
@@ -160,6 +178,8 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
       expectedWindowId: WINDOW,
       expectedAccountBoundaryRevision: 1,
       expectedCharacterBoundaryRevision: null,
+      // 预留凭据也进同一条条件 UPDATE：凭证未绑定/被释放/过期时这里 changes=0。
+      expectedReservationRevision: 1,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -368,6 +388,99 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
     expect(await store.commitPermitAtomic({ ...base, argsHash: 'deadbeef' })).toMatchObject({ ok: false });
     expect(await store.commitPermitAtomic({ ...base, installationId: 'other-device' })).toMatchObject({ ok: false });
     expect((await store.getAction('act-mismatch'))?.permitIssuedAt).toBeNull();
+  });
+  it('合法形状但从未签发 / 借用别人的 / 已释放 / 已过期 的凭据都签不出许可（零写入）', async () => {
+    await seedAccountBoundary();
+    await registerCharacter();
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).bindInstallation(USER, 'install-1', NOW);
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+
+    // 借用：act-borrower 指向 act-owner 的凭据（那条记录绑定的是 act-owner）。
+    const ownerRow = await insertAction('act-owner');
+    const borrower = await insertAction('act-borrower');
+    await db.prepare("UPDATE autonomy_life_actions SET payload = json_set(payload, '$.reservationId', ?) WHERE owner_id = ? AND id = ?")
+      .bind(ownerRow.reservationId, USER, 'act-borrower')
+      .run();
+
+    // 合法形状但从未签发：同窗口/同角色/同时间戳，counter 随便挑一个没发过的。
+    const ghost = await insertAction('act-ghost');
+    const ghostId = `rsv_${WINDOW}_${CHAR}_${NOW}_999999`;
+    await db.prepare("UPDATE autonomy_life_actions SET payload = json_set(payload, '$.reservationId', ?) WHERE owner_id = ? AND id = ?")
+      .bind(ghostId, USER, 'act-ghost')
+      .run();
+
+    // 已释放：记录改成 released（额度也还回去了）。
+    const releasedRow = await insertAction('act-released');
+    await db.prepare('UPDATE autonomy_life_budget_reservations SET state = ? WHERE owner_id = ? AND reservation_id = ?')
+      .bind('released', USER, releasedRow.reservationId)
+      .run();
+
+    // 已过期：凭据 TTL 过了。
+    const expiredRow = await insertAction('act-expired-rsv');
+    await db.prepare('UPDATE autonomy_life_budget_reservations SET expires_at = ? WHERE owner_id = ? AND reservation_id = ?')
+      .bind(NOW - 1, USER, expiredRow.reservationId)
+      .run();
+
+    const cases: Array<{ id: string; argsHash: string; policyVersion: string }> = [
+      { id: 'act-borrower', argsHash: borrower.argsHash, policyVersion: borrower.policyVersion },
+      { id: 'act-ghost', argsHash: ghost.argsHash, policyVersion: ghost.policyVersion },
+      { id: 'act-released', argsHash: releasedRow.argsHash, policyVersion: releasedRow.policyVersion },
+      { id: 'act-expired-rsv', argsHash: expiredRow.argsHash, policyVersion: expiredRow.policyVersion },
+    ];
+    for (const item of cases) {
+      // insertAction 已经给了合法的「已 claim」形状（installationId + leaseEpoch=1 + 未过期租约），
+      // 所以拒绝只能来自凭据本身。
+      const result = await commitPermit(runtime.engine, {
+        accountId: USER,
+        actionId: item.id,
+        installationId: 'install-1',
+        leaseEpoch: 1,
+        argsHash: item.argsHash,
+        policyVersion: item.policyVersion,
+        nowMs: NOW,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.detail).toMatch(/reservation_/);
+      const after = await runtime.store.getAction(item.id);
+      expect(after?.permitIssuedAt).toBeNull();
+      expect(after?.permitNonce).toBeNull();
+      expect(after?.status).toBe('scheduled');
+    }
+  });
+  it('读完凭据后、许可 UPDATE 之前凭据被释放 → 条件 UPDATE 让整笔失败（并发失效）', async () => {
+    const action = await insertAction('act-rsv-race');
+    await seedAccountBoundary();
+    await registerCharacter();
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).bindInstallation(USER, 'install-1', NOW);
+    const reservationId = action.reservationId!;
+    let injected = false;
+    fresh({
+      beforeStatement: (text) => {
+        if (!injected && /UPDATE autonomy_life_actions/.test(text)) {
+          injected = true;
+          // 另一台设备/对账任务在 verify 之后把这个凭据释放掉（revision 一起变）。
+          sql.prepare("UPDATE autonomy_life_budget_reservations SET state = 'released', revision = revision + 1 WHERE owner_id = ? AND reservation_id = ?")
+            .run(USER, reservationId);
+        }
+      },
+    });
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const result = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: 'act-rsv-race',
+      installationId: 'install-1',
+      leaseEpoch: 1,
+      argsHash: action.argsHash,
+      policyVersion: action.policyVersion,
+      nowMs: NOW,
+    });
+    expect(injected).toBe(true);
+    expect(result.ok).toBe(false);
+    const after = await runtime.store.getAction('act-rsv-race');
+    expect(after?.permitIssuedAt).toBeNull();
+    expect(after?.status).toBe('scheduled');
   });
 });
 
@@ -856,5 +969,110 @@ describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一�
     const quota = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...second });
     expect(quota?.status).toBe(429);
     expect(await count()).toBe(1);
+  });
+
+  it('许可签发之后新增匹配的禁区/回避话题 → 副作用前按当前策略拒绝（fetch=0、愿望零新增）', async () => {
+    const wishBinding = await prepareExternalAction({ kind: 'travel.wish', args: wishArgs, actionId: 'act-wish-avoid' });
+    const readBinding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-avoid' });
+
+    // 保留 grant 与 allowedKinds，只加 avoidTopics（许可已经签好了）。
+    await seedAccountBoundary({
+      allowedKinds: ['external.read', 'travel.wish'],
+      externalGrants: [grant('xhs', { dailyQuota: 5 }), grant('amap', { dailyQuota: 5 })],
+      avoidTopics: ['咖啡', '海边'],
+    });
+    const wishCount = async () => Number((await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_wishes WHERE owner_id = ?').bind(USER).first())?.n ?? 0);
+    const before = await wishCount();
+
+    const readRes = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title'], ...readBinding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(readRes?.status).toBe(403);
+    expect((await readRes!.json() as any).error.code).toBe('POLICY_DENIED');
+
+    const wishRes = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...wishBinding });
+    expect(wishRes?.status).toBe(403);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await wishCount()).toBe(before);
+    // 许可未被核销：拒的是「当前策略」，不是「许可坏了」。
+    const untouched = await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).getAction('act-wish-avoid');
+    expect(untouched?.permitConsumedAt).toBeNull();
+  });
+
+  it('许可签发之后把同类动作上限收紧到 0 → 按当前 limits 拒绝（零副作用）', async () => {
+    const binding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-limit' });
+    await seedAccountBoundary({
+      allowedKinds: ['external.read'],
+      externalGrants: [grant('xhs', { dailyQuota: 5 })],
+      limits: { perKindActionsPerDay: 0 },
+    });
+    const res = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title'], ...binding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(res?.status).toBe(429);
+    expect((await res!.json() as any).error.code).toBe('RATE_LIMITED');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('读完边界、核销 UPDATE 之前才加禁区 → 边界 revision CAS 让整笔失败（真 SQL 竞态）', async () => {
+    const binding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-race-policy' });
+    let injected = false;
+    fresh({
+      beforeStatement: (text) => {
+        if (!injected && /UPDATE autonomy_life_actions/.test(text)) {
+          injected = true;
+          // 另一台设备在这个空隙里加了匹配当前 query 的回避话题（revision 一起变）。
+          sql.prepare(`UPDATE autonomy_life_boundaries
+            SET revision = revision + 1,
+                payload = json_set(payload, '$.avoidTopics', json('["咖啡"]'))
+            WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    });
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const res = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title'], ...binding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(injected).toBe(true);
+    expect(res?.status).toBe(409);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const after = await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).getAction('act-read-race-policy');
+    expect(after?.permitConsumedAt).toBeNull();
+  });
+
+  it('读完凭据、核销 UPDATE 之前凭据被释放 → 核销失败（零出网）', async () => {
+    const binding = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-race-rsv' });
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const row = (await runtime.store.getAction('act-read-race-rsv'))!;
+    let injected = false;
+    fresh({
+      beforeStatement: (text) => {
+        if (!injected && /UPDATE autonomy_life_actions/.test(text)) {
+          injected = true;
+          sql.prepare("UPDATE autonomy_life_budget_reservations SET state = 'released', revision = revision + 1 WHERE owner_id = ? AND reservation_id = ?")
+            .run(USER, row.reservationId);
+        }
+      },
+    });
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const res = await call(
+      '/autonomy-life/v1/external/read',
+      { charId: CHAR, query: '咖啡', fields: ['title'], ...binding },
+      { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' },
+    );
+    expect(injected).toBe(true);
+    expect(res?.status).toBe(409);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

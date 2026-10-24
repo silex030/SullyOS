@@ -197,6 +197,15 @@ async function seedAction(input) {
     online: true,
   });
   const inserted = await runtime.store.insertAction(row);
+  // 与引擎同一步：预留凭据必须绑定到这条动作，否则许可签发/外部副作用会按「没依据」拒绝。
+  const bound = await runtime.budget.bindReservation({
+    reservationId: reservation.grant.reservationId,
+    actionId: row.id,
+    charId,
+    windowId: row.windowId,
+    nowMs,
+  });
+  if (!bound) throw new Error('reservation_bind_failed');
   return { inserted, action: row, reservation: reservation.grant };
 }
 

@@ -21,6 +21,7 @@ import {
 import type { CapabilityProbeState } from '../../../../utils/autonomyLife/adapters';
 import { boundaryGate } from '../../../../utils/autonomyLife/boundary';
 import { verifyReservationHold, windowIdAt } from '../../../../utils/autonomyLife/budget';
+import { checkIntentPolicy } from '../../../../utils/autonomyLife/policy';
 import { hashArgs } from '../../../../contracts/autonomyLife';
 import type { ActionRow } from '../../../../utils/autonomyLife/engine';
 import { createAutonomyLifeRuntime, defaultCharacterBoundary, type AutonomyLifeRuntime } from './runtime';
@@ -453,19 +454,50 @@ async function handleExternalWindowAction(args: {
     wishText = text;
   }
 
-  // 预算窗口 + 预留依据（与 commit-permit 同一套判定）。
+  // 许可签发之后用户可能又加了禁区/回避话题、收紧了限额：副作用之前必须按**当前生效边界**
+  // 重跑完整的内容/参数策略（不能只查开关与 kind）。这里拒绝后不会走到核销与出网。
+  const policyDecision = checkIntentPolicy(
+    {
+      kind: action.kind,
+      args: action.args,
+      purpose: action.semanticPurpose,
+      boundary: {
+        forbiddenCategories: effective.forbiddenCategories,
+        avoidTopics: effective.avoidTopics,
+        allowFictionalNpc: effective.allowFictionalNpc,
+        externalGrants: effective.externalGrants,
+      },
+    },
+    nowMs,
+  );
+  if (!policyDecision.allowed) {
+    return deps.respond(
+      policyDecision.reasonCode === 'grant_missing' ? 403 : 403,
+      buildErrorBody(
+        policyDecision.reasonCode === 'grant_missing' ? 'GRANT_REQUIRED' : 'POLICY_DENIED',
+        policyDecision.reasonCode === 'grant_missing' ? 'grant_missing_or_expired' : 'current_policy_denied',
+        { requestId: 'external', serverTime: nowMs },
+      ),
+    );
+  }
+
+  // 适用限额（同一窗口内同类动作数）也要按当前 limits 重验；0 = 明确禁止。
+  const perKindLimit = effective.limits.perKindActionsPerDay;
+  if (perKindLimit !== null && perKindLimit <= 0) {
+    return deps.respond(429, buildErrorBody('RATE_LIMITED', 'kind_actions_exhausted', { requestId: 'external', serverTime: nowMs }));
+  }
+
+  // 预算窗口 + 预留凭据（按 id 查真实记录、绑定本动作，不是「本窗口有过用量」）。
   const windowId = windowIdAt({ now: () => nowMs }, effective.timezone);
   if (action.windowId !== windowId) return conflict('window_mismatch');
-  const budgetRows = await runtime.budget
-    .mutate(windowId, ['account', charId], (snapshot) => ({ updates: [], result: snapshot }))
-    .catch(() => null);
-  const hold = verifyReservationHold({
+  const hold = await verifyReservationHold(runtime.budget, {
     reservationId: action.reservationId,
+    ownerId,
     windowId,
     charId,
+    actionId: action.id,
     nowMs,
     timezone: effective.timezone,
-    rows: { account: budgetRows?.account ?? null, char: budgetRows ? budgetRows[charId] ?? null : null },
   });
   if (!hold.ok) return conflict(hold.reason ?? 'reservation_not_held');
 
@@ -483,6 +515,8 @@ async function handleExternalWindowAction(args: {
     expectedWindowId: windowId,
     expectedAccountBoundaryRevision: effective.accountRevision ?? null,
     expectedCharacterBoundaryRevision: effective.characterRevision ?? null,
+    expectedReservationRevision: hold.revision ?? null,
+    maxKindActions: perKindLimit,
   });
   if (!consumed.ok) {
     const status = consumed.code === 'NOT_FOUND' ? 404 : consumed.code === 'FORBIDDEN' ? 403 : consumed.code === 'GLOBAL_PAUSED' ? 409 : 409;

@@ -13,8 +13,9 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqlite';
 import { normalizeBoundary } from '../../../../utils/autonomyLife/boundary';
+import { parseReservationId } from '../../../../utils/autonomyLife/budget';
 import type { AutonomyTickPack } from '../autonomyScheduler';
-import { gateLegacyAutonomyPacks } from './legacyGate';
+import { gateLegacyAutonomyPacks, reserveLegacyRoundCall, settleLegacyRoundCall } from './legacyGate';
 import { ensureAutonomyLifeSchema, resetAutonomyLifeSchemaCacheForTesting, type LifeDb } from './store';
 
 const NOW = Date.parse('2026-10-24T04:00:00.000Z');
@@ -56,11 +57,11 @@ async function seedNewBoundary(overrides: Record<string, unknown> = {}) {
   return boundary;
 }
 
-async function registerCharacter(charPayload: Record<string, unknown> = {}) {
+async function registerCharacter(charPayload: Record<string, unknown> = {}, charId = CHAR) {
   const row = normalizeBoundary(charPayload, { scope: 'character', nowMs: NOW, revision: 0 });
   await db
     .prepare('INSERT OR REPLACE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(USER, 'character', CHAR, row.revision, JSON.stringify(row), NOW)
+    .bind(USER, 'character', charId, row.revision, JSON.stringify(row), NOW)
     .run();
 }
 
@@ -144,5 +145,149 @@ describe('旧自动回合：存量配置不能绕过新边界', () => {
     const second = await gateLegacyAutonomyPacks({ db, packs: [pack()], nowMs: NOW });
     expect(second).toEqual(first);
     expect(second.allowed).toEqual([]);
+  });
+});
+
+/**
+ * 真正的执行期硬门：`reserveLegacyRoundCall` / `settleLegacyRoundCall`。
+ *
+ * 这组用例跑真 SQLite：建任务→排队→到点这一跳的「原子预留 → 结算」，以及排队之后
+ * 暂停/撤权/禁区变更与进程重启都必须是零模型调用、零业务写入。
+ */
+describe('旧自动回合：执行期统一边界 + 原子预算（真 SQLite）', () => {
+  const limitsWithAccountCalls = (accountCalls: number) => ({
+    accountModelCallsPerDay: accountCalls,
+    charModelCallsPerDay: 5,
+    accountTokensPerDay: 10_000,
+    charTokensPerDay: 4_000,
+  });
+
+  const readBudget = async (charId: string) => {
+    const rows = await db
+      .prepare('SELECT scope, used_calls, reserved_calls, used_tokens FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ?')
+      .bind(USER, WINDOW)
+      .all();
+    return (rows.results ?? []).filter((row) => row.scope === 'account' || row.scope === charId);
+  };
+
+  const countReservations = async () => Number(
+    (await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_budget_reservations WHERE owner_id = ?').bind(USER).first())?.n ?? 0,
+  );
+
+  it('同账号多角色只剩一次额度 → 最多一个角色拿到预许可（原子预留，不是只读筛包）', async () => {
+    await seedNewBoundary({ limits: limitsWithAccountCalls(1) });
+    await registerCharacter({}, 'char-a');
+    await registerCharacter({}, 'char-b');
+
+    const first = await reserveLegacyRoundCall({ db, ownerId: USER, charId: 'char-a', nowMs: NOW });
+    expect(first.ok).toBe(true);
+    if (first.ok) {
+      expect(parseReservationId(first.permit.reservationId)).not.toBeNull();
+      expect(await countReservations()).toBe(1);
+    }
+
+    const second = await reserveLegacyRoundCall({ db, ownerId: USER, charId: 'char-b', nowMs: NOW });
+    expect(second).toMatchObject({ ok: false, reason: 'budget_exhausted' });
+    // 被拒的角色没有留下预留记录，也没有把额度占上（账号行是 char-a 的那条）。
+    expect(await countReservations()).toBe(1);
+    const bRows = (await readBudget('char-b')).filter((row) => row.scope === 'char-b');
+    expect(bRows).toEqual([]);
+  });
+
+  it('旧路径调用之后新预算增加（结算把消费记进统一账本）', async () => {
+    await seedNewBoundary();
+    await registerCharacter();
+    const reserved = await reserveLegacyRoundCall({ db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(reserved.ok).toBe(true);
+    if (!reserved.ok) return;
+
+    // 预留是「在途」，还没算已用。
+    let rows = await readBudget(CHAR);
+    expect(rows.map((row) => row.used_calls)).toEqual([0, 0]);
+    expect(rows.map((row) => row.reserved_calls)).toEqual([1, 1]);
+
+    const settled = await settleLegacyRoundCall({
+      db,
+      permit: reserved.permit,
+      actualTokens: 120,
+      requestStarted: true,
+    });
+    expect(settled).toBe(true);
+
+    rows = await readBudget(CHAR);
+    for (const row of rows) {
+      expect(row.used_calls).toBe(1);
+      expect(row.reserved_calls).toBe(0);
+      expect(row.used_tokens).toBe(120);
+    }
+    const record = await db
+      .prepare('SELECT state, settled_at FROM autonomy_life_budget_reservations WHERE owner_id = ? AND reservation_id = ?')
+      .bind(USER, reserved.permit.reservationId)
+      .first();
+    expect(record?.state).toBe('settled');
+    expect(Number(record?.settled_at)).toBeGreaterThan(0);
+  });
+
+  it('排队之后暂停 / 关角色 / 新增禁区（含重启）→ 零模型调用、零业务写入', async () => {
+    const scenarios: Array<{ name: string; overrides: () => Promise<void>; reason: string }> = [
+      { name: '总暂停', overrides: async () => { await seedNewBoundary({ globalPaused: true }); }, reason: 'paused' },
+      { name: '关角色', overrides: async () => { await seedNewBoundary({ charEnabled: false }); }, reason: 'char_disabled' },
+      { name: '新增禁区', overrides: async () => { await seedNewBoundary({ avoidTopics: ['前任'] }); }, reason: 'forbidden_topic' },
+      { name: '撤掉消息 kind 授权', overrides: async () => { await seedNewBoundary({ allowedKinds: ['journal.write'] }); }, reason: 'kind_not_allowed' },
+    ];
+    for (const scenario of scenarios) {
+      await seedNewBoundary();
+      await registerCharacter();
+      await scenario.overrides();
+      // 进程「重启」：换一个干净的适配器 + 清 schema 缓存，闸不能靠内存状态。
+      db = createSqliteD1(sql) as unknown as LifeDb;
+      resetAutonomyLifeSchemaCacheForTesting();
+      await ensureAutonomyLifeSchema(db);
+
+      const result = await reserveLegacyRoundCall({ db, ownerId: USER, charId: CHAR, nowMs: NOW });
+      expect(result, scenario.name).toMatchObject({ ok: false, reason: scenario.reason });
+      expect(await countReservations(), scenario.name).toBe(0);
+      expect(await readBudget(CHAR), scenario.name).toEqual([]);
+      // 业务表：没有任何经历/愿望被写（零业务效果）。
+      const experiences = await db
+        .prepare('SELECT COUNT(*) AS n FROM autonomy_experiences WHERE char_id = ?')
+        .bind(CHAR)
+        .first()
+        .catch(() => ({ n: 0 }));
+      expect(Number(experiences?.n ?? 0), scenario.name).toBe(0);
+    }
+  });
+
+  it('预留与边界复核之间有暂停写入 → 释放这次预留（零消费）', async () => {
+    await seedNewBoundary();
+    await registerCharacter();
+    let injected = false;
+    db = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        // 预留记录刚落库、第二次读边界之前，另一台设备按了总暂停。
+        if (!injected && text.includes('INSERT OR IGNORE INTO autonomy_life_budget_reservations')) {
+          injected = true;
+          sql.prepare("UPDATE autonomy_life_boundaries SET revision = revision + 1, payload = json_set(payload, '$.globalPaused', json('true')) WHERE owner_id = ? AND scope = 'account' AND char_id = ''")
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const result = await reserveLegacyRoundCall({ db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(injected).toBe(true);
+    expect(result).toMatchObject({ ok: false });
+    const rows = await readBudget(CHAR);
+    for (const row of rows) {
+      expect(row.used_calls).toBe(0);
+      expect(row.reserved_calls).toBe(0);
+    }
+    const records = await db
+      .prepare('SELECT state FROM autonomy_life_budget_reservations WHERE owner_id = ?')
+      .bind(USER)
+      .all();
+    // 预留下就被释放：记录存在但状态是 released（额度已还回去）。
+    expect((records.results ?? []).map((row) => row.state)).toEqual(['released']);
   });
 });

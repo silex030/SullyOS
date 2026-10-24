@@ -40,6 +40,8 @@ import {
   type BudgetPort,
   type BudgetRow,
   type BudgetScopeKey,
+  type ReservationRecord,
+  type ReservationUpdate,
 } from '../../../../utils/autonomyLife/budget';
 import type { RecentActivity } from '../../../../utils/autonomyLife/rhythm';
 
@@ -169,6 +171,25 @@ export const AUTONOMY_LIFE_DDL = [
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, window_id, scope)
+  )`,
+  // 预留凭据：许可签发/外部副作用前按 id 查这一条（不是看「本窗口有过用量」）。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_budget_reservations (
+    owner_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    counter INTEGER NOT NULL,
+    kind TEXT,
+    plan_ref TEXT,
+    calls INTEGER NOT NULL,
+    tokens INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    action_id TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    settled_at INTEGER,
+    revision INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, reservation_id)
   )`,
 ] as const;
 
@@ -496,6 +517,15 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
               WHERE c.owner_id = autonomy_life_actions.owner_id
                 AND c.char_id = autonomy_life_actions.char_id
                 AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
+            )
+            AND EXISTS (
+              SELECT 1 FROM autonomy_life_budget_reservations r
+              WHERE r.owner_id = autonomy_life_actions.owner_id
+                AND r.reservation_id = json_extract(autonomy_life_actions.payload, '$.reservationId')
+                AND r.state != 'released'
+                AND COALESCE(r.action_id, '') = autonomy_life_actions.id
+                AND r.revision = ?
+                AND r.expires_at > ?
             )`)
         .bind(
           JSON.stringify(next),
@@ -509,6 +539,8 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
           ownerId,
           input.charId,
           input.expectedCharacterBoundaryRevision ?? -1,
+          input.expectedReservationRevision ?? -1,
+          input.nowMs,
         )
         .run();
 
@@ -545,6 +577,10 @@ export interface ConsumeExternalPermitInput {
   expectedWindowId: string;
   expectedAccountBoundaryRevision: number | null;
   expectedCharacterBoundaryRevision: number | null;
+  /** 同一窗口内同类动作的当前上限（null = 不限）；条件 UPDATE 里原子核验。 */
+  maxKindActions: number | null;
+  /** 核销前读到的预留凭据 revision（同一条 UPDATE 里核，防「读完凭据后被释放」）。 */
+  expectedReservationRevision?: number | null;
 }
 
 /**
@@ -614,6 +650,25 @@ export async function consumeExternalPermitAtomic(
           WHERE c.owner_id = autonomy_life_actions.owner_id
             AND c.char_id = autonomy_life_actions.char_id
             AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
+        )
+        AND EXISTS (
+          SELECT 1 FROM autonomy_life_budget_reservations r
+          WHERE r.owner_id = autonomy_life_actions.owner_id
+            AND r.reservation_id = json_extract(autonomy_life_actions.payload, '$.reservationId')
+            AND r.state != 'released'
+            AND COALESCE(r.action_id, '') = autonomy_life_actions.id
+            AND r.revision = ?
+            AND r.expires_at > ?
+        )
+        AND (
+          ? IS NULL OR (
+            SELECT COUNT(*) FROM autonomy_life_actions x
+            WHERE x.owner_id = autonomy_life_actions.owner_id
+              AND x.char_id = autonomy_life_actions.char_id
+              AND x.id != autonomy_life_actions.id
+              AND COALESCE(json_extract(x.payload, '$.kind'), '') = ?
+              AND COALESCE(json_extract(x.payload, '$.windowId'), '') = ?
+          ) < ?
         )`)
     .bind(
       JSON.stringify(next),
@@ -633,6 +688,12 @@ export async function consumeExternalPermitAtomic(
       ownerId,
       input.charId,
       input.expectedCharacterBoundaryRevision ?? -1,
+      input.expectedReservationRevision ?? -1,
+      input.nowMs,
+      input.maxKindActions,
+      input.kind,
+      input.expectedWindowId,
+      input.maxKindActions,
     )
     .run();
 
@@ -723,6 +784,24 @@ const rowFromBudget = (record: Record<string, unknown>): BudgetRow => ({
   updatedAt: asNumber(record.updated_at),
 });
 
+const rowFromReservation = (record: Record<string, unknown>): ReservationRecord => ({
+  reservationId: asString(record.reservation_id),
+  counter: asNumber(record.counter),
+  ownerId: asString(record.owner_id),
+  windowId: asString(record.window_id),
+  charId: asString(record.char_id),
+  kind: typeof record.kind === 'string' ? record.kind : null,
+  planRef: typeof record.plan_ref === 'string' ? record.plan_ref : null,
+  calls: asNumber(record.calls),
+  tokens: asNumber(record.tokens),
+  state: record.state === 'settled' || record.state === 'released' ? record.state : 'held',
+  actionId: typeof record.action_id === 'string' && record.action_id ? record.action_id : null,
+  createdAt: asNumber(record.created_at),
+  expiresAt: asNumber(record.expires_at),
+  settledAt: record.settled_at === null || record.settled_at === undefined ? null : asNumber(record.settled_at),
+  revision: asNumber(record.revision),
+});
+
 /**
  * D1 版预算端口。
  *
@@ -745,6 +824,23 @@ export function createD1BudgetPort(options: { db: LifeDb; ownerId: string }): Bu
       rows[scope] = row ? rowFromBudget(row) : emptyBudgetRow(windowId, scope, Date.now());
     }
     return rows;
+  };
+
+  const readReservation = async (reservationId: string): Promise<ReservationRecord | null> => {
+    const row = await db
+      .prepare('SELECT * FROM autonomy_life_budget_reservations WHERE owner_id = ? AND reservation_id = ?')
+      .bind(ownerId, String(reservationId ?? '').trim())
+      .first();
+    return row ? rowFromReservation(row) : null;
+  };
+
+  const readReservations = async (ids: string[]): Promise<Record<string, ReservationRecord>> => {
+    const out: Record<string, ReservationRecord> = {};
+    for (const id of ids) {
+      const record = await readReservation(id);
+      if (record) out[id] = record;
+    }
+    return out;
   };
 
   const writeRow = async (row: BudgetRow, expectedRevision: number, created: boolean): Promise<boolean> => {
@@ -773,12 +869,65 @@ export function createD1BudgetPort(options: { db: LifeDb; ownerId: string }): Bu
     return changesOf(updated) > 0;
   };
 
+  /**
+   * 预留记录写入（与预算行同一次 mutate 调用）。
+   *   - expectedRevision = -1 → 新建（INSERT OR IGNORE：同 id 已存在 = 冲突，不覆盖）；
+   *   - 否则 `WHERE revision = ?` 条件更新（结算/释放都走这条）。
+   */
+  const writeReservation = async (update: ReservationUpdate): Promise<boolean> => {
+    const record = update.reservation;
+    if (update.expectedRevision === -1) {
+      const inserted = await db
+        .prepare(`INSERT OR IGNORE INTO autonomy_life_budget_reservations
+          (owner_id, reservation_id, window_id, char_id, counter, kind, plan_ref, calls, tokens, state, action_id, created_at, expires_at, settled_at, revision)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(
+          ownerId, record.reservationId, record.windowId, record.charId, record.counter, record.kind, record.planRef,
+          record.calls, record.tokens, record.state, record.actionId, record.createdAt, record.expiresAt,
+          record.settledAt, record.revision,
+        )
+        .run();
+      return changesOf(inserted) > 0;
+    }
+    const updated = await db
+      .prepare(`UPDATE autonomy_life_budget_reservations
+        SET state = ?, settled_at = ?, revision = ?
+        WHERE owner_id = ? AND reservation_id = ? AND revision = ?`)
+      .bind(
+        record.state, record.settledAt, record.revision,
+        ownerId, record.reservationId, update.expectedRevision,
+      )
+      .run();
+    return changesOf(updated) > 0;
+  };
+
   return {
     available: () => true,
+    readReservation,
+    async bindReservation(input) {
+      const updated = await db
+        .prepare(`UPDATE autonomy_life_budget_reservations
+          SET action_id = ?, revision = revision + 1
+          WHERE owner_id = ? AND reservation_id = ? AND action_id IS NULL
+            AND state != 'released' AND window_id = ? AND char_id = ?`)
+        .bind(input.actionId, ownerId, input.reservationId, input.windowId, input.charId)
+        .run();
+      if (changesOf(updated) > 0) return true;
+      // 幂等：同一张凭据再次绑同一条动作算成功；绑到别的动作/别的角色一律 false。
+      const existing = await readReservation(input.reservationId);
+      return !!existing
+        && existing.actionId === input.actionId
+        && existing.windowId === input.windowId
+        && existing.charId === input.charId;
+    },
     mutate<T>(
       windowId: string,
       scopes: BudgetScopeKey[],
-      mutator: (rows: Record<string, BudgetRow>) => BudgetMutationResult<T> | null,
+      mutator: (
+        rows: Record<string, BudgetRow>,
+        reservations: Record<string, ReservationRecord>,
+      ) => BudgetMutationResult<T> | null,
+      reservationIds: string[] = [],
     ): Promise<T | null> {
       const run = async (): Promise<T | null> => {
         for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -787,8 +936,18 @@ export function createD1BudgetPort(options: { db: LifeDb; ownerId: string }): Bu
           for (const scope of scopes) {
             snapshot[scope] = { ...existing[scope], kindCounts: { ...existing[scope].kindCounts } };
           }
-          const outcome = mutator(snapshot);
+          const held = await readReservations(reservationIds);
+          const outcome = mutator(snapshot, held);
           if (!outcome) return null;
+          // 预留记录先落（条件更新失败 = 凭据状态已变，整笔放弃，不再写预算行）。
+          let reservationsOk = true;
+          for (const update of outcome.reservations ?? []) {
+            if (!(await writeReservation(update))) {
+              reservationsOk = false;
+              break;
+            }
+          }
+          if (!reservationsOk) return null;
           let ok = true;
           for (const row of outcome.updates) {
             const before = existing[row.scope];

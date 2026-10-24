@@ -198,6 +198,12 @@ export interface AtomicPermitCommit {
    */
   expectedAccountBoundaryRevision: number | null;
   expectedCharacterBoundaryRevision: number | null;
+  /**
+   * 发许可前读到的**预留凭据 revision**。同一条条件 UPDATE 里核：
+   * 记录仍属于本动作、状态不是 released、未过期、revision 没变。
+   * null/undefined = 证明不了凭据仍有效 → 拒绝（fail closed）。
+   */
+  expectedReservationRevision?: number | null;
 }
 
 export type AtomicPermitResult =
@@ -425,6 +431,7 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     limits: (await deps.boundaryFor(charId)).limits,
     calls: 1,
     tokens: deps.reserveTokensPerRun ?? 1600,
+    planRef: `rhythm-plan:${charId}:${localDateKey(nowMs, row.windowTimezone)}`,
   });
   if (!reservation.ok) {
     const next = nextRevision({
@@ -605,6 +612,29 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     installationId: installation,
     online,
   });
+  // 预留凭据必须绑定到这条动作：没有绑定的记录不能给许可背书（防「借别人的凭据」）。
+  // 绑定失败 = 账本与凭据对不上，宁可不落动作（fail closed），也不签一张无依据的许可。
+  const bound = await deps.budget
+    .bindReservation({
+      reservationId: reservation.grant.reservationId,
+      actionId: action.id,
+      charId,
+      windowId: action.windowId,
+      nowMs,
+    })
+    .catch(() => false);
+  if (!bound) {
+    const next = nextRevision({
+      ...row,
+      needs: nextNeeds,
+      lastEvaluatedAt: nowMs,
+      availability: 'limited',
+      reasonCodes: ['MODEL_FAILED'],
+      nextCheckAt: nowMs + 30 * 60_000,
+    });
+    await deps.store.putCharacterLife(next, row.revision);
+    return { ...baseResult('model_failed', ['MODEL_FAILED'], 1), budgetDimension: 'reservation_not_bound' };
+  }
   await deps.store.insertAction(action);
 
   const next = nextRevision({
@@ -850,26 +880,21 @@ export async function commitPermit(deps: EngineDeps, args: {
     return { ok: false, code: decision.reasonCode === 'grant_missing' ? 'GRANT_REQUIRED' : 'POLICY_DENIED' };
   }
 
-  // 预算：端口不可用 → fail closed；预留必须仍属于当前窗口且在途（不是伪造的 id）。
+  // 预算：端口不可用 → fail closed；预留凭据必须能按 id 查到真实记录、绑定本动作、
+  // 未释放未过期（不是「本窗口有过任意用量」）。
   if (!deps.budget.available()) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
   const windowTimezone = life?.windowTimezone ?? boundary.timezone;
   const currentWindow = windowIdAt({ now: () => nowMs }, windowTimezone);
   if (action.windowId !== currentWindow) return { ok: false, code: 'STATE_CONFLICT', detail: 'window_mismatch' };
 
-  // 只读快照（不写预算行）：预留 id 必须自证归属本窗口/本角色，且两层预算行都还有在途预留。
-  const budgetRows = await deps.budget
-    .mutate(currentWindow, ['account', action.charId], (snapshot) => ({ updates: [], result: snapshot }))
-    .catch(() => null);
-  const hold = verifyReservationHold({
+  const hold = await verifyReservationHold(deps.budget, {
     reservationId: action.reservationId,
+    ownerId: args.accountId,
     windowId: currentWindow,
     charId: action.charId,
+    actionId: action.id,
     nowMs,
     timezone: windowTimezone,
-    rows: {
-      account: budgetRows?.account ?? null,
-      char: budgetRows ? budgetRows[action.charId] ?? null : null,
-    },
   });
   if (!hold.ok) return { ok: false, code: 'STATE_CONFLICT', detail: hold.reason };
 
@@ -890,6 +915,7 @@ export async function commitPermit(deps: EngineDeps, args: {
     expectedWindowId: currentWindow,
     expectedAccountBoundaryRevision: boundary.accountRevision ?? null,
     expectedCharacterBoundaryRevision: boundary.characterRevision ?? null,
+    expectedReservationRevision: hold.revision ?? null,
   });
   if (!committed.ok) return { ok: false, code: committed.code };
   const next = committed.action;

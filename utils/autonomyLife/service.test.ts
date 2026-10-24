@@ -298,7 +298,7 @@ describe('服务：状态与边界（§7）', () => {
     });
     expect(reserved.ok).toBe(true);
     if (!reserved.ok) return;
-    const action = buildActionRow({
+    const reservedAction = buildActionRow({
       charId: CHAR,
       chosen: { kind: 'journal.write', semanticPurpose: 'c', purposeKey: 'pc2', args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: 'c' } },
       nowMs: NOW,
@@ -309,7 +309,16 @@ describe('服务：状态与边界（§7）', () => {
       installationId: 'install-1',
       online: true,
     });
-    await store.insertAction(action);
+    // 引擎在落动作时把凭据绑定到动作（这里手动补同一步：只认绑定过的那条）。
+    expect(await deps.budget.bindReservation({
+      reservationId: reserved.grant.reservationId,
+      actionId: reservedAction.id,
+      charId: CHAR,
+      windowId: budgetWindowId(NOW, TZ),
+      nowMs: NOW,
+    })).toBe(true);
+    await store.insertAction(reservedAction);
+    const action = reservedAction;
     const claimed = await service.claim({ installationId: 'install-1', charId: CHAR });
     const claimedBody = claimed.body as any;
     expect(claimedBody.action.id).toBe(action.id);

@@ -16,8 +16,10 @@ import {
   precheckBudget,
   projectBudgetUsage,
   reserveBudget,
+  RESERVATION_TTL_MS,
   rotationOrder,
   settleBudget,
+  verifyReservationHold,
   windowIdAt,
 } from './budget';
 import { createManualClock } from './time';
@@ -159,16 +161,119 @@ describe('预算：结算口径（§5.2）', () => {
     expect(charRow.reservedCalls).toBe(0);
   });
 
-  it('重试要新预留（同一 grant 不能重复结算出新额度）', async () => {
+  it('同一张凭据不能重复结算（第二次拒绝，预算不重复扣账）', async () => {
     const port = createMemoryBudgetPort();
     const reserved = await reserveBudget(port, baseRequest);
     if (!reserved.ok) throw new Error('reserve failed');
-    await settleBudget(port, reserved.grant, { actualTokens: 100, requestStarted: true });
-    await settleBudget(port, reserved.grant, { actualTokens: 100, requestStarted: true });
+    const first = await settleBudget(port, reserved.grant, { actualTokens: 100, requestStarted: true });
+    expect(first.ok).toBe(true);
+    const second = await settleBudget(port, reserved.grant, { actualTokens: 100, requestStarted: true });
+    expect(second).toMatchObject({ ok: false, code: 'STATE_CONFLICT' });
     const charRow = Object.values(port.snapshot()).find((row) => row.scope === 'char-1')!;
-    // 两次结算同一 grant 的 usedCalls 会重复 +1 —— 这是硬约束：调用方必须为新请求重新预留，
-    // 引擎的 retry 路径（见 engine.test.ts）就是这么做的；这里记录「不允许复用」的口径。
-    expect(charRow.usedCalls).toBe(2);
+    // 只结算一次：重试必须重新预留（新凭据），不能拿旧凭据再扣一次。
+    expect(charRow.usedCalls).toBe(1);
+    const record = Object.values(port.reservationSnapshot()).find((row) => row.charId === 'char-1')!;
+    expect(record.state).toBe('settled');
+  });
+});
+
+describe('预算：预留凭据（可追溯，不拿历史用量背书）', () => {
+  const WINDOW_ID = 'w:2026-10-24';
+
+  it('预留会落一条记录：owner/角色/窗口/counter 与 id 自证一致，初始 held 未绑定', async () => {
+    const port = createMemoryBudgetPort();
+    const reserved = await reserveBudget(port, { ...baseRequest, planRef: 'rhythm-plan:char-1:2026-10-24' });
+    if (!reserved.ok) throw new Error('reserve failed');
+    const record = await port.readReservation(reserved.grant.reservationId);
+    expect(record).toMatchObject({
+      ownerId: 'acct-1',
+      charId: 'char-1',
+      windowId: WINDOW_ID,
+      state: 'held',
+      actionId: null,
+      planRef: 'rhythm-plan:char-1:2026-10-24',
+      calls: 1,
+    });
+    expect(record!.counter).toBeGreaterThan(0);
+  });
+
+  it('格式合法但从未签发的 id → reservation_missing（不再靠 usedCalls 背书）', async () => {
+    const port = createMemoryBudgetPort();
+    const reserved = await reserveBudget(port, baseRequest);
+    if (!reserved.ok) throw new Error('reserve failed');
+    await settleBudget(port, reserved.grant, { actualTokens: 10, requestStarted: true });
+    // 伪造一条同窗口/同角色、counter 也从 1 开始、格式完全合法的 id。
+    const forged = `rsv_${WINDOW_ID}_char-1_${NOW}_1`;
+    const verdict = await verifyReservationHold(port, {
+      reservationId: forged,
+      windowId: WINDOW_ID,
+      charId: 'char-1',
+      actionId: 'act-x',
+      nowMs: NOW,
+      timezone: TZ,
+    });
+    expect(verdict).toMatchObject({ ok: false, reason: 'reservation_missing' });
+  });
+
+  it('借用另一条动作的凭据 → reservation_not_bound；释放/过期 → 明确拒绝', async () => {
+    const port = createMemoryBudgetPort();
+    const reserved = await reserveBudget(port, baseRequest);
+    if (!reserved.ok) throw new Error('reserve failed');
+    const id = reserved.grant.reservationId;
+    await settleBudget(port, reserved.grant, { actualTokens: 10, requestStarted: true });
+
+    // 未绑定：任何动作都借不走。
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: 'act-a', nowMs: NOW, timezone: TZ,
+    })).toMatchObject({ ok: false, reason: 'reservation_not_bound' });
+
+    // 绑定到 act-a 后：act-a 能用，act-b 不能。
+    expect(await port.bindReservation({ reservationId: id, actionId: 'act-a', charId: 'char-1', windowId: WINDOW_ID, nowMs: NOW })).toBe(true);
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: 'act-a', nowMs: NOW, timezone: TZ,
+    })).toMatchObject({ ok: true });
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: 'act-b', nowMs: NOW, timezone: TZ,
+    })).toMatchObject({ ok: false, reason: 'reservation_not_bound' });
+
+    // 过期：超过凭据 TTL 就拒（不能拿隔天的旧凭据执行）。
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: 'act-a',
+      nowMs: NOW + RESERVATION_TTL_MS + 1, timezone: TZ,
+    })).toMatchObject({ ok: false, reason: 'reservation_expired' });
+  });
+
+  it('释放掉的凭据不能再用（preflight 取消 → released）', async () => {
+    const port = createMemoryBudgetPort();
+    const reserved = await reserveBudget(port, baseRequest);
+    if (!reserved.ok) throw new Error('reserve failed');
+    const id = reserved.grant.reservationId;
+    await port.bindReservation({ reservationId: id, actionId: 'act-r', charId: 'char-1', windowId: WINDOW_ID, nowMs: NOW });
+    await settleBudget(port, reserved.grant, { requestStarted: false });
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: 'act-r', nowMs: NOW, timezone: TZ,
+    })).toMatchObject({ ok: false, reason: 'reservation_released' });
+    // 预算也没被占：usedCalls 仍是 0。
+    const charRow = Object.values(port.snapshot()).find((row) => row.scope === 'char-1')!;
+    expect(charRow.usedCalls).toBe(0);
+  });
+
+  it('绑定与结算并发：其中一方条件更新失败就整笔放弃（不产生半条状态）', async () => {
+    const port = createMemoryBudgetPort();
+    const reserved = await reserveBudget(port, baseRequest);
+    if (!reserved.ok) throw new Error('reserve failed');
+    const id = reserved.grant.reservationId;
+    const [a, b] = await Promise.all([
+      port.bindReservation({ reservationId: id, actionId: 'act-1', charId: 'char-1', windowId: WINDOW_ID, nowMs: NOW }),
+      port.bindReservation({ reservationId: id, actionId: 'act-2', charId: 'char-1', windowId: WINDOW_ID, nowMs: NOW }),
+    ]);
+    // 两个请求串行化后只有第一个成功；第二个既不能抢绑，也不能改掉第一个的绑定。
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    const record = await port.readReservation(id);
+    expect(['act-1', 'act-2']).toContain(record?.actionId);
+    expect(await verifyReservationHold(port, {
+      reservationId: id, windowId: WINDOW_ID, charId: 'char-1', actionId: record?.actionId, nowMs: NOW, timezone: TZ,
+    })).toMatchObject({ ok: true });
   });
 });
 
