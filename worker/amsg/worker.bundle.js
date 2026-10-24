@@ -13785,6 +13785,26 @@ var AUTONOMY_LIFE_DDL = [
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, window_id, scope)
   )`,
+  // 旧自动回合的**输出效果认领**：一个回合（round_ref）只允许落一次业务产物。
+  //
+  // 为什么需要：`llmOutput` 可能被上游重放（同一次模型输出的 handler 再跑一遍），
+  // 也可能被同一份 carried state 直接调两次。只靠「预算是 held」挡不住——第一次
+  // 结算之后状态变成 settled，第二次仍能写第二批经历并再次 emitResult。这里用
+  // (owner_id, round_ref) 主键 + 条件 INSERT 做**一次性**认领：抢到的那一次才允许
+  // 落业务效果，且认领本身绑定到那条可信的预留记录（owner/角色/生命周期）。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_round_claims (
+    owner_id TEXT NOT NULL,
+    round_ref TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    output_hash TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, round_ref)
+  )`,
   // 预留凭据：许可签发/外部副作用前按 id 查这一条（不是看「本窗口有过用量」）。
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget_reservations (
     owner_id TEXT NOT NULL,
@@ -14350,6 +14370,45 @@ async function readBudgetRows(options) {
   };
   return { account: await read("account"), char: await read(charId) };
 }
+async function claimRoundEffect(input) {
+  const ownerId = asString3(input.ownerId).trim();
+  const charId = asString3(input.charId).trim();
+  const roundRef = asString3(input.roundRef).trim();
+  const reservationId = asString3(input.reservationId).trim();
+  if (!ownerId || !charId || !roundRef || !reservationId) return { ok: false, reason: "invalid_input" };
+  const claimId = `clm_${crypto.randomUUID()}`;
+  const expiresAt = input.nowMs + (input.ttlMs ?? 6 * 60 * 60 * 1e3);
+  try {
+    const inserted = await input.db.prepare(`INSERT OR IGNORE INTO autonomy_life_round_claims
+        (owner_id, round_ref, claim_id, char_id, reservation_id, output_hash, state, created_at, expires_at, revision)
+        SELECT ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, 0
+        WHERE EXISTS (
+          SELECT 1 FROM autonomy_life_budget_reservations r
+          WHERE r.owner_id = ? AND r.reservation_id = ? AND r.char_id = ?
+            AND r.state IN ('held', 'settled') AND r.expires_at > ?
+        )`).bind(
+      ownerId,
+      roundRef,
+      claimId,
+      charId,
+      reservationId,
+      asString3(input.outputHash),
+      input.nowMs,
+      expiresAt,
+      ownerId,
+      reservationId,
+      charId,
+      input.nowMs
+    ).run();
+    if (changesOf4(inserted) > 0) {
+      return { ok: true, claimId, outputHash: asString3(input.outputHash) };
+    }
+    const existing = await input.db.prepare("SELECT claim_id FROM autonomy_life_round_claims WHERE owner_id = ? AND round_ref = ?").bind(ownerId, roundRef).first();
+    return { ok: false, reason: existing ? "claim_exists" : "reservation_invalid" };
+  } catch {
+    return { ok: false, reason: "store_unavailable" };
+  }
+}
 
 // worker/amsg/src/autonomyLife/legacyGate.ts
 var LEGACY_AUTONOMY_KIND = "interaction.message";
@@ -14475,6 +14534,48 @@ async function legacyRoundStillAllowed(args) {
   });
   if (!read.ok) return read.reason;
   return legacyBoundaryDenial(read.boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
+}
+async function chargeLegacyQuota(args) {
+  const read = await readEffectiveBoundary(args.db, {
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs
+  });
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const boundary = read.boundary;
+  const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
+  if (denial) return { ok: false, reason: denial };
+  const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
+  if (!port.available()) return { ok: false, reason: "budget_exhausted" };
+  const reserved = await reserveBudget(port, {
+    nowMs: args.nowMs,
+    windowTimezone: boundary.timezone,
+    accountId: args.ownerId,
+    charId: args.charId,
+    limits: boundary.limits,
+    // 只占「配额」，不占模型调用/ token：calls=0 / tokens=0 时 precheckBudget 不判这两维，
+    // 通知与 kind 计数各自按自己的额度判。
+    calls: 0,
+    tokens: 0,
+    ...args.notification ? { notification: true } : {},
+    ...args.kind ? { kind: args.kind } : {},
+    planRef: `legacy-quota:${args.kind ?? "notification"}:${args.charId}`
+  });
+  if (!reserved.ok) {
+    return {
+      ok: false,
+      reason: args.notification ? "notifications_exhausted" : "budget_exhausted"
+    };
+  }
+  await settleBudget(port, reserved.grant, { requestStarted: true, actualTokens: 0 }).catch(() => void 0);
+  return { ok: true };
+}
+async function reserveLegacyNotification(args) {
+  return chargeLegacyQuota({ ...args, notification: true });
+}
+var LEGACY_TRAVEL_KIND = "travel.wish";
+async function reserveLegacyEffect(args) {
+  return chargeLegacyQuota(args);
 }
 
 // worker/amsg/src/autonomyFire.ts
@@ -14976,6 +15077,17 @@ var readUsage = (ctx) => {
   const total = pick2("total_tokens") || prompt + completion;
   return { prompt, completion, total };
 };
+function hashAutonomyOutput(text) {
+  const raw = String(text ?? "");
+  let h1 = 2166136261;
+  let h2 = 16777619;
+  for (let index = 0; index < raw.length; index += 1) {
+    const code = raw.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 16777619) >>> 0;
+    h2 = Math.imul(h2 + code >>> 0, 2246822507) >>> 0;
+  }
+  return `h_${raw.length}_${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
+}
 var readRecentExperiencePages = async (db, charId, sinceMs) => {
   const rows = await db.prepare("SELECT q, created_at FROM autonomy_experiences WHERE char_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?").bind(charId, sinceMs, RUMIN_PAGES).all();
   return (rows.results ?? []).filter(isRecord6).map((row) => ({
@@ -15334,27 +15446,49 @@ var autonomyRoundHandler = {
     if (!db) return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.dbUnavailable };
     const carried = readCarriedState(state);
     if (!carried) return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.stateMissing };
-    if (carried.budgetPermit) {
-      const usageForBudget = readUsage(ctx);
-      const settled = await settleLegacyRoundCall({
-        db,
-        permit: carried.budgetPermit,
-        actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
-        requestStarted: true
-      });
-      if (!settled) console.warn("[amsg:autonomy] \u9884\u7B97\u7ED3\u7B97\u5931\u8D25\uFF08\u8BB0\u5F55\u7559\u7ED9\u5BF9\u8D26\uFF09", carried.charId);
-    }
-    if (carried.ownerUserId) {
-      const denial = await legacyRoundStillAllowed({
-        db,
-        ownerId: carried.ownerUserId,
+    if (!carried.ownerUserId || !carried.budgetPermit || !carried.roundRef) {
+      console.warn("[amsg:autonomy] \u8F93\u51FA\u7F3A\u5C11\u53EF\u4FE1 owner/\u51ED\u636E/\u56DE\u5408\u5F15\u7528\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4EFB\u4F55\u4E1A\u52A1\u4EA7\u7269\uFF08fail-closed\uFF09", {
         charId: carried.charId,
-        nowMs: carried.nowMs
+        hasOwner: !!carried.ownerUserId,
+        hasPermit: !!carried.budgetPermit,
+        hasRoundRef: !!carried.roundRef
       });
-      if (denial) {
-        console.warn("[amsg:autonomy] \u6267\u884C\u671F\u8FB9\u754C\u5DF2\u53D8\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4E1A\u52A1\u4EA7\u7269", carried.charId, denial);
-        return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.governanceDenied };
-      }
+      return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+    }
+    const outputHash = hashAutonomyOutput(ctx.llmOutputText || "");
+    const claim = await claimRoundEffect({
+      db,
+      ownerId: carried.ownerUserId,
+      charId: carried.charId,
+      roundRef: carried.roundRef,
+      reservationId: carried.budgetPermit.reservationId,
+      outputHash,
+      nowMs: carried.nowMs
+    });
+    if (!claim.ok) {
+      console.warn("[amsg:autonomy] \u8F93\u51FA\u6548\u679C\u8BA4\u9886\u88AB\u62D2\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4EFB\u4F55\u4E1A\u52A1\u4EA7\u7269", carried.charId, claim.reason);
+      return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+    }
+    const usageForBudget = readUsage(ctx);
+    const settled = await settleLegacyRoundCall({
+      db,
+      permit: carried.budgetPermit,
+      actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
+      requestStarted: true
+    });
+    if (!settled) {
+      console.warn("[amsg:autonomy] \u9884\u7B97\u7ED3\u7B97\u88AB\u62D2\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4E1A\u52A1\u4EA7\u7269", carried.charId, carried.budgetPermit.reservationId);
+      return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.budgetExhausted };
+    }
+    const denial = await legacyRoundStillAllowed({
+      db,
+      ownerId: carried.ownerUserId,
+      charId: carried.charId,
+      nowMs: carried.nowMs
+    });
+    if (denial) {
+      console.warn("[amsg:autonomy] \u6267\u884C\u671F\u8FB9\u754C\u5DF2\u53D8\uFF0C\u8FD9\u4E00\u8F6E\u4E0D\u843D\u4E1A\u52A1\u4EA7\u7269", carried.charId, denial);
+      return { decision: "skip-push", reason: AUTONOMY_FIRE_SKIP.governanceDenied };
     }
     if (carried.mode === "workflow") return handleWorkflowOutput(db, ctx, carried);
     const reply = parseAutonomyRoundReply(ctx.llmOutputText || "");
@@ -15372,12 +15506,20 @@ var autonomyRoundHandler = {
     if (travelIntent === null) {
       console.warn("[amsg:autonomy] \u51FA\u884C\u610F\u56FE\u5F62\u72B6\u4E0D\u5408\u6CD5\uFF08\u8FD9\u4E00\u8F6E\u4E0D\u5EFA\u613F\u671B\uFF09", carried.charId);
     } else if (travelIntent.kind !== "none") {
-      try {
-        const ownerUserId = await readAutonomyOwnerUserId(db, carried.charId);
-        if (ownerUserId) {
+      const effect = await reserveLegacyEffect({
+        db,
+        ownerId: carried.ownerUserId,
+        charId: carried.charId,
+        nowMs: carried.nowMs,
+        kind: LEGACY_TRAVEL_KIND
+      });
+      if (!effect.ok) {
+        console.warn("[amsg:autonomy] \u51FA\u884C\u613F\u671B\u88AB\u7EDF\u4E00\u8FB9\u754C/\u914D\u989D\u62D2\u7EDD\uFF08\u8FD9\u4E00\u8F6E\u4E0D\u5EFA\u613F\u671B\uFF09", carried.charId, effect.reason);
+      } else {
+        try {
           await ensureTravelSchema(db);
           const intentResult = await recordTravelIntent(db, {
-            userId: ownerUserId,
+            userId: carried.ownerUserId,
             charId: carried.charId,
             intent: travelIntent,
             nowMs: carried.nowMs
@@ -15388,9 +15530,9 @@ var autonomyRoundHandler = {
             written: intentResult.written,
             reason: intentResult.reason
           });
+        } catch (error) {
+          console.warn("[amsg:autonomy] \u51FA\u884C\u610F\u613F\u6CA1\u843D\u8FDB\u613F\u671B\u8868\uFF08\u8FD9\u4E00\u8F6E\u5176\u4F59\u7167\u5E38\uFF09", error);
         }
-      } catch (error) {
-        console.warn("[amsg:autonomy] \u51FA\u884C\u610F\u613F\u6CA1\u843D\u8FDB\u613F\u671B\u8868\uFF08\u8FD9\u4E00\u8F6E\u5176\u4F59\u7167\u5E38\uFF09", error);
       }
     }
     let experiences = reply.experiences;
@@ -15410,7 +15552,7 @@ var autonomyRoundHandler = {
     const pushedIndex = hasBig ? processed.findIndex((item) => item.importance >= 2) : -1;
     const parts = wallClockPartsInZone(carried.nowMs, { tzId: carried.tzId });
     const pushedToday = await countPushedOnDate(db, carried.charId, carried.tzId, carried.dateKey, carried.nowMs);
-    const push = shouldPushAutonomy({
+    let push = shouldPushAutonomy({
       push: carried.autonomy.push,
       pushedToday,
       lastPushAt: carried.lastPushAt,
@@ -15418,6 +15560,18 @@ var autonomyRoundHandler = {
       ...carried.autonomy.quietHours ? { quietHours: carried.autonomy.quietHours } : {},
       minutesOfDay: parts.hour * 60 + parts.minute
     }) && pushedIndex >= 0;
+    if (push) {
+      const quota = await reserveLegacyNotification({
+        db,
+        ownerId: carried.ownerUserId,
+        charId: carried.charId,
+        nowMs: carried.nowMs
+      });
+      if (!quota.ok) {
+        console.log("[amsg:autonomy] \u7EDF\u4E00\u901A\u77E5\u989D\u5EA6\u5DF2\u6EE1/\u5173\u95ED\uFF0C\u8FD9\u4E00\u8F6E\u53EA\u843D\u7ECF\u5386\u4E0D\u53D1\u63D0\u9192", carried.charId, quota.reason);
+        push = false;
+      }
+    }
     const written = [];
     for (const [index, item] of processed.entries()) {
       const isPushed = push && index === pushedIndex;
@@ -26660,6 +26814,72 @@ function summariseAutonomyLifeOutcomes(outcomes) {
   };
 }
 
+// worker/amsg/src/autonomyLife/travelGate.ts
+var TRAVEL_MODEL_KIND = LEGACY_TRAVEL_KIND;
+async function travelModelGateAllows(args) {
+  const read = await readEffectiveBoundary(args.db, {
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs
+  });
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND);
+  return denial ? { ok: false, reason: denial } : { ok: true };
+}
+async function travelModelAccess(args) {
+  const gate = await travelModelGateAllows({
+    db: args.db,
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs
+  });
+  if (!gate.ok) return gate;
+  const [settings, charSettings, budget] = await Promise.all([
+    getTravelSettings(args.travelDb, args.ownerId).catch(() => null),
+    getTravelCharSettings(args.travelDb, { userId: args.ownerId, charId: args.charId }).catch(() => null),
+    getTravelBudget(args.travelDb, { userId: args.ownerId, nowMs: args.nowMs }).catch(() => null)
+  ]);
+  if (!settings || settings.enabled !== true) return { ok: false, reason: "travel_disabled" };
+  if (!charSettings || charSettings.enabled !== true) return { ok: false, reason: "travel_char_disabled" };
+  if (!budget) return { ok: false, reason: "travel_budget_missing" };
+  if (budget.paused) return { ok: false, reason: "travel_budget_paused" };
+  if (!(budget.mapCallsLimit > 0)) return { ok: false, reason: "travel_budget_zero" };
+  return { ok: true };
+}
+function gateTravelDecisionPort(port, deps) {
+  if (!port) return null;
+  const now = deps.now ?? (() => Date.now());
+  const gated = async (run) => {
+    const nowMs = now();
+    const reserved = await reserveLegacyRoundCall({
+      db: deps.db,
+      ownerId: deps.ownerId,
+      charId: deps.charId,
+      nowMs,
+      kind: TRAVEL_MODEL_KIND
+    });
+    if (!reserved.ok) {
+      throw new Error(`autonomy-life-gate:${reserved.reason}`);
+    }
+    try {
+      return await run();
+    } finally {
+      await settleLegacyRoundCall({
+        db: deps.db,
+        permit: reserved.permit,
+        actualTokens: port.lastUsageTokens?.() ?? null,
+        requestStarted: true
+      }).catch(() => void 0);
+    }
+  };
+  return {
+    choose: (input) => gated(() => port.choose(input)),
+    ...port.nextSegment ? { nextSegment: (input) => gated(() => port.nextSegment(input)) } : {},
+    ...port.lastUsageTokens ? { lastUsageTokens: () => port.lastUsageTokens() } : {},
+    ...port.proposeIntent ? { proposeIntent: (input) => gated(() => port.proposeIntent(input)) } : {}
+  };
+}
+
 // utils/airp/chatLifeWorkflow.ts
 var CHAT_LIFE_WORKFLOW_REQUEST_VERSION = 1;
 var CHAT_LIFE_WORKFLOW_MAX_PROPOSALS = 2;
@@ -28439,8 +28659,17 @@ async function createTravelAnchorSearch(env, userId) {
 }
 async function buildTravelSubjectWiring(env, subject) {
   const anchor = await readTravelAnchorForTick(env, subject);
-  const [decisionPort, budget, guardrails] = await Promise.all([
-    createTravelDecisionForSubject(env, subject),
+  const lifeDb = env.DB;
+  const nowMs = Date.now();
+  const modelGate = await travelModelAccess({
+    db: lifeDb,
+    travelDb: env.DB,
+    ownerId: subject.userId,
+    charId: subject.charId,
+    nowMs
+  });
+  const [rawDecisionPort, budget, guardrails] = await Promise.all([
+    modelGate.ok ? createTravelDecisionForSubject(env, subject) : Promise.resolve(null),
     getTravelBudget(env.DB, {
       userId: subject.userId,
       nowMs: Date.now()
@@ -28451,6 +28680,17 @@ async function buildTravelSubjectWiring(env, subject) {
       subject.userId
     ).catch(() => null)
   ]);
+  const decisionPort = modelGate.ok ? gateTravelDecisionPort(rawDecisionPort, {
+    db: lifeDb,
+    ownerId: subject.userId,
+    charId: subject.charId
+  }) : null;
+  if (!modelGate.ok) {
+    console.log("[amsg:travel] \u7EDF\u4E00\u8FB9\u754C\u4E0D\u5141\u8BB8\u51FA\u884C\u94FE\u8DEF\u8C03\u6A21\u578B\uFF0C\u672C\u8F6E\u53EA\u63A8\u8FDB\u5DF2\u6709\u884C\u7A0B", {
+      charId: subject.charId,
+      reason: modelGate.reason
+    });
+  }
   const intentWindowMs = resolveIntentProbeWindowMs({
     configuredMinutes: Number(env.TRAVEL_INTENT_PROBE_MINUTES ?? ""),
     guardrailGapMinutes: guardrails?.guardrails?.sameKindMinGapMinutes ?? null

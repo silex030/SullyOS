@@ -282,3 +282,98 @@ export async function legacyRoundStillAllowed(args: {
   if (!read.ok) return read.reason;
   return legacyBoundaryDenial(read.boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
 }
+
+/* ------------------------------------------------------------------ *
+ * 统一配额：提醒（通知）与「效果」类 kind
+ * ------------------------------------------------------------------ */
+
+export type LegacyQuotaFailure = LegacyAutonomySkipReason | 'notifications_exhausted';
+
+/**
+ * 在统一账本里**原子**占用一格配额（不涉及模型调用）。
+ *
+ *   - `notification: true` → 账号层 `notificationsPerDay`（多角色共享同一格）；
+ *   - `kind: 'travel.wish'` → 角色层 `perKindActionsPerDay` + kind 计数。
+ *
+ * 为什么必须走统一账本：旧链路（AIRP 回合的提醒、出行愿望）以前只读自己的旧开关，
+ * 于是「新设置里通知关掉 / 额度用完」根本挡不住它。这里把「判额 + 占额」放进
+ * `reserveBudget` 的同一临界区（D1 侧是条件 UPDATE），并发下不会超额。
+ *
+ * 失败时不留下任何预算行/预留记录（`reserveBudget` 的既有语义）。
+ */
+async function chargeLegacyQuota(args: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  nowMs: number;
+  notification?: boolean;
+  kind?: string;
+}): Promise<{ ok: true } | { ok: false; reason: LegacyQuotaFailure }> {
+  const read = await readEffectiveBoundary(args.db, {
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs,
+  });
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const boundary = read.boundary;
+  // 边界本身先过一遍：暂停/关角色/kind 未授权时连额度都不该占。
+  const denial = legacyBoundaryDenial(boundary, args.kind ?? LEGACY_AUTONOMY_KIND);
+  if (denial) return { ok: false, reason: denial };
+
+  const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
+  if (!port.available()) return { ok: false, reason: 'budget_exhausted' };
+  const reserved = await reserveBudget(port, {
+    nowMs: args.nowMs,
+    windowTimezone: boundary.timezone,
+    accountId: args.ownerId,
+    charId: args.charId,
+    limits: boundary.limits,
+    // 只占「配额」，不占模型调用/ token：calls=0 / tokens=0 时 precheckBudget 不判这两维，
+    // 通知与 kind 计数各自按自己的额度判。
+    calls: 0,
+    tokens: 0,
+    ...(args.notification ? { notification: true } : {}),
+    ...(args.kind ? { kind: args.kind } : {}),
+    planRef: `legacy-quota:${args.kind ?? 'notification'}:${args.charId}`,
+  });
+  if (!reserved.ok) {
+    return {
+      ok: false,
+      reason: args.notification ? 'notifications_exhausted' : 'budget_exhausted',
+    };
+  }
+  // 立刻结算这张「零调用」凭据：配额在预留时就已经记账（notifications / kindCounts），
+  // 结算只是把记录推进到 settled，避免留下一条无主的在途预留。
+  await settleBudget(port, reserved.grant, { requestStarted: true, actualTokens: 0 }).catch(() => undefined);
+  return { ok: true };
+}
+
+/**
+ * 提醒（推送）前的统一通知额度：返回 false 只代表「这一次不发提醒」，
+ * 私人活动照常落库（与新 UI 的承诺一致：通知关闭只影响提醒）。
+ */
+export async function reserveLegacyNotification(args: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  nowMs: number;
+}): Promise<{ ok: true } | { ok: false; reason: LegacyQuotaFailure }> {
+  return chargeLegacyQuota({ ...args, notification: true });
+}
+
+/** 出行愿望的 kind。 */
+export const LEGACY_TRAVEL_KIND = 'travel.wish' as const;
+
+/**
+ * 「效果」类动作的 kind 配额（出行愿望等）：落业务效果之前占一格 `perKindActionsPerDay`，
+ * 并复核当前边界确实允许这个 kind（用户没授权 travel.wish 就不许落愿望）。
+ */
+export async function reserveLegacyEffect(args: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  nowMs: number;
+  kind: string;
+}): Promise<{ ok: true } | { ok: false; reason: LegacyQuotaFailure }> {
+  return chargeLegacyQuota(args);
+}

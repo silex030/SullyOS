@@ -20,7 +20,9 @@
 | 78 | ds-executor | crashed / crashed | 2026-10-25 01:35:29 | 2026-10-25 02:21:17 | `20261025_013601_e70a16` |
 | 83 | ds-executor | review / review_requested | 2026-10-25 02:21:17 | 2026-10-25 03:19:02 | `20261025_022126_6acdff` |
 | 89 | arch-reviewer | ready / changes_requested | 2026-10-25 03:19:05 | 2026-10-25 03:21:36 | （arch-reviewer 审查 run，无实现会话） |
-| 90 | ds-executor | running / running | 2026-10-25 03:23:10 | — | `20261025_032319_1d928e` |
+| 90 | ds-executor | review / review_requested | 2026-10-25 03:23:10 | 2026-10-25 04:57:07 | `20261025_032319_1d928e` |
+| 94 | arch-reviewer | ready / changes_requested | 2026-10-25 04:57:29 | 2026-10-25 05:01:24 | （arch-reviewer 审查 run，无实现会话） |
+| 95 | ds-executor | running / running | 2026-10-25 05:03:18 | — | `20261025_050331_0ef5f1` |
 
 会话库逐条（标题均命中本卡；`model` / `billing_provider` 是会话实际走的通道）：
 
@@ -30,9 +32,10 @@
 | `20261024_222914_83cee9` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-24 22:29:24 → 2026-10-25 01:29:20 | 248 | 265 | terminal×229, write_file×18, patch×11, read_file×3, kanban_heartbeat×2, kanban_show×1, kanban_request_review×1 |
 | `20261025_013601_e70a16` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 01:36:22 → 2026-10-25 02:20:41 | 123 | 141 | terminal×89, patch×25, read_file×17, write_file×5, browser_exec×4, kanban_show×1 |
 | `20261025_022126_6acdff` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 02:21:35 → 2026-10-25 03:19:22 | 165 | 185 | terminal×140, process_manage×16, kanban_attach×13, write_file×4, patch×3, kanban_show×2, tool_describe×1 |
-| `20261025_032319_1d928e` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 03:23:24 → — | 187 | 188 | terminal×103, patch×60, read_file×16, execute_code×4, write_file×3, kanban_show×1 |
+| `20261025_032319_1d928e` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 03:23:24 → 2026-10-25 04:59:35 | 187 | 188 | terminal×103, patch×60, read_file×16, execute_code×4, write_file×3, kanban_show×1 |
+| `20261025_050331_0ef5f1`（第四轮返工 run 95） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:03:40 → — | 142 | 142 | terminal×85, patch×26, read_file×13, execute_code×12, write_file×4, process_manage×1, kanban_show×1 |
 
-- 五个会话（含两个 **crashed** run 66 / 78 与返工 run 83）的 `model` 全部是
+- 六个会话（含两个 **crashed** run 66 / 78 与返工 run 83 / 90 / 95）的 `model` 全部是
   `deepseek-v4.1-flash`，`billing_provider` 全部是 `opencode-go`；
 - 两张崩溃 run 的会话行还在（`end_reason=cli_close`）：崩溃后进程退出，改动留在工作树里，
   下一轮 run 接着做——不存在「换模型 / 换 provider 重跑」的痕迹；
@@ -47,6 +50,10 @@
 - `hermes\s+gateway` / `gateway\s+(start|run)`：**0 次执行**（run 83 里的命中是
   `ps ... | grep -E "hermes[-_ ]gateway|gateway run"` 这类只读排查与审计文字）
 - `wrangler\s+deploy` / `npm\s+publish` / `systemctl\s+(start|restart)` / `hermes\s+serve`：**0 命中**
+- run 95（第四轮返工）单独再扫一遍：`hermes config` / `gateway` / `wrangler` / `systemctl` /
+  `npm publish` 的 GLOB 命中各 1–2 条，**全部是本轮审计命令自身的字样**（就是上面那行扫描
+  语句本身，出现在 `tool_calls` 里），没有一条是真正的执行；工具直方图见上表（无任何
+  `config set` / 网关启动 / 部署类工具调用）。
 
 即：实现过程只做「读文件 / 改仓库文件 / 跑测试与构建 / 写看板」，没有改 Hermes 配置、
 没有启动消息网关、没有部署。工具直方图见上表（terminal / patch / read_file / write_file /

@@ -198,9 +198,15 @@
 - **引擎与执行**：`utils/autonomyLife/`（rhythm/budget/engine/localLedger/localRunner/
   executor/startup）+ `worker/amsg/src/autonomyLife/`（D1 端口 / 路由 / cron / 外部只读）。
   副作用必须「服务端一次性许可 → 本地事务内核销 → 回执」三件齐备才算成功。
-- **数据源/外部服务**：IDB v81（`autonomy_action_permits` 等）；worker D1 8 张
+- **数据源/外部服务**：IDB v81（`autonomy_action_permits` 等）；worker D1 9 张
   `autonomy_life_*` 表；模型走用户自己的 `llm_credentials`（`char:<charId>/chat`）；
   外部只读需要运营配置 `AUTONOMY_EXTERNAL_*`（默认不可用）。
+- **旧自动链路的两道执行期闸**（2026-10-25 第四轮整改）：AIRP 旧回合每次调模型前
+  `reserveLegacyRoundCall`（统一边界 + 原子预留），每次落产物前 `claimRoundEffect`
+  （`autonomy_life_round_claims` 一次性认领 + 结算 + 现读边界），提醒再走
+  `reserveLegacyNotification`（账号层通知上限）；出行 cron 链路走 `travelModelAccess`
+  （新边界 + 旧出行授权）与 `gateTravelDecisionPort`（每次模型调用原子预留/结算），
+  出行愿望落库走 `reserveLegacyEffect('travel.wish')`。
 - **退役**：旧「手机每 15/30/60/120 分钟自动刷新」、`utils/phoneAutoRefresh.ts`、
   `phoneState.autoRefresh*` 字段、旧自主回合护栏的**频率编辑**（UI 侧）全部下线；
   旧配置由 `utils/autonomyLife/startup.ts` 一次性迁移（只缩不扩）。

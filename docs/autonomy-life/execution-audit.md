@@ -2,12 +2,24 @@
 
 本文是 P2「执行边界审计」的可复核材料：执行期模型/provider、配置与 schema 变更、
 权限与网关边界、旧入口退役证据、真实联调路径与**仍未覆盖**的部分。所有数字/命令都是
-在本仓库 `wt/t_984b3cfc`（本文件所在提交）上实际跑出来的，不含推测值；验证日志跑在 `9db93fd0`，之后只改本文件。
+在本仓库 `wt/t_984b3cfc`（本文件所在提交）上实际跑出来的，不含推测值；本轮全部日志在
+最终代码上重跑（见 §7 与 [`evidence/`](./evidence/README.md)）。
 
 > 更新（本卡）：`docs/autonomy-life/entry-migration.md` 里「后端 D1 端口与 worker 路由
 > 尚未接线」的限制已解除，见第 4 节。
 
-## 0. 本轮返工摘要（对应第二轮复审 comment 64 的四条）
+## 0. 本轮返工摘要（对应第四轮复审 comment 的四个阻断项）
+
+| 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler） |
+| --- | --- | --- |
+| 1. 旧回合输出不是强制的一次性执行门：缺 `budgetPermit`/`ownerUserId` 的旧形状 state 被放行；结算失败只 warn 后继续；同一 state 回放会再写一批经历/再下发 | 新增 `autonomy_life_round_claims` + `claimRoundEffect()`：**一条条件 INSERT** 同时校验「预留记录真实存在 + owner/角色匹配 + held/settled + 未过期」并 `(owner_id, round_ref)` 主键去重；`llmOutput` 顺序改为 **可信 owner/凭据/回合引用 → 认领 → 结算 → 现读边界 → 产物**，任一步失败即零业务效果、零下发；结算被拒不再放行 | `worker/amsg/src/autonomyLife/store.ts`、`autonomyFire.ts`；`autonomyFire.integration.test.ts` 新增 7 例：顺序回放 / 并发回放 / 旧形状 state / 伪造 owner / 伪造凭据 id / 换角色凭据 / 已释放 / 已过期 / 认领写失败 / 认领记录可追溯 |
+| 2. 旧回合绕过用户新通知上限（`notificationsPerDay`） | 新增 `reserveLegacyNotification()`：强推之前按**账号层** `notificationsPerDay` 原子占一格（多角色共享），失败**只关提醒**（`notification.show=false`），私人活动照常落库 | `legacyGate.test.ts`（额度 0 / 只剩 1 条时两角色竞争 / 并发抢最后一格）、`autonomyFire.integration.test.ts`（上限 0、排队后收紧到 0、成功 +1 后再来一轮被挡） |
+| 3. 出行链路（cron tick 的意图探针 / 决策 / 分段）与回合内 `travelIntent` 完全旁路新边界 | 新增 `travelModelAccess()`（**新边界 + 旧出行授权**两套都要过）与 `gateTravelDecisionPort()`（每次模型调用前按当前边界重判 + 原子预留/结算）；`index.ts` 的 `buildTravelSubjectWiring` 过不了就不装 `decisionPort`；回合内愿望落库改走 `reserveLegacyEffect('travel.wish')`（kind 白名单 + per-kind 配额） | `travelGate.ts`、`index.ts`；`travel/legacyGate.integration.test.ts`（真 SQLite + 真 tick：7 种拒绝场景零模型请求零愿望、中途暂停仍被拦、允许时 used_calls/usage 进统一预算）、`autonomyFire.integration.test.ts`（travel.wish 未授权/暂停零愿望，授权时落一条并占 kind 配额） |
+| 4. 证据未持久化、交付树不一致 | 本轮所有日志**重新在最终代码上跑**并入库 `docs/autonomy-life/evidence/`（提交在送审 HEAD 内），同时作为本任务 durable attachments 上传；新增完整 grep 审计脚本（按实际入口逐个列） | 见 §7 与本文件同提交的 `evidence/`；附件 id 见 handoff |
+
+上一轮（第三轮）的返工摘要保留在下面，便于对照。
+
+## 0.1 上一轮返工摘要（第三轮复审 comment 的四条）
 
 | 复审意见 | 本轮改动 | 证据 |
 | --- | --- | --- |
@@ -55,7 +67,7 @@
 | 变更 | 位置 | 说明 |
 | --- | --- | --- |
 | IDB `DB_VERSION` 80 → **81** | `utils/db.ts` | 新增 `autonomy_action_permits`（keyPath `actionId`，`expiresAt` 索引）；不做数据搬迁 |
-| D1 新表（懒建，`CREATE TABLE IF NOT EXISTS`） | `worker/amsg/src/autonomyLife/store.ts` 的 `AUTONOMY_LIFE_DDL` | `autonomy_life_accounts / characters / actions / events / boundaries / budget / budget_reservations / external_usage / wishes`；不改上游表。**本卡新增** `autonomy_life_budget_reservations`（预留凭据：owner、窗口、角色、counter、kind、planRef、state=held/settled/released、actionId 绑定、expiresAt、revision） |
+| D1 新表（懒建，`CREATE TABLE IF NOT EXISTS`） | `worker/amsg/src/autonomyLife/store.ts` 的 `AUTONOMY_LIFE_DDL` | `autonomy_life_accounts / characters / actions / events / boundaries / budget / budget_reservations / external_usage / wishes / round_claims`；不改上游表。`autonomy_life_budget_reservations`（预留凭据：owner、窗口、角色、counter、kind、planRef、state=held/settled/released、actionId 绑定、expiresAt、revision）；**本卡新增** `autonomy_life_round_claims`（输出效果的一次性认领：主键 `(owner_id, round_ref)`、绑定 `reservation_id`、`output_hash`、`state=claimed`、`expires_at`、`revision`） |
 | Worker 路由 | `worker/amsg/src/index.ts`（`/autonomy-life/v1/*`） | 挂在既有 amsg worker 的配置门之后；**没有**新增网关/进程/bot |
 | 新增环境变量 | `AMSG_SERVER_TOKEN`（**必须配置**，否则路由 401/拒绝启动能力） | `AUTONOMY_EXTERNAL_XHS_URL` / `AUTONOMY_EXTERNAL_AMAP_URL` / `AUTONOMY_EXTERNAL_READ_HOSTS` 可选；未配置 = 外部只读能力明确不可用 |
 | 删除 | `utils/phoneAutoRefresh.ts` 及其测试、`CharacterProfile.phoneState.autoRefresh*` 三个字段 | 旧「按分钟自动生成手机记录」链路整条退役 |
@@ -193,6 +205,15 @@ worker/amsg/src/autonomyLife/legacyGate.test.ts
 worker/amsg/src/autonomyScheduler.test.ts
 ```
 
+> 第四轮返工起，**完整**的入口审计不再是「只搜这两个符号」，而是一个可复跑的脚本
+> `scripts/autonomy-legacy-grep-audit.sh`（原始输出见 `evidence/legacy-grep.log.gz`）：
+> 按实际入口逐个列 AIRP 调度 / AIRP fire handler / 出行 cron tick / 出行模型端口 /
+> 出行愿望落库 / 旧护栏与旧 token 账本 / 手机自动刷新 / 旧频率编辑 / 外部占位 / 旧
+> `autonomyLife/client.ts` / 新闸自己的落点，并给出「非测试 / 测试」命中计数。
+> 本轮结论：手机自动刷新只剩退役代码与测试、旧频率编辑 0 命中、`external_window_not_implemented`
+> 0 命中、`autonomyLife/client.ts` 0 命中；两条旧自动链路（AIRP 回合、出行 tick）都已在
+> **每次真正调模型之前**与**每次落业务效果之前**接上统一闸。
+
 - **两道闸，执行期那道才是硬门**：
   1. cron 建任务前 `gateLegacyAutonomyPacks()` 按新边界筛包（省一次上游往返，挡掉明显不该建的）；
   2. **每一跳真正调模型之前** `autonomyRoundHandler.beforeFire` 调 `reserveLegacyRoundCall()`：
@@ -218,6 +239,36 @@ worker/amsg/src/autonomyScheduler.test.ts
 - 迁移的 `allowedKinds` 只做**交集**：旧配置没开 → 不授予任何 kind；有旧能力清单 →
   与首期内部能力取交集；外部窗口永远需要单独授权（`migration.ts` + `migration.test.ts`）。
 
+### 5.1 第四轮补的三道闸（对应的复现用例见 §7 与 `evidence/`）
+
+1. **输出效果一次性执行门**（`worker/amsg/src/autonomyFire.ts` 的 `llmOutput` +
+   `worker/amsg/src/autonomyLife/store.ts` 的 `claimRoundEffect`）：
+   - 顺序固定为「可信 owner + 预留凭据 + 稳定 `roundRef`（缺一 fail closed）→
+     `claimRoundEffect` 条件 INSERT 认领 → `settleLegacyRoundCall` 结算 → 现读边界 → 写产物」；
+   - 认领是一条 `INSERT ... SELECT ... WHERE EXISTS(预留记录可用)`，主键 `(owner_id, round_ref)`：
+     同一回合的第二次（回放/并发）、伪造 owner、伪造凭据 id、凭据已释放/已过期、认领表写失败
+     **全部零新增经历、零再次 `emitResult`、不重复结算**（以前缺凭据也能继续写，重放会写第二批）；
+   - 结算被拒（`STATE_CONFLICT` / 存储不可用）不再只 `console.warn` 后放行，直接零业务效果。
+2. **提醒受用户新通知上限约束**（`reserveLegacyNotification`）：强推之前按账号层
+   `notificationsPerDay` 在统一账本里原子占一格（多角色共享，D1 侧条件 UPDATE）；
+   额度 0 / 已耗尽 → **只关提醒**（`notification.show=false`、经历 `pushed=0`），
+   私人活动照常落库（与新 UI「通知关闭只影响提醒」的承诺一致）。
+3. **出行链路纳入统一边界/预算**（`worker/amsg/src/autonomyLife/travelGate.ts`）：
+   - `travelModelAccess()`：新边界（`travel.wish` 必须在 allowedKinds、未暂停、未关角色、
+     无未验证禁区）**与**旧出行授权（账号/角色开关、地图预算未暂停且额度 > 0）两套都要过；
+   - `index.ts` 的 `buildTravelSubjectWiring` 过不了就**不装 `decisionPort`** → tick 的意图探针 /
+     选点决策 / 闲逛分段零模型请求、零新增愿望；
+   - `gateTravelDecisionPort()`：每次模型调用前再按当前边界重判 + 原子预留、调用后按真实
+     usage 结算（tick 中途被暂停也拦得住）；旧的隐私脱敏 / 地图额度 / 旧 travel 账本原样保留；
+   - 回合内 `travelIntent` 落库改走 `reserveLegacyEffect('travel.wish')`：kind 白名单 +
+     `perKindActionsPerDay` 配额，边界暂停/未授权时零愿望。
+
+> 行为变更（有意为之，与 §5 的口径一致）：**升级后没有新建 `autonomy_life_boundaries`
+> 的存量用户，出行链路也不再调模型**（`travelModelAccess` 的 `account_disabled`）。想要
+> 继续，必须在新入口里显式打开总开关、允许 `travel.wish`、不设未验证禁区、且额度有余量。
+> 已有行程的时间相位推进、地图候选/路线（旧地图额度）不受影响。
+
+
 ## 6. 仍未覆盖（residual risk，交付时如实列出）
 
 1. **AIRP 旧自主回合是「改道」不是「删除」**：`worker/amsg/src/autonomyScheduler.ts` 的实现
@@ -237,22 +288,39 @@ worker/amsg/src/autonomyScheduler.test.ts
    D1 特有的行为（如 `meta.changes` 返回形状）已在适配器里对齐并有测试，但生产首跑仍需观察。
 7. **旧链路预留泄漏窗口**：`beforeFire` 预落后若上游根本没回调 `llmOutput`（进程被杀/上游丢任务），
    那次预留会停在 held 直到凭据 TTL（6h）或窗口日切；额度只会少不会多。
+8. **认领表只增不减**：`autonomy_life_round_claims` 每次旧回合/计划执行写一行（带 `expires_at`），
+   本卡没有做清理任务；单用户每天几行，量级可忽略，但**没有自动 GC**（与 `autonomy_life_events`
+   同属待补的运维项）。过期认领不会放行任何新效果（主键决定一次性），只是占行。
+9. **旧回合被拒后在途凭据的处理**：认领失败/边界拒绝时凭据按「请求已发出」结算（不白嫖）；
+   只有认领表本身写失败时才停在 held 等对账（见 residual 7 的同一处理路径）。
+10. **出行 tick 的 token 结算口径**：`TravelDecisionPort.lastUsageTokens()` 是「最近一次调用」
+    的用量（旧端口语义），一次 tick 里先 `proposeIntent` 再 `nextSegment` 时，第二次结算可能
+    按同一次 usage 记账 → **只多算不少算**；调用次数（`used_calls`）是逐次准确的。
+    该口径与旧 travel 账本一致，本卡没有改它。
 
 ## 7. 验证日志（本机真实输出，日志作为本任务 durable attachments）
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 自主生活相关用例（含旧回合 fire 真 SQLite 集成） | `npx vitest run utils/autonomyLife worker/amsg/src/autonomyLife worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts components/autonomy-life` | **20 文件 / 317 用例全通过，EXIT 0**（`focused.log`） |
-| 全量用例（**完整原始输出**） | `npx vitest run` | **623 文件 / 7577 用例全通过，EXIT 0**（`vitest-full.log`，未裁剪） |
-| 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **56 条错误，与基线 `f7f040c7` 归一化路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log`、`tsc-baseline.log`、`tsc-compare.txt`） |
-| 构建 | `pnpm run build` | **EXIT 0**（worker bundle + vite built in 2m58s；`build.log`） |
-| 真实浏览器联调 | `AUTONOMY_E2E_EVIDENCE=... node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e/e2e-run.log`、`e2e/e2e-report.json`、`e2e/e2e-http-requests.json`） |
-| 旧入口 / 旧频率 grep | 见 §5 的精确命令 | 旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client` 均 **0 命中**；旧 AIRP 的 `runAutonomyTick\|createAutonomyPostTask` 只剩实现、cron 入口（先筛包）与测试，**每次调模型前另有执行期硬门**（`legacy-grep.log`） |
+| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `pnpm exec vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 891 用例全通过，EXIT 0**（`focused.log.gz`） |
+| 全量用例（**完整原始输出**） | `pnpm exec vitest run` | **624 文件 / 7606 用例全通过，EXIT 0**（212.7s，`vitest-full.log.gz`，未裁剪） |
+| 类型检查（全仓） | `pnpm exec tsc -p tsconfig.json --noEmit` | **两边各 56 条；归一化 worktree 路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
+| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 2m 13s；`build.log.gz`） |
+| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=/tmp/ev/e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
+| 旧入口完整审计（按实际入口） | `bash scripts/autonomy-legacy-grep-audit.sh` | 见 `legacy-grep.log.gz`：旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client.ts` 均 **0 命中**；AIRP 回合、出行 tick 的模型调用与效果落库都有**执行期**统一闸 |
 | 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署 |
 
-说明：`vitest-full.log` 是完整的原始 stdout（600+ KB），不是手工汇总；两次全量分别跑在
-04:05 与 04:46，均一次全通过，没有再出现首次交付时那两条负载敏感用例的偶发失败。
+本轮新增的可复现用例（都在上面两份日志里，真 SQLite）：
 
-验证跑在提交 **`98e570dd`** 的内容上（提交前工作树与提交内容一致；此后仅本文件与
-`runtime-audit.md` 的文档更新）。同一批原始日志也入库到
-[`evidence/`](./evidence/README.md)（`gunzip -c` 读），同时作为本任务附件上传。
+- `autonomyFire.integration.test.ts`：顺序回放 / 并发回放 / 旧形状 state / 伪造 owner /
+  伪造凭据 id / 换角色凭据 / 已释放 / 已过期 / 认领写失败 / 认领记录可追溯；
+  通知上限 0、排队后收紧到 0、成功后 +1 再被挡；出行愿望未授权零愿望 / 授权落一条并占 kind 配额 / 暂停零愿望。
+- `legacyGate.test.ts`：通知额度 0、两角色抢最后一格、并发抢一格、`travel.wish` 未授权 /
+  额度 1 / 暂停时都不占额、不写行。
+- `travel/legacyGate.integration.test.ts`：真 tick + 真闸，7 种拒绝场景零模型请求零愿望、
+  wiring 建好后中途暂停仍被拦、允许时 `used_calls=1` / `used_tokens=321` 进统一预算。
+
+说明：`vitest-full.log` 是完整的原始 stdout（600+ KB），不是手工汇总。本轮全部日志都在
+**最终代码**上跑（构建里重新生成了 `worker/amsg/worker.bundle.js`，同一提交内）；
+同一批原始日志也入库到 [`evidence/`](./evidence/README.md)（`gunzip -c` 读），
+并作为本任务 durable attachments 上传。

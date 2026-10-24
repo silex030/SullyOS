@@ -172,6 +172,26 @@ export const AUTONOMY_LIFE_DDL = [
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, window_id, scope)
   )`,
+  // 旧自动回合的**输出效果认领**：一个回合（round_ref）只允许落一次业务产物。
+  //
+  // 为什么需要：`llmOutput` 可能被上游重放（同一次模型输出的 handler 再跑一遍），
+  // 也可能被同一份 carried state 直接调两次。只靠「预算是 held」挡不住——第一次
+  // 结算之后状态变成 settled，第二次仍能写第二批经历并再次 emitResult。这里用
+  // (owner_id, round_ref) 主键 + 条件 INSERT 做**一次性**认领：抢到的那一次才允许
+  // 落业务效果，且认领本身绑定到那条可信的预留记录（owner/角色/生命周期）。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_round_claims (
+    owner_id TEXT NOT NULL,
+    round_ref TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    output_hash TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner_id, round_ref)
+  )`,
   // 预留凭据：许可签发/外部副作用前按 id 查这一条（不是看「本窗口有过用量」）。
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget_reservations (
     owner_id TEXT NOT NULL,
@@ -988,6 +1008,101 @@ export async function readBudgetRows(options: {
     return row ? rowFromBudget(row) : null;
   };
   return { account: await read('account'), char: await read(charId) };
+}
+
+/* ------------------------------------------------------------------ *
+ * 输出效果认领（旧自动回合的一次性执行门）
+ * ------------------------------------------------------------------ */
+
+export type RoundClaimFailure =
+  | 'invalid_input'
+  | 'claim_exists'
+  | 'reservation_invalid'
+  | 'store_unavailable';
+
+export type RoundClaimResult =
+  | { ok: true; claimId: string; outputHash: string }
+  | { ok: false; reason: RoundClaimFailure };
+
+/**
+ * 认领这一回合的**输出效果**（一次性、可追溯、绑定可信预留）。
+ *
+ * 一条语句完成「校验 + 认领」，没有任何「先读后写」的窗口：
+ *   1. 预留记录必须真实存在、属于本 owner、本角色，且生命周期可用
+ *      （`held` 在途 / `settled` 已结算的计划期凭据）且未过期；
+ *   2. `(owner_id, round_ref)` 是主键 → 同一回合只有第一次 INSERT 能成功。
+ *
+ * 返回 `claim_exists` = 这一回合已经被认领过（重放/并发），调用方必须零业务效果。
+ * 返回 `reservation_invalid` = 凭据不可信（缺失/伪造/释放/过期），同样零业务效果。
+ * 抛错/存储不可用一律按拒绝处理（fail closed）。
+ */
+export async function claimRoundEffect(input: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  roundRef: string;
+  reservationId: string;
+  outputHash: string;
+  nowMs: number;
+  /** 认领记录的有效期（默认与动作执行窗对齐的 6h）。 */
+  ttlMs?: number;
+}): Promise<RoundClaimResult> {
+  const ownerId = asString(input.ownerId).trim();
+  const charId = asString(input.charId).trim();
+  const roundRef = asString(input.roundRef).trim();
+  const reservationId = asString(input.reservationId).trim();
+  if (!ownerId || !charId || !roundRef || !reservationId) return { ok: false, reason: 'invalid_input' };
+
+  const claimId = `clm_${crypto.randomUUID()}`;
+  const expiresAt = input.nowMs + (input.ttlMs ?? 6 * 60 * 60 * 1000);
+  try {
+    const inserted = await input.db
+      .prepare(`INSERT OR IGNORE INTO autonomy_life_round_claims
+        (owner_id, round_ref, claim_id, char_id, reservation_id, output_hash, state, created_at, expires_at, revision)
+        SELECT ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, 0
+        WHERE EXISTS (
+          SELECT 1 FROM autonomy_life_budget_reservations r
+          WHERE r.owner_id = ? AND r.reservation_id = ? AND r.char_id = ?
+            AND r.state IN ('held', 'settled') AND r.expires_at > ?
+        )`)
+      .bind(
+        ownerId, roundRef, claimId, charId, reservationId, asString(input.outputHash), input.nowMs, expiresAt,
+        ownerId, reservationId, charId, input.nowMs,
+      )
+      .run();
+    if (changesOf(inserted) > 0) {
+      return { ok: true, claimId, outputHash: asString(input.outputHash) };
+    }
+    // 没插进去：要么这一回合已经认领过，要么凭据不可信。两者对调用方都是「拒绝」，
+    // 但要能区分（审计/测试要看得见原因）。
+    const existing = await input.db
+      .prepare('SELECT claim_id FROM autonomy_life_round_claims WHERE owner_id = ? AND round_ref = ?')
+      .bind(ownerId, roundRef)
+      .first();
+    return { ok: false, reason: existing ? 'claim_exists' : 'reservation_invalid' };
+  } catch {
+    return { ok: false, reason: 'store_unavailable' };
+  }
+}
+
+/** 只读：这个回合有没有被认领过（审计/测试用）。 */
+export async function readRoundClaim(options: {
+  db: LifeDb;
+  ownerId: string;
+  roundRef: string;
+}): Promise<{ claimId: string; charId: string; reservationId: string; outputHash: string; state: string } | null> {
+  const row = await options.db
+    .prepare('SELECT claim_id, char_id, reservation_id, output_hash, state FROM autonomy_life_round_claims WHERE owner_id = ? AND round_ref = ?')
+    .bind(options.ownerId, options.roundRef)
+    .first();
+  if (!row) return null;
+  return {
+    claimId: asString(row.claim_id),
+    charId: asString(row.char_id),
+    reservationId: asString(row.reservation_id),
+    outputHash: asString(row.output_hash),
+    state: asString(row.state),
+  };
 }
 
 /** 角色状态投影复用（路由层只读） */

@@ -15,7 +15,13 @@ import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqli
 import { normalizeBoundary } from '../../../../utils/autonomyLife/boundary';
 import { parseReservationId } from '../../../../utils/autonomyLife/budget';
 import type { AutonomyTickPack } from '../autonomyScheduler';
-import { gateLegacyAutonomyPacks, reserveLegacyRoundCall, settleLegacyRoundCall } from './legacyGate';
+import {
+  gateLegacyAutonomyPacks,
+  reserveLegacyEffect,
+  reserveLegacyNotification,
+  reserveLegacyRoundCall,
+  settleLegacyRoundCall,
+} from './legacyGate';
 import { ensureAutonomyLifeSchema, resetAutonomyLifeSchemaCacheForTesting, type LifeDb } from './store';
 
 const NOW = Date.parse('2026-10-24T04:00:00.000Z');
@@ -289,5 +295,92 @@ describe('旧自动回合：执行期统一边界 + 原子预算（真 SQLite）
       .all();
     // 预留下就被释放：记录存在但状态是 released（额度已还回去）。
     expect((records.results ?? []).map((row) => row.state)).toEqual(['released']);
+  });
+});
+
+
+/**
+ * 统一配额：旧链路的**提醒**与**效果**类 kind 都必须走新账本。
+ *
+ * 这组用例跑真 SQLite：通知额度是账号层的（多角色共享同一格），kind 额度是角色层的；
+ * 判额与占额在同一个临界区（D1 侧条件 UPDATE），并发下不会超额。
+ */
+describe('旧链路统一配额：提醒 / kind 效果（真 SQLite）', () => {
+  const readBudgetRow = async (scope: string) => db
+    .prepare('SELECT notifications, kind_counts, used_calls, reserved_calls FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+    .bind(USER, WINDOW, scope)
+    .first();
+
+  const countBudgetRows = async () => Number(
+    (await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_budget WHERE owner_id = ?').bind(USER).first())?.n ?? 0,
+  );
+
+  it('通知上限 = 0 → 拒，且不留下任何预算行/预留记录（只影响提醒）', async () => {
+    await seedNewBoundary({ limits: { notificationsPerDay: 0 } });
+    await registerCharacter();
+    const result = await reserveLegacyNotification({ db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(result).toEqual({ ok: false, reason: 'notifications_exhausted' });
+    expect(await countBudgetRows()).toBe(0);
+    const reservations = await db
+      .prepare('SELECT COUNT(*) AS n FROM autonomy_life_budget_reservations WHERE owner_id = ?')
+      .bind(USER)
+      .first();
+    expect(Number(reservations?.n ?? 0)).toBe(0);
+  });
+
+  it('通知额度只剩 1 条：同账号两个角色只有一个能占（账号层共享，原子）', async () => {
+    await seedNewBoundary({ limits: { notificationsPerDay: 1 } });
+    await registerCharacter({}, 'char-a');
+    await registerCharacter({}, 'char-b');
+    const first = await reserveLegacyNotification({ db, ownerId: USER, charId: 'char-a', nowMs: NOW });
+    expect(first).toEqual({ ok: true });
+    const row = await readBudgetRow('account');
+    expect(Number(row?.notifications)).toBe(1);
+    // 第二个角色（另一次调用）拿不到同一格。
+    const second = await reserveLegacyNotification({ db, ownerId: USER, charId: 'char-b', nowMs: NOW });
+    expect(second).toEqual({ ok: false, reason: 'notifications_exhausted' });
+    expect(Number((await readBudgetRow('account'))?.notifications)).toBe(1);
+  });
+
+  it('并发抢最后一格通知：只有一次成功', async () => {
+    await seedNewBoundary({ limits: { notificationsPerDay: 1 } });
+    await registerCharacter({}, 'char-a');
+    await registerCharacter({}, 'char-b');
+    const results = await Promise.all([
+      reserveLegacyNotification({ db, ownerId: USER, charId: 'char-a', nowMs: NOW }),
+      reserveLegacyNotification({ db, ownerId: USER, charId: 'char-b', nowMs: NOW }),
+    ]);
+    expect(results.filter((item) => item.ok)).toHaveLength(1);
+    expect(Number((await readBudgetRow('account'))?.notifications)).toBe(1);
+  });
+
+  it('travel.wish 未授权 → 效果被拒，kind 计数不动', async () => {
+    await seedNewBoundary();
+    await registerCharacter();
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: false, reason: 'kind_not_allowed' });
+    expect(await countBudgetRows()).toBe(0);
+  });
+
+  it('travel.wish 授权后：占一格 per-kind（额度 1 时第二次被拒）', async () => {
+    await seedNewBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], limits: { perKindActionsPerDay: 1 } });
+    await registerCharacter();
+    const first = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(first).toEqual({ ok: true });
+    const row = await readBudgetRow(CHAR);
+    expect(JSON.parse(String(row?.kind_counts ?? '{}'))['travel.wish']).toBe(1);
+    const second = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toBe('budget_exhausted');
+  });
+
+  it('账号暂停 → 提醒与效果都被拒（连额度都不该占）', async () => {
+    await seedNewBoundary({ globalPaused: true, allowedKinds: ['interaction.message', 'travel.wish'] });
+    await registerCharacter();
+    expect(await reserveLegacyNotification({ db, ownerId: USER, charId: CHAR, nowMs: NOW }))
+      .toEqual({ ok: false, reason: 'paused' });
+    expect(await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' }))
+      .toEqual({ ok: false, reason: 'paused' });
+    expect(await countBudgetRows()).toBe(0);
   });
 });

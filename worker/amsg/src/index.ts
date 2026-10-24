@@ -225,6 +225,8 @@ import type { TravelTickSubject } from './travel/tick';
 import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './autonomyLife/routes';
 import { handleAutonomyLifeScheduled, summariseAutonomyLifeOutcomes } from './autonomyLife/tick';
 import { gateLegacyAutonomyPacks } from './autonomyLife/legacyGate';
+import { gateTravelDecisionPort, travelModelAccess } from './autonomyLife/travelGate';
+import type { LifeDb } from './autonomyLife/store';
 import { AUTONOMY_DAILY_TOKEN_BUDGET } from '../../../utils/airp/autonomySettings';
 import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
 import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
@@ -3416,8 +3418,21 @@ async function createTravelAnchorSearch(env: Env, userId: string) {
 /** 每个主体的完整 tick 接线。 */
 async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
   const anchor = await readTravelAnchorForTick(env, subject);
-  const [decisionPort, budget, guardrails] = await Promise.all([
-    createTravelDecisionForSubject(env, subject),
+  const lifeDb = env.DB as unknown as LifeDb;
+  const nowMs = Date.now();
+  // 统一边界 + 旧出行授权：任何一边不允许（新总暂停 / 关角色 / 未授权 travel.wish /
+  // 新增禁区 / 无边界行；或出行面板关掉、角色关掉、地图预算暂停/为零）就**不装
+  // decisionPort**——tick 里所有模型分支都靠它，没有端口就是零模型请求、零新增愿望。
+  // 以前这条链路完全不看新边界，用户按下总暂停它照样问模型「想不想出去」。
+  const modelGate = await travelModelAccess({
+    db: lifeDb,
+    travelDb: env.DB as unknown as Parameters<typeof travelModelAccess>[0]['travelDb'],
+    ownerId: subject.userId,
+    charId: subject.charId,
+    nowMs,
+  });
+  const [rawDecisionPort, budget, guardrails] = await Promise.all([
+    modelGate.ok ? createTravelDecisionForSubject(env, subject) : Promise.resolve(null),
     getTravelBudgetRow(env.DB as unknown as TravelStoreDb, {
       userId: subject.userId,
       nowMs: Date.now(),
@@ -3428,6 +3443,20 @@ async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
       subject.userId,
     ).catch(() => null),
   ]);
+  // 每一次模型调用前还要再过一次统一闸（tick 中途边界可能变严）+ 原子预留统一预算。
+  const decisionPort = modelGate.ok
+    ? gateTravelDecisionPort(rawDecisionPort, {
+      db: lifeDb,
+      ownerId: subject.userId,
+      charId: subject.charId,
+    })
+    : null;
+  if (!modelGate.ok) {
+    console.log('[amsg:travel] 统一边界不允许出行链路调模型，本轮只推进已有行程', {
+      charId: subject.charId,
+      reason: modelGate.reason,
+    });
+  }
   // 意图探针窗口：运维可配的分钟数 → 用户自己配的同类动作最小间隔 → 3h 兜底。
   // 复用同一份 autonomy 护栏（同一份授权），不新造一套设置，也不硬编码 3h。
   const intentWindowMs = resolveIntentProbeWindowMs({
