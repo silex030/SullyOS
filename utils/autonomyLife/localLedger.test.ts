@@ -448,6 +448,32 @@ describe('本地库：旧消费入口原子化（§4.3 末段）', () => {
     expect(missing).toMatchObject({ status: 'failed', code: 'NOT_FOUND' });
   });
 
+  it('查手机购买走同一原子扣款；重复 purchaseId 不二次扣钱', async () => {
+    const { appendCharPurchaseTxn } = await import('../charLedger');
+    const first = await appendCharPurchaseTxn(CHAR, {
+      amount: 12.5, merchant: '模拟便利店', item: '饮料', category: 'shopping', purchaseId: 'purchase-1', timestamp: NOW,
+    });
+    expect(first.deducted).toBe(true);
+    expect(await readBalance()).toBe(987.5);
+    const second = await appendCharPurchaseTxn(CHAR, {
+      amount: 12.5, merchant: '模拟便利店', item: '饮料', category: 'shopping', purchaseId: 'purchase-1', timestamp: NOW + 1000,
+    });
+    expect(second.deducted).toBe(true);
+    expect(await readBalance()).toBe(987.5);
+    expect(await count('bank_transactions')).toBe(1);
+  });
+
+  it('余额不足时沿用旧语义：记一条未扣款流水，余额不动', async () => {
+    const { appendCharPurchaseTxn } = await import('../charLedger');
+    await DB.saveBankState(bankState(1));
+    const link = await appendCharPurchaseTxn(CHAR, {
+      amount: 50, merchant: '贵店', item: '大件', category: 'shopping', purchaseId: 'purchase-2', timestamp: NOW,
+    });
+    expect(link.deducted).toBe(false);
+    expect(await readBalance()).toBe(1);
+    expect(await count('bank_transactions')).toBe(1);
+  });
+
   it('金额按最小货币整数校验（0 / 负数 / 小数拒绝），避免拿分当元', async () => {
     for (const totalMinor of [0, -100, 1.5]) {
       const outcome = await debitCharCardAtomic(port, {

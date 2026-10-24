@@ -758,6 +758,8 @@ export interface CharCardDebitArgs {
     totalMinor: number;
     charName?: string;
     note?: string;
+    /** 流水分类（默认 shopping）；查手机模拟购买沿用既有 'purchase' 口径由调用方给。 */
+    category?: string;
   };
 }
 
@@ -827,7 +829,7 @@ export async function debitCharCardAtomic(port: LocalDbPort, input: CharCardDebi
         await tx.put('bank_transactions', {
           id: voucherId,
           amount: -totalYuan,
-          category: 'shopping',
+          category: args.category ?? 'shopping',
           note: args.note ?? (args.charName ? `${args.shop}（${args.charName}点的）` : args.shop),
           timestamp: input.nowMs,
           dateStr: localDateKey(input.nowMs, 'UTC'),

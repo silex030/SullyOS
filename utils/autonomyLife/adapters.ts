@@ -130,8 +130,6 @@ export function describeCapabilities(input: {
       if (!probes.map.configured) unavailableReason = 'map_not_configured';
       else if (!probes.map.reachable) unavailableReason = 'external_adapter_unreachable';
       else if (!grantActive(boundary, 'amap', nowMs)) unavailableReason = 'grant_missing';
-    } else if (requiresGrant && !grantActive(boundary, kind === 'travel.wish' ? 'amap' : 'xhs', nowMs)) {
-      unavailableReason = 'grant_missing';
     }
     const available = !unavailableReason;
     return {

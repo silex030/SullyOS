@@ -22,6 +22,17 @@ const NOW = Date.UTC(2026, 9, 24, 4, 0, 0);
 const TZ = 'Asia/Shanghai';
 const CHAR = 'char-http';
 
+const BASE_LIMITS: EffectiveBoundaryV1['limits'] = {
+  accountModelCallsPerDay: 6,
+  charModelCallsPerDay: 2,
+  accountTokensPerDay: 10_000,
+  charTokensPerDay: 4_000,
+  notificationsPerDay: 1,
+  perKindActionsPerDay: 3,
+  virtualSpendPerDayMinor: 20_000,
+  virtualOrderMaxMinor: 5_000,
+};
+
 const accountBoundary = (raw: Record<string, unknown> = {}, revision = 1): BoundaryV1 => normalizeBoundary(
   { enabled: true, globalPaused: false, timezone: TZ, allowedKinds: ['journal.write'], ...raw },
   { scope: 'account', nowMs: NOW, revision },
@@ -77,17 +88,7 @@ function serviceDeps(opts?: { account?: BoundaryV1 }): { deps: AutonomyLifeServi
         timezone: account.timezone ?? TZ,
         allowedKinds: account.allowedKinds ?? ['journal.write'],
         allowFictionalNpc: account.allowFictionalNpc ?? false,
-        limits: {
-          accountModelCallsPerDay: 6,
-          charModelCallsPerDay: 2,
-          accountTokensPerDay: 10_000,
-          charTokensPerDay: 4_000,
-          notificationsPerDay: 1,
-          perKindActionsPerDay: 3,
-          virtualSpendPerDayMinor: 20_000,
-          virtualOrderMaxMinor: 5_000,
-          ...account.limits,
-        },
+        limits: { ...BASE_LIMITS, ...account.limits },
       } as EffectiveBoundaryV1;
     },
     candidatesFor: () => [{ kind: 'journal.write', semanticPurpose: 'note', args: { title: 't', body: 'b' } }],
