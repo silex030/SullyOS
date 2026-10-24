@@ -944,6 +944,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           } catch (e) {
               console.warn('[RetiredExternalAgent] legacy terminal key cleanup failed', e);
           }
+          // 已退役的 Spark 社交 App（2026-10-24 整块删除）本机残留清理：只删它独占的
+          // 三个精确键；朋友圈共用的 spark_char_handles 与 IndexedDB 里的帖子/资料一律不动。
+          try {
+              const { retireSparkStorage } = await import('../utils/retiredSpark');
+              retireSparkStorage();
+          } catch (e) {
+              console.warn('[RetiredSpark] legacy Spark key cleanup failed', e);
+          }
           try {
               const { seedBuiltinPromptPresets, migrateLegacyVoiceOverrides } = await import('../utils/promptPresetSeeding');
               const { getResolvedPromptPresets } = await import('../utils/promptPresetRuntime');
@@ -4097,6 +4105,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   : undefined,
               
               socialAppData: (mode === 'text_only' || mode === 'media_only' || mode === 'full') ? {
+                  // 历史遗留块（Spark 社交 App 已于 2026-10-24 移除，代码侧不再有入口）。
+                  // 保留原样只为一件事：**老用户的马甲表/资料/背景图不能因为这次减法从备份里消失**。
+                  //   charHandles → `spark_char_handles` 仍被朋友圈 MomentsApp 与聊天提示词读取，必须继续备份；
+                  //   userProfile / userId / userBg → Spark 独占，但现在还留着数据的用户靠它把资产带过机器，
+                  //   等下次清理普查确认全量用户都换过一版备份后再删这一段。
                   // 容错解析：这两个键是 localStorage 里的裸字符串，写坏一个就会让整次导出失败
                   // （用户看到「导出失败」却不知道该删哪个键）。导出路径上宁可丢这一小块。
                   // 泛型不显式写：让 TS 从 fallback 推断，好跟 FullBackupData.socialAppData 的类型对齐。
