@@ -198,6 +198,7 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 | --- | --- |
 | `utils/socialShareTool.ts`（新） | 工具 schema、可读集合、引用解析、预算、执行、成对记录器（`ShareExcerptPairRecorder`）与投影 —— 纯逻辑，可单测 |
 | `hooks/useChatAI.ts` | 六处接线：注入工具（**拿不到持久化锚点时不注入**）、工具循环入口、按名分发（`dispatchShareExcerptToolCall`＝执行+立刻落库）、成功尾部与 `finally` 两处收尾 flush（有界重试，仍失败明确上报「未保存·待补偿」）、降级提示 |
+| `utils/chatToolLoopBudget.ts`（新） | 工具循环总轮数的**唯一口径**（纯函数）：MCP / 分享-only / 混用三类分开算，分享卡在场不改变混用工具的用户设置（见 §8.4 末条） |
 | `utils/messageFormat.ts` | `normalizeMessageContent` 把 `metadata.shareExcerpts` 成对投影进下一轮 |
 | `utils/socialShare.ts` | `fetchShareExcerpts` 未改；**只改了模型投影**：`[分享 …]` 用完整 shareRef（见 §8.6） |
 
@@ -227,6 +228,14 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
   避免为了砍溢出片段而丢掉 `nextCursor`；真溢出时由客户端截断并在结果里说明。
 - 剩余额度连一条切片都放不下（<320）→ `TURN_BUDGET_EXHAUSTED`，不发请求。
 - 同参重复调用 → `DUPLICATE_TOOL_CALL`（不再打网络、不再扣额度）；一轮最多 8 次调用（`TOOL_CALL_LIMIT`）。
+- **工具循环总轮数（返工第 4 轮 P1-2）**：口径收在 `utils/chatToolLoopBudget.resolveChatToolLoopBudget`
+  （纯函数，hook 不再自己算），三分支：
+  ① 本轮注入了通用 MCP → `max(用户设置, 12)`（保持 master 侧 12 轮预算，原行为）；
+  ② **只有**分享片段工具（没有瑞幸/麦当劳/排程/蓝牙/生活工作流）→ `min(用户设置, 4)`：
+     分享预算最多两次满额读，4 轮够「读 → 换 query → 续读 → 收口」，且**不放宽**用户设置（设 1 就是 1）；
+  ③ 其它所有情形（混用 / 没有分享工具）→ 用户设置原值，**分享卡在场不改变任何东西**。
+  旧实现只看 `shareExcerptTurn` 就把混用轮压成 4（需要第 5/6 轮的其它工具链提前停；用户设 1 时又被放宽到 4），
+  属「现有工具循环退化」，已按此口径修掉。
 
 ### 8.5 结果语义（模型看到什么）
 
@@ -285,11 +294,18 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 - **写库失败 = 未保存 + 待补偿**（返工第 2 轮，`ShareExcerptPairOutbox`）：
   失败的批次**留在待补偿队列**里，不标记已写、也不当作已保存；下一次工具调用（`record`）
   与收尾 `flush` 会按原始锚点**有界重试**（每次 flush 最多 `SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts = 3` 轮，
-  hook 有两个收尾点，所以一整轮最多 6 轮 + 每次调用自带 1 轮）。队列按「每条消息 ≤16 条 / ≤8 条消息」封顶，
+  hook 有两个收尾点，所以一整轮最多 6 轮 + 每次调用自带 1 轮）。队列按「每条消息 ≤256 条 / ≤8 条消息」封顶，
   已写集合按 512 条封顶，超限丢最旧并 `console.error`。重试用尽仍失败 →
   `snapshot().unsaved === true`（= 队列里还有任何未落库记录，含往轮遗留）+
   `console.error`「工具记录未能写入历史（待补偿）」，**不承诺已保存**；下一轮收尾还会用同一份队列补写。
   待补偿队列是进程内内存结构：应用重启后这些记录确实会丢（这在日志里是可见的失败，不是静默）。
+- **不按条数截断（返工第 4 轮 P1-1）**：本轮收到的**每一次**调用都成对保留，拒绝/超限记录不能挤掉成功证据。
+  旧实现每次写库 `pairs.slice(-8)`，而次数上限只挡「第 9 次网络读取」、不挡产生 call/result：一批 9 个不同 id
+  的调用（第 1 条真读到字幕、第 2–8 条同参被 `DUPLICATE_TOOL_CALL` 拒、第 9 条 `TOOL_CALL_LIMIT`）会把**唯一成功的
+  片段**挤出历史；outbox 那边已 `markWritten`、`pending=0`，收尾 flush 也不会补回来——健康 DB 下的静默丢证据。
+  现在体量有界不靠条数：一条消息只装**这一轮**的记录（锚点 = 本轮触发消息，不跨轮累积）+ 成功正文受轮次
+  2400 token 夹紧 + 失败记录只有一行结构化说明；**投影**（下一轮进模型）另受 600 token 夹紧。
+  「保留完整」与「投影有界」是两件事，不再用持久化删记录去换投影额度。
 - **下一轮投影**：`normalizeMessageContent` 把这对记录渲染成
   `[read_share_excerpts 记录 · N 次调用]`（≤600 token），`user` 与 `assistant` 角色都会投影
   （正常是 user——记录挂在触发消息上），`system`/`tool` 不背。
@@ -308,19 +324,21 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 ### 8.8 本机验证（真实执行，2026-10-24 / 返工复跑 2026-10-25）
 
 ```
-npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts
-                                            → 2 files / 56 passed（42 + 14）
-npx vitest run $(ls utils/*[cC]hat*.test.ts) → 38 files / 354 passed
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
-  utils/mcpToolBridge utils/agenticTools utils/messageFormat utils/socialShare \
-  utils/chatRequestPayload worker/social-content utils/socialContent
-                                            → 29 files / 355 passed
+  utils/chatToolLoopBudget.test.ts          → 3 files / 73 passed（45 + 17 + 11）
+npx vitest run $(ls utils/*[cC]hat*.test.ts) → 39 files / 365 passed
+npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
+  utils/chatToolLoopBudget.test.ts utils/mcpToolBridge utils/agenticTools \
+  utils/messageFormat utils/socialShare utils/chatRequestPayload \
+  worker/social-content utils/socialContent  → 30 files / 372 passed
 ```
 
-> 计数口径：返工第 3 轮（2026-10-25，按 arch-reviewer 第 3 次复核意见）为 56 / 354 / 355；
-> 第 2 轮为 51 / 354 / 350，第 1 轮为 45 / 354 / 344。执行卡最初记的 22 + 8 = 30 例、
-> 定向 329 例是更早的数字，旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在
-> `evidence/`（提交内），第 3 轮为 `evidence/*-r3.log`。
+> 计数口径：返工第 4 轮（2026-10-25，按 arch-reviewer 第 4 次复核意见）为 73 / 365 / 372；
+> 第 3 轮为 56 / 354 / 355，第 2 轮为 51 / 354 / 350，第 1 轮为 45 / 354 / 344。
+> 第 4 轮新增 17 例（分享工具 3 例：>8 条批次历史保留、12 条不截断、待补偿上限；
+> 轮数口径 11 例；接线 3 例）。执行卡最初记的 22 + 8 = 30 例、定向 329 例是更早的数字，
+> 旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在 `evidence/`（提交内），
+> 第 4 轮为 `evidence/*-r4.log`。
 
 覆盖点：
 
@@ -443,15 +461,41 @@ arch-reviewer 在 `62569fd1` 上复核，判定「失败批次不重试」「无
   处于「待补偿」；这与「不承诺工具片段不占未来上下文」一致，但**模型侧无法感知**该差异。
 
 
+### 8.13 返工记录（第 4 轮，2026-10-25）
+
+arch-reviewer 在 `86c67854` 上复核，第 3 轮两项修复（共享 outbox 去重键带锚点、saver 等事务提交）核验通过，
+但按原卡「历史必须成对保留」「现有工具循环不得退化」仍判两处 P1：
+
+| # | 问题 | 修法 | 复验（真实执行） |
+| --- | --- | --- | --- |
+| P1-1 | **健康 DB 下也静默删除已成功读取的历史**：`attachShareExcerptPairs` 每次写库 `pairs.slice(-8)`（`SHARE_EXCERPT_RECORD_KEEP = 8`），而 `maxToolCallsPerTurn` 只挡「第 9 次网络读取」、不挡产生 call/result。一批 9 个不同 id（第 1 条真读到字幕、第 2–8 条同参 `DUPLICATE_TOOL_CALL`、第 9 条 `TOOL_CALL_LIMIT`）会把唯一成功的片段挤出历史，outbox 却已 `markWritten`、`pending=0`，flush 不会补 | **不再按条数截断**：本轮收到的每一次调用都成对保留（拒绝记录不能抹掉成功证据），落库侧仍按 `toolCallId` 幂等去重。体量有界改由结构保证：一条消息只装一轮记录（锚点 = 触发消息）+ 成功正文受轮次 2400 token 夹紧 + 失败记录只有一行；**投影**另受 600 token 夹紧。同时把待补偿队列的单消息上限从 16 提到 256（次数上限只挡网络读取，一批 >16 条的失败批次会被 16 挤掉最旧的未落库记录；256 是内存安全阀） | 新增「一批 9 个不同 id」真实 DB 用例：seed 消息 → 9 次 `dispatchShareExcerptToolCall`（1 成功 + 7 重复 + 1 超次数）→ 生产 `flush()` → 从库里读回 **9 条 pair**、顺序与执行顺序一致、`pairs[0].result.ok === true` 且含字幕、`pairs[8].result.code === 'TOOL_CALL_LIMIT'`；再重复提交同一批 + `record` + `flush` → 仍 9 条（幂等，不删已有对）；`renderShareExcerptPairProjection` 仍 ≤600+160 字符。判别性证据：把 `pairs` 临时改回 `slice(-8)`（mutation）→ 该用例立刻失败（`length 9` 实际 8），恢复后通过。另加纯函数用例（12 条不截断 + 按 id 去重）与队列用例（20 条未落库批次不被挤掉） |
+| P1-2 | **新分享卡改变其它工具的总循环预算**：`useChatAI` 的 `MAX_LOOPS` 写成 `shareExcerptTurn ? 4 : mcpSettings.maxToolLoops`，注释却说「只有分享片段工具时」——只要没有 MCP、有一张分享卡在场，瑞幸 / amsg2 / bt / 生活工作流混用轮也被强制 4 轮（原本需要第 5/6 轮的链提前停）；用户设 `maxToolLoops = 1` 时又被反向放宽到 4 | 轮数口径收进新模块 `utils/chatToolLoopBudget.ts` 的纯函数 `resolveChatToolLoopBudget`，hook 不再自己算：① 有通用 MCP → `max(用户设置, 12)`（原行为）；② **只有**分享片段工具 → `min(用户设置, 4)`（不放宽用户设置）；③ 混用或没有分享工具 → 用户设置原值。hook 传入 `mcpToolsAvailable / shareExcerptsAvailable / otherToolsAvailable`（瑞幸/麦当劳/排程/蓝牙/生活工作流任一即算「有别的工具」） | 新增 `utils/chatToolLoopBudget.test.ts`（11 例，**真调用**决策函数 + 与 hook 3.6 循环同形的驱动器）：默认 6 时有/无分享卡对同一条 6 轮工具链的执行序列逐项相同且都跑完；`maxToolLoops=1` 的混用轮只跑 1 轮（不再变 4）；12 轮设置保持 12；MCP 在场恒为 `max(用户设置,12)`；分享-only 时 6→4、12→4、2→2、1→1（不放宽）；分享-only 的 5 轮链条只发 4 次请求。wiring 测试钉 hook 走该函数、旧三元表达式已消失、六类工具标志都传进去了 |
+
+本轮**未**改模型 / provider / 配置 / 审批 / 权限，未启动任何消息网关，未部署、未合并。
+边界材料继续放在 `evidence/EXECUTION-AUDIT.md`。
+
+本轮新增/变化的残余风险：
+
+- **历史体量随本轮调用条数增长**：不再截断意味着「模型一次吐 50 个 tool_calls」时，该消息的
+  `metadata.shareExcerpts` 会带 50 条记录（成功正文仍受 2400 token 夹紧，失败记录各一行）。
+  这是「不丢证据」的代价；投影（进模型）仍 ≤600 token，不影响后续上下文预算。
+- 待补偿队列单消息上限 256 条仍是**有界丢弃**：真实一轮远到不了，但真到了会 `console.error` 丢最旧，
+  不标已写（不会谎报已保存）。
+- 轮数口径是纯函数，hook 侧只负责把「谁在场」传对；**没有**在真实 React 运行里跑过整条 hook
+  （仓库 vitest 是纯 Node，`useChatAI` 绑死 React）。wiring 测试钉住传参形状，行为测试钉住决策函数。
+
+
 ## 9. 已知限制（必须带着交付）
 
 1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
    `failed/partial` + 结构化错误，不编造内容。
 2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**，
    并由返工卡 t_38463abd 修掉「可见引用不可执行」「记录只靠最终回复落库」「写库失败无补偿」
-   「无锚点仍返回片段」四处缺陷（见 §8.6 / §8.10 / §8.11）：
-   单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、引用歧义即拒绝、每次调用即时成对落库、
-   写库失败有界重试并在失败时明确「未保存·待补偿」、无锚点不读、失败如实返回。
+   「无锚点仍返回片段」（§8.6 / §8.10 / §8.11）以及「历史被 8 条截断」「分享卡压低其它工具轮数」
+   （§8.13）六处缺陷：
+   单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、引用歧义即拒绝、每次调用即时成对落库且**不按条数截断**、
+   写库失败有界重试并在失败时明确「未保存·待补偿」、无锚点不读、失败如实返回、
+   工具循环轮数只在自己是唯一工具时收紧。
    仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
 3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
    各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。

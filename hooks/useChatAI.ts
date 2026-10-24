@@ -26,6 +26,7 @@ import { callMcpTool, getMcpUseNativeTools, hasWorkerUnreachableMcpServer, loadM
 import { normalizeMcpToolArguments, validateMcpToolArguments } from '../utils/mcpFireCore';
 import { bumpMcpTurn, recordMcpResult } from '../utils/mcpResultMemory';
 import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, buildMcpTextFallbackBody, extractTextFakedMcpCalls, formatMcpToolResult, MCP_CHAT_MAX_STALLED_ROUNDS, MCP_CHAT_MAX_TOOL_LOOPS, sanitizeMcpLeadInText, shouldRetryMcpWithoutTools, stripTextFakedMcpCalls, type FakedMcpCall } from '../utils/mcpToolBridge';import { buildToolResultMessage, normalizeToolCallsForCompat } from '../utils/toolCallCompat';
+import { resolveChatToolLoopBudget } from '../utils/chatToolLoopBudget';
 import { toolCallFingerprint } from '../utils/agenticToolFeedback';
 // 链接分享按需读片段（执行卡 t_75dd49a5）：分享卡在场 + 总开关开着时把 read_share_excerpts
 // 注入本轮工具清单；执行/预算/落历史的逻辑都在 socialShareTool（独立模块，别往本文件加逻辑）。
@@ -1885,10 +1886,22 @@ export const useChatAI = ({
             //       结果只回填循环不落卡片。两类工具可同时在场, 按名字各走各的。
             if ((payload.flags.luckinChatActive || mcpToolResolve || amsg2ToolsInjected || btToolsInjected || chatLifeWorkflowToolsInjected || shareExcerptTurn) && data.choices?.[0]?.message?.tool_calls?.length) {
                 // 每轮工具轮数上限：优先用户设置；接通用 MCP 时取两者较大值，保证 master 侧 12 轮预算。
-                // 只有分享片段工具时不需要那么多轮（预算最多撑两次满额读），给 4 轮就够纠错。
-                const MAX_LOOPS = mcpToolResolve
-                    ? Math.max(mcpSettings.maxToolLoops, MCP_CHAT_MAX_TOOL_LOOPS)
-                    : shareExcerptTurn ? 4 : mcpSettings.maxToolLoops;
+                // 分享片段工具**只在它是唯一工具时**才按分享预算收紧到 4 轮（且不放宽用户设置）；
+                // 混用其它工具（瑞幸 / 麦当劳 / 排程 / 蓝牙 / 生活工作流）时，分享卡在场不得改变原轮数。
+                // 决策口径收在 utils/chatToolLoopBudget（纯函数，有行为回归），hook 里不再各算一套。
+                const MAX_LOOPS = resolveChatToolLoopBudget({
+                    maxToolLoops: mcpSettings.maxToolLoops,
+                    mcpToolsAvailable: !!mcpToolResolve,
+                    shareExcerptsAvailable: !!shareExcerptTurn,
+                    otherToolsAvailable: !!(
+                        payload.flags.luckinChatActive
+                        || payload.flags.mcdActive
+                        || payload.flags.luckinActive
+                        || amsg2ToolsInjected
+                        || btToolsInjected
+                        || chatLifeWorkflowToolsInjected
+                    ),
+                });
                 // 懒加载展开重填（二次请求）的预算：与主循环共享 maxToolLoops 上限，防死循环
                 let mcpRefillsUsed = 0;                let loopMessages = [...baseReqBody.messages];
                 const loc = luckinChatRef?.current;

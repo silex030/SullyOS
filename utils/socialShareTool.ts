@@ -20,7 +20,9 @@
  *
  * 落历史：每次调用执行完**立刻**把 call（工具名/参数）与 result（状态/收费/文本）成对写进
  * 「本轮触发消息」（`contextMsgs` 的最后一条，发送前已落库、id 确定）的 metadata.shareExcerpts；
- * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。写库失败的批**留在待补偿队列**
+ * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。**本轮收到的每一次调用都保留**
+ * （含拒绝/超限，不按条数截断——拒绝记录不能挤掉已成功的片段，返工第 4 轮 P1-1）。
+ * 写库失败的批**留在待补偿队列**
  * （`ShareExcerptPairOutbox`），由下一次 dispatch / 收尾 flush 有界重试；重试仍失败就明确标为
  * 「未保存」并上报，不冒充已保存。下一轮投影由 messageFormat 读出这对记录
  * （成对渲染，不单独回放孤立片段，≤600 token）。落库器见 ShareExcerptPairRecorder。
@@ -80,8 +82,23 @@ export const SHARE_EXCERPT_LIMITS = {
   partKeyChars: 64,
 } as const;
 
-/** 落历史时给每条助手消息保留的调用记录上限（同一轮最多 4 次调用，留点余量）。 */
-export const SHARE_EXCERPT_RECORD_KEEP = 8;
+/**
+ * 落历史**不做条数截断**（返工第 4 轮 P1-1）。
+ *
+ * 曾经这里有个 `SHARE_EXCERPT_RECORD_KEEP = 8`，`attachShareExcerptPairs` 每次写库
+ * `pairs.slice(-8)`。后果是：一批 9 个不同 id 的调用（第 1 条真读到字幕，第 2–8 条同参被
+ * `DUPLICATE_TOOL_CALL` 拒，第 9 条 `TOOL_CALL_LIMIT`）会把**唯一成功的证据**挤出历史；
+ * 而 outbox 那边已 markWritten、`pending=0`，收尾 flush 也不会补回来 —— 健康 DB 下的静默丢证据。
+ * 次数上限（`maxToolCallsPerTurn`）只挡「第 N+1 次网络读取」，不挡产生 call/result，所以不能靠它兜底。
+ *
+ * 现在的口径：**本轮收到的每一次调用都成对保留**，拒绝记录不能抹掉既有成功证据。
+ * 体量本身有界，不需要条数上限来兜：
+ *  - 每条消息的 metadata 只装**这一轮**的记录（锚点 = 本轮触发消息，不跨轮累积）；
+ *  - 成功片段的正文合计受轮次预算 ≤2400 token 夹紧（`SHARE_BUDGETS.excerptsPerUserTurnTokens`）；
+ *  - 失败/拒绝记录只有一行结构化说明（各自 ≤ 一次信封量级），条数由本轮 tool_calls 决定；
+ *  - 「投影」（下一轮进模型的文本）另有 600 token 上限（`SHARE_EXCERPT_PROJECTION_TOKENS`），
+ *    与「历史保留多少」是两件事：保留完整、投影有界。
+ */
 /** 下一轮投影里这些片段最多占多少 token（与「片段会占未来上下文」的说明一致，但仍要有界）。 */
 export const SHARE_EXCERPT_PROJECTION_TOKENS = 600;
 
@@ -854,6 +871,10 @@ export interface ShareExcerptPairRecord {
  *
  * 幂等：同一 toolCallId 只保留一条。逐次落库（每执行完一次工具就写）与收尾 flush 会重复
  * 提交同一批记录，DB 侧重试也可能重放，这里必须按 id 去重，否则历史里会出现重复对。
+ *
+ * 不截断（返工第 4 轮 P1-1）：本轮收到的每一次调用都留着，**拒绝记录不能挤掉成功证据**。
+ * 曾经 `pairs.slice(-8)` 会让一批 9 个 id 的调用把第 1 条成功记录挤出历史（见文件头注释）。
+ * 体量有界来自「一条消息 = 一轮」+ 轮次预算 2400 token + 失败记录只有一行；投影另有 600 token 上限。
  */
 export function attachShareExcerptPairs(prev: any, records: readonly ShareExcerptCallRecord[]): any {
   const base = prev && typeof prev === 'object' ? prev : {};
@@ -878,7 +899,8 @@ export function attachShareExcerptPairs(prev: any, records: readonly ShareExcerp
     ...base,
     [SHARE_EXCERPT_META_KEY]: {
       version: 1,
-      pairs: pairs.slice(-SHARE_EXCERPT_RECORD_KEEP),
+      // 全部保留（不 slice）：拒绝/超限记录不能把已成功的片段挤出历史。
+      pairs,
     } satisfies ShareExcerptPairRecord,
   };
 }
@@ -960,11 +982,14 @@ export type ShareExcerptPairSaver = (messageId: number, records: readonly ShareE
 /**
  * 待补偿队列与重试的上界（不是无限重试，也不会无限堆内存）。
  *  - perAnchorRecords / anchors：失败批次最多留多少（本轮 + 最近几轮），超了丢最旧的并明确报错。
+ *    `perAnchorRecords` 必须**明显高于一轮可能产生的记录数**（返工第 4 轮 P1-1）：次数上限只挡
+ *    「第 N+1 次网络读取」，一批 tool_calls 里被拒的每一条仍会产生记录；16 太近，一批 17+ 条的
+ *    失败批次会从队列里挤掉最旧的未落库记录。256 是内存安全阀，真实一轮远到不了。
  *  - flushAttempts：每次 flush 最多再尝试几轮写库；hook 有两个收尾点（成功尾部 + finally），
  *    所以一整轮的尝试次数上界是 `2 × flushAttempts`，再加每次 dispatch 自带的那一次。
  */
 export const SHARE_EXCERPT_OUTBOX_LIMITS = {
-  perAnchorRecords: 16,
+  perAnchorRecords: 256,
   anchors: 8,
   flushAttempts: 3,
   /** 「已写成功」这一事实最多记多少条（跨轮共享；只增不去重写，容量只防无界增长）。 */

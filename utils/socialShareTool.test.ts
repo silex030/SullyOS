@@ -1387,3 +1387,149 @@ describe('read_share_excerpts · 真实 IndexedDB 事务提交（返工第 3 轮
     }
   });
 });
+
+/**
+ * 返工第 4 轮 P1-1：健康 DB 下也不许静默删除已成功读取的历史。
+ *
+ * 旧实现把每条消息的成对记录截到最近 8 条（`pairs.slice(-8)`），而次数上限
+ * （`maxToolCallsPerTurn = 8`）只挡「第 9 次网络读取」、不挡产生 call/result：一批 9 个不同 id
+ * 的调用（1 条真读到 + 7 条同参重复 + 1 条超次数）会把**唯一成功的证据**挤出历史，
+ * outbox 那边却已 markWritten、`pending=0`，收尾 flush 也不会补回来。
+ *
+ * 这里走真实 DB 层（fake-indexeddb）+ 生产 saver（`updateMessageMetadataCommitted`）：
+ * dispatch → 事务提交 → 生产收尾 flush → 从库里读回，断言成功与失败 pair 都在、顺序不变、
+ * 重试幂等，且「下一轮投影」仍然有界（保留完整 ≠ 投影无限）。
+ */
+describe('read_share_excerpts · 一批 >8 个不同 id 的成对历史（返工第 4 轮 P1-1）', () => {
+  async function clearMessages(): Promise<void> {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('messages', 'readwrite');
+      tx.objectStore('messages').clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  const committedSaver = (messageId: number, records: readonly any[]) =>
+    DB.updateMessageMetadataCommitted(messageId, (prev: any) => attachShareExcerptPairs(prev, records));
+
+  it('成功读取不被「同参重复 + 超次数」挤出历史：9 条 pair 全部在库里，重试幂等，投影有界', async () => {
+    await clearMessages();
+    stubShareServer();
+    const id = await DB.saveMessage({
+      charId: 'char-batch',
+      role: 'user',
+      type: 'text',
+      content: '看这个 https://www.bilibili.com/video/BV1xx411c7mD 讲了什么？',
+      timestamp: 10,
+      metadata: { shares: { version: 1, attachments: [attachment()] } },
+    } as any);
+    const saved = await DB.getMessageById(id);
+    const contextMessages: any[] = [{ id, role: 'user', metadata: saved!.metadata }];
+    const turn = createShareExcerptTurn(contextMessages, {
+      endpoint,
+      now: () => 1_000,
+    })!;
+    const outbox = new ShareExcerptPairOutbox();
+    const recorder = new ShareExcerptPairRecorder({ anchorId: id, savePairs: committedSaver, outbox });
+
+    const outcomes: any[] = [];
+    // 第 1 条：真的读到字幕（唯一的成功证据）
+    outcomes.push(await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }, 'call_ok'),
+      turn,
+      recorder,
+    }));
+    // 第 2–8 条：同参重复（不同 toolCallId）→ DUPLICATE_TOOL_CALL
+    for (let i = 2; i <= 8; i++) {
+      outcomes.push(await dispatchShareExcerptToolCall({
+        toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }, `call_dup_${i}`),
+        turn,
+        recorder,
+      }));
+    }
+    // 第 9 条：本轮次数上限 → TOOL_CALL_LIMIT
+    outcomes.push(await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['comments'] }, 'call_limit'),
+      turn,
+      recorder,
+    }));
+    // 生产收尾（hook 成功尾部 / finally 就是这么调）
+    await recorder.flush();
+
+    // 执行侧口径：1 成功 + 7 重复 + 1 超次数
+    expect(outcomes.map((o) => o.code)).toEqual([
+      'OK',
+      'DUPLICATE_TOOL_CALL', 'DUPLICATE_TOOL_CALL', 'DUPLICATE_TOOL_CALL', 'DUPLICATE_TOOL_CALL',
+      'DUPLICATE_TOOL_CALL', 'DUPLICATE_TOOL_CALL', 'DUPLICATE_TOOL_CALL',
+      'TOOL_CALL_LIMIT',
+    ]);
+    expect(outcomes[0].text).toContain('第一段字幕');
+    expect(recorder.snapshot()).toMatchObject({ recorded: 9, pendingRecords: 0, outboxPending: 0, unsaved: false });
+
+    // 落库侧口径：9 条全在，顺序与执行顺序一致，成功证据仍在
+    const after = await DB.getMessageById(id);
+    const pairs = (after!.metadata as any)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(9);
+    expect(pairs.map((p: any) => p.call.toolCallId)).toEqual(outcomes.map((o) => o.record.toolCallId));
+    expect(pairs[0].result.ok).toBe(true);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    expect(pairs.slice(1, 8).every((p: any) => p.result.code === 'DUPLICATE_TOOL_CALL')).toBe(true);
+    expect(pairs[8].result.code).toBe('TOOL_CALL_LIMIT');
+
+    // 幂等：同一批记录再提交一次（DB 重试 / 重复 flush 的形状）不产生重复对，也不删已有对
+    await committedSaver(id, outcomes.map((o) => o.record));
+    await recorder.record(outcomes.map((o) => o.record));
+    await recorder.flush();
+    const replay = (await DB.getMessageById(id))!.metadata as any;
+    expect(replay[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(9);
+    expect(replay[SHARE_EXCERPT_META_KEY].pairs[0].result.text).toContain('第一段字幕');
+
+    // 保留完整 ≠ 投影无限：下一轮进模型的投影仍被 600 token 夹紧，但第一条成功片段还在
+    const after2 = (await DB.getMessageById(id))!.metadata;
+    const projection = renderShareExcerptPairProjection(after2, 'user')!;
+    expect(projection).toContain('read_share_excerpts 记录');
+    expect(projection).toContain('第一段字幕');
+    expect(Array.from(projection).length).toBeLessThanOrEqual(600 + 160);
+    // 消息级投影（normalizeMessageContent）也照常拼得上这份有界投影
+    const messageProjection = normalizeMessageContent(await DB.getMessageById(id) as any, '角色', '我');
+    expect(messageProjection).toContain('read_share_excerpts 记录');
+  });
+
+  it('成对记录不再按条数截断（12 条都在），且按 id 去重', () => {
+    const records = Array.from({ length: 12 }, (_, i) => ({
+      toolCallId: `call_${i + 1}`,
+      name: SHARE_EXCERPTS_TOOL_NAME,
+      args: { shareRef: SHARE_REF },
+      ok: i === 0,
+      code: i === 0 ? 'OK' : 'DUPLICATE_TOOL_CALL',
+      chargedTokens: i === 0 ? 100 : 0,
+      at: i,
+      resultText: i === 0 ? '[read_share_excerpts · OK] header\n1. transcript：第一段字幕内容' : '未读取',
+    }));
+    const meta = attachShareExcerptPairs({}, records);
+    expect(meta[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(12);
+    expect(meta[SHARE_EXCERPT_META_KEY].pairs[0].call.toolCallId).toBe('call_1');
+    expect(meta[SHARE_EXCERPT_META_KEY].pairs[11].call.toolCallId).toBe('call_12');
+    // 重复提交同一批：仍然 12 条（落库侧按 toolCallId 去重）
+    const replay = attachShareExcerptPairs(meta, records);
+    expect(replay[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(12);
+  });
+
+  it('待补偿队列的单消息上限高于一轮可能产生的记录数（20 条未落库批次不被挤掉）', async () => {
+    const outbox = new ShareExcerptPairOutbox();
+    const records = Array.from({ length: 20 }, (_, i) => ({
+      toolCallId: `call_pending_${i + 1}`,
+      name: SHARE_EXCERPTS_TOOL_NAME,
+      args: {},
+      ok: false,
+      code: 'TOOL_CALL_LIMIT' as const,
+      chargedTokens: 0,
+      at: i,
+      resultText: '未读取',
+    }));
+    outbox.add(101, records);
+    expect(outbox.pendingCount(101)).toBe(20);
+  });
+});

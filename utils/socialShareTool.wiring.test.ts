@@ -132,3 +132,48 @@ describe('read_share_excerpts · 可见标识与文档', () => {
     expect(doc).toContain('### 8.12 返工记录（第 3 轮');
   });
 });
+
+/**
+ * 返工第 4 轮 P1-2：工具循环总轮数不许被「在场的一张分享卡」改掉。
+ *
+ * 运行时行为（同一份其它工具序列、有/无分享卡、maxToolLoops=1/6/12）在
+ * `utils/chatToolLoopBudget.test.ts` 里真跑；这里只钉 hook 有没有走那唯一口径、
+ * 有没有把「还有哪些工具在场」如实传进去（React hook 本身在纯 Node 里跑不起来）。
+ */
+describe('read_share_excerpts · 工具循环轮数接线（返工第 4 轮 P1-2）', () => {
+  it('hook 用 chatToolLoopBudget 的唯一口径，不再自己算 shareExcerptTurn ? 4', () => {
+    expect(chatSrc).toContain("from '../utils/chatToolLoopBudget'");
+    expect(chatSrc).toMatch(/const MAX_LOOPS = resolveChatToolLoopBudget\(\{/);
+    // 旧写法（只看 shareExcerptTurn 就把混用轮压成 4）必须消失
+    expect(chatSrc).not.toMatch(/shareExcerptTurn \? 4 : mcpSettings\.maxToolLoops/);
+    expect(chatSrc).not.toMatch(/mcpToolResolve\s*\n?\s*\?\s*Math\.max\(mcpSettings\.maxToolLoops, MCP_CHAT_MAX_TOOL_LOOPS\)/);
+  });
+
+  it('传给口径的「其它工具在场」覆盖全部混用工具，分享-only 判断才可能成立', () => {
+    const block = chatSrc.match(/const MAX_LOOPS = resolveChatToolLoopBudget\(\{[\s\S]{0,700}?\n                \}\);/);
+    expect(block, '找不到轮数决策块').not.toBeNull();
+    const src = block![0];
+    expect(src).toContain('maxToolLoops: mcpSettings.maxToolLoops');
+    expect(src).toContain('mcpToolsAvailable: !!mcpToolResolve');
+    expect(src).toContain('shareExcerptsAvailable: !!shareExcerptTurn');
+    expect(src).toContain('otherToolsAvailable: !!(');
+    for (const flag of [
+      'payload.flags.luckinChatActive',
+      'payload.flags.mcdActive',
+      'payload.flags.luckinActive',
+      'amsg2ToolsInjected',
+      'btToolsInjected',
+      'chatLifeWorkflowToolsInjected',
+    ]) {
+      expect(src).toContain(flag);
+    }
+  });
+
+  it('文档记下轮数口径与「不按条数截断」的历史保留', () => {
+    const doc = readFileSync(fileURLToPath(new URL('../docs/social-content/integration-v1.md', import.meta.url)), 'utf8');
+    expect(doc).toContain('resolveChatToolLoopBudget');
+    expect(doc).toContain('分享卡在场不改变任何东西');
+    expect(doc).toContain('不按条数截断');
+    expect(doc).toContain('### 8.13 返工记录（第 4 轮');
+  });
+});
