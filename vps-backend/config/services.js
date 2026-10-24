@@ -50,6 +50,8 @@ export const services = [
       'LLM_TIMEOUT_MS', 'MCP_MAX_LOOPS', 'MCP_PINNED_TOOLS', 'MCP_SERVERS',
       'AMSG_CLIENT_TOKEN',
       'DUFS_PORT', 'DUFS_AUTH', 'DUFS_ROOT',
+      // 链接分享：main-agent 只做鉴权后的反代，解析在 social-content（8842）里跑。
+      'SOCIAL_CONTENT_URL', 'SOCIAL_SERVICE_TOKEN', 'SHARE_LINKS_ENABLED',
       'INSTANT_PUSH_URL', 'AMSG_URL', 'PROACTIVE_PUSH_URL',
       // 本地 EmbeddingGemma2（127.0.0.1:8850）：这几个只服务 main-agent 的
       // /v1/local-embedding* 路由，由 systemd EnvironmentFile
@@ -85,6 +87,32 @@ export const services = [
       // 原 CF 面板上的 scheduled trigger：D1 过期 blob 清理（未启用 D1 时为空操作，安全）
       { expr: '0 * * * *', name: 'd1-blob-sweeper' },
     ],
+  },
+  {
+    // 链接分享解析（小红书/抖音/B站）—— 独立 Worker，只监听 127.0.0.1，
+    // 外部入口统一经 main-agent 的 /agent/v1/social/* 鉴权反代（不单独开公网面）。
+    // 依赖 node:http(s) 的连接绑定 transport（抗 DNS 重绑定），无 D1 绑定会明确 503。
+    name: 'social-content',
+    port: 8842,
+    enabled: true,
+    bundle: path.join(repoRoot, 'worker/social-content/worker.bundle.js'),
+    envKeys: [
+      'SHARE_LINKS_ENABLED',
+      'SOCIAL_SERVICE_TOKEN', 'SOCIAL_SERVICE_ALLOW_ANONYMOUS', 'SOCIAL_DEPLOYMENT_SCOPE',
+      'SOCIAL_SOURCE_ID_BILIBILI', 'SOCIAL_SOURCE_ID_XIAOHONGSHU', 'SOCIAL_SOURCE_ID_DOUYIN',
+      'SOCIAL_MAX_LINKS_PER_MESSAGE', 'SOCIAL_MAX_CONCURRENT_PER_SCOPE',
+      'SOCIAL_RESOLVE_DEADLINE_MS', 'SOCIAL_PER_REQUEST_TIMEOUT_MS', 'SOCIAL_MAX_REDIRECTS',
+      'SOCIAL_CONTENT_CACHE_ALLOWED', 'TRANSCRIPTION_ENABLED', 'EXPERIMENTAL_XHS_COMMENTS',
+      'REDNOTE_INDEPENDENT_SESSION',
+    ],
+    db: {
+      bindKey: 'SOCIAL_CONTENT_DB',
+      pathEnv: 'SOCIAL_CONTENT_DB_PATH',
+      defaultPath: path.join(dataDir, 'social-content.sqlite'),
+      schemaPath: path.join(repoRoot, 'worker/social-content/schema.sql'),
+      enableIf: () => true,
+    },
+    crons: [],
   },
   {
     name: 'amsg',

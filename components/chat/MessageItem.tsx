@@ -2,6 +2,8 @@
 
 
 import React, { useEffect, useRef, useState } from 'react';
+import SocialShareCard from './SocialShareCard';
+import { shareAttachmentsOf } from '../../utils/socialShare';
 import { Message, ChatTheme } from '../../types';
 import { phoneFieldToText } from '../../utils/phoneEvidence';
 import { tryParseLifeSimResetCard } from '../../utils/lifeSimChatCard';
@@ -2280,6 +2282,22 @@ const MessageItem = React.memo(({
                 travel={travel}
             />,
         );
+    }
+
+    // --- 链接分享卡片（小红书/抖音/B站；metadata.shares，集成卡 t_babca897）---
+    // 显示层保留原消息文本（content），卡片只承载“读了什么/没读到什么”；
+    // 模型侧看到的是 utils/messageFormat 的投影（链接→shareRef + 有界简介）。
+    {
+        const shareAttachments = shareAttachmentsOf(m.metadata);
+        if (shareAttachments.length > 0) {
+            return commonLayout(
+                <SocialShareCard
+                    messageId={m.id}
+                    attachments={shareAttachments}
+                    content={isUser ? m.content : undefined}
+                />,
+            );
+        }
     }
 
     // --- Webpage Share Card (用户分享的网页 / 视频平台链接) ---

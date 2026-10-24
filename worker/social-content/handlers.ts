@@ -30,7 +30,7 @@ export interface HandlerResult {
   body: unknown;
 }
 
-const HTTP_BY_CODE: Record<string, number> = {
+export const HTTP_BY_CODE: Record<string, number> = {
   INVALID_URL: 422,
   UNSUPPORTED_PLATFORM: 422,
   UNSUPPORTED_LINK_TYPE: 422,

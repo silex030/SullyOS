@@ -23,6 +23,15 @@ import { XhsMcpClient, extractNotesFromMcpData, normalizeXhsLiteDetail } from '.
 import { extractWebpageContent, detectFirstUrl, detectXhsShortUrl, extractXhsShareTitle, isXhsUrl, extractXhsNoteId, expandShortUrl, type ExtractedWebpage } from '../utils/webpageExtractor';
 import { isVideoShareUrl, parseVideoShareUrl } from '../utils/videoParser';
 import { detectBilibiliShare, fetchBilibiliWebpage } from '../utils/bilibiliCard';
+// 链接分享统一链路（小红书/抖音/B站；默认关闭，见 utils/socialShare.ts）
+import {
+    isSocialShareEnabled,
+    planShareText,
+    resolveSharesForMessage,
+    mergeShareAttachments,
+    shareAttachmentsOf,
+    recoverPendingShares,
+} from '../utils/socialShare';
 import { isDevDebugAvailable } from '../utils/devDebug';
 import { isImageValue, migrateDataUrlToRef, putImageBlob, useBlobRefUrl } from '../utils/blobRef';
 import { buildReplySnapshotContent } from '../utils/applyAssistantPostProcessing';
@@ -1021,6 +1030,25 @@ const Chat: React.FC = () => {
         }
     }, [activeCharacterId]);
 
+    // 链接分享历史恢复：重开聊天时把停在 queued/resolving 的卡补一次（只读 GET，不触发模型）。
+    // 依赖 messages.length：卡片状态更新后不会改变条数，因此不会自激抖动。
+    useEffect(() => {
+        if (!activeCharacterId || messages.length === 0 || !isSocialShareEnabled()) return;
+        const pendingCount = messages.filter((m) =>
+            shareAttachmentsOf(m.metadata).some((a) => a.state === 'queued' || a.state === 'resolving'),
+        ).length;
+        if (pendingCount === 0) return;
+        let cancelled = false;
+        recoverPendingShares(
+            messages,
+            { updateMessageMetadata: (id, updater) => DB.updateMessageMetadata(id, updater) },
+            { conversationId: activeCharacterId },
+        ).then((r) => {
+            if (!cancelled && r.updated > 0) reloadMessages(visibleCountRef.current);
+        }).catch(() => { /* 恢复失败就保持原状态，用户可点卡片重试 */ });
+        return () => { cancelled = true; };
+    }, [activeCharacterId, messages.length, reloadMessages]);
+
     useEffect(() => {
         if (activeCharacterId) {
             // Update ref BEFORE any async work so stale reloadMessages calls
@@ -1510,10 +1538,65 @@ const Chat: React.FC = () => {
             }
         }
 
+        // ---- 链接分享统一链路（新，默认关闭）----
+        // 开关 os_social_share_config.enabled + 服务端 SHARE_LINKS_ENABLED 双门控。开启后：
+        //   1) 消息照常落库（原文不动，原文是事实来源）；
+        //   2) 后台请求主代理 /agent/v1/social/shares/resolve，首屏最多等 1500ms；
+        //   3) 卡片状态写进同一条消息的 metadata.shares，角色下一轮看到的是
+        //      「链接→shareRef + 有界简介」而不是原始长链接（投影见 utils/messageFormat）。
+        // 晚到的解析结果只更新卡片，不重复触发模型调用。
+        const sharePlan = type === 'text' && !customContent ? planShareText(text) : null;
+        const shareFlowActive = !!sharePlan && isSocialShareEnabled();
+        if (shareFlowActive && savedUserMsgId) {
+            const messageId = savedUserMsgId;
+            const conversationId = char.id;
+            const applyShareResult = async (attachments: any[], persistence: 'available' | 'unavailable') => {
+                if (attachments.length === 0) return;
+                await DB.updateMessageMetadata(messageId, (prev: any) => ({
+                    ...(prev || {}),
+                    shares: {
+                        version: 1,
+                        persisting: persistence,
+                        attachments: mergeShareAttachments(shareAttachmentsOf(prev), attachments),
+                        updatedAt: Date.now(),
+                    },
+                }));
+            };
+            const pending = resolveSharesForMessage({
+                conversationId,
+                messageId: String(messageId),
+                characterId: conversationId,
+                text,
+            });
+            // 首屏预算：最多等 1500ms（契约 6.1）；超时就先按“未读取”展示，晚到再补
+            const first = await Promise.race([
+                pending,
+                new Promise<null>((resolve) => { setTimeout(() => resolve(null), 1500); }),
+            ]);
+            if (first && first.ok) {
+                await applyShareResult(first.value.attachments, 'available');
+            } else if (first && !first.ok) {
+                if (first.payload?.attachments) {
+                    await applyShareResult(first.payload.attachments, 'unavailable');
+                    addToast('分享卡片没有存进服务器，本次仅本机可见（消息照常发送）', 'info');
+                } else {
+                    addToast(`链接解析失败（${first.error}），消息已按原文发送`, 'info');
+                }
+            }
+            // 晚到结果：只补卡片，不再调用模型
+            pending.then(async (late) => {
+                if (!late || !late.ok || late.value.attachments.length === 0) return;
+                await applyShareResult(late.value.attachments, 'available');
+                await reloadMessages(visibleCountRef.current);
+            }).catch(() => { /* 晚到失败不打扰用户，卡片保留“未读取”状态 */ });
+            await reloadMessages(visibleCountRef.current);
+        }
+
         // 小红书链接 → xhs_card。主路径不依赖任何后端：小红书分享文案自带标题（【标题】）
         // 和笔记 id/token，直接解析就能建卡，让「没部署小红书 MCP」的用户也能让角色看到分享了哪篇笔记。
         // 配了 MCP 的话再抓详情补正文/封面/作者（锦上添花，抓失败也不影响基础卡）。
-        if (type === 'text') {
+        // 新链路已经接管本条消息里的平台链接时跳过，避免同一链接出两张卡。
+        if (type === 'text' && !shareFlowActive) {
             let xhsCardCreated = false;
             let webpageCardCreated = false;
             const xhsFullNoteId = extractXhsNoteId(text);

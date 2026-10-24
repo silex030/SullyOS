@@ -1387,6 +1387,55 @@ async function mcpRelayProxy(req, env, url) {
   return new Response(res.body, { status: res.status, headers: out });
 }
 
+/**
+ * 链接分享服务反代（集成卡 t_babca897）。
+ *
+ * 为什么放在 main-agent 而不是让浏览器直连：social-content 只监听 127.0.0.1，也不实现
+ * 自己的账号体系；外部契约仍是 `/agent/v1/social/*`，鉴权复用这里的 X-Client-Token。
+ * 服务端到服务端再加一道 X-Social-Service-Token（SOCIAL_SERVICE_TOKEN），避免同机其它进程
+ * 直接打内部端口。
+ *
+ * 超时：解析总期限 20s（契约默认），反代给 25s，超时如实回 504 而不是挂住浏览器。
+ */
+async function socialProxy(request, env, plain, url) {
+  const base = (env.SOCIAL_CONTENT_URL || '').trim().replace(/\/+$/, '');
+  if (!base) {
+    return json({ error: 'social_content_unavailable', hint: 'SOCIAL_CONTENT_URL not configured' }, 503);
+  }
+  const headers = new Headers();
+  const contentType = request.headers.get('content-type');
+  if (contentType) headers.set('content-type', contentType);
+  const serviceToken = (env.SOCIAL_SERVICE_TOKEN || '').trim();
+  if (serviceToken) headers.set('x-social-service-token', serviceToken);
+
+  const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+  let body;
+  if (hasBody) {
+    const raw = await request.text();
+    if (raw.length > 256 * 1024) return json({ error: 'body_too_large' }, 413);
+    body = raw;
+  }
+
+  let res;
+  try {
+    res = await fetch(base + plain + (url.search || ''), {
+      method: request.method,
+      headers,
+      body,
+      signal: AbortSignal.timeout(25000),
+    });
+  } catch (err) {
+    const timeout = err && (err.name === 'AbortError' || err.name === 'TimeoutError');
+    return json({ error: timeout ? 'TIMEOUT' : 'NETWORK_ERROR', retryable: true }, timeout ? 504 : 502);
+  }
+
+  const out = new Headers();
+  out.set('content-type', res.headers.get('content-type') || 'application/json; charset=utf-8');
+  out.set('access-control-allow-origin', '*');
+  out.set('cache-control', 'no-store');
+  return new Response(res.body, { status: res.status, headers: out });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -1406,6 +1455,11 @@ export default {
         providers: providers.length,
         mcpServers: mcpServersOf(env).map((s) => s.name),
         mcpMaxLoops: parseInt(env.MCP_MAX_LOOPS || '12', 10) || 12,
+        // 链接分享：只看“有没有配反代地址 / 总开关开没开”，不暴露服务端 token
+        shareLinks: {
+          configured: Boolean((env.SOCIAL_CONTENT_URL || '').trim()),
+          enabled: String(env.SHARE_LINKS_ENABLED || '').trim().toLowerCase() === 'true',
+        },
         time: new Date().toISOString(),
       });
     }
@@ -1424,6 +1478,11 @@ export default {
         || plain === '/v1/local-embedding/embeddings'
         || plain === '/v1/local-embedding/health') {
       return handleLocalEmbedding(request, env, { authorize: (req) => checkAuth(req, env) });
+    }
+
+    // 链接分享解析（契约：内部 /v1/social/*，外部 /agent/v1/social/*，鉴权复用上面的 checkAuth）
+    if (plain === '/v1/social' || plain.startsWith('/v1/social/')) {
+      return socialProxy(request, env, plain, url);
     }
 
     if (plain === '/v1/chat/completions') return handleChat(request, env);

@@ -62,6 +62,14 @@ const WORKERS = [
   // worker.bundle.js；此前 bundle 是 src 的手工合并版，2026-09-11 起改为
   // esbuild 产物，与其它走构建的 worker 同形态（避免 src 改了 bundle 忘了跟）。
   { name: 'proactive-push', skipPublicOut: true },
+  // social-content = 链接分享解析（小红书/抖音/B站），独立 8842 服务，由 main-agent 反代。
+  // 它是本清单里唯一用 node:* 的 worker（DNS 解析 + 连接绑定 transport 才能抗 DNS 重绑定），
+  // 因此单独把 node:* 标成 external：宿主是 Node 22，不需要打进 bundle。
+  {
+    name: 'social-content',
+    skipPublicOut: true,
+    external: ['node:*'],
+  },
   // sullyos-home = VPS Home 真相源（消息/记忆/事件/世界状态，8837）。纯后端，
   // 不被前端静态 fetch，只产 worker.bundle.js 供 VPS 宿主加载。
   { name: 'sullyos-home', skipPublicOut: true },
@@ -121,7 +129,13 @@ for (const w of WORKERS) {
   }
 
   for (const out of outputs) {
-    await build({ ...sharedOpts, entryPoints: [entry], outfile: out, banner });
+    await build({
+      ...sharedOpts,
+      ...(w.external ? { external: [...sharedOpts.external, ...w.external] } : {}),
+      entryPoints: [entry],
+      outfile: out,
+      banner,
+    });
     normalizeModuleBannerComments(out);
   }
 

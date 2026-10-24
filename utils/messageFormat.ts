@@ -16,6 +16,7 @@ import { formatLifeSimResetCardForContext } from './lifeSimChatCard';
 import { formatQixiEventCardForContext, tryParseQixiEventChatCard } from './qixiChatCard';
 import { formatTransferRecord } from './transferFormat';
 import { formatStatCount } from './videoParser';
+import { buildShareMessageProjection, shareAttachmentsOf } from './socialShare';
 
 /**
  * 表情包消息的 content 存的是图床 URL，本身不带名字。拼上下文时要靠这个反查出
@@ -103,6 +104,15 @@ export function normalizeMessageContent(
     userName: string,
 ): string {
     const type = msg.type as string;
+
+    // 链接分享（集成卡 t_babca897）：消息里带 share 附件时，模型看到的是
+    // 「原文里的链接替换成 shareRef + 有界简介」，而不是原始长链接/整段正文。
+    // 这是契约 6.1 的模型投影；显示层仍保留原消息（卡片渲染见 SocialShareCard）。
+    const shares = shareAttachmentsOf(msg.metadata);
+    if (shares.length > 0) {
+        const projection = buildShareMessageProjection(msg.content, shares, { userName });
+        if (projection) return projection;
+    }
 
     // 纯视觉类给占位；语音优先使用配套转写，避免把音频资源地址送进上下文。
     if (type === 'image') return '[图片]';

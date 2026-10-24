@@ -48,5 +48,25 @@ CREATE INDEX IF NOT EXISTS ix_share_message
 CREATE INDEX IF NOT EXISTS ix_share_state_lease
   ON social_share_attachments (state, lease_until);
 
+-- 内容库（集成卡 t_babca897，契约 5.1「复用 social_content_items」）
+-- 集成交接时的现状核实：仓库里没有已实现的 social_content_items（只有本目录 schema 草案的
+-- 注释提到它），因此按同一契约最小实现这张表：正文/字幕/评论样本整体以 ContentRecord JSON
+-- 落一行，content_revision 单调（旧版本不得覆盖新版本）；scope 仍由服务端鉴权上下文决定。
+-- 契约要求的 queries/sources/media 拆表在 v1 未实现（见 docs/social-content/integration-v1.md
+-- 的已知限制）；media 不双存字节，只存 URL 引用。
+CREATE TABLE IF NOT EXISTS social_content_items (
+  content_id       TEXT NOT NULL,
+  scope            TEXT NOT NULL,
+  platform         TEXT NOT NULL,
+  content_revision INTEGER NOT NULL CHECK (content_revision >= 1),
+  record_json      TEXT NOT NULL,
+  fetched_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (scope, content_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_content_platform
+  ON social_content_items (scope, platform, updated_at);
+
 -- 内容正文/评论/字幕沿用共享 social_content_items 等表；这里不重复建内容表，
 -- 也不双存图片字节（契约 3.3 / 5.1）。

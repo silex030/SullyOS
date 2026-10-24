@@ -22,7 +22,11 @@ export const nodePinningTransport = (req) =>
 
     const mod = url.protocol === 'https:' ? httpsRequest : httpRequest;
     const family = pinned.includes(':') ? 6 : 4;
-    const lookup = (_hostname, _options, cb) => cb(null, pinned, family);
+    // Node ≥20 的 Agent 会用 lookup(host, { all: true }, cb) —— 此时回调必须给
+    // [{ address, family }] 数组，给字符串会报 ERR_INVALID_IP_ADDRESS（集成联调时实测）。
+    // 两种调用形态都返回同一个已验证地址，仍然不重新解析域名。
+    const lookup = (_hostname, options, cb) =>
+      options && options.all ? cb(null, [{ address: pinned, family }]) : cb(null, pinned, family);
 
     const clientReq = mod(
       {
