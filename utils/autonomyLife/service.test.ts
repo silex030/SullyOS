@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 import type { BoundaryV1, EffectiveBoundaryV1 } from '../../contracts/autonomyLife';
 import { normalizeBoundary } from './boundary';
 import { budgetWindowId } from './time';
-import { createMemoryBudgetPort } from './budget';
+import { createMemoryBudgetPort, reserveBudget } from './budget';
 import type { BudgetPort } from './budget';
 import { buildActionRow, createInMemoryLifeStore, emptyCharacterLife, reportReceipt, type EngineDeps } from './engine';
 import { createAutonomyLifeService, type AutonomyLifeServiceDeps, type BoundaryRepo } from './service';
@@ -257,19 +257,59 @@ describe('服务：状态与边界（§7）', () => {
   it('claim → commit-permit → receipt：错误租约被拒，正确回执落终态', async () => {
     const { deps, store } = serviceDeps();
     const service = createAutonomyLifeService(deps);
-    const action = buildActionRow({
+
+    // 伪造的预留 id（没有本窗口的预算依据）不能换来许可：先把它钉住。
+    const forged = buildActionRow({
       charId: CHAR,
       chosen: { kind: 'journal.write', semanticPurpose: 'c', purposeKey: 'pc', args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: 'c' } },
       nowMs: NOW,
       budgetWindowId: budgetWindowId(NOW, TZ),
-      reservationId: 'rsv',
+      reservationId: 'rsv-made-up',
+      policyVersion: 'autonomy-life-v1',
+      tz: TZ,
+      installationId: 'install-1',
+      online: true,
+    });
+    await store.insertAction(forged);
+    await store.bindInstallation('acct-http', 'install-1', NOW);
+    const forgedClaim = await service.claim({ installationId: 'install-1', charId: CHAR });
+    const forgedPermit = await service.commitPermit({
+      actionId: forged.id,
+      installationId: 'install-1',
+      leaseEpoch: (forgedClaim.body as any).leaseEpoch,
+      argsHash: forged.argsHash,
+      policyVersion: 'autonomy-life-v1',
+    });
+    expect(forgedPermit.status).toBe(409);
+    // 让它退出「可领取」，免得后面 claim 又碰到它（伪造许可不该改变它的状态）。
+    const stillScheduled = (await store.getAction(forged.id))!;
+    expect(stillScheduled.status).toBe('scheduled');
+    await store.putAction({ ...stillScheduled, status: 'cancelled' }, stillScheduled.revision);
+
+    // 真预留（reserveBudget 写的预算行 + 正规 id）才发得出许可。
+    const reserved = await reserveBudget(deps.budget, {
+      nowMs: NOW,
+      windowTimezone: TZ,
+      accountId: 'acct-http',
+      charId: CHAR,
+      limits: BASE_LIMITS,
+      tokens: 100,
+      kind: 'journal.write',
+    });
+    expect(reserved.ok).toBe(true);
+    if (!reserved.ok) return;
+    const action = buildActionRow({
+      charId: CHAR,
+      chosen: { kind: 'journal.write', semanticPurpose: 'c', purposeKey: 'pc2', args: { title: 't', body: 'b' }, reasonSummary: 'r', candidate: { kind: 'journal.write', semanticPurpose: 'c' } },
+      nowMs: NOW,
+      budgetWindowId: budgetWindowId(NOW, TZ),
+      reservationId: reserved.grant.reservationId,
       policyVersion: 'autonomy-life-v1',
       tz: TZ,
       installationId: 'install-1',
       online: true,
     });
     await store.insertAction(action);
-    await store.bindInstallation('acct-http', 'install-1', NOW);
     const claimed = await service.claim({ installationId: 'install-1', charId: CHAR });
     const claimedBody = claimed.body as any;
     expect(claimedBody.action.id).toBe(action.id);

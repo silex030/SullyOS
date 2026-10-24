@@ -190,6 +190,9 @@ export function mergeEffectiveBoundary(args: {
   return {
     schemaVersion: AUTONOMY_LIFE_SCHEMA_VERSION,
     revision: Math.max(account.revision, character?.revision ?? 0),
+    // 原始两层 revision：许可条件更新用它发现并发撤销/改限额（不是取 max）。
+    accountRevision: account.revision,
+    characterRevision: character?.revision ?? null,
     scope: 'account',
     enabled: stricterOff(character?.enabled, account.enabled),
     globalPaused: account.globalPaused ?? false,

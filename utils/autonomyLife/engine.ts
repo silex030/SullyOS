@@ -40,6 +40,7 @@ import {
   projectBudgetUsage,
   reserveBudget,
   settleBudget,
+  verifyReservationHold,
   windowIdAt,
   type BudgetGrant,
   type BudgetPort,
@@ -188,6 +189,15 @@ export interface AtomicPermitCommit {
   nonce: string;
   /** claim 之后读到的动作 revision：并发领取代次已变就失败。 */
   expectedRevision: number;
+  /** 发许可前读到的当前预算窗口（动作行里也必须是这个窗口）。 */
+  expectedWindowId: string;
+  /**
+   * 读边界时看到的两层 revision。条件 UPDATE 里必须仍然相等——
+   * 用户在「读完边界之后、写许可之前」撤销授权/改限额/改禁区会让 changes=0。
+   * null/undefined = 证明不了边界仍有效 → 一样拒绝（fail closed）。
+   */
+  expectedAccountBoundaryRevision: number | null;
+  expectedCharacterBoundaryRevision: number | null;
 }
 
 export type AtomicPermitResult =
@@ -757,6 +767,8 @@ export interface PermitResult {
   permit?: ExecutionPermit;
   /** 条件提交后的动作行（status=running + 许可字段）。执行器必须用这一份，不能用 claim 时的旧快照。 */
   action?: ActionRow;
+  /** 精确的拒绝原因（window_mismatch / reservation_* 等），只用于诊断，不参与判定。 */
+  detail?: string;
 }
 
 /**
@@ -782,32 +794,40 @@ export async function commitPermit(deps: EngineDeps, args: {
   const nowMs = args.nowMs ?? (deps.clock ?? systemClock).now();
   const action = await deps.store.getAction(args.actionId);
   if (!action) return { ok: false, code: 'NOT_FOUND' };
+  if (!args.installationId) return { ok: false, code: 'FORBIDDEN' };
   if (action.status === 'unknown') return { ok: false, code: 'UNKNOWN_EFFECT' };
   if (isTerminalActionStatus(action.status)) return { ok: false, code: 'STATE_CONFLICT' };
-  if (action.status !== 'running' && action.status !== 'scheduled' && action.status !== 'waiting_device') {
-    return { ok: false, code: 'STATE_CONFLICT' };
-  }
-  // 身份：只有该动作的 charId 才谈得上「执行谁的动作」。
   if (!action.charId) return { ok: false, code: 'FORBIDDEN' };
-  if (action.installationId && action.installationId !== args.installationId) return { ok: false, code: 'FORBIDDEN' };
-  if (action.leaseEpoch !== args.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' };
-  if (action.leaseExpiresAt !== null && nowMs > action.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' };
+  if (!action.installationId) return { ok: false, code: 'FORBIDDEN' };
+  if (action.installationId !== args.installationId) return { ok: false, code: 'FORBIDDEN' };
+  // 暂停优先于其它原因报出来：已经按下暂停的动作不该再说「状态冲突」。
+  const pause = await deps.store.getAccountPause(args.accountId);
+  if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' };
+  const life = await deps.store.getCharacterLife(action.charId);
+  if (life?.pauseRequestedAt != null) return { ok: false, code: 'GLOBAL_PAUSED' };
+
+  // 只有「真的被设备领到、租约仍在、还没发过许可」的动作能签许可。
+  // 裸的 scheduled 行（没 claim）没有 installationId / leaseEpoch=0 / leaseExpiresAt=null，
+  // 一律拒——否则「跳过 claim 直接 commit」就是一条绕过线。
+  if (action.status !== 'scheduled') return { ok: false, code: 'STATE_CONFLICT' };
+  if (!Number.isInteger(action.leaseEpoch) || action.leaseEpoch < 1) return { ok: false, code: 'STATE_CONFLICT' };
+  if (action.leaseExpiresAt === null) return { ok: false, code: 'STATE_CONFLICT' };
+  if (nowMs > action.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' };
   if (nowMs > action.expiresAt) return { ok: false, code: 'STATE_CONFLICT' };
   if (action.argsHash !== args.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
   // 参数自证：动作行里的参数与被批准的 hash 必须一致（防止只换参数不换 hash）。
   if (hashArgs(action.args) !== args.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
   if (action.policyVersion !== args.policyVersion) return { ok: false, code: 'STATE_CONFLICT' };
-  // 许可不许「转发式复用」：已被别的租约/已消费过的许可不能再发。
-  if (action.permitConsumedAt !== null) return { ok: false, code: 'STATE_CONFLICT' };
+  // 许可不许「转发式复用」：已被别的租约/已消费过的许可不能再发；
+  // 已发过许可的动作也不再签第二张（一次动作一张许可）。
+  if (action.permitIssuedAt !== null || action.permitConsumedAt !== null) {
+    return { ok: false, code: 'STATE_CONFLICT' };
+  }
 
-  // 暂停：账号层 + 角色层都要看，且原因分开报。
-  const pause = await deps.store.getAccountPause(args.accountId);
-  if (pause.paused) return { ok: false, code: 'GLOBAL_PAUSED' };
+  // 边界：暂停/关闭/角色禁用/kind 白名单。
   const boundary = await deps.boundaryFor(action.charId);
   if (boundary.globalPaused || boundary.enabled === false) return { ok: false, code: 'GLOBAL_PAUSED' };
   if (boundary.charEnabled === false) return { ok: false, code: 'CHAR_DISABLED' };
-  const life = await deps.store.getCharacterLife(action.charId);
-  if (life?.pauseRequestedAt != null) return { ok: false, code: 'GLOBAL_PAUSED' };
   const kindGate = boundaryGate(boundary, action.kind);
   if (!kindGate.ok) return { ok: false, code: kindGate.code };
 
@@ -830,11 +850,28 @@ export async function commitPermit(deps: EngineDeps, args: {
     return { ok: false, code: decision.reasonCode === 'grant_missing' ? 'GRANT_REQUIRED' : 'POLICY_DENIED' };
   }
 
-  // 预算：端口不可用 → fail closed；预留必须仍属于当前窗口（过期窗口里的预留不再有效）。
+  // 预算：端口不可用 → fail closed；预留必须仍属于当前窗口且在途（不是伪造的 id）。
   if (!deps.budget.available()) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
   const windowTimezone = life?.windowTimezone ?? boundary.timezone;
   const currentWindow = windowIdAt({ now: () => nowMs }, windowTimezone);
-  if (action.windowId !== currentWindow) return { ok: false, code: 'STATE_CONFLICT' };
+  if (action.windowId !== currentWindow) return { ok: false, code: 'STATE_CONFLICT', detail: 'window_mismatch' };
+
+  // 只读快照（不写预算行）：预留 id 必须自证归属本窗口/本角色，且两层预算行都还有在途预留。
+  const budgetRows = await deps.budget
+    .mutate(currentWindow, ['account', action.charId], (snapshot) => ({ updates: [], result: snapshot }))
+    .catch(() => null);
+  const hold = verifyReservationHold({
+    reservationId: action.reservationId,
+    windowId: currentWindow,
+    charId: action.charId,
+    nowMs,
+    timezone: windowTimezone,
+    rows: {
+      account: budgetRows?.account ?? null,
+      char: budgetRows ? budgetRows[action.charId] ?? null : null,
+    },
+  });
+  if (!hold.ok) return { ok: false, code: 'STATE_CONFLICT', detail: hold.reason };
 
   const expiresAt = nowMs + PERMIT_TTL_MS;
   const nonce = `nonce_${action.id}_${action.leaseEpoch}_${nowMs.toString(36)}_${hashString(`${action.argsHash}|${action.leaseEpoch}|${nowMs}`)}`;
@@ -850,6 +887,9 @@ export async function commitPermit(deps: EngineDeps, args: {
     expiresAt,
     nonce,
     expectedRevision: action.revision,
+    expectedWindowId: currentWindow,
+    expectedAccountBoundaryRevision: boundary.accountRevision ?? null,
+    expectedCharacterBoundaryRevision: boundary.characterRevision ?? null,
   });
   if (!committed.ok) return { ok: false, code: committed.code };
   const next = committed.action;
@@ -1246,15 +1286,19 @@ export function createInMemoryLifeStore(): LifeStorePort & {
       if (!current) return { ok: false, code: 'NOT_FOUND' as const };
       if (current.revision !== input.expectedRevision) return { ok: false, code: 'STATE_CONFLICT' as const };
       if (current.charId !== input.charId) return { ok: false, code: 'FORBIDDEN' as const };
-      if (current.installationId && current.installationId !== input.installationId) return { ok: false, code: 'FORBIDDEN' as const };
+      if (!input.installationId || !current.installationId || current.installationId !== input.installationId) {
+        return { ok: false, code: 'FORBIDDEN' as const };
+      }
       if (isTerminalActionStatus(current.status)) return { ok: false, code: 'STATE_CONFLICT' as const };
-      if (current.status !== 'scheduled' && current.status !== 'waiting_device') {
-        // 只有「已领到但还没发许可」的动作能发许可；running 已发过，其它状态先对账。
+      // 只有「已 claim 且未发许可」的动作能发许可。
+      if (current.status !== 'scheduled') return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.permitIssuedAt !== null) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.leaseEpoch !== input.leaseEpoch || current.leaseEpoch < 1) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.leaseExpiresAt === null || input.nowMs > current.leaseExpiresAt) {
         return { ok: false, code: 'STATE_CONFLICT' as const };
       }
-      if (current.leaseEpoch !== input.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' as const };
-      if (current.leaseExpiresAt !== null && input.nowMs > current.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' as const };
       if (input.nowMs > current.expiresAt) return { ok: false, code: 'STATE_CONFLICT' as const };
+      if (current.windowId !== input.expectedWindowId) return { ok: false, code: 'STATE_CONFLICT' as const };
       if (current.argsHash !== input.argsHash) return { ok: false, code: 'STATE_CONFLICT' as const };
       if (current.policyVersion !== input.policyVersion) return { ok: false, code: 'STATE_CONFLICT' as const };
       if (current.permitConsumedAt !== null) return { ok: false, code: 'STATE_CONFLICT' as const };

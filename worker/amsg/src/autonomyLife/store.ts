@@ -449,10 +449,16 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
       const current = await readAction(input.actionId);
       if (!current) return { ok: false, code: 'NOT_FOUND' };
       if (current.charId !== input.charId) return { ok: false, code: 'FORBIDDEN' };
-      if (current.installationId && current.installationId !== input.installationId) return { ok: false, code: 'FORBIDDEN' };
+      if (!input.installationId || !current.installationId || current.installationId !== input.installationId) {
+        return { ok: false, code: 'FORBIDDEN' };
+      }
       if (isTerminalActionStatus(current.status)) return { ok: false, code: 'STATE_CONFLICT' };
-      if (current.status !== 'scheduled' && current.status !== 'waiting_device') return { ok: false, code: 'STATE_CONFLICT' };
-      if (current.leaseEpoch !== input.leaseEpoch) return { ok: false, code: 'STATE_CONFLICT' };
+      // 只有「已 claim、未发许可」的动作能发许可（status=waiting_device 表示还没设备领走）。
+      if (current.status !== 'scheduled') return { ok: false, code: 'STATE_CONFLICT' };
+      if (current.permitIssuedAt !== null) return { ok: false, code: 'STATE_CONFLICT' };
+      if (current.leaseEpoch !== input.leaseEpoch || current.leaseEpoch < 1) return { ok: false, code: 'STATE_CONFLICT' };
+      if (current.leaseExpiresAt === null || input.nowMs > current.leaseExpiresAt) return { ok: false, code: 'STATE_CONFLICT' };
+      if (current.windowId !== input.expectedWindowId) return { ok: false, code: 'STATE_CONFLICT' };
       if (current.argsHash !== input.argsHash) return { ok: false, code: 'STATE_CONFLICT' };
       if (current.policyVersion !== input.policyVersion) return { ok: false, code: 'STATE_CONFLICT' };
       if (current.permitConsumedAt !== null) return { ok: false, code: 'STATE_CONFLICT' };
@@ -468,11 +474,19 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
         revision: current.revision + 1,
       };
 
+      // 一句 UPDATE 承担全部线性化条件：动作 CAS + 账号暂停 + 角色暂停 + 预算窗口
+      // + **边界两层 revision**（撤销授权/改限额/改禁区都会让 revision 变）。
+      // 边界 revision 传 null 时 COALESCE(...,-1) = NULL 恒不成立 → fail closed。
       const updated = await db
         .prepare(`UPDATE autonomy_life_actions
           SET status = 'running', revision = revision + 1, payload = ?, updated_at = ?
           WHERE owner_id = ? AND id = ? AND revision = ?
-            AND status IN ('scheduled', 'waiting_device')
+            AND status = 'scheduled'
+            AND json_extract(payload, '$.windowId') = ?
+            AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+                  WHERE owner_id = ? AND scope = 'account' AND char_id = ''), -1) = ?
+            AND COALESCE((SELECT revision FROM autonomy_life_boundaries
+                  WHERE owner_id = ? AND scope = 'character' AND char_id = ?), -1) = ?
             AND EXISTS (
               SELECT 1 FROM autonomy_life_accounts a
               WHERE a.owner_id = autonomy_life_actions.owner_id AND a.paused = 0
@@ -483,7 +497,19 @@ export function createD1LifeStore(options: D1LifeStoreOptions): LifeStorePort & 
                 AND c.char_id = autonomy_life_actions.char_id
                 AND json_extract(c.payload, '$.pauseRequestedAt') IS NOT NULL
             )`)
-        .bind(JSON.stringify(next), input.nowMs, ownerId, input.actionId, input.expectedRevision)
+        .bind(
+          JSON.stringify(next),
+          input.nowMs,
+          ownerId,
+          input.actionId,
+          input.expectedRevision,
+          input.expectedWindowId,
+          ownerId,
+          input.expectedAccountBoundaryRevision ?? null,
+          ownerId,
+          input.charId,
+          input.expectedCharacterBoundaryRevision ?? -1,
+        )
         .run();
 
       if (changesOf(updated) > 0) return { ok: true, action: next };
@@ -519,6 +545,15 @@ export function createD1BoundaryRepo(options: { db: LifeDb; ownerId: string; def
 
   return {
     async getAccount() {
+      const existing = await read('account', '');
+      if (existing) return existing;
+      // 懒建账号边界行：许可条件 UPDATE 用「账号边界 revision」做并发 CAS，
+      // 没有行就只能退回 -1，会让每次签许可都失败（或把缺行当成「最新」）。
+      // 这里像 account 行一样按默认值建一行 revision=0，之后所有写都是 CAS。
+      await db
+        .prepare('INSERT OR IGNORE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(ownerId, 'account', '', options.defaultBoundary.revision, JSON.stringify(options.defaultBoundary), Date.now())
+        .run();
       return (await read('account', '')) ?? options.defaultBoundary;
     },
     async getCharacter(charId) {

@@ -254,6 +254,80 @@ export function precheckBudget(inputs: BudgetPrecheckInputs): BudgetPrecheck {
 let reservationCounter = 0;
 
 /**
+ * 解析预留 id（`rsv_<windowId>_<charId>_<createdAt>_<counter>`）。
+ *
+ * 为什么需要：动作行里只存 reservationId 一个字符串，签发许可时必须能自证
+ * 「这个预留属于本窗口、本角色」，否则伪造一个 id 就能过。windowId 不含 `_`，
+ * 所以按 `_` 从右往左解析（charId 允许带下划线），解析不出来 = 拒绝。
+ */
+export function parseReservationId(
+  reservationId: string | null | undefined,
+): { windowId: string; charId: string; createdAt: number; counter: number } | null {
+  const raw = String(reservationId ?? '').trim();
+  if (!raw) return null;
+  const match = /^rsv_(w:[^_]+)_(.+)_(\d{1,16})_(\d{1,9})$/.exec(raw);
+  if (!match) return null;
+  const createdAt = Number(match[3]);
+  const counter = Number(match[4]);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(counter)) return null;
+  return { windowId: match[1], charId: match[2], createdAt, counter };
+}
+
+export interface ReservationVerification {
+  ok: boolean;
+  reason?:
+    | 'reservation_missing'
+    | 'reservation_malformed'
+    | 'reservation_window_mismatch'
+    | 'reservation_character_mismatch'
+    | 'reservation_not_held';
+}
+
+/**
+ * 服务端在签发许可前复核预留依据：id 自证归属 + 预算行里仍有在途预留。
+ *
+ * 只校验「预留还在」不够——伪造 id 也能撞上别人留下的 reservedCalls；只校验 id 也不够
+ * ——预留可能已结算（reserved 归零）。两条都过才发许可。
+ */
+export function verifyReservationHold(input: {
+  reservationId: string | null | undefined;
+  windowId: string;
+  charId: string;
+  nowMs: number;
+  /** 用于校验预留创建时刻确实落在该窗口（缺省跳过这一条）。 */
+  timezone?: string;
+  rows: { account: BudgetRow | null; char: BudgetRow | null };
+}): ReservationVerification {
+  const parsed = parseReservationId(input.reservationId);
+  if (!parsed) {
+    return {
+      ok: false,
+      reason: String(input.reservationId ?? '').trim() ? 'reservation_malformed' : 'reservation_missing',
+    };
+  }
+  if (parsed.windowId !== input.windowId) return { ok: false, reason: 'reservation_window_mismatch' };
+  if (parsed.charId !== input.charId) return { ok: false, reason: 'reservation_character_mismatch' };
+  // 预留不会晚于签发时刻产生；时钟回拨/伪造都对不上。
+  if (parsed.createdAt > input.nowMs) return { ok: false, reason: 'reservation_malformed' };
+  if (input.timezone && budgetWindowId(parsed.createdAt, input.timezone) !== input.windowId) {
+    return { ok: false, reason: 'reservation_window_mismatch' };
+  }
+  const account = input.rows.account;
+  const char = input.rows.char;
+  if (!account || !char) return { ok: false, reason: 'reservation_not_held' };
+  if (account.windowId !== input.windowId || char.windowId !== input.windowId) {
+    return { ok: false, reason: 'reservation_window_mismatch' };
+  }
+  // 本窗口必须真的有预算记账（预留或在途已结算）：空窗口里冒出来的 id = 没有依据。
+  // 注意不能只认 reservedCalls：计划期的预留会在模型调用后立刻结算成 used，
+  // 到执行期 reservedCalls 归零是正常状态，不代表「没发生过预留」。
+  if (account.reservedCalls + account.usedCalls < 1 || char.reservedCalls + char.usedCalls < 1) {
+    return { ok: false, reason: 'reservation_not_held' };
+  }
+  return { ok: true };
+}
+
+/**
  * 预留：原子、全维度、失败即全不预留。
  * 存储不可用/抛错 → SERVICE_UNAVAILABLE（fail closed），绝不「先放过去再补账」。
  */

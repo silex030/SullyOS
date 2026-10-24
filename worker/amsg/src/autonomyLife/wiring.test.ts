@@ -27,6 +27,9 @@ const NOW = Date.parse('2026-10-24T04:00:00.000Z');
 const USER = 'user-1';
 const CHAR = 'char-1';
 const TOKEN = 'shared-token';
+const WINDOW = 'w:2026-10-24';
+/** 合法预留 id：服务端受理前会校验它自证「本窗口 + 本角色」。 */
+const reservationFor = (charId = CHAR) => `rsv_${WINDOW}_${charId}_${NOW}_1`;
 
 let sql: TestSqlite;
 let db: LifeDb;
@@ -43,6 +46,8 @@ beforeEach(async () => {
   await ensureAutonomyLifeSchema(db);
   // 账号行懒建：先读一次，避免测试里第一条 UPDATE 没有行。
   await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).getAccountPause(USER);
+  // 预算行：许可条件提交会核对「预留 id 有本窗口的预算依据」。
+  await seedBudgetHold();
 });
 
 const boundaryRow = (overrides: Record<string, unknown> = {}) => normalizeBoundary(
@@ -64,6 +69,17 @@ async function seedAccountBoundary(overrides: Record<string, unknown> = {}) {
     .bind(USER, 'account', '', boundary.revision, JSON.stringify(boundary), NOW)
     .run();
   return boundary;
+}
+
+/** 预算行：账号层与角色层各一条，证明本窗口真的预留/结算过模型调用。 */
+async function seedBudgetHold(charId = CHAR) {
+  for (const scope of ['account', charId]) {
+    await db.prepare(`INSERT OR REPLACE INTO autonomy_life_budget
+      (owner_id, window_id, scope, used_calls, reserved_calls, used_tokens, reserved_tokens, notifications, kind_counts, spend_minor, revision, updated_at)
+      VALUES (?, ?, ?, 1, 0, 10, 0, 0, '{}', 0, 1, ?)`)
+      .bind(USER, WINDOW, scope, NOW)
+      .run();
+  }
 }
 
 /** 登记角色边界（客户端打开过该角色的自主生活）。 */
@@ -98,7 +114,7 @@ async function insertAction(actionId: string, options: { charId?: string; instal
     revision: 0,
     policyVersion: 'autonomy-life-v1',
     dedupeKey: 'abc12345',
-    reservationId: 'rsv-1',
+    reservationId: reservationFor(options.charId ?? CHAR),
     installationId: options.installationId === undefined ? 'install-1' : options.installationId,
     resultRef: null,
     errorCode: null,
@@ -133,6 +149,9 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
       expiresAt: NOW + 60_000,
       nonce: 'nonce-1',
       expectedRevision: 0,
+      expectedWindowId: WINDOW,
+      expectedAccountBoundaryRevision: 1,
+      expectedCharacterBoundaryRevision: null,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -172,6 +191,9 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
       expiresAt: NOW + 60_000,
       nonce: 'nonce-race',
       expectedRevision: 0,
+      expectedWindowId: WINDOW,
+      expectedAccountBoundaryRevision: 1,
+      expectedCharacterBoundaryRevision: null,
     });
     expect(result).toMatchObject({ ok: false, code: 'GLOBAL_PAUSED' });
 
@@ -203,9 +225,115 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
       expiresAt: NOW + 60_000,
       nonce: 'nonce-x',
       expectedRevision: 0,
+      expectedWindowId: WINDOW,
+      expectedAccountBoundaryRevision: 1,
+      expectedCharacterBoundaryRevision: 0,
     });
     expect(result).toMatchObject({ ok: false, code: 'GLOBAL_PAUSED' });
     expect((await store.getAction('act-charpause'))?.status).toBe('scheduled');
+  });
+
+  it('未 claim 的原始 scheduled 行不能签许可（没有设备/租约 → 直接拒，零写入）', async () => {
+    const raw = await insertAction('act-unclaimed', { installationId: null });
+    await seedAccountBoundary();
+    // 模拟「跳过 claim 直接 commit」：租约字段是动作创建时的初值。
+    await db.prepare("UPDATE autonomy_life_actions SET payload = json_set(payload, '$.leaseEpoch', 0, '$.leaseExpiresAt', NULL) WHERE owner_id = ? AND id = ?")
+      .bind(USER, 'act-unclaimed')
+      .run();
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const result = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: 'act-unclaimed',
+      installationId: 'install-1',
+      leaseEpoch: 0,
+      argsHash: raw.argsHash,
+      policyVersion: raw.policyVersion,
+      nowMs: NOW,
+    });
+    expect(result).toMatchObject({ ok: false, code: 'FORBIDDEN' });
+    const after = await runtime.store.getAction('act-unclaimed');
+    expect(after?.permitIssuedAt).toBeNull();
+    expect(after?.permitNonce).toBeNull();
+    expect(after?.status).toBe('scheduled');
+  });
+
+  it('伪造/缺失的预算依据不能通过：伪造 reservationId → 拒；本窗口没有预算行 → 拒', async () => {
+    await seedAccountBoundary();
+    await registerCharacter();
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+
+    const forgedRow = await insertAction('act-forged-rsv');
+    await db.prepare("UPDATE autonomy_life_actions SET payload = json_set(payload, '$.reservationId', 'rsv_made_up') WHERE owner_id = ? AND id = ?")
+      .bind(USER, 'act-forged-rsv')
+      .run();
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).bindInstallation(USER, 'install-1', NOW);
+    const claimed = await claimAction(runtime.engine, { accountId: USER, installationId: 'install-1', charId: CHAR });
+    expect(claimed.action?.id).toBe('act-forged-rsv');
+    const forged = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: 'act-forged-rsv',
+      installationId: 'install-1',
+      leaseEpoch: claimed.leaseEpoch,
+      argsHash: forgedRow.argsHash,
+      policyVersion: forgedRow.policyVersion,
+      nowMs: NOW,
+    });
+    expect(forged).toMatchObject({ ok: false, code: 'STATE_CONFLICT' });
+    expect((await runtime.store.getAction('act-forged-rsv'))?.permitIssuedAt).toBeNull();
+
+    // 本窗口没有任何预算记账（连预留/结算都没有）→ 同样没有依据。
+    await db.prepare('DELETE FROM autonomy_life_budget WHERE owner_id = ?').bind(USER).run();
+    await db.prepare("UPDATE autonomy_life_actions SET payload = json_set(payload, '$.reservationId', ?) WHERE owner_id = ? AND id = ?")
+      .bind(reservationFor(), USER, 'act-forged-rsv')
+      .run();
+    const noBasis = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: 'act-forged-rsv',
+      installationId: 'install-1',
+      leaseEpoch: claimed.leaseEpoch,
+      argsHash: forgedRow.argsHash,
+      policyVersion: forgedRow.policyVersion,
+      nowMs: NOW,
+    });
+    expect(noBasis).toMatchObject({ ok: false, code: 'STATE_CONFLICT' });
+    expect((await runtime.store.getAction('act-forged-rsv'))?.permitIssuedAt).toBeNull();
+  });
+
+  it('读完边界之后、UPDATE 之前撤销授权 → revision CAS 让整笔失败（真 SQL 回归）', async () => {
+    await seedAccountBoundary();
+    await registerCharacter();
+    const row = await insertAction('act-revoke-race');
+    let injected = false;
+    fresh({
+      beforeStatement: (text) => {
+        if (!injected && /UPDATE autonomy_life_actions/.test(text)) {
+          injected = true;
+          // 另一台设备在同一时刻撤销外部授权（边界 payload 与 revision 一起变）。
+          sql.prepare("UPDATE autonomy_life_boundaries SET revision = revision + 1, payload = json_set(payload, '$.externalGrants', json('[]')) WHERE owner_id = ? AND scope = 'account' AND char_id = ''")
+            .run(USER);
+        }
+      },
+    });
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+    await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).bindInstallation(USER, 'install-1', NOW);
+    const runtime = createAutonomyLifeRuntime({ db, userId: USER, charId: CHAR, now: () => NOW });
+    const claimed = await claimAction(runtime.engine, { accountId: USER, installationId: 'install-1', charId: CHAR });
+    expect(claimed.action?.id).toBe('act-revoke-race');
+    const result = await commitPermit(runtime.engine, {
+      accountId: USER,
+      actionId: 'act-revoke-race',
+      installationId: 'install-1',
+      leaseEpoch: claimed.leaseEpoch,
+      argsHash: row.argsHash,
+      policyVersion: row.policyVersion,
+      nowMs: NOW,
+    });
+    expect(result.ok).toBe(false);
+    expect(injected).toBe(true);
+    const after = await runtime.store.getAction('act-revoke-race');
+    expect(after?.permitIssuedAt).toBeNull();
+    expect(after?.permitNonce).toBeNull();
   });
 
   it('revision / hash / 设备 / 窗口 任一不符 → 拒绝（零写入）', async () => {
@@ -224,6 +352,9 @@ describe('D1 许可条件提交：暂停与动作 CAS 同一句', () => {
       expiresAt: NOW + 60_000,
       nonce: 'nonce-y',
       expectedRevision: 0,
+      expectedWindowId: WINDOW,
+      expectedAccountBoundaryRevision: 1,
+      expectedCharacterBoundaryRevision: null,
     };
     expect(await store.commitPermitAtomic({ ...base, expectedRevision: 9 })).toMatchObject({ ok: false });
     expect(await store.commitPermitAtomic({ ...base, argsHash: 'deadbeef' })).toMatchObject({ ok: false });

@@ -274,6 +274,13 @@ export interface EffectiveBoundaryV1 extends BoundaryV1 {
   timezone: string;
   allowedKinds: ActivityKind[];
   allowFictionalNpc: boolean;
+  /**
+   * 账号层/角色层边界行的 revision（合并投影时的**原始**来源）。
+   * 签发许可时带进条件 UPDATE，用来发现「读完边界之后、写许可之前」发生的
+   * 撤销授权 / 改限额 / 改禁区的并发写入；缺省（旧调用点）按 fail closed 处理。
+   */
+  accountRevision?: number;
+  characterRevision?: number | null;
 }
 
 /** 用户改这些字段一律 422 DEPRECATED_FIELD —— 频率/周期不是边界。 */
