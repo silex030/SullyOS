@@ -1,0 +1,9 @@
+HEAD=6065dff3 2026-10-25T03:33:00+08:00
+VITEST_TOOL_EXIT=0 (3 files / 73 passed = 45 + 17 + 11)
+VITEST_CHAT_EXIT=0 (39 files / 365 passed)
+VITEST_FOCUSED_EXIT=0 (30 files / 372 passed)
+TSC_EXIT=2 (56 pre-existing, error-set diff vs evidence/tsc-full.log empty)
+VITE_BUILD_EXIT=0 (2m39s)
+MUTATION_HISTORY_SLICE8=FAILS_NEW_CASE (restored, not in commit)
+MUTATION_LOOP_BUDGET_OLD_TERNARY=would yield 4 for mixed+share (behaviour test asserts 6)
+DONE=2026-10-25T03:33:00+08:00

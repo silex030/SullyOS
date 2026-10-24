@@ -427,3 +427,74 @@ evidence/*-r3.log + 本文件 §9          （原始日志与边界材料）
 2. 真实供应商模型是否会主动调用该工具（fixture 模型链路，无灰度数据）。
 3. 真实平台内容（B 站 412 / 抖音登录墙 / XHS 停用）。
 4. 未部署、未合并。
+
+## 10. 第 4 轮返工（run 87，2026-10-25 02:50 起）
+
+### 10.1 本 run 的模型 / provider（只读查询，命令可复跑）
+
+```bash
+echo "$HERMES_SESSION_ID"        # → 20261025_025053_29e758
+python3 - <<'PY'
+import sqlite3, os
+sid = os.environ['HERMES_SESSION_ID']
+c = sqlite3.connect('file:/root/.hermes/profiles/ds-executor/state.db?mode=ro', uri=True)
+print(list(c.execute("select session_id, model, billing_provider, billing_base_url, api_call_count"
+                     " from session_model_usage where session_id=?", (sid,))))
+PY
+```
+
+输出（本 session 仅 1 行，即全程未换模型）：
+
+```
+[('20261025_025053_29e758', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 67)]
+```
+
+- 本卡 run = 87（只读查询 `task_runs`：`select id, profile, status, started_at from task_runs
+  where task_id='t_38463abd' order by id desc limit 3` → `(87, 'ds-executor', 'running', 1792867842)`，
+  即 2026-10-25 02:50:42；上一条 `(82, 'ds-executor', 'review', …)` 是第 3 轮）。
+- 本 agent 进程由 dispatcher 以 profile 默认配置拉起，未使用 `--model/--provider`，未改 MoA / profile / 权限。
+
+### 10.2 配置与仓库边界
+
+```bash
+sha256sum /root/.hermes/profiles/ds-executor/config.yaml   # 6b005711…6113
+stat -c '%y' /root/.hermes/profiles/ds-executor/config.yaml # 2026-10-24 16:35:36 +0800
+git -C /opt/sullyos/sullyos-repo rev-parse HEAD            # 259626ae4d43…
+git -C /opt/sullyos/sullyos-repo status --porcelain | wc -l # 0
+ps -eo pid,lstart,cmd | grep -i gateway | grep -v grep     # 只有既存 1664081（Oct 24 10:12:57）
+```
+
+- `config.yaml` 与第 1–3 轮**同一份**（sha256 一致、mtime 早于本 run 1.5 天），本轮未改配置。
+- 主仓库 HEAD `259626ae`、工作树 clean；本卡改动只在 worktree
+  `/root/.hermes/kanban/workspaces/t_75dd49a5/repo` 内，未合并、未部署。
+- 未启动任何消息网关；未改 approvals / delegation / kanban 配置；diff 内无密钥形状字符串。
+
+### 10.3 本 run 改动范围（相对上一轮 HEAD 86c67854，实现提交 6065dff3）
+
+```
+utils/socialShareTool.ts              （去掉 pairs.slice(-8)/SHARE_EXCERPT_RECORD_KEEP；outbox 单消息上限 16→256）
+utils/chatToolLoopBudget.ts           （新：工具循环总轮数唯一口径，纯函数）
+hooks/useChatAI.ts                    （MAX_LOOPS 改调 resolveChatToolLoopBudget，传六类工具在场标志）
+utils/chatToolLoopBudget.test.ts      （新：11 例行为回归 + 同形循环驱动器）
+utils/socialShareTool.test.ts         （+3：一批 9 个 id 的真实 DB 用例、12 条不截断、队列 20 条不被挤掉）
+utils/socialShareTool.wiring.test.ts  （+3：hook 走唯一口径 / 旧三元已消失 / 六类标志都传 / 文档断言）
+docs/social-content/integration-v1.md （§8.2、§8.4 轮数口径、§8.6 不截断、§8.8 计数、§8.13 第 4 轮、§9）
+evidence/*-r4.log + 本文件 §10 + EVIDENCE-SUMMARY.md + VERIFY-R4-HEAD.txt
+```
+
+### 10.4 本 run 实际跑过的命令类别
+
+- 只读：`kanban_show`、`read_file`/`grep`/`sed`/`wc`、`git status/diff/log/rev-parse`、`sha256sum`、`stat`、`ps`、
+  `python3` 以 `mode=ro` 读 `state.db` 与 `kanban.db`。
+- 写路径（仅本 worktree 内）：`patch`/`write_file` 改代码/测试/文档、`npx vitest run … > evidence/*-r4.log`、
+  `npx tsc -p tsconfig.json --noEmit > evidence/tsc-full-r4.log`、`npx vite build > evidence/vite-build-r4.log`。
+- 一处**临时 mutation 验证**（跑完立刻从备份恢复，未留在提交里）：把 `attachShareExcerptPairs` 的
+  `pairs` 改回 `pairs.slice(-8)`，新用例立刻失败（9 条变 8 条），恢复后通过。
+
+### 10.5 仍然无法自证的项（与第 1–3 轮一致）
+
+1. provider 侧计费/受理回执（本机拿不到）。
+2. 真实供应商模型是否会主动调用该工具（fixture 模型链路，无灰度数据）。
+3. 真实平台内容（B 站 412 / 抖音登录墙 / XHS 停用）。
+4. 真实 React 运行下的整条 `useChatAI` 工具循环（纯 Node vitest 跑不了 hook）。
+5. 未部署、未合并。
