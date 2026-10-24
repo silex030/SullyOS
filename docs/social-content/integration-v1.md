@@ -281,7 +281,10 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 2. **平台真实内容仍未打通**（同 §9 第 1 条）：工具读得到的前提是内容库里真有内容；B站 412、抖音登录墙、
    XHS 会话停用的现状不变，`read_share_excerpts` 只会如实返回失败。
 3. **未部署**：前端与 worker 都没发布；`SHARE_LINKS_ENABLED` 仍按 §4 的灰度流程走。
-4. **发布门禁**：定向 vitest 已跑（见 §8.8）；全量 `tsc` / `vite build` 结果见本卡交付 metadata。
+4. **发布门禁**：定向 vitest 已跑（见 §8.8）。全量 `tsc -p tsconfig.json --noEmit` 与
+   `npx vite build` 本机都跑过 —— `tsc` 报 56 个错误、**全部是本次改动之外的既有错误**
+   （vps-backend / worker/instant-push 等），改动文件 0 错误；`vite build` EXIT=0（1m47s，
+   产物在 gitignore 的 `dist/`）。仍不等于发布验收：没有跑 `pnpm run check:workers`，也没有部署。
 5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
    `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
    （模型看不到 ref，实际不可达）。属已知边界，未额外收紧。

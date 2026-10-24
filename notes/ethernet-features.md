@@ -343,4 +343,5 @@
   - 预算：单次 ≤1200 / 用户轮次 ≤2400（复用 `SHARE_BUDGETS`），一轮一个预算对象、并发先预留不超卖；不信模型传的 maxTokens 与服务端自报 tokenEstimate，按每码点 ≈1 token 重算并夹紧。剩余不足一条切片直接拒绝。
   - 边界：只能给 shareRef/contentId（来自本轮上下文里的卡），URL/baseUrl/token/scope 一律拒绝且不发请求；只读、不改配置、scope 仍由服务端决定。失败/超限返回结构化 code 并要求「基于已有简介回答、不要声称读过」。中转拒绝 tools 的轮次退回无工具并显式告知。
   - 测试：`utils/socialShareTool.test.ts`（22）+ `utils/socialShareTool.wiring.test.ts`（8）；链路用 fixture 模型 + 真 `buildExcerpts` 生成的 HTTP 响应，回归 mcpToolBridge/agenticTools/messageFormat/socialShare/chatRequestPayload/social-content 共 29 文件 327 例通过；`utils/*chat*` 38 文件 354 例通过。
+  - 门禁：全量 `tsc` 56 个既有错误（改动文件 0 新增）、`vite build` EXIT=0；未跑 check:workers、未部署。
   - 未验证：真实模型是否主动调用、平台真实内容（B站 412/抖音登录墙/XHS 会话停用不变）、未部署。
