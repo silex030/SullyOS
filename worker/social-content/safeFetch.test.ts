@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { safeGet } from './safeFetch';
+import { safeGet, type SafeFetchDeps, type TransportResponse } from './safeFetch';
 import { SocialError } from './errors';
 import { fakeDeps, hangingTransport } from './testSupport';
 import { nodePinningTransport } from './nodeTransport.js';
@@ -221,5 +221,124 @@ describe('nodePinningTransport（真实连接，本机回环）', () => {
         maxBytes: 1024,
       }),
     ).rejects.toThrow('pinned_address_required');
+  });
+});
+
+
+/**
+ * 缺陷 2 的回归：期限必须覆盖**整条链路**（DNS + 连接 + 每跳 + 读完正文），
+ * 而不是只罩住 transport 拿到响应头的那一下。下面用“卡住 DNS / 卡住正文 / 慢重定向链”
+ * 三种在旧实现里会无限等待的形态验证。
+ */
+describe('全链路期限（DNS + 连接 + 正文）', () => {
+  it('DNS 卡住时也被总期限打断（不会拖穿 resolve 的 20s）', async () => {
+    const deps = {
+      resolve: () => new Promise<string[]>(() => {}),
+      transport: async () => {
+        throw new Error('must not be called');
+      },
+    };
+    const started = Date.now();
+    await expect(
+      safeGet('https://www.bilibili.com/x', deps, {
+        allowedHosts: HOSTS,
+        perRequestTimeoutMs: 5000,
+        deadline: started + 60,
+      }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('正文读取卡住时被总期限打断（旧实现已 clearTimeout，正文可无限等）', async () => {
+    const deps = {
+      resolve: async () => ['93.184.216.34'],
+      transport: async () => ({
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+        readBody: () => new Promise<{ text: string; bytes: number; truncated: boolean }>(() => {}),
+      }),
+    };
+    const started = Date.now();
+    await expect(
+      safeGet('https://www.bilibili.com/x', deps, {
+        allowedHosts: HOSTS,
+        perRequestTimeoutMs: 5000,
+        deadline: started + 60,
+      }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('慢重定向链按“总期限”截断，而不是 跳数 × 单跳超时 累加', async () => {
+    let hops = 0;
+    const deps = {
+      resolve: async () => ['93.184.216.34'],
+      transport: async () => {
+        hops += 1;
+        await new Promise((r) => setTimeout(r, 30));
+        return {
+          status: 302,
+          headers: { location: `https://www.bilibili.com/video/BV1xx411c7mD?p=${hops}` },
+          readBody: async () => ({ text: '', bytes: 0, truncated: false }),
+          discard: () => {},
+        };
+      },
+    };
+    const started = Date.now();
+    await expect(
+      safeGet('https://b23.tv/XyZ123', deps, {
+        allowedHosts: HOSTS,
+        perRequestTimeoutMs: 5000,
+        deadline: started + 70,
+      }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT' });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(400);
+    expect(hops).toBeLessThan(5);
+  });
+
+  it('不读正文的分支（重定向/非 2xx）显式 discard，避免连接泄漏', async () => {
+    const discarded: number[] = [];
+    let step = 0;
+    const deps: SafeFetchDeps = {
+      resolve: async () => ['93.184.216.34'],
+      transport: async (): Promise<TransportResponse> => {
+        step += 1;
+        if (step === 1) {
+          return {
+            status: 302,
+            headers: { location: 'https://www.bilibili.com/video/BV1xx411c7mD' },
+            readBody: async () => ({ text: '', bytes: 0, truncated: false }),
+            discard: () => {
+              discarded.push(302);
+            },
+          };
+        }
+        if (step === 2) {
+          return {
+            status: 404,
+            headers: {},
+            readBody: async () => ({ text: 'nope', bytes: 4, truncated: false }),
+            discard: () => {
+              discarded.push(404);
+            },
+          };
+        }
+        throw new Error('unexpected hop');
+      },
+    };
+    await expect(
+      safeGet('https://b23.tv/XyZ123', deps, { allowedHosts: HOSTS, perRequestTimeoutMs: 1000 }),
+    ).rejects.toMatchObject({ code: 'CONTENT_NOT_FOUND' });
+    expect(discarded).toEqual([302, 404]);
+  });
+
+  it('预算充足时整条链路正常完成（deadline 不误杀）', async () => {
+    const { deps } = fakeDeps({ 'www.bilibili.com/video/BV1xx411c7mD': { body: 'ok' } });
+    const res = await safeGet('https://www.bilibili.com/video/BV1xx411c7mD', deps, {
+      allowedHosts: HOSTS,
+      deadline: Date.now() + 5000,
+    });
+    expect(res.text).toBe('ok');
   });
 });

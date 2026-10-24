@@ -64,7 +64,7 @@ npx tsc --noEmit -p <scratch>/tsconfig.social.json   # include 本题新增文�
 
 | 目标 | 结果 | 说明 |
 | --- | --- | --- |
-| `api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD` | HTTP 412（带/不带 UA+Referer 都一样） | 被风控预检拦截；已把 412 映射为 `ACCESS_DENIED`，**不声称 B 站真实接通** |
+| `api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD` | HTTP 412（伪装桌面 Chrome UA）→ 改用中性 UA 后 **HTTP 200 / `code:0`** | 412 的触发条件是**浏览器 UA 而不是出口**：同一 URL/出口下 `curl` 默认 UA 与 `SullyOS/1.0 (...)` 都 200（返工 t_42231e16 §5.1 复测）。适配器已改为中性 UA，真实内容读取成功 |
 | `www.xiaohongshu.com/explore/64f0aa11bb` | 302 → `/website-login/error?error_code=300015`（"浏览环境异常"） | 与"会话桥停用、正文 AUTH_REQUIRED"的实现一致；未尝试绕过 |
 | `www.iesdouyin.com/share/video/7300123456789012345/` | 302 → `www.douyin.com/video/...`；跟随后 200，页面含 1 处 `_ROUTER_DATA`，`loaderData`/`errors` 中无 aweme 节点 | 说明分享页结构可读但该 id 无内容；据此把"有 router 无 aweme"映射成 `CONTENT_NOT_FOUND`，仅在完全抠不到 `_ROUTER_DATA` 时判 `UPSTREAM_CHANGED` |
 | `xhslink.com/a/9Kd2Lm`（随手构造的路径） | 404 | 说明短链路径非法时上游直接 404，适配器会得到 `CONTENT_NOT_FOUND` 而非伪造 |
@@ -73,7 +73,9 @@ npx tsc --noEmit -p <scratch>/tsconfig.social.json   # include 本题新增文�
 
 ## 4. 未验证范围（交付时必须带着这段话）
 
-1. 三平台**均未完成真实内容成功读取**。B 站被 412 风控拦截；抖音只验证到分享页可读、无真实成功样本；XHS 无会话且不恢复会话，正文永远 `AUTH_REQUIRED`。
+1. ~~三平台均未完成真实内容成功读取~~ → 返工 t_42231e16 后：**B 站已真实读到内容**（标题/正文/评论样本；
+   该样例无原生字幕所以字幕为 `not_available`）；抖音仍是登录墙、XHS 按产品决策不抓正文（`AUTH_REQUIRED`）。
+   证据：`worker/social-content/realNetwork.probe.test.ts`（`SOCIAL_REAL_NETWORK=1`）+ 集成文档 §5。
 2. RedNote 独立会话未验证（开关默认 false，代码路径只有 host 白名单变化）。
 3. 字幕二次 URL（`aisubtitle.hdslb.com`）与评论接口的真实响应形状未验证，只有夹具。
 4. Cloudflare Workers / VPS 实际部署：未挂路由、未绑定 `SOCIAL_CONTENT_DB`、未跑 `tsc`/构建门禁结论（见下）、未验证自包含 data:URL bundle。

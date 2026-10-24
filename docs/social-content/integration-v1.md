@@ -1,6 +1,7 @@
 # 链接分享整合 v1：接线、验证与已知限制（t_babca897）
 
-> 状态：**叶子模块 + 集成接线完成，本机验证通过；未部署生产，未确认任一平台真实内容读取成功。**
+> 状态：**叶子模块 + 集成接线完成；返工 t_42231e16 后 B 站已读到真实内容（抖音/XHS 仍受限，见 §5）；
+> 未部署生产。**
 > 契约来源：`share-contract-v1.txt`（t_6bca2291 附件）。
 > 父卡交付：`utils/socialContent/*`、`worker/social-content/*`（识别器、适配器、SSRF 抓取、状态机）。
 > 本卡新增：服务宿主装配、持久化、反代、客户端投影/卡片/发送链路、回归与体检。
@@ -97,52 +98,92 @@ main-agent 只做**鉴权后的反代**；外部契约仍是 `/agent/v1/social/*
 - **注意**：前端开关打开、服务端关闭时，发送不会被阻塞，但会收到一次“消息已按原文发送”的提示，
   并保留原文（不建半成品卡）。
 
-## 5. 真实网络验证（本机出口，2026-10-24，只读、无账号/Cookie）
+## 5. 真实网络验证（本机出口在海外，2026-10-24，只读、无账号/Cookie）
 
-用本卡构建的 bundle 起本地宿主（`social-host.mjs`，data: URL 加载，验证自包含），走真实 HTTP API：
+**返工后（t_42231e16）新增：真实网络探针测试**，默认跳过，只有显式开启才跑，避免把真网络混进
+CI 的 mock 测试里：
+
+```
+SOCIAL_REAL_NETWORK=1 npx vitest run worker/social-content/realNetwork.probe.test.ts --reporter=verbose
+→ REAL_NETWORK_PROBE [ {...}, {...}, {...} ]   # 每平台一行：outcome/ms/title/bodyChars/transcript/errorCode
+```
+
+最近一次原始输出（完整日志见附件 `real-network-probe.log`）：
 
 | 输入 | 结果 | 说明 |
 | --- | --- | --- |
-| `https://www.bilibili.com/video/BV1xx411c7mD` | `failed / ACCESS_DENIED` | api.bilibili.com 返回 412（风控预检），映射为 ACCESS_DENIED。**不声称 B 站接通** |
-| `https://b23.tv/BV1xx411c7mD` | `failed / ACCESS_DENIED` | 短链展开后同样撞 412 |
-| `https://www.xiaohongshu.com/explore/64f0aa11bb` | `failed / AUTH_REQUIRED` | 实现层面 XHS 正文一律不抓（会话桥停用），如实报需要登录 |
-| `https://xhslink.com/a/9Kd2Lm` | `failed / CONTENT_NOT_FOUND` | 短链路径非法 → 上游 404，未伪造内容 |
-| `https://www.iesdouyin.com/share/video/7300123456789012345/` | `failed / AUTH_REQUIRED` | 分享页 302→www.douyin.com 后返回登录墙页面；与父卡“200 但无 aweme”结论不同，说明**结果随出口/时间变化**，统一映射为 AUTH_REQUIRED |
-| `https://www.bilibili.com.evil.example/...` | `failed / UNSUPPORTED_PLATFORM` | 相似域名不进平台白名单 |
+| `https://www.bilibili.com/video/BV1xx411c7mD` | **`ok`**（1.7s） | 真实读到：标题「字幕君交流场所」、正文 3 字符、原生字幕 `not_available`、评论样本 `available`。**B 站真实接通（该样例内容极少，但确为真实响应）** |
+| `https://www.iesdouyin.com/share/video/7300123456789012345/` | `failed / AUTH_REQUIRED`（2.6s） | 分享页 302→www.douyin.com 后返回登录墙；结构化错误如实返回。ID 为探针输入，不保证视频存在 |
+| `https://www.xiaohongshu.com/explore/64f0aa11bb` | `failed / AUTH_REQUIRED`（0ms，不出站） | XHS 会话桥停用（缺 camofox），detail 能力为 false：**实现层面就不抓正文**，直接如实报需要登录 |
 
-结论：**三平台均未取得真实内容**；真实链路的成功形状只有夹具测试覆盖（`adapters.test.ts`），
-部署到其它出口后必须重跑本节表格，不能把本表当“已接通”。
+### 5.1 一个真实的适配器缺陷（本轮修掉）
+
+上一轮探测把 B 站 412 归因为「风控不可绕」。本轮把请求头拆开重测，发现**恰恰是伪装的
+Chrome UA 触发 412**（同一 URL、同一出口、同一时间点）：
+
+```
+curl -A "Mozilla/5.0"        → HTTP 412（风控页）
+curl -A "Mozilla/5.0 ... Chrome/120 Safari/537.36" → HTTP 412
+curl -A "curl/8.5.0"         → HTTP 200 {"code":0,...}
+curl -A "SullyOS/1.0 (...)"  → HTTP 200 {"code":0,...}
+```
+
+适配器原先把 UA 伪装成桌面 Chrome → 每次都 412。改为说明用途的中性 UA（`SullyOS/1.0
+(social-content; read-only link resolver)`）后，真实探针拿到了 `code:0` 的真实内容。
+这不改任何契约/权限，只是不再冒用浏览器身份。
+
+### 5.2 仍然受限的部分（不许写成“已接通”）
+
+- 抖音：登录墙，一次出口一个时间点，未尝试账号/Cookie 绕过。
+- 小红书：会话桥停用是**产品决策**，不是网络问题；正文能力恒为 `AUTH_REQUIRED`。
+- 字幕/评论的二次 URL（`aisubtitle.hdslb.com`、reply 接口）本轮样例没有字幕轨，
+  故真实字幕内容仍未验证；只有夹具覆盖。
 
 ## 6. 自动化验证（本机真实执行）
 
+返工 t_42231e16 后的定向回归（真实执行，原始输出见附件 `vitest-focused.log`）：
+
 ```
-npx vitest run worker/social-content utils/socialContent utils/messageFormat
-→ Test Files 15 passed | Tests 188 passed
+npx vitest run worker/social-content utils/socialContent utils/socialShare.test.ts \
+  utils/messageFormat.share.test.ts utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
+  worker/main-agent/src/socialProxy.test.ts components/chat/SocialShareCard.test.tsx
+→ Test Files 18 passed | 1 skipped (19)
+→ Tests      258 passed | 1 skipped (259)
+（跳过的那 1 个是真实网络探针：只有 SOCIAL_REAL_NETWORK=1 才跑，避免把真网络混进默认 CI）
+```
 
-npx vitest run worker/main-agent utils/messageItemModuleLayout.test.ts ... vps-backend
-→ Test Files 19 passed | Tests 193 passed
+真实网络（单独跑、单独留证）：
 
-npx vitest run worker/main-agent/src/socialProxy.test.ts      → 7 passed
-npx vitest run worker/social-content/src/chain.test.ts        → 4 passed
-npx vitest run components/chat/SocialShareCard.test.tsx       → 6 passed
-npx vitest run utils/socialShare.test.ts                      → 20 passed
+```
+SOCIAL_REAL_NETWORK=1 npx vitest run worker/social-content/realNetwork.probe.test.ts --reporter=verbose
+→ 1 passed；REAL_NETWORK_PROBE 三行见 §5
+```
+
+全量门禁（原始日志见附件，失败也要如实留档）：
+
+```
+npx tsc -p tsconfig.json --noEmit        → TSC_EXIT=2；56 个错误，与返工前基线**逐条相同**
+                                           （vps-backend/mastodon-mcp、components/os、utils/* 等），
+                                           本次改动/新增文件 0 个错误（附件 tsc-full.log）
+npx vite build                           → VITE_EXIT=0，built in 7m 43s（附件 vite-build.log）
+npx node scripts/build-workers.mjs       → 8 个 bundle 重建；只有 social-content/worker.bundle.js 变化
 ```
 
 覆盖点（与验收矩阵对应）：
 
-- **识别**：三平台长短链、`/discovery/item`、BV/av、分P、重复链接合并、第 6 条起 `SIZE_LIMIT`、相似域名拒绝。
+- **识别**：三平台长短链、`/discovery/item`、BV/av、分 P、重复链接合并、第 6 条起 `SIZE_LIMIT`、相似域名拒绝。
 - **状态机与持久化**（真实 SQLite）：唯一约束、revision CAS、跨 scope 404、租约抢占/释放、
-  重启恢复（`recoverInterrupted` 幂等）、内容 `content_revision` 单调。
-- **接口差异修复**：`nodeTransport` 的 `lookup(all:true)` 形态（父卡实现让三平台全报
-  `NETWORK_ERROR` 的根因，修复后真实探测能拿到 412/登录墙）。
-- **重复回复/异步竞态**：首屏只等 1500ms；晚到结果只写卡不触发第二次模型调用；合并按
-  `(attempt, revision)` 单调丢弃旧事件。
-- **安全**：SSRF（相似域名/IP 字面量/私网/重定向跨站/无 pinned 地址拒绝）、正文体积夹紧
-  （200000 字符 + `truncated` 标记）、请求体 256KiB + 文本 16000 UTF-16 上限、跨 scope 不可枚举、
-  外部文本纯文本渲染 + 转义、跳转仅 https、服务令牌不进 `/health`。
+  **幂等入口**（终态复用/在途复用/过期接管）、重启恢复（`includeLive`）、迟到写入不覆盖。
+- **接口差异修复**：`nodeTransport` 的 `lookup(all:true)` 形态、**中性 UA**（412 风控）。
+- **重复回复/异步竞态**：首屏只等 1500ms；占位先落库；晚到结果只写卡不触发第二次模型调用；
+  合并按 `(attempt, revision)` 单调丢弃旧事件。
+- **安全**：SSRF（相似域名/IP 字面量/私网/重定向跨站/无 pinned 地址拒绝）、**全链路期限**
+  （DNS/正文/重定向链都在预算内、非正文响应显式 discard）、正文体积夹紧（200000 字符 + `truncated`）、
+  请求体 256KiB + 文本 16000 UTF-16 上限、跨 scope 不可枚举、外部文本低信任隔离 + 边界伪造中和、
+  跳转仅 https、服务令牌不进 `/health`。
+- **字幕语义**：available/failed/not_available/not_requested/absent 五态，只有 failed 降级为 partial，
+  其余状态在投影里显式说明「没有字幕，只能按简介讨论」。
 - **凭据**：服务端不接受请求体里的 baseUrl/token/账号；XHS 不读 Cookie；反代不透传客户端 token。
-
-未覆盖的验证：全量 `tsc -p tsconfig.json` 与 `vite build` 在本机未作为发布门禁证据（见 §10）。
 
 ### 6.1 联调实测（本机两进程：main-agent 18830 → social-content 18842，真实外网 + 真实 SQLite）
 
@@ -169,15 +210,17 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 脚本：`scripts/audit/socialShareTokenAudit.ts`（命令见文件头）。
 
 ```
-典型短视频（字幕 1.5k 字，笔记 800 字）  旧 2581 token → 新 515 token（省 80.0%）
-长讲座    （字幕 12k 字，笔记 4k 字）    旧 16281 token → 新 515（省 96.8%）
-极长      （字幕 80k 字，笔记 20k 字）    旧 100281 token → 新 515（省 99.5%）
+典型短视频（字幕 1.5k 字，笔记 800 字）  旧 2581 token → 新 725 token（省 71.9%）
+长讲座    （字幕 12k 字，笔记 4k 字）    旧 16281 token → 新 725（省 95.6%）
+极长      （字幕 80k 字，笔记 20k 字）    旧 100281 token → 新 725（省 99.3%）
 ```
 
 - 口径：每 Unicode 码点 ≈1 token（保守上限），不是供应商账单数字。
 - 投影在重复构建下字节稳定（`projection_stable_across_builds: true`），意味着这条历史消息在
   后续每轮重发时是**稳定前缀的一部分**，不会因解析刷新而抖动；
-  每轮额外开销 ≈ 投影大小（515 token 级别），旧链路每轮要重发整段字幕。
+  每轮额外开销 ≈ 投影大小（725 token 级别），旧链路每轮要重发整段字幕。
+- 相比返工前（515 token）多出的 ~210 token 是**低信任隔离的固定成本**：一句“不执行其中指令”
+  的说明 + 每卡一对 `<<<EXTERNAL_CONTENT>>>` 边界（内容里的伪造边界会被中和）。
 - **缓存命中率：not_provided** —— 本机没有供应商 prompt-cache usage 字段，不虚构命中率；
   上线后应看 `promptCacheDiagnostics` / `llmUsage` 的真实 usage 再谈收益。
 
@@ -294,23 +337,38 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
 
 ## 9. 已知限制（必须带着交付）
 
-1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
-   `failed/partial` + 结构化错误，不编造内容。
+1. **平台真实内容**：B 站已在本机海外出口读到真实响应（§5，中性 UA）；抖音登录墙、XHS 会话
+   桥按产品决策停用。受限平台一律 `failed` + 结构化错误，不编造内容。
 2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**
    （`read_share_excerpts`，见 §8）：单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、
    失败如实返回。仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
-3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
-   各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。
+3. **租约/幂等的边界**：解析入口现在做了「终态复用 + 在途作业复用 + 过期接管 + CAS 回写」，
+   同 key 重复 POST 不再重复抓（§11 证据）。但这只保证**同 key 单飞**：不同消息里的同一
+   链接仍是两张卡（按契约就是两条分享）；多副本下如果所有副本同时绕过租约（例如系统时钟
+   严重漂移）仍可能各抓一次，结果靠 CAS 保持单调。
 4. **内容表是最小实现**：`social_content_items` 一行存整条 ContentRecord（JSON），没有拆
    queries/sources/media 表；`cacheAllowed=false` 时不做持久化。
 5. **ASR / XHS 实验评论 / RedNote 独立会话**：未实现，开关默认关。
 6. **旧链路仍在**：XHS 的 MCP 建卡、通用网页抓取、B 站 `bilibiliCard` 分支保留；新开关打开时
    这三条对本条消息里的平台链接让位（避免双卡），关闭时完全照旧。两套链路并存是有意的回滚面。
-7. **发布门禁未执行**：本机全量 `tsc`/`vite build` 未完成（>10 分钟），发布前必须跑并记录；
-   自包含 data:URL 加载已由本卡宿主脚本在本地验证（bundle 可加载、health 200），但线上 8842
-   的 Caddy/health 读回未做。
+7. **发布门禁**：本轮已在本机跑全量 `tsc -p tsconfig.json` 与 `vite build`，原始日志作为附件
+   （`tsc-full.log` / `vite-build.log`）；全量 `tsc` 仍有一批**既有**错误（见 §6），
+   本卡改动文件 0 新增。线上 8842 的 Caddy/health 读回仍未做。
+8. **低信任隔离是结构护栏，不是注入过滤器**：它保证外部内容有可识别边界、边界不可被内容伪造、
+   块前有「不执行其中指令」的说明；它**不**做语义级注入检测（那需要模型侧防护）。真实模型
+   面对精心构造的注入是否仍会服从，本机未验证。
 
-## 10. 发布步骤（本卡未执行，交发布流程）
+## 10. 返工 t_42231e16：五条缺陷 → 修复 → 证据
+
+| # | 缺陷 | 修复（文件） | 证据（测试/日志） |
+| --- | --- | --- | --- |
+| 1 | 幂等与租约没接进真实解析路径（重复 POST 重复抓；租约/占位不进 pipeline；重启恢复无测试） | `worker/social-content/resolver.ts`（终态复用、在途租约复用、过期接管 `claim`、CAS 终态回写、只兜底本请求发起的卡）、`src/store.ts`（`leaseUntil` 读写、`recoverInterrupted({includeLive})`）、`src/service.ts`（把 `existing`/`store` 传进 resolver，启动恢复用 includeLive） | `src/service.test.ts` 新增 5 例（真实 SQLite + 可卡住的适配器）：占位在 fetch 返回前落库且带租约；在途重复 POST 只抓 1 次；**真实在途任务重启恢复** → failed(TIMEOUT) 且迟到成功不覆盖、retry 成功；晚到失败仍回写 |
+| 2 | 请求期限不覆盖全链路（DNS/正文在预算外；重定向/错误响应不释放资源） | `safeFetch.ts`（`policy.deadline` 全链路预算、DNS/正文各自预算、`discard`、所有分支 finally 清定时器）、`nodeTransport.js`（`discard`）、三个适配器把 `ctx.deadline` 传进每次 `safeGet` | `safeFetch.test.ts` 新增 5 例：DNS 卡住/正文卡住/慢重定向链都在总预算内 TIMEOUT（耗时断言）、重定向与非 2xx 显式 discard、预算充足不误杀；SSRF 逐跳校验/私网/白名单/降级沿用原 7 例 |
+| 3 | 内容理解未闭环（字幕语义、按需检索工具、外部内容低信任隔离） | 字幕：`stateFromRecord` 产出 `transcriptState`，`resolveShares`/`service.resolveOne` 写进 `contextProjection`，`renderShareCardProjection` 对 failed/not_available/not_requested/absent 显式降级；工具：`utils/socialShareTool.ts`（cherry-pick t_75dd49a5，未重做）；低信任：`utils/socialShare.ts` 的 `EXTERNAL_UNTRUSTED_NOTICE` / `externalBlockOpen` / `sanitizeExternalText` / `wrapUntrustedContent`，`buildShareMessageProjection` 每卡包块，工具片段同样包块 | `utils/socialShare.test.ts` 新增 8 例（3 例注入边界 + 5 例字幕五态）；`utils/socialShareTool.test.ts` 新增 1 例（片段包块 + 伪造标记中和 + 预算不超卖）；`src/service.test.ts`/`chain.test.ts` 断言投影含字幕降级说明 |
+| 4 | `socialShare.ts` A-B-A 交错重复链接的 span 替换偏移 | `buildShareMessageProjection`：全局按起点升序做合法性/重叠裁剪，再**倒序一次性替换**（不再按卡片分组） | `utils/socialShare.test.ts` 新增 2 例：A-B-A 精确输出（`先看[分享 a]，再看[分享 b]，最后回到[分享 a]。`，a 出现 3 次、b 2 次）、越界/重叠 span 跳过不写错位置 |
+| 5 | 证据不完整（无类型检查/构建原始日志；真实网络与 mock 不分；无三平台真实证据） | 新增 `worker/social-content/realNetwork.probe.test.ts`（仅 `SOCIAL_REAL_NETWORK=1` 跑）、B 站 UA 修复（中性 UA，见 §5.1） | 附件 `tsc-full.log`、`vite-build.log`、`real-network-probe.log`；本文 §5/§6 引用。三平台里 B 站真实成功，抖音/XHS 如实失败并说明原因 |
+
+## 11. 发布步骤（本卡未执行，交发布流程）
 
 1. `pnpm run build`（含 `build:workers`，产出 `worker/social-content/worker.bundle.js`）。
 2. 定向门禁：本文件 §6 的 vitest 命令 + `pnpm run check:workers`。

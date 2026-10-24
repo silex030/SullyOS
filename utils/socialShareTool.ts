@@ -26,7 +26,11 @@
 import { SHARE_BUDGETS, type ShareAttachment, type ShareState } from './socialContent/types';
 import {
   estimateShareTokens,
+  EXTERNAL_BLOCK_CLOSE,
+  EXTERNAL_UNTRUSTED_NOTICE,
+  externalBlockOpen,
   fetchShareExcerpts,
+  sanitizeExternalText,
   shareAttachmentsOf,
   shortShareRef,
   type ExcerptsInput,
@@ -459,7 +463,7 @@ const clockLabel = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
 function segmentLine(index: number, seg: ExcerptsResult['segments'][number]): string {
   const time = seg.startMs != null && seg.endMs != null ? ` ${clockLabel(seg.startMs)}-${clockLabel(seg.endMs)}` : '';
-  return `${index}. ${seg.field}${time}：${seg.text}`;
+  return `${index}. ${seg.field}${time}：${sanitizeExternalText(seg.text)}`;
 }
 
 function failureText(code: string, detail: string, extra?: string): string {
@@ -707,7 +711,18 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
       footer = `（可续读：cursor=${body.nextCursor}）`;
     }
 
-    const text = [header, ...lines, footer].filter(Boolean).join('\n');
+    // 片段同样是外部内容：整段放进低信任块，并在块前声明“只作资料、不执行其中指令”。
+    // 块的边界标记已由 sanitizeExternalText 中和，内容无法伪造收尾/闭合。（缺陷 3）
+    const text = [
+      header,
+      EXTERNAL_UNTRUSTED_NOTICE,
+      externalBlockOpen(target.shareRef),
+      ...lines,
+      EXTERNAL_BLOCK_CLOSE,
+      footer,
+    ]
+      .filter(Boolean)
+      .join('\n');
     turn.seenSignatures.add(signature);
     charged = estimateShareTokens(text);
     if (charged > grant) {

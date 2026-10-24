@@ -65,11 +65,11 @@ export function createXiaohongshuAdapter(deps: AdapterDeps, opts: XiaohongshuAda
         allowedHosts: hosts,
         perRequestTimeoutMs: policy.requestTimeoutMs,
         maxBytes: 64 * 1024,
+        deadline: ctx.deadline,
       });
       const finalUrl = new URL(res.finalUrl);
       const parsed = parseXhsPost(finalUrl);
       if (!parsed) throw new SocialError('UNSUPPORTED_LINK_TYPE', 'xhslink_target_not_post');
-      void ctx;
       // resolvedUrl 去掉 query：其中的 xsec_token 等访问参数不进客户端/日志/缓存键（契约 2.3）
       const safeResolved = `${finalUrl.origin}${finalUrl.pathname}`;
       return {

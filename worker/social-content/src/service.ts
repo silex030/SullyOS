@@ -17,7 +17,6 @@ import {
   type ContentRecord,
   type ExcerptsRequest,
   type ShareAttachment,
-  type ShareState,
   type SocialPlatform,
 } from '../../../utils/socialContent/types';
 import { buildContentId, extractShareLinks } from '../../../utils/socialContent/links';
@@ -27,7 +26,7 @@ import { asSocialError, RevisionConflictError, SocialError, VersionUnavailableEr
 import { HTTP_BY_CODE } from '../handlers';
 import { buildLocalSummary, planRetry, resolveShares, stateFromRecord } from '../resolver';
 import type { ScopedSocialStore, SocialStoreRoot } from './store';
-import { occurrenceKeyOf, PersistenceUnavailable } from './store';
+import { PersistenceUnavailable } from './store';
 import type { SocialServiceConfig } from './config';
 import { SHARE_SCHEMA_VERSION } from '../../../utils/socialContent/types';
 
@@ -83,21 +82,6 @@ export function createSocialService(deps: SocialServiceDeps) {
     return deps.store.forScope(scope);
   }
 
-  /** 把解析结果落库，并回读确认（不把“写了”当“存住了”）。 */
-  async function persist(st: ScopedSocialStore, attachment: ShareAttachment): Promise<ShareAttachment> {
-    const ok = await writeOrThrow(st, attachment, 0);
-    if (ok) return attachment;
-    // 插入被唯一索引挡下：说明同消息同链接已有卡（重复 POST / 另一个进程刚建过），回读它
-    const existing = await st.get(attachment.shareRef);
-    if (existing) return existing;
-    // 不是重复而是插入失败：尝试 CAS 写入一次
-    const updated = await writeOrThrow(st, attachment, attachment.revision - 1);
-    if (updated) return attachment;
-    const after = await st.get(attachment.shareRef);
-    if (after) return after;
-    throw new PersistenceUnavailable('share_insert_failed');
-  }
-
   return {
     /**
      * POST /shares/resolve —— 幂等：同一 messageId + 同一链接只会有一张卡；
@@ -116,8 +100,8 @@ export function createSocialService(deps: SocialServiceDeps) {
 
         const storeAvailable = deps.store.available;
         const st = storeAvailable ? scoped(scope) : null;
+        // 同消息已有卡先读出来：终态直接复用、在途带租约的作业不重复抓（契约 4.1/4.3 幂等）
         const existing = st ? await st.listByMessage(messageId) : [];
-        const existingByKey = new Map(existing.map((a) => [occurrenceKeyOf(a), a]));
 
         const result = await resolveShares(
           {
@@ -133,6 +117,7 @@ export function createSocialService(deps: SocialServiceDeps) {
             sourceIdFor: deps.sourceIdFor,
             now,
             store: st,
+            existing,
             rednoteEnabled: deps.config.rednoteEnabled,
             maxConcurrentPerScope: deps.config.maxConcurrentPerScope,
             resolveDeadlineMs: deps.config.resolveDeadlineMs,
@@ -140,7 +125,7 @@ export function createSocialService(deps: SocialServiceDeps) {
           { onUpdate: deps.onUpdate },
         );
 
-        if (!st) {
+        if (!st || result.persistence === 'unavailable') {
           return {
             status: 503,
             body: {
@@ -151,21 +136,11 @@ export function createSocialService(deps: SocialServiceDeps) {
           };
         }
 
-        const merged: ShareAttachment[] = [];
-        for (const attachment of result.attachments) {
-          const prior = existingByKey.get(occurrenceKeyOf(attachment));
-          // 已有终态且不旧于本次结果 → 用已存的（幂等 + 不被旧持有者覆盖）
-          if (prior && isTerminal(prior.state) && prior.revision >= attachment.revision) {
-            merged.push(prior);
-            continue;
-          }
-          merged.push(await persist(st, attachment));
-        }
-
+        // 占位/终态都由 resolver 按 revision CAS 落库；这里不再重复写一遍（重复写只会多一次无谓 IO）
         return {
           status: 202,
           body: {
-            attachments: merged.map(light),
+            attachments: result.attachments.map(light),
             pollAfterMs: result.pollAfterMs,
             droppedOverLimit: result.droppedOverLimit,
           },
@@ -220,7 +195,20 @@ export function createSocialService(deps: SocialServiceDeps) {
         const planned = planRetry(existing, expectedRevision, now());
         const ok = await st.put(planned, existing.revision);
         if (!ok) return { status: 409, body: { error: 'revision_conflict' } };
-        const resolved = await resolveOne(st, planned, scope);
+        // retry 也是一次真实解析：先抢租约，避免两个重试请求同时打平台/互相覆盖
+        let baseRevision = planned.revision;
+        try {
+          const claimed = await st.claim(planned.shareRef, now() + deps.config.resolveDeadlineMs + 5000, now());
+          if (claimed) {
+            baseRevision += 1;
+          } else {
+            // 另一个重试请求刚刚抢到租约：不要并发打平台，也不要假装重跑成功
+            return { status: 409, body: { error: 'retry_in_flight' } };
+          }
+        } catch {
+          // 租约不可用（存储异常）：照旧按 revision CAS 重跑，最坏是重复抓一次
+        }
+        const resolved = await resolveOne(st, planned, scope, baseRevision);
         return { status: 202, body: { attachment: light(resolved) } };
       } catch (err) {
         return fail(err);
@@ -262,15 +250,21 @@ export function createSocialService(deps: SocialServiceDeps) {
       }
     },
 
-    /** 重启恢复：把租约过期的 resolving 行明确标 failed（幂等，可在每次启动调用）。 */
+    /** 重启恢复：把上次进程留下的 queued/resolving 明确标 failed（幂等，每次启动调用）。 */
     async recover(): Promise<number> {
-      return deps.store.recoverInterrupted(now());
+      // 进程刚起：上一个持有者的租约即使“还没到期”也已经没人续了（单实例部署）。
+      // 不收它就会让用户看到一条永远“解析中”的卡，所以这里 includeLive=true。
+      return deps.store.recoverInterrupted(now(), { includeLive: true });
     },
   };
 
   /** retry 的重跑：从 originalUrl 重新识别 → 受控展开 → 抓取 → CAS 落库。 */
-  async function resolveOne(st: ScopedSocialStore, planned: ShareAttachment, scope: string): Promise<ShareAttachment> {
-    const recordRevision = planned.revision;
+  async function resolveOne(
+    st: ScopedSocialStore,
+    planned: ShareAttachment,
+    scope: string,
+    recordRevision: number = planned.revision,
+  ): Promise<ShareAttachment> {
     try {
       const extracted = extractShareLinks(planned.originalUrl, { rednoteEnabled: deps.config.rednoteEnabled });
       const candidate = extracted.ok ? extracted.candidates[0] : null;
@@ -296,7 +290,7 @@ export function createSocialService(deps: SocialServiceDeps) {
         };
       }
       const record = await adapter.fetchContent(target, { scope, deadline, now });
-      const { state, coverage, missing } = stateFromRecord(record);
+      const { state, coverage, missing, transcriptState } = stateFromRecord(record);
       const contentId = buildContentId(record.platform, record.sourceId, record.externalId);
       const next: ShareAttachment = {
         ...planned,
@@ -327,6 +321,7 @@ export function createSocialService(deps: SocialServiceDeps) {
           evidenceCoverage: coverage,
           reason: missing.length ? `missing:${missing.join(',')}` : null,
           frozenAt: now(),
+          transcriptState,
         },
       };
       const ok = await st.put(next, recordRevision);
@@ -356,24 +351,6 @@ export function createSocialService(deps: SocialServiceDeps) {
     await st.put(failed, expectedRevision);
     return failed;
   }
-}
-
-/** 写库异常统一折成 PERSISTENCE_UNAVAILABLE：存储坏了不能伪装成网络错误/成功。 */
-async function writeOrThrow(
-  st: ScopedSocialStore,
-  attachment: ShareAttachment,
-  expectedRevision: number,
-): Promise<boolean> {
-  try {
-    return await st.put(attachment, expectedRevision);
-  } catch (err) {
-    if (err instanceof PersistenceUnavailable) throw err;
-    throw new PersistenceUnavailable(`share_write_failed:${(err as Error)?.message ?? 'unknown'}`);
-  }
-}
-
-function isTerminal(state: ShareState): boolean {
-  return state === 'ready' || state === 'partial' || state === 'failed' || state === 'cancelled';
 }
 
 /**
