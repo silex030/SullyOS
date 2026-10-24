@@ -349,6 +349,8 @@ npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.t
    `npx vite build` 本机都跑过（日志在 `evidence/`）：`tsc` EXIT=2、**56 个错误**，
    与返工前基线（父卡 `evidence/tsc-full.log`）的 `error TS` 行集合 **逐行一致**
    （`diff` 空、56 vs 56），改动文件 0 错误；`vite build` EXIT=0（5m49s，产物在 gitignore 的 `dist/`）。
+   返工第 2 轮在 `43721c4e` 上复跑同一套门禁：`tsc` 仍 EXIT=2 / 56 个 / 错误集 `diff` 空，
+   `vite build` EXIT=0（2m57s），vitest 51 / 354 / 350 全绿（原始日志 `evidence/*-r2.log`）。
    仍不等于发布验收：没有跑 `pnpm run check:workers`，也没有部署。
 5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
    `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
