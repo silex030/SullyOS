@@ -1,12 +1,12 @@
 /**
- * read_share_excerpts 的接线守卫（执行卡 t_75dd49a5）。
+ * read_share_excerpts 的接线守卫（执行卡 t_75dd49a5 / 返工卡 t_38463abd）。
  *
  * 运行时行为在 socialShareTool.test.ts 里真跑（含真实 excerpts 服务逻辑 + fixture 模型/HTTP）；
  * 这里只钉「useChatAI / messageFormat 有没有把那个模块接上」——仓库的 vitest 是纯 Node，
  * useChatAI 绑死 React 跑不起来，沿用 amsg2ChatLoop.wiring.test.ts 的源码级断言做法。
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const chatSrc = readFileSync(fileURLToPath(new URL('../hooks/useChatAI.ts', import.meta.url)), 'utf8');
@@ -17,7 +17,8 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     expect(chatSrc).toContain("from '../utils/socialShareTool'");
     expect(chatSrc).toContain('buildShareExcerptsTool');
     expect(chatSrc).toContain('createShareExcerptTurn');
-    expect(chatSrc).toContain('executeShareExcerptToolCall');
+    expect(chatSrc).toContain('dispatchShareExcerptToolCall');
+    expect(chatSrc).toContain('ShareExcerptPairRecorder');
     expect(chatSrc).toContain('SHARE_EXCERPTS_TOOL_NAME');
   });
 
@@ -35,17 +36,29 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     expect(chatSrc).toMatch(/chatLifeWorkflowToolsInjected\s*\|\|\s*shareExcerptTurn\)\s*&&\s*data\.choices\?\.\[0\]\?\.message\?\.tool_calls\?\.length/);
   });
 
-  it('按工具名分发到执行器，并用 buildToolResultMessage 成对回填', () => {
-    const dispatch = chatSrc.match(/if \(shareExcerptTurn && fname === SHARE_EXCERPTS_TOOL_NAME\) \{[\s\S]{0,600}?continue;/);
+  it('按工具名分发到执行器，用 dispatch 一次完成「执行 + 立刻成对落库」，再回填工具结果', () => {
+    const dispatch = chatSrc.match(/if \(shareExcerptTurn && fname === SHARE_EXCERPTS_TOOL_NAME\) \{[\s\S]{0,700}?continue;/);
     expect(dispatch, '找不到分发块').not.toBeNull();
-    expect(dispatch![0]).toContain('executeShareExcerptToolCall({ toolCall: tc, turn: shareExcerptTurn })');
+    expect(dispatch![0]).toContain('dispatchShareExcerptToolCall({');
+    expect(dispatch![0]).toContain('recorder: shareExcerptRecorder');
     expect(dispatch![0]).toContain('buildToolResultMessage(tc, excerptOutcome.text)');
     expect(dispatch![0]).toContain('loopMessages.push');
+    // 不允许绕过 dispatch 直接调执行器（否则记录又会回到「等最终回复」才有）
+    expect(dispatch![0]).not.toContain('executeShareExcerptToolCall(');
   });
 
-  it('本轮 call/result 成对落进助手消息 metadata（下一轮投影读得回来）', () => {
-    expect(chatSrc).toMatch(/pickShareExcerptAnchor\(recentAfterTurn as any\[\], turnStartedAt\)/);
-    expect(chatSrc).toMatch(/DB\.updateMessageMetadata\(anchorId, \(prev: any\) => attachShareExcerptPairs\(prev, records\)\)/);
+  it('落库器锚在本轮触发消息，逐次写库；不依赖最终回复、也不按时间戳猜锚点', () => {
+    // 在 try 外声明：成功 / 失败 / 中断三条路径（含 finally）都能收尾
+    expect(chatSrc).toMatch(/let shareExcerptRecorder: ShareExcerptPairRecorder \| null = null;/);
+    expect(chatSrc).toMatch(/shareExcerptRecorder = shareExcerptTurn\s*\?\s*new ShareExcerptPairRecorder\(\{/);
+    expect(chatSrc).toMatch(/anchorId: pickShareExcerptTurnAnchor\(contextMsgs\)/);
+    expect(chatSrc).toMatch(/DB\.updateMessageMetadata\(messageId, \(prev: any\) => attachShareExcerptPairs\(prev, records\)\)/);
+    // 返工要求：不再用「最近 30 条里找 assistant」这种猜锚点
+    expect(chatSrc).not.toContain('pickShareExcerptAnchor');
+    expect(chatSrc).not.toContain('executeShareExcerptToolCall');
+    // 成功尾部与 finally 都等一次写入落地（幂等，重复 flush 是 no-op）
+    const flushes = chatSrc.match(/await shareExcerptRecorder\.flush\(\)/g) || [];
+    expect(flushes.length).toBeGreaterThanOrEqual(2);
   });
 
   it('中转拒绝 tools 时这一轮退回无工具且明确不许假装读过', () => {
@@ -64,5 +77,24 @@ describe('read_share_excerpts · 下一轮投影接线', () => {
     expect(formatSrc).toContain("from './socialShareTool'");
     expect(formatSrc).toMatch(/const excerptProjection = renderShareExcerptPairProjection\(msg\.metadata, msg\.role\)/);
     expect(formatSrc).toMatch(/return excerptProjection \? `\$\{body\}\\n\\n\$\{excerptProjection\}` : body;/);
+  });
+});
+
+describe('read_share_excerpts · 可见标识与文档', () => {
+  it('模型投影用完整 shareRef（不再截成 12 字符的短引用）', () => {
+    const shareSrc = readFileSync(fileURLToPath(new URL('./socialShare.ts', import.meta.url)), 'utf8');
+    expect(shareSrc).toMatch(/const ref = share\.shareRef;/);
+    expect(shareSrc).toMatch(/const token = `\[分享 \$\{att\.shareRef\}\]`;/);
+    expect(shareSrc).not.toMatch(/const ref = shortShareRef\(share\.shareRef\)/);
+    expect(shareSrc).not.toMatch(/\[分享 \$\{shortShareRef\(att\.shareRef\)\}\]/);
+  });
+
+  it('文档 §8 记录工具接入、可见标识、预算与失败/超限降级', () => {
+    const docPath = fileURLToPath(new URL('../docs/social-content/integration-v1.md', import.meta.url));
+    expect(existsSync(docPath)).toBe(true);
+    const doc = readFileSync(docPath, 'utf8');
+    expect(doc).toContain('工具接入与预算');
+    expect(doc).toContain('SHARE_REF_AMBIGUOUS');
+    expect(doc).toContain('ShareExcerptPairRecorder');
   });
 });

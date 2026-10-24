@@ -18,9 +18,14 @@
  *  - **失败如实**：超限/失败都返回结构化结果，并明确要求「基于已有简介回答、说明片段不可用」，
  *    不让模型把没读到说成读过。
  *
- * 落历史：每次调用的 call（工具名/参数）与 result（状态/收费/文本）成对记进本轮记录，
- * 由 useChatAI 在回复落库后挂到该条助手消息的 metadata.shareExcerpts 上；下一轮投影由
- * messageFormat 读出这对记录（成对渲染，不单独回放孤立片段）。
+ * 落历史：每次调用执行完**立刻**把 call（工具名/参数）与 result（状态/收费/文本）成对写进
+ * 「本轮触发消息」（`contextMsgs` 的最后一条，发送前已落库、id 确定）的 metadata.shareExcerpts；
+ * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。下一轮投影由 messageFormat
+ * 读出这对记录（成对渲染，不单独回放孤立片段，≤600 token）。落库器见 ShareExcerptPairRecorder。
+ *
+ * 引用契约：模型可见标识 = **完整 shareRef**（投影里 `[分享 shr_...]`）；执行器精确匹配，
+ * 并容忍 ≥8 字符的唯一前缀。前缀命中多张卡时返回 SHARE_REF_AMBIGUOUS 并列出候选，
+ * 绝不按相似度猜一张（返工卡 t_38463abd P1）。
  */
 
 import { SHARE_BUDGETS, type ShareAttachment, type ShareState } from './socialContent/types';
@@ -28,7 +33,6 @@ import {
   estimateShareTokens,
   fetchShareExcerpts,
   shareAttachmentsOf,
-  shortShareRef,
   type ExcerptsInput,
   type ExcerptsResult,
   type ShareCallResult,
@@ -52,6 +56,11 @@ export const SHARE_EXCERPT_LIMITS = {
   perTurnTokens: SHARE_BUDGETS.excerptsPerUserTurnTokens,
   envelopeTokens: 220,
   minGrantTokens: 320,
+  /**
+   * 模型把可见 shareRef 抄一半时能接受的最短前缀。低于它就当作「没这一张」，
+   * 免得 4~7 个字符的公共前缀把多张卡糊到一张上（返工卡 t_38463abd P1）。
+   */
+  minRefPrefixChars: 8,
   /**
    * 服务端 excerpts 的契约是「至少返回一条切片，哪怕已经超出预算」，单条切片上限 400 字符
    * （worker/social-content/excerpts.ts 的 MAX_SEGMENT_CHARS）。请求时先把这段可能的溢出
@@ -93,6 +102,8 @@ export type ShareExcerptToolCode =
   | 'INVALID_ARGUMENTS'
   | 'ARGUMENT_NOT_ALLOWED'
   | 'MISSING_TARGET'
+  | 'SHARE_REF_INVALID'
+  | 'SHARE_REF_AMBIGUOUS'
   | 'SHARE_TARGET_MISMATCH'
   | 'SHARE_NOT_IN_CONTEXT'
   | 'SHARE_CONTENT_NOT_READY'
@@ -142,7 +153,8 @@ export function buildShareExcerptsTool() {
       name: SHARE_EXCERPTS_TOOL_NAME,
       description: [
         '读取本轮对话里已出现的分享卡（小红书 / 抖音 / B站等）的原始片段：正文、字幕、评论样本。',
-        '只能用 shareRef 或 contentId 指定卡片；不能传 URL、域名、baseUrl、token、scope —— 地址与授权由系统与服务端决定。',
+        '只能用 shareRef 或 contentId 指定卡片；shareRef 就照抄上下文里 [分享 shr_xxx] 括号里的完整值（抄短了会被拒绝或提示歧义）。',
+        '不能传 URL、域名、baseUrl、token、scope —— 地址与授权由系统与服务端决定。',
         '单次最多 1200 token，一个用户轮次里所有调用合计最多 2400 token；超限或失败的返回是结构化的，',
         '这时请基于卡片里已有的简介回答，并说明片段没读到，不要声称读过。',
         '卡片简介已经够回答时不要调用；只有确实需要引用原文/字幕/评论细节时才读。',
@@ -153,7 +165,7 @@ export function buildShareExcerptsTool() {
         properties: {
           shareRef: {
             type: 'string',
-            description: '卡片引用，形如 shr_...（上下文里 [分享 shr_xxx] 中的那个）。',
+            description: '卡片引用：照抄上下文里 [分享 shr_...] 括号内的完整值（允许唯一前缀，但不要自己改写）。',
           },
           contentId: {
             type: 'string',
@@ -351,6 +363,77 @@ export function hasReadableShareExcerptTarget(turn: ShareExcerptTurn | null | un
     if (target.readable) return true;
   }
   return false;
+}
+
+// ─── 引用解析（可见标识 = 完整 shareRef；容忍唯一前缀，歧义必须拒绝） ──────
+
+/** 分享引用的形状：`shr_` + 1~64 位字母数字（服务端随机 32 位 hex）。 */
+export const SHARE_REF_PATTERN = /^shr_[0-9A-Za-z]{1,64}$/;
+
+export type ShareRefResolution =
+  | { ok: true; target: ShareExcerptTarget; matched: 'exact' | 'prefix' }
+  | {
+      ok: false;
+      code: 'SHARE_REF_INVALID' | 'SHARE_REF_AMBIGUOUS' | 'SHARE_NOT_IN_CONTEXT';
+      detail: string;
+      /** 歧义时的候选完整引用（供模型改抄完整值；不含其它卡的内容）。 */
+      candidates: string[];
+    };
+
+/**
+ * 把模型给的 shareRef 解析成「本轮可读集合」里的一张卡。规则只有三条，宁拒绝不猜：
+ *  1. 完整引用精确命中 → 就用它（正常路径，投影里给的就是完整值）；
+ *  2. 否则按**前缀**找（只允许 >= minRefPrefixChars），唯一命中才接受 —— 这是对模型抄短的容错；
+ *  3. 命中多张 = 歧义，直接拒绝并列出候选完整引用；**绝不**按相似度/长度挑一个，
+ *     否则会把 A 卡的内容当成 B 卡的回答（返工卡 t_38463abd P1 的核心要求）。
+ * 不在此集合里 → SHARE_NOT_IN_CONTEXT（模型不能指向本轮没出现过的内容）。
+ */
+export function resolveShareExcerptTarget(
+  turn: ShareExcerptTurn,
+  rawRef: unknown,
+): ShareRefResolution {
+  const ref = typeof rawRef === 'string' ? rawRef.trim() : '';
+  if (!ref) {
+    return { ok: false, code: 'SHARE_REF_INVALID', detail: 'shareRef 为空', candidates: [] };
+  }
+  const exact = turn.targets.get(ref);
+  if (exact) return { ok: true, target: exact, matched: 'exact' };
+
+  if (!SHARE_REF_PATTERN.test(ref)) {
+    return {
+      ok: false,
+      code: 'SHARE_REF_INVALID',
+      detail: `shareRef=${clipCodepoints(ref, 48)} 形状不对，应形如 shr_...（照抄上下文里的完整值）`,
+      candidates: [],
+    };
+  }
+
+  if (Array.from(ref).length < SHARE_EXCERPT_LIMITS.minRefPrefixChars) {
+    return {
+      ok: false,
+      code: 'SHARE_NOT_IN_CONTEXT',
+      detail: `shareRef=${ref} 不在本轮上下文里（前缀至少 ${SHARE_EXCERPT_LIMITS.minRefPrefixChars} 个字符才能认出是哪张卡）`,
+      candidates: [],
+    };
+  }
+
+  const needle = ref.toLowerCase();
+  const hits = [...turn.targets.values()].filter((t) => t.shareRef.toLowerCase().startsWith(needle));
+  if (hits.length === 1) return { ok: true, target: hits[0], matched: 'prefix' };
+  if (hits.length > 1) {
+    return {
+      ok: false,
+      code: 'SHARE_REF_AMBIGUOUS',
+      detail: `前缀 ${ref} 命中 ${hits.length} 张卡，无法确定要读哪一张`,
+      candidates: hits.map((t) => t.shareRef),
+    };
+  }
+  return {
+    ok: false,
+    code: 'SHARE_NOT_IN_CONTEXT',
+    detail: '这张卡不在本轮上下文里（只能读本轮对话里出现过的分享卡）',
+    candidates: [],
+  };
 }
 
 // ─── 入参清洗 ────────────────────────────────────────────────────────
@@ -571,17 +654,18 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
 
   // 目标解析：只在本轮可见卡片里找，绝不按模型给的名字去猜内容。
   let target: ShareExcerptTarget | undefined;
-  if (args.shareRef && args.contentId) {
-    const byRef = turn.targets.get(args.shareRef);
-    if (!byRef) {
-      return finish(false, 'SHARE_NOT_IN_CONTEXT', failureText('SHARE_NOT_IN_CONTEXT', `shareRef=${shortShareRef(args.shareRef)} 不在本轮上下文里`), 0, recordArgs);
+  if (args.shareRef) {
+    const resolved = resolveShareExcerptTarget(turn, args.shareRef);
+    if (!resolved.ok) {
+      const extra = resolved.candidates.length
+        ? `候选（请照抄其中一个完整值）：${resolved.candidates.join(', ')}`
+        : '';
+      return finish(false, resolved.code, failureText(resolved.code, resolved.detail, extra), 0, recordArgs);
     }
-    if (byRef.contentId !== args.contentId) {
+    target = resolved.target;
+    if (args.contentId && target.contentId !== args.contentId) {
       return finish(false, 'SHARE_TARGET_MISMATCH', failureText('SHARE_TARGET_MISMATCH', 'shareRef 与 contentId 不是同一张卡'), 0, recordArgs);
     }
-    target = byRef;
-  } else if (args.shareRef) {
-    target = turn.targets.get(args.shareRef);
   } else if (args.contentId) {
     target = turn.byContentId.get(args.contentId);
   }
@@ -659,7 +743,7 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
         true,
         'NO_SEGMENTS',
         [
-          `[read_share_excerpts · 无匹配片段] ${shortShareRef(target.shareRef)} contentRevision=${target.contentRevision} 字段=${args.fields.join('/')}${args.query ? ` query=${args.query}` : ''}`,
+          `[read_share_excerpts · 无匹配片段] ${target.shareRef} contentRevision=${target.contentRevision} 字段=${args.fields.join('/')}${args.query ? ` query=${args.query}` : ''}`,
           '这次请求成功了，但上述字段/关键词下没有可返回的片段。别把「没匹配到」说成「读过了」，需要就换个 query 或字段再试。',
         ].join('\n'),
         0,
@@ -692,7 +776,7 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
     const remainingBefore = turn.budget.remaining;
     const budgetAfterHint = Math.max(0, remainingBefore - Math.min(grant, bodyEstimate + SHARE_EXCERPT_LIMITS.envelopeTokens));
     const header = [
-      `[read_share_excerpts · OK] ${shortShareRef(target.shareRef)}`,
+      `[read_share_excerpts · OK] ${target.shareRef}`,
       `contentRevision=${target.contentRevision}`,
       `字段=${args.fields.join('/')}`,
       args.query ? `query=${args.query}` : '',
@@ -738,17 +822,28 @@ export interface ShareExcerptPairRecord {
 }
 
 /**
- * 把本轮 call/result 成对挂到助手消息 metadata 上（只增不改已有键）。
+ * 把本轮 call/result 成对挂到消息 metadata 上（只增不改已有键）。
  * 成对存的意义：下一轮投影能还原「模型问了什么 → 系统回了什么」，不会只回放一段孤立片段，
  * 也不会因为片段没落历史而让模型下一轮「记得自己读过」却拿不出依据。
+ *
+ * 幂等：同一 toolCallId 只保留一条。逐次落库（每执行完一次工具就写）与收尾 flush 会重复
+ * 提交同一批记录，DB 侧重试也可能重放，这里必须按 id 去重，否则历史里会出现重复对。
  */
 export function attachShareExcerptPairs(prev: any, records: readonly ShareExcerptCallRecord[]): any {
   const base = prev && typeof prev === 'object' ? prev : {};
   const existing: ShareExcerptPairRecord | null = base[SHARE_EXCERPT_META_KEY] ?? null;
   const pairs = Array.isArray(existing?.pairs) ? [...existing!.pairs] : [];
+  const seen = new Set<string>();
+  for (const pair of pairs) {
+    const id = pair?.call?.toolCallId;
+    if (typeof id === 'string' && id) seen.add(id);
+  }
   for (const record of records ?? []) {
+    const id = typeof record?.toolCallId === 'string' ? record.toolCallId.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
     pairs.push({
-      call: { toolCallId: record.toolCallId, name: record.name, args: record.args, at: record.at },
+      call: { toolCallId: id, name: record.name, args: record.args, at: record.at },
       result: { ok: record.ok, code: record.code, chargedTokens: record.chargedTokens, text: record.resultText },
     });
   }
@@ -771,14 +866,16 @@ export function readShareExcerptPairs(metadata: any): ShareExcerptPairRecord | n
 /**
  * 下一轮投影：把本轮记录的 call/result 成对渲染成有界文本。
  * 只接受带 tool_call_id 的成对记录；budget 默认 600 token，超了按顺序截断（稳定、不抖动）。
- * 只对助手消息生效（用户消息不背工具记录）。
+ *
+ * 角色：assistant（兜底锚点）与 user（正常锚点——记录挂在本轮触发消息上）都要投影；
+ * 其它角色（system/tool）不背工具记录。
  */
 export function renderShareExcerptPairProjection(
   metadata: any,
   role: string | null | undefined,
   opts: { maxTokens?: number } = {},
 ): string | null {
-  if (role !== 'assistant') return null;
+  if (role !== 'assistant' && role !== 'user') return null;
   const record = readShareExcerptPairs(metadata);
   if (!record) return null;
   const budget = Math.max(1, Math.min(opts.maxTokens ?? SHARE_EXCERPT_PROJECTION_TOKENS, SHARE_EXCERPT_PROJECTION_TOKENS));
@@ -800,24 +897,128 @@ export function renderShareExcerptPairProjection(
   }
   if (chunks.length === 0) return null;
   return [
-    `[上轮 read_share_excerpts 记录 · ${chunks.length} 次调用]`,
+    `[read_share_excerpts 记录 · ${chunks.length} 次调用]`,
     ...chunks,
-    '（这是上一轮真实读到的片段；它们只覆盖当时请求的部分，不代表完整内容）',
+    '（这是此前真实读到的片段；它们只覆盖当时请求的部分，不代表完整内容）',
   ].join('\n');
 }
 
 /**
- * 找本轮回复该挂记录的那条助手消息：本次生成开始之后落库的最后一条 assistant。
- * 抽成纯函数便于测试；找不到就返回 null（不强行挂到别的消息上）。
+ * 找本轮该挂记录的那条消息：**本轮请求上下文里的最后一条消息**（触发本轮的那条）。
+ *
+ * 为什么不用「本次生成开始后落库的助手消息」当锚点：那要求最终自然语言回复成功落库，
+ * 模型失败/用户取消/后处理异常时就无锚可挂，记录直接丢（返工卡 t_38463abd P1 第 2 条）。
+ * 触发消息在发请求前就已经在库里、id 确定，逐次落库不依赖后续任何一步成功，
+ * 也不可能挂到并发的其它轮次上（id 来自本轮 contextMsgs 快照，不是时间戳扫库）。
  */
-export function pickShareExcerptAnchor(
-  messages: readonly { id: number; role: string; timestamp?: number }[] | null | undefined,
-  sinceMs: number,
+export function pickShareExcerptTurnAnchor(
+  messages: readonly { id?: unknown; role?: unknown }[] | null | undefined,
 ): number | null {
-  let found: number | null = null;
+  let byRole: number | null = null;
+  let any: number | null = null;
   for (const msg of messages ?? []) {
-    if (msg.role !== 'assistant') continue;
-    if (typeof msg.timestamp === 'number' && msg.timestamp >= sinceMs) found = msg.id;
+    const id = (msg as { id?: unknown })?.id;
+    if (typeof id !== 'number' || !Number.isFinite(id) || id <= 0) continue;
+    any = id;
+    // 只有 user/assistant 消息会被投影（system/tool 不背记录）——优先锚在它们身上，
+    // 免得记录落在一个下一轮根本不会被渲染的消息上。
+    const role = (msg as { role?: unknown })?.role;
+    if (role === 'user' || role === 'assistant') byRole = id;
   }
-  return found;
+  return byRole ?? any;
+}
+
+/** 成对记录写库的回调（测试注入；生产是 DB.updateMessageMetadata + attachShareExcerptPairs）。 */
+export type ShareExcerptPairSaver = (messageId: number, records: readonly ShareExcerptCallRecord[]) => Promise<void>;
+
+export interface ShareExcerptRecorderSnapshot {
+  anchorId: number | null;
+  /** 已成功写库的 toolCallId 数。 */
+  recorded: number;
+  /** 写库失败次数（失败的那批不会被标记成已写，后续 flush 会重试）。 */
+  failures: number;
+  /** 当前排队的写操作数（>0 表示还有没落地的记录）。 */
+  pendingWrites: number;
+}
+
+/**
+ * 本轮工具记录的持久化器：**每执行完一次工具就成对写库**，而不是等整轮回复写完。
+ *
+ * 保证（对应契约「工具 call/result 必须成对保留在历史里」）：
+ *  - 成对：call 与 result 在同一批、同一次 metadata 写入里落盘，不存在只有一半。
+ *  - 及时：读成功/失败/超限/取消都会立刻落，后续模型请求失败或用户中断都不影响已读过的调用。
+ *  - 幂等：同一 toolCallId 只写一次（内存去重 + attachShareExcerptPairs 落库侧按 id 去重）。
+ *  - 串行：写入排在同一条 promise 链上，避免并发 read-modify-write 把彼此覆盖。
+ *  - 不抛：写库失败只记账（failures+1），工具结果照常回给模型；下次 flush 会重试同一批。
+ *  - 无锚不猜：anchorId 为空时不写、不猜别的消息（宁缺勿错挂到别人的轮次）。
+ */
+export class ShareExcerptPairRecorder {
+  readonly anchorId: number | null;
+  private readonly savePairs: ShareExcerptPairSaver;
+  private readonly done = new Set<string>();
+  private queue: Promise<void> = Promise.resolve();
+  private failures = 0;
+  private writes = 0;
+  private queued = 0;
+
+  constructor(opts: { anchorId: number | null; savePairs: ShareExcerptPairSaver }) {
+    this.anchorId = typeof opts.anchorId === 'number' && Number.isFinite(opts.anchorId) ? opts.anchorId : null;
+    this.savePairs = opts.savePairs;
+  }
+
+  /** 落一批记录。可重复调用；返回的 promise 在本批写库尝试结束后 resolve（永不 reject）。 */
+  record(records: readonly ShareExcerptCallRecord[] | null | undefined): Promise<void> {
+    const fresh = (records ?? []).filter((r) => typeof r?.toolCallId === 'string' && r.toolCallId && !this.done.has(r.toolCallId));
+    if (this.anchorId == null || fresh.length === 0) return this.queue;
+    this.queued += 1;
+    this.queue = this.queue.then(async () => {
+      // 排队期间可能已被前一批写掉（同一批重复提交 / 并发调用），这里再筛一次。
+      const still = fresh.filter((r) => !this.done.has(r.toolCallId));
+      try {
+        if (still.length === 0) return;
+        await this.savePairs(this.anchorId as number, still);
+        for (const r of still) this.done.add(r.toolCallId);
+        this.writes += 1;
+      } catch (e) {
+        this.failures += 1;
+        console.warn('[share-excerpt] 工具记录落历史失败（本轮继续，flush 时重试）:', e);
+      } finally {
+        this.queued = Math.max(0, this.queued - 1);
+      }
+    });
+    return this.queue;
+  }
+
+  /** 等所有已排队的写入落地（失败不抛；调用方可看 snapshot 决定是否告警）。 */
+  flush(): Promise<void> {
+    return this.queue;
+  }
+
+  has(toolCallId: string): boolean {
+    return this.done.has(toolCallId);
+  }
+
+  snapshot(): ShareExcerptRecorderSnapshot {
+    return {
+      anchorId: this.anchorId,
+      recorded: this.done.size,
+      failures: this.failures,
+      pendingWrites: this.queued,
+    };
+  }
+}
+
+/**
+ * 工具循环里的一处接线：执行一次 read_share_excerpts，**立刻**把这条 call/result 成对写库，
+ * 再把结果文本交给调用方回填给模型。useChatAI 与测试都走这个函数，避免「hook 里另写一遍」分叉。
+ * 落库失败不影响工具结果（recorder 内部吞掉异常并记账）。
+ */
+export async function dispatchShareExcerptToolCall(input: {
+  toolCall: ShareExcerptToolCallLike | null | undefined;
+  turn: ShareExcerptTurn;
+  recorder?: ShareExcerptPairRecorder | null;
+}): Promise<ExecuteShareExcerptResult> {
+  const outcome = await executeShareExcerptToolCall({ toolCall: input.toolCall, turn: input.turn });
+  if (input.recorder) await input.recorder.record([outcome.record]);
+  return outcome;
 }

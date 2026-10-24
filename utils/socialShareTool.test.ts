@@ -18,13 +18,16 @@ import {
   attachShareExcerptPairs,
   buildShareExcerptsTool,
   createShareExcerptTurn,
+  dispatchShareExcerptToolCall,
   executeShareExcerptToolCall,
-  pickShareExcerptAnchor,
+  pickShareExcerptTurnAnchor,
   renderShareExcerptPairProjection,
+  resolveShareExcerptTarget,
   SHARE_EXCERPT_LIMITS,
   SHARE_EXCERPT_META_KEY,
   SHARE_EXCERPTS_TOOL_NAME,
   ShareExcerptBudget,
+  ShareExcerptPairRecorder,
   hasReadableShareExcerptTarget,
 } from './socialShareTool';
 
@@ -165,8 +168,12 @@ interface HttpCall {
   body: any;
 }
 
-/** 桩：把请求交给服务端真实 buildExcerpts，返回真实形状的响应（不编造执行输出）。 */
-function stubShareServer(record: ContentRecord | null = contentRecord()) {
+/** 桩：把请求交给服务端真实 buildExcerpts，返回真实形状的响应（不编造执行输出）。
+ *  byId 可按 contentId 提供不同内容（多卡场景要证明「读的是这张卡，不是那张」）。 */
+function stubShareServer(
+  record: ContentRecord | null = contentRecord(),
+  byId: Record<string, ContentRecord> = {},
+) {
   const calls: HttpCall[] = [];
   const fetchMock = vi.fn(async (input: any, init?: any) => {
     const url = String(typeof input === 'string' ? input : input?.url ?? input);
@@ -175,9 +182,10 @@ function stubShareServer(record: ContentRecord | null = contentRecord()) {
     calls.push({ url, method: String(init?.method || 'GET'), token: headers.get('x-client-token'), body });
     const m = /\/agent\/v1\/social\/items\/(.+)\/excerpts$/.exec(url);
     if (!m) return new Response(JSON.stringify({ error: 'not_found' }), { status: 404 });
-    if (!record) return new Response(JSON.stringify({ error: 'CONTENT_NOT_FOUND' }), { status: 404 });
+    const effective = byId[decodeURIComponent(m[1])] ?? record;
+    if (!effective) return new Response(JSON.stringify({ error: 'CONTENT_NOT_FOUND' }), { status: 404 });
     try {
-      const result = buildExcerpts(record, {
+      const result = buildExcerpts(effective, {
         contentRevision: Number(body?.contentRevision),
         query: typeof body?.query === 'string' ? body.query : null,
         fields: Array.isArray(body?.fields) ? body.fields : ['text'],
@@ -205,13 +213,87 @@ function makeTurn(messages: any[] = [userMessage()], opts: { budget?: ShareExcer
 
 /** 还原 useChatAI 里的调用形状：模型给 tool_call，执行器跑，结果回填。 */
 async function runToolCall(turn: any, args: Record<string, unknown>, id = 'call_1') {
-  const toolCall = {
+  const toolCall = toolCallFor(args, id);
+  const outcome = await executeShareExcerptToolCall({ toolCall, turn });
+  return { toolCall, outcome };
+}
+
+function toolCallFor(args: Record<string, unknown>, id = 'call_1') {
+  return {
     id,
     type: 'function',
     function: { name: SHARE_EXCERPTS_TOOL_NAME, arguments: JSON.stringify(args) },
   };
-  const outcome = await executeShareExcerptToolCall({ toolCall, turn });
-  return { toolCall, outcome };
+}
+
+/** 每张卡一份内容记录（多卡场景要证明读到的是这张卡的字幕，不是那张的）。 */
+function cardRecord(contentId: string, marker: string): ContentRecord {
+  const base = contentRecord();
+  return {
+    ...base,
+    id: contentId,
+    externalId: contentId.split(':').pop() || contentId,
+    title: `${marker}标题`,
+    transcripts: [
+      {
+        ...base.transcripts[0],
+        segments: [{ id: 's0', startMs: 0, endMs: 1000, text: `${marker}字幕片段内容` }],
+        plainText: `${marker}字幕片段内容`,
+      },
+    ],
+  };
+}
+
+/** 两张卡的分享消息：shareRef 前 12 字符（旧短引用口径）完全相同 → 短引用必然歧义。 */
+const DUAL = {
+  idA: 'bilibili:public:AAA',
+  idB: 'bilibili:public:BBB',
+  refA: 'shr_0123456789aa' + 'a'.repeat(20),
+  refB: 'shr_0123456789bb' + 'b'.repeat(20),
+  urlA: 'https://a.example/1',
+  urlB: 'https://b.example/2',
+};
+
+function dualCardMessage() {
+  const content = `看 ${DUAL.urlA} 和 ${DUAL.urlB} 讲什么？`;
+  const mk = (shareRef: string, contentId: string, url: string, messageId: string): ShareAttachment =>
+    attachment({
+      shareRef,
+      contentId,
+      messageId,
+      originalUrl: url,
+      resolvedUrl: url,
+      canonicalUrl: url,
+      openUrl: url,
+      occurrenceSpans: [{ start: content.indexOf(url), end: content.indexOf(url) + url.length }],
+      preview: { ...attachment().preview!, title: `${shareRef.slice(14, 16)}标题` },
+      contextProjection: { ...attachment().contextProjection!, shareRef, contentId, contentRevision: 3 },
+    });
+  return {
+    id: 201,
+    charId: 'char-1',
+    role: 'user' as const,
+    type: 'text' as const,
+    content,
+    timestamp: 10,
+    metadata: {
+      shares: {
+        version: 1,
+        attachments: [mk(DUAL.refA, DUAL.idA, DUAL.urlA, '101'), mk(DUAL.refB, DUAL.idB, DUAL.urlB, '102')],
+      },
+    },
+  };
+}
+
+/** 内存版 metadata 存档：行为与 DB.updateMessageMetadata + attachShareExcerptPairs 一致。 */
+function memoryStore() {
+  const store = new Map<number, any>();
+  const writes: Array<{ id: number; ids: string[] }> = [];
+  const saver = async (id: number, records: readonly any[]) => {
+    writes.push({ id, ids: records.map((r) => r.toolCallId) });
+    store.set(id, attachShareExcerptPairs(store.get(id), records));
+  };
+  return { store, writes, saver };
 }
 
 afterEach(() => {
@@ -254,7 +336,10 @@ describe('read_share_excerpts · 真实链路（fixture 模型 + 真实 excerpts
 
     // 1) 卡在上下文里，且投影是 shareRef + 简介（模型看不到原始长链接里的大段正文）
     const projection = normalizeMessageContent(user as any, '角色', '我');
-    expect(projection).toContain('[分享 shr_01234567');
+    // 模型可见标识就是它之后要拿去调工具的那个值（完整 shareRef）——从真实投影里取，不另起一份。
+    const visibleShareRef = /\[分享 ([^\]\s]+)\]/.exec(projection)?.[1] ?? '';
+    expect(visibleShareRef).toBe(SHARE_REF);
+    expect(projection).toContain(`[分享 ${SHARE_REF}]`);
     expect(projection).toContain('简介：');
 
     // 2) 工具注入：有卡才建 turn；schema 来自本模块
@@ -271,7 +356,8 @@ describe('read_share_excerpts · 真实链路（fixture 模型 + 真实 excerpts
         {
           id: 'call_1',
           type: 'function',
-          function: { name: SHARE_EXCERPTS_TOOL_NAME, arguments: JSON.stringify({ shareRef: SHARE_REF, fields: ['transcript'] }) },
+          // 模型只能照抄上下文里看到的引用 → 直接用投影里提取出的那个值（不偷看 metadata 的完整 ID）
+          function: { name: SHARE_EXCERPTS_TOOL_NAME, arguments: JSON.stringify({ shareRef: visibleShareRef, fields: ['transcript'] }) },
         },
       ],
     };
@@ -326,7 +412,7 @@ describe('read_share_excerpts · 真实链路（fixture 模型 + 真实 excerpts
     expect(stored[SHARE_EXCERPT_META_KEY]).toBeDefined();
     const pair = stored[SHARE_EXCERPT_META_KEY].pairs[0];
     expect(pair.call.toolCallId).toBe('call_1');
-    expect(pair.call.args.shareRef).toBe(SHARE_REF);
+    expect(pair.call.args.shareRef).toBe(visibleShareRef);
     expect(pair.result.text).toContain('第一段字幕');
 
     const nextRound = normalizeMessageContent(
@@ -334,7 +420,7 @@ describe('read_share_excerpts · 真实链路（fixture 模型 + 真实 excerpts
       '角色',
       '我',
     );
-    expect(nextRound).toContain('上轮 read_share_excerpts 记录');
+    expect(nextRound).toContain('read_share_excerpts 记录');
     expect(nextRound).toContain(SHARE_REF);
     expect(nextRound).toContain('第一段字幕');
   });
@@ -564,6 +650,270 @@ describe('read_share_excerpts · 权限与入参边界', () => {
   });
 });
 
+describe('read_share_excerpts · 可见标识 = 可执行标识（返工 P1 第 1 条）', () => {
+  it('投影里给的是完整 shareRef：两张卡同前缀也不会出现「看着一样」的引用', () => {
+    const msg = dualCardMessage();
+    const projection = normalizeMessageContent(msg as any, '角色', '我');
+    const visible = new Set([...projection.matchAll(/\[分享 ([^\]\s]+)\]/g)].map((m) => m[1]));
+    expect(visible).toEqual(new Set([DUAL.refA, DUAL.refB]));
+    // 旧口径（前 12 字符）会把两张卡显示成同一个字符串，这正是要修的缺陷
+    expect(DUAL.refA.slice(0, 12)).toBe(DUAL.refB.slice(0, 12));
+    expect(projection).not.toContain(DUAL.refA.slice(0, 12) + ']');
+  });
+
+  it('多卡同前缀：抄短成公共前缀一律判歧义并列出候选，一次请求都不发（绝不猜一张）', async () => {
+    const { calls } = stubShareServer(null, {
+      [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
+      [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
+    });
+    const turn = createShareExcerptTurn([dualCardMessage()], { endpoint, now: () => 1_000 })!;
+    const short = DUAL.refA.slice(0, 12); // 模型抄短（旧可见值）
+    const ambiguous = await runToolCall(turn, { shareRef: short, fields: ['transcript'] });
+    expect(ambiguous.outcome.ok).toBe(false);
+    expect(ambiguous.outcome.code).toBe('SHARE_REF_AMBIGUOUS');
+    expect(ambiguous.outcome.text).toContain(DUAL.refA);
+    expect(ambiguous.outcome.text).toContain(DUAL.refB);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('唯一前缀仍能命中，且读到的是那张卡的内容（不是同前缀的另一张）', async () => {
+    const { calls } = stubShareServer(null, {
+      [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
+      [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
+    });
+    const turnA = createShareExcerptTurn([dualCardMessage()], { endpoint, now: () => 1_000 })!;
+    const uniquePrefix = DUAL.refA.slice(0, 16); // 只属于 A
+    const hitA = await runToolCall(turnA, { shareRef: uniquePrefix, fields: ['transcript'] });
+    expect(hitA.outcome.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain(encodeURIComponent(DUAL.idA));
+    expect(hitA.outcome.text).toContain('A卡字幕片段内容');
+    expect(hitA.outcome.text).not.toContain('B卡字幕片段内容');
+
+    const turnB = createShareExcerptTurn([dualCardMessage()], { endpoint, now: () => 1_000 })!;
+    const hitB = await runToolCall(turnB, { shareRef: DUAL.refB, fields: ['transcript'] });
+    expect(hitB.outcome.ok).toBe(true);
+    expect(calls[1].url).toContain(encodeURIComponent(DUAL.idB));
+    expect(hitB.outcome.text).toContain('B卡字幕片段内容');
+  });
+
+  it('形状不对/太短/集合外的引用：结构化拒绝且不发请求', async () => {
+    const { calls } = stubShareServer();
+    const turn = makeTurn();
+    const urlLike = await runToolCall(turn, { shareRef: 'https://evil.example.com/x' });
+    const tooShort = await runToolCall(turn, { shareRef: 'shr_01' });
+    const unknown = await runToolCall(turn, { shareRef: 'shr_ffffffffffffffffffffffffffffffff' });
+    const partial = await runToolCall(turn, { shareRef: SHARE_REF.slice(0, 20) });
+    expect(urlLike.outcome.code).toBe('SHARE_REF_INVALID');
+    expect(tooShort.outcome.code).toBe('SHARE_NOT_IN_CONTEXT');
+    expect(unknown.outcome.code).toBe('SHARE_NOT_IN_CONTEXT');
+    expect(partial.outcome.ok).toBe(true); // 单卡时短前缀唯一命中，属容错
+    expect(calls).toHaveLength(1);
+  });
+
+  it('resolveShareExcerptTarget：精确 > 唯一前缀 > 歧义/未知（纯函数口径）', () => {
+    const turn = createShareExcerptTurn([dualCardMessage()], { endpoint })!;
+    const exact = resolveShareExcerptTarget(turn, DUAL.refB);
+    expect(exact.ok).toBe(true);
+    if (exact.ok) {
+      expect(exact.matched).toBe('exact');
+      expect(exact.target.contentId).toBe(DUAL.idB);
+    }
+    const prefixed = resolveShareExcerptTarget(turn, DUAL.refA.slice(0, 18));
+    expect(prefixed.ok && prefixed.matched).toBe('prefix');
+    const ambiguous = resolveShareExcerptTarget(turn, DUAL.refA.slice(0, 12));
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok) expect(ambiguous.candidates).toEqual([DUAL.refA, DUAL.refB]);
+  });
+});
+
+describe('read_share_excerpts · call/result 成对落历史（不依赖最终回复，返工 P1 第 2 条）', () => {
+  it('每执行完一次工具就成对落库到本轮触发消息；之后模型失败/取消/没有助手回复都不影响', async () => {
+    stubShareServer();
+    const { store, writes, saver } = memoryStore();
+    // 锚点 = contextMsgs 最后一条（本轮触发消息），此时库里还没有任何 assistant 回复
+    const anchorId = pickShareExcerptTurnAnchor([{ id: 77 }, { id: 101 }]);
+    expect(anchorId).toBe(101);
+    const recorder = new ShareExcerptPairRecorder({ anchorId, savePairs: saver });
+    const turn = makeTurn();
+
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn,
+      recorder,
+    });
+    await recorder.flush();
+
+    expect(outcome.ok).toBe(true);
+    expect(writes).toEqual([{ id: 101, ids: [outcome.record.toolCallId] }]);
+    const pairs = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+    expect(pairs[0].call.args.shareRef).toBe(SHARE_REF);
+    expect(pairs[0].result.ok).toBe(true);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    expect(recorder.snapshot()).toMatchObject({ anchorId: 101, recorded: 1, failures: 0, pendingWrites: 0 });
+
+    // 下一轮真的读得回来：挂在触发消息（user）上也要投影
+    const nextRound = normalizeMessageContent(
+      { id: 101, charId: 'char-1', role: 'user', type: 'text', content: '看这个', timestamp: 10, metadata: store.get(101) } as any,
+      '角色',
+      '我',
+    );
+    expect(nextRound).toContain('read_share_excerpts 记录');
+    expect(nextRound).toContain('第一段字幕');
+  });
+
+  it('取消 / 网络失败的调用也成对留存（不是只留成功的）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      throw err;
+    }));
+    const { store, saver } = memoryStore();
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF }),
+      turn,
+      recorder,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.code).toBe('TIMEOUT'); // 用户取消/中断走的就是这条
+    const pairs = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.args.shareRef).toBe(SHARE_REF);
+    expect(pairs[0].result.ok).toBe(false);
+    expect(pairs[0].result.code).toBe('TIMEOUT');
+    expect(recorder.snapshot().recorded).toBe(1);
+  });
+
+  it('两轮并发各写各自的触发消息：同 toolCallId 也不串轮、不互相覆盖', async () => {
+    stubShareServer(null, {
+      [DUAL.idA]: cardRecord(DUAL.idA, 'A卡'),
+      [DUAL.idB]: cardRecord(DUAL.idB, 'B卡'),
+    });
+    const { store, saver } = memoryStore();
+    const msgA = { id: 301, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[0]] } }, role: 'user', type: 'text', content: 'A', charId: 'c' };
+    const msgB = { id: 302, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[1]] } }, role: 'user', type: 'text', content: 'B', charId: 'c' };
+    const turnA = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
+    const turnB = createShareExcerptTurn([msgB], { endpoint, now: () => 1_000 })!;
+    const recA = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgA]), savePairs: saver });
+    const recB = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgB]), savePairs: saver });
+
+    await Promise.all([
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_1'), turn: turnA, recorder: recA }),
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refB, fields: ['transcript'] }, 'call_1'), turn: turnB, recorder: recB }),
+    ]);
+
+    const pairsA = store.get(301)[SHARE_EXCERPT_META_KEY].pairs;
+    const pairsB = store.get(302)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairsA).toHaveLength(1);
+    expect(pairsB).toHaveLength(1);
+    expect(pairsA[0].call.args.shareRef).toBe(DUAL.refA);
+    expect(pairsA[0].result.text).toContain('A卡字幕片段内容');
+    expect(pairsA[0].result.text).not.toContain('B卡字幕片段内容');
+    expect(pairsB[0].call.args.shareRef).toBe(DUAL.refB);
+    expect(pairsB[0].result.text).toContain('B卡字幕片段内容');
+  });
+
+  it('幂等：同一批记录重复提交只写一次，落库侧也按 toolCallId 去重（DB 重试不产生重复对）', async () => {
+    stubShareServer();
+    const { store, writes, saver } = memoryStore();
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn,
+      recorder,
+    });
+    await recorder.record([outcome.record]); // 收尾 flush 又提交同一批
+    await recorder.record(turn.calls);
+    expect(writes).toHaveLength(1);
+    expect(store.get(101)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+
+    // 落库侧重放同一批：attach 自己也要按 id 去重
+    const replayed = attachShareExcerptPairs(store.get(101), [outcome.record, outcome.record]);
+    expect(replayed[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+  });
+
+  it('落库失败不阻断工具结果，失败批次不标记已写（重试能补上）', async () => {
+    stubShareServer();
+    // 这条路径本来就会 console.warn（失败的可见信号），测试里静音以免污染输出
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let attempts = 0;
+    const store = new Map<number, any>();
+    const saver = async (id: number, records: readonly any[]) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('IDB quota');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
+      turn,
+      recorder,
+    });
+    // 工具结果照常给模型（落库失败只影响下一轮回放）
+    expect(outcome.ok).toBe(true);
+    expect(outcome.text).toContain('第一段字幕');
+    expect(recorder.snapshot()).toMatchObject({ recorded: 0, failures: 1 });
+    expect(recorder.has(outcome.record.toolCallId)).toBe(false);
+
+    await recorder.record([outcome.record]); // 重试同一批
+    expect(recorder.has(outcome.record.toolCallId)).toBe(true);
+    expect(attempts).toBe(2);
+    expect(store.get(101)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('写入串行化：并发 record 的 read-modify-write 不互相覆盖', async () => {
+    const store = new Map<number, any>();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const saver = async (id: number, records: readonly any[]) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const prev = store.get(id);
+      await new Promise((r) => setTimeout(r, 5));
+      store.set(id, attachShareExcerptPairs(prev, records));
+      inFlight -= 1;
+    };
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 5, savePairs: saver });
+    const record = (id: string) => ({
+      toolCallId: id,
+      name: SHARE_EXCERPTS_TOOL_NAME,
+      args: {},
+      ok: true,
+      code: 'OK',
+      chargedTokens: 1,
+      at: 1,
+      resultText: 'x',
+    });
+    await Promise.all([recorder.record([record('a')]), recorder.record([record('b')])]);
+    expect(maxInFlight).toBe(1);
+    expect(store.get(5)[SHARE_EXCERPT_META_KEY].pairs.map((p: any) => p.call.toolCallId)).toEqual(['a', 'b']);
+  });
+
+  it('拿不到本轮触发消息 id 时不写、也不挂到别的消息上（宁缺勿错挂）', async () => {
+    stubShareServer();
+    const { store, writes, saver } = memoryStore();
+    const recorder = new ShareExcerptPairRecorder({ anchorId: null, savePairs: saver });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF }),
+      turn,
+      recorder,
+    });
+    expect(outcome.ok).toBe(true);
+    expect(writes).toHaveLength(0);
+    expect(store.size).toBe(0);
+    expect(pickShareExcerptTurnAnchor([{}, { id: 'oops' }, { id: null }])).toBeNull();
+  });
+});
+
 describe('read_share_excerpts · 落历史与下一轮投影', () => {
   it('成对记录：call 与 result 一一对应，投影只回放成对块且有界', () => {
     const records = [
@@ -603,20 +953,23 @@ describe('read_share_excerpts · 落历史与下一轮投影', () => {
     expect(projection).toContain('TURN_BUDGET_EXHAUSTED');
     expect(Array.from(projection).length).toBeLessThanOrEqual(600 + 80); // 标题/说明行不超预算太多
 
-    // 用户消息不背工具记录
-    expect(renderShareExcerptPairProjection(meta, 'user')).toBeNull();
+    // 记录挂在「本轮触发消息」上（正常是用户消息）→ user 角色必须投影；system/tool 不背
+    expect(renderShareExcerptPairProjection(meta, 'user')).not.toBeNull();
+    expect(renderShareExcerptPairProjection(meta, 'system')).toBeNull();
+    expect(renderShareExcerptPairProjection(meta, 'tool')).toBeNull();
     // 没记录就没有投影
     expect(renderShareExcerptPairProjection({}, 'assistant')).toBeNull();
   });
 
-  it('锚点只挑本轮之后落库的最后一条 assistant', () => {
-    const msgs = [
-      { id: 1, role: 'assistant', timestamp: 10 },
-      { id: 2, role: 'user', timestamp: 20 },
-      { id: 3, role: 'assistant', timestamp: 30 },
-      { id: 4, role: 'assistant', timestamp: 25 },
-    ];
-    expect(pickShareExcerptAnchor(msgs as any, 20)).toBe(4);
-    expect(pickShareExcerptAnchor(msgs as any, 40)).toBeNull();
+  it('锚点 = 本轮触发消息（contextMsgs 最后一条），与最终回复是否落库无关', () => {
+    // 正常用户轮：contextMsgs 结尾就是那条刚落库的用户消息，此刻还没有 assistant 回复
+    expect(pickShareExcerptTurnAnchor([{ id: 1 }, { id: 2, role: 'user' }, { id: 3, role: 'user' }])).toBe(3);
+    // 主动消息/无最终回复的轮次：结尾可能是上一条 assistant，同样能定位到确定的消息
+    expect(pickShareExcerptTurnAnchor([{ id: 8, role: 'user' }, { id: 9, role: 'assistant' }])).toBe(9);
+    expect(pickShareExcerptTurnAnchor([])).toBeNull();
+    expect(pickShareExcerptTurnAnchor(null)).toBeNull();
+    // 尾部系统提示不抢占锚点（system 角色不投影，锚在它身上等于白存）
+    expect(pickShareExcerptTurnAnchor([{ id: 5, role: 'user' }, { id: 6, role: 'system' }])).toBe(5);
+    expect(pickShareExcerptTurnAnchor([{}, { id: 'oops' }, { id: 0 }, { id: -1 }])).toBeNull();
   });
 });

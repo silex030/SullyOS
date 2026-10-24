@@ -101,7 +101,7 @@ describe('模型投影（后续轮次）', () => {
   it('链接替换成 shareRef，问题保留，简介进投影', () => {
     const text = '看看 https://www.bilibili.com/video/BV1xx411c7mD 讲了啥？';
     const proj = buildShareMessageProjection(text, [attachment()], { userName: '我' })!;
-    expect(proj).toContain('[分享 shr_01234567]');
+    expect(proj).toContain('[分享 shr_0123456789abcdef0123456789abcdef]');
     expect(proj).not.toContain('https://www.bilibili.com');
     expect(proj).toContain('讲了啥');
     expect(proj).toContain('夹具视频标题');
@@ -139,7 +139,12 @@ describe('模型投影（后续轮次）', () => {
       }),
     );
     const total = buildShareMessageProjection('01234', many)!;
-    expect(estimateShareTokens(total)).toBeLessThanOrEqual(SHARE_BUDGETS.summaryPerMessageTokens + 200);
+    // 卡片段仍受 1200 总量夹紧；用户原文段只承担「链接 → 完整 shareRef」的替换开销，
+    // 该开销有界：每张卡最多 `[分享 ` + 36 字符 + `]` ≈ 41 字符，单条消息最多 5 个链接。
+    const [textSection, ...cardSections] = total.split('\n\n');
+    expect(estimateShareTokens(cardSections.join('\n\n'))).toBeLessThanOrEqual(SHARE_BUDGETS.summaryPerMessageTokens + 40);
+    expect(estimateShareTokens(textSection)).toBeLessThanOrEqual(5 + 5 * 45 + 20);
+    expect(estimateShareTokens(total)).toBeLessThanOrEqual(SHARE_BUDGETS.summaryPerMessageTokens + 5 * 45 + 60);
   });
 
   it('多链接各自替换，保留原文其他内容', () => {
@@ -155,8 +160,8 @@ describe('模型投影（后续轮次）', () => {
       occurrenceSpans: [{ start: text.indexOf(urlB), end: text.indexOf(urlB) + urlB.length }],
     });
     const proj = buildShareMessageProjection(text, [a, b])!;
-    expect(proj).toContain('[分享 shr_aaaaaaaa]');
-    expect(proj).toContain('[分享 shr_bbbbbbbb]');
+    expect(proj).toContain(`[分享 shr_${'a'.repeat(32)}]`);
+    expect(proj).toContain(`[分享 shr_${'b'.repeat(32)}]`);
     expect(proj).toContain('开头看');
     expect(proj).toContain('中间');
     expect(proj).toContain('结尾');
@@ -194,7 +199,7 @@ describe('状态合并与安全跳转', () => {
     expect(safeOpenUrl(attachment({ openUrl: null, resolvedUrl: null, canonicalUrl: null }))).toBeNull();
   });
 
-  it('shortShareRef 稳定且比完整 ref 短', () => {
+  it('shortShareRef 只给 UI 用：稳定且比完整 ref 短（不得出现在模型投影里）', () => {
     const full = 'shr_0123456789abcdef0123456789abcdef';
     expect(shortShareRef(full)).toBe('shr_01234567');
   });

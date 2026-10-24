@@ -196,10 +196,10 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 
 | 位置 | 改动 |
 | --- | --- |
-| `utils/socialShareTool.ts`（新） | 工具 schema、可读集合、预算、执行、成对记录与投影 —— 纯逻辑，可单测 |
-| `hooks/useChatAI.ts` | 四处接线：注入工具、工具循环入口、按名分发、回复落库后挂记录 |
+| `utils/socialShareTool.ts`（新） | 工具 schema、可读集合、引用解析、预算、执行、成对记录器（`ShareExcerptPairRecorder`）与投影 —— 纯逻辑，可单测 |
+| `hooks/useChatAI.ts` | 五处接线：注入工具、工具循环入口、按名分发（`dispatchShareExcerptToolCall`＝执行+立刻落库）、收尾 flush、降级提示 |
 | `utils/messageFormat.ts` | `normalizeMessageContent` 把 `metadata.shareExcerpts` 成对投影进下一轮 |
-| `utils/socialShare.ts` | 复用 `fetchShareExcerpts`（未改动）；没有新造抓取/URL 接口 |
+| `utils/socialShare.ts` | `fetchShareExcerpts` 未改；**只改了模型投影**：`[分享 …]` 用完整 shareRef（见 §8.6） |
 
 ### 8.3 权限与入参边界
 
@@ -209,6 +209,10 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
   **一次请求都不发**（授权 scope 仍由服务端决定，客户端不传）。
 - 可读集合只来自**本轮真正进上下文的消息** `metadata.shares`（服务端落过库的卡）。
   集合外的 shareRef/contentId → `SHARE_NOT_IN_CONTEXT`；两者指向不同卡 → `SHARE_TARGET_MISMATCH`。
+- **引用解析只做三件事，宁拒绝不猜**（返工卡 t_38463abd P1）：① 完整 shareRef 精确命中；
+  ② 否则按前缀找（只接受 ≥8 字符），**唯一**命中才用；③ 命中多张 → `SHARE_REF_AMBIGUOUS`
+  并列出候选完整引用，一次请求都不发。形状不对（URL/路径/空格等）→ `SHARE_REF_INVALID`。
+  绝不按相似度/长度挑一张，否则会把 A 卡的内容当成 B 卡的回答。
 - 卡片状态不是 `ready`/`partial`、或没有 `contentId`/版本 → `SHARE_CONTENT_NOT_READY`，不读。
 - 只读：不写服务端、不改配置、不落业务数据；唯一副作用是本轮预算记账。
 
@@ -231,17 +235,43 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 | `OK` | 读到了片段（带 `cursor` 可续读） | 用片段内容回答 |
 | `NO_SEGMENTS` | 请求成功但该字段/关键词没匹配到 | 别把「没匹配到」说成「读过了」 |
 | `SHARE_NOT_IN_CONTEXT` / `SHARE_CONTENT_NOT_READY` / `MISSING_TARGET` / `SHARE_TARGET_MISMATCH` | 目标不合法或没内容 | 基于已有简介回答 |
+| `SHARE_REF_AMBIGUOUS` | 抄短的 shareRef 命中多张卡（结果里给候选完整值） | 照抄其中一个完整值重试，或基于简介回答 |
+| `SHARE_REF_INVALID` | shareRef 形状不对（URL/路径等） | 照抄上下文里的完整值，别再构造 |
 | `TURN_BUDGET_EXHAUSTED` / `TOOL_CALL_LIMIT` / `DUPLICATE_TOOL_CALL` | 超预算/超次数/复读 | 基于已有简介回答 |
 | `VERSION_UNAVAILABLE` / `CONTENT_NOT_FOUND` / `TIMEOUT` / `NETWORK_ERROR` / `SHARE_LINKS_DISABLED` | 服务端透传的真实失败 | 如实说明片段不可用 |
 
 每种失败文本都带同一句收口：「片段没有读到……不要声称自己读过原文/字幕/评论」。
 
-### 8.6 历史与下一轮投影
+### 8.6 可见标识、历史与下一轮投影
 
-- **实际历史**（请求里）：`assistant(tool_calls)` + `role:tool`（`tool_call_id` 相同）成对进消息数组，
+**模型可见标识 = 完整 shareRef**（返工卡 t_38463abd P1 第 1 条）。投影里每一处引用都是
+`[分享 shr_<32 位>]`，就是执行器认的那个值；模型照抄即可命中。`shortShareRef()` 退化为
+**只给 UI 用**（卡片角标），不再参与任何进模型的文本——旧口径把引用截成 12 字符，
+两张同前缀的卡在模型眼里完全一样，照着投影调用必然 `SHARE_NOT_IN_CONTEXT` 或读错卡。
+
+| 层 | 用的是什么 |
+| --- | --- |
+| 消息投影（进模型）`buildShareMessageProjection` / `renderShareCardProjection` | 完整 shareRef |
+| 工具结果标题（进模型）`[read_share_excerpts · OK] …` | 完整 shareRef（模型后续引用不会抄到不可执行的值） |
+| 卡片 UI（`SocialShareCard`） | `shortShareRef`（纯展示） |
+
+**历史**（返工卡 t_38463abd P1 第 2 条，改为「不依赖最终回复」）：
+
+- **请求内**：`assistant(tool_calls)` + `role:tool`（`tool_call_id` 相同）成对进消息数组，
   下一跳请求与最终回复都基于这份成对记录。
-- **落库**：回复落库后把本轮 call/result 成对写进该条助手消息的 `metadata.shareExcerpts`；
-  下一轮 `normalizeMessageContent` 渲染成 `[上轮 read_share_excerpts 记录 · N 次调用]`（≤600 token）。
+- **落库时机**：每执行完一次工具就成对写一次（`dispatchShareExcerptToolCall` →
+  `ShareExcerptPairRecorder.record`），**不等**最终自然语言回复、也不等后处理成功。
+  模型失败 / 用户取消 / 空回复 / 后处理抛错时，已经读过的调用都已经在库里。
+- **落库位置**：**本轮触发消息**（`contextMsgs` 最后一条，发送前就已落库、id 确定）的
+  `metadata.shareExcerpts`。不用「生成开始后最近 30 条里找 assistant」这种时间戳猜锚点，
+  因此也不会挂到并发的其它轮次上。拿不到触发消息 id 时**不写也不猜**（宁缺勿错挂）。
+- **幂等与串行**：`toolCallId` 去重（内存 + `attachShareExcerptPairs` 落库侧各一次），
+  重复提交/DB 重试不产生重复对；写入排在同一条 promise 链上，避免并发 read-modify-write 互相覆盖。
+- **失败可见**：写库失败不阻断工具结果（`console.warn` + 计数），失败批次不标记已写，
+  下一批 `record`/`flush` 会重试。
+- **下一轮投影**：`normalizeMessageContent` 把这对记录渲染成
+  `[read_share_excerpts 记录 · N 次调用]`（≤600 token），`user` 与 `assistant` 角色都会投影
+  （正常是 user——记录挂在触发消息上），`system`/`tool` 不背。
 - **明确**：片段会占未来上下文（不承诺它们不占），只是有界且成对，不会只剩一段孤立片段
   让模型误以为自己读过更多。
 
@@ -254,21 +284,21 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 - 若同一轮还注入了主动消息 2.0 排程工具，降级时这些工具也随 `tools` 一起被删；同样补一句
   「这一轮排程工具不可用：不要声称已经记下、修改或撤销任何提醒/安排」，避免角色用正文假装登记成功。
 
-### 8.8 本机验证（真实执行，2026-10-24）
+### 8.8 本机验证（真实执行，2026-10-24 / 返工复跑 2026-10-25）
 
 ```
-npx vitest run utils/socialShareTool.test.ts          → 22 passed
-npx vitest run utils/socialShareTool.wiring.test.ts   → 9 passed
-npx vitest run $(ls utils/*[cC]hat*.test.ts)          → 38 files / 354 passed
-npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
-  utils/socialShare utils/chatRequestPayload worker/social-content utils/socialContent
-                                                       → 29 files / 330 tests passed
+npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts
+                                            → 2 files / 45 passed（34 + 11）
+npx vitest run $(ls utils/*[cC]hat*.test.ts) → 38 files / 354 passed
+npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
+  utils/mcpToolBridge utils/agenticTools utils/messageFormat utils/socialShare \
+  utils/chatRequestPayload worker/social-content utils/socialContent
+                                            → 29 files / 344 passed
 ```
 
-> 验收卡 t_38463abd 于 2026-10-24 23:22 原样复跑核对上表：38 文件 354 例、29 文件 330 例全部通过
-> （执行卡当时记的 `326` 是笔误，已按复跑结果校正；330 比 329 多出的 1 例是验收补的
-> 「降级时排程工具也要禁假装登记」接线断言）。全量 `tsc` 也独立复跑：56 个既有错误、
-> 与执行卡日志逐行一致、改动文件 0 新增。
+> 计数口径：返工卡 t_38463abd 的复跑（2026-10-25）为 45 / 354 / 344。
+> 执行卡当时记的 22 + 8 = 30 例、定向 329 例是返工前的数字；返工新增/改写的用例见下，
+> 旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在 `evidence/`（提交内）。
 
 覆盖点：
 
@@ -276,11 +306,21 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
   `fetchShareExcerpts` 的 HTTP 契约 → 服务端真实 `buildExcerpts`（fixture 内容记录）生成响应 →
   `role:tool` 结果 → 下一跳请求成对 → 最终回复 → 落 metadata → 下一轮投影读得回来。
   桩只在 `fetch` 与模型输出上；响应体不是手写 JSON，是仓库真实服务端函数算出来的。
+- **可见标识（返工 P1）**：主链路用 `normalizeMessageContent` 输出里提取的引用来驱动调用
+  （不偷看 metadata 的完整 ID）；两张同 12 字符前缀的卡 → 可见的是两个不同完整引用；
+  抄短成公共前缀 → `SHARE_REF_AMBIGUOUS` 且列出候选、零请求；唯一前缀 → 命中且读到的是
+  **那张卡**的内容（断言不含另一张卡的字幕）；URL 形状 → `SHARE_REF_INVALID`；太短/集合外 →
+  `SHARE_NOT_IN_CONTEXT`。
+- **落库（返工 P1 第 2 条）**：每执行一次就落一次（`dispatchShareExcerptToolCall`）；
+  取消/网络失败（`AbortError` → `TIMEOUT`）也成对留；两轮并发各写各自触发消息、同 `toolCallId`
+  不串；重复提交与落库侧重放都只留一条；写库失败不阻断工具结果且失败批次可重试；
+  并发 `record` 的 read-modify-write 串行化（最大并发写 = 1，两条记录都在）；
+  无锚点时不写不猜。
 - 预算：单次夹紧、轮次累计、并发不超卖、小额直接拒绝、同参去重、次数上限、收费按自身重算。
 - 权限：URL/baseUrl/token/scope 拒绝且不发请求；集合外 shareRef/contentId 拒绝；状态不符拒绝；
   cursor 格式校验；shareRef/contentId 映射与错配。
 - 失败：`VERSION_UNAVAILABLE`、`CONTENT_NOT_FOUND`、`NO_SEGMENTS`；失败文本都要求如实说没读到。
-- 历史：call/result 成对落 metadata、投影有界、只对助手消息生效、锚点只挑本轮之后的消息。
+- 投影：call/result 成对落 metadata、投影有界、`user`/`assistant` 投影而 `system`/`tool` 不投影。
 
 ### 8.9 未验证 / 未部署（必须带着交付）
 
@@ -289,9 +329,10 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
    XHS 会话停用的现状不变，`read_share_excerpts` 只会如实返回失败。
 3. **未部署**：前端与 worker 都没发布；`SHARE_LINKS_ENABLED` 仍按 §4 的灰度流程走。
 4. **发布门禁**：定向 vitest 已跑（见 §8.8）。全量 `tsc -p tsconfig.json --noEmit` 与
-   `npx vite build` 本机都跑过 —— `tsc` 报 56 个错误、**全部是本次改动之外的既有错误**
-   （vps-backend / worker/instant-push 等），改动文件 0 错误；`vite build` EXIT=0（1m47s，
-   产物在 gitignore 的 `dist/`）。仍不等于发布验收：没有跑 `pnpm run check:workers`，也没有部署。
+   `npx vite build` 本机都跑过（日志在 `evidence/`）：`tsc` EXIT=2、**56 个错误**，
+   与返工前基线（父卡 `evidence/tsc-full.log`）的 `error TS` 行集合 **逐行一致**
+   （`diff` 空、56 vs 56），改动文件 0 错误；`vite build` EXIT=0（5m49s，产物在 gitignore 的 `dist/`）。
+   仍不等于发布验收：没有跑 `pnpm run check:workers`，也没有部署。
 5. 可读集合取自本轮装载的历史消息（`contextMsgs`）的 `metadata.shares`，没有和最终
    `cleanedApiMessages` 再求一次交集：被上下文裁掉、但仍留在 `contextMsgs` 里的卡理论上可被点名
    （模型看不到 ref，实际不可达）。属已知边界，未额外收紧。
@@ -299,12 +340,29 @@ npx vitest run utils/mcpToolBridge utils/agenticTools utils/messageFormat \
    之类文本。本卡只保证它是纯文本、有界、来源可追溯（shareRef + contentRevision），与旧链路
    直接注入字幕全文同级；没有额外过滤，也没有让模型据此获得任何工具/权限。
 
+### 8.10 返工记录（验收卡 t_38463abd，2026-10-25）
+
+arch-reviewer 在 `70cdd836` 上发现三处阻塞验收的问题，本节记录修法与复验口径。
+
+| # | 问题 | 修法 | 复验 |
+| --- | --- | --- | --- |
+| P1-1 | 模型可见引用被截成 12 字符，执行器只索引完整 shareRef → 照投影调用必然失败；测试用 fixture 注入不可见完整 ID，掩盖缺陷 | 投影与工具结果标题一律用完整 shareRef（`shortShareRef` 只留 UI）；执行器加前缀解析，**歧义即拒绝并给候选**；主链路测试改为从 `normalizeMessageContent` 输出提取引用驱动调用 | §8.8「可见标识」5 例：单卡成功、多卡同前缀歧义、唯一前缀命中且读到正确卡、URL/太短/未知拒绝、纯函数解析口径 |
+| P1-2 | call/result 只在「最终回复后处理成功」后从最近 30 条 assistant 里找锚点落库 → 模型失败/取消/空回复/无锚点时记录丢失 | 新增 `ShareExcerptPairRecorder`：锚在本轮触发消息（`contextMsgs` 最后一条，发送前已落库），**每执行一次工具成对写一次**；幂等 + 串行 + 失败可重试 + 无锚不猜；成功尾部与 `finally` 各 flush 一次 | §8.8「落库」7 例：逐次落库（无 assistant 也在）、取消/网络失败成对留、两轮并发隔离、幂等/重放、写库失败不阻断且可重试、并发串行、无锚不写 |
+| P1-3 | 执行边界（模型/provider/授权/回滚面）没有可核验证据 | 交付 `evidence/EXECUTION-AUDIT.md`：本 run 的 session 模型/provider（`state.db` 的 sessions/session_model_usage 只读查询）、`config.yaml` 的 model/provider 与 mtime（早于本轮，未改动）、改动文件清单、未启动网关、未部署 | 审计文件随卡提交；旧评论里的 `piaomiao/[AA]deepseek-4.1-flash-1017` 是建卡时的模型钉值记录，与本 run 实际跑的不是同一层证据，已在审计里标明 |
+
+返工对既有行为的可见影响：
+
+- 模型投影每张卡多 ~24 字符（完整引用）——由 §8.6 的 350/1200 预算继续夹紧；定向回归全部通过。
+- 记录不再挂在助手消息上，而是挂在**触发消息**上，因此 `user` 角色的消息也会带
+  `[read_share_excerpts 记录]` 投影（≤600 token）。
+
 ## 9. 已知限制（必须带着交付）
 
 1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
    `failed/partial` + 结构化错误，不编造内容。
-2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**
-   （`read_share_excerpts`，见 §8）：单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、
+2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**，
+   并由返工卡 t_38463abd 修掉「可见引用不可执行」「记录只靠最终回复落库」两处缺陷（见 §8.6 / §8.10）：
+   单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、引用歧义即拒绝、每次调用即时成对落库、
    失败如实返回。仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
 3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
    各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。

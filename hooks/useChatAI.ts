@@ -34,9 +34,10 @@ import {
     attachShareExcerptPairs,
     buildShareExcerptsTool,
     createShareExcerptTurn,
-    executeShareExcerptToolCall,
+    dispatchShareExcerptToolCall,
     hasReadableShareExcerptTarget,
-    pickShareExcerptAnchor,
+    pickShareExcerptTurnAnchor,
+    ShareExcerptPairRecorder,
     SHARE_EXCERPTS_TOOL_NAME,
     type ShareExcerptTurn,
 } from '../utils/socialShareTool';
@@ -688,6 +689,10 @@ export const useChatAI = ({
             setSearchStatus('');
         };
 
+        // 分享片段 call/result 的落库器：在 try 外声明，成功/失败/中断三条路径（含 finally）都能收尾。
+        // 具体实例在拿到本轮触发消息 id 后创建（见 shareEndpoint 那段）。
+        let shareExcerptRecorder: ShareExcerptPairRecorder | null = null;
+
         try {
             const baseUrl = effectiveApi.baseUrl.replace(/\/+$/, '');
             const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey || 'sk-none'}` };
@@ -1248,6 +1253,17 @@ export const useChatAI = ({
             const lifeWorkflowSourceRef = latestUserMsgRef?.id != null
                 ? `chat:${char.id}:m${latestUserMsgRef.id}`
                 : `chat:${char.id}:t${Date.now().toString(36)}`;
+            // 分享片段的 call/result 落库器（返工卡 t_38463abd P1 第 2 条）：
+            // 锚在**本轮触发消息**（contextMsgs 最后一条，发送前就已落库、id 确定），每执行完一次
+            // 工具就成对写一次库 —— 不依赖最终自然语言回复成功，模型失败/用户取消/后处理异常都不会丢；
+            // 也不按时间戳扫库猜锚点，所以不会挂到并发的其它轮次上。拿不到锚点就干脆不挂（不猜）。
+            shareExcerptRecorder = shareExcerptTurn
+                ? new ShareExcerptPairRecorder({
+                    anchorId: pickShareExcerptTurnAnchor(contextMsgs),
+                    savePairs: (messageId, records) =>
+                        DB.updateMessageMetadata(messageId, (prev: any) => attachShareExcerptPairs(prev, records)),
+                })
+                : null;
             const chatLifeWorkflowToolsInjected = chatLifeWorkflowAvailability(mergeAutonomySettings(char)).allowed;
             if (chatLifeWorkflowToolsInjected) {
                 baseReqBody.tools = [...(baseReqBody.tools || []), ...CHAT_LIFE_WORKFLOW_TOOLS];
@@ -1510,7 +1526,6 @@ export const useChatAI = ({
             }
 
             let data: any;
-            const turnStartedAt = Date.now();
             try {
                 spendLlmCall();
                 data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -2016,7 +2031,13 @@ export const useChatAI = ({
                         // 参数不在这里二次解析：executor 内部统一清洗（拒绝 URL/token/scope，限制字段与额度）。
                         if (shareExcerptTurn && fname === SHARE_EXCERPTS_TOOL_NAME) {
                             setSearchStatus('正在读取分享片段...');
-                            const excerptOutcome = await executeShareExcerptToolCall({ toolCall: tc, turn: shareExcerptTurn });
+                            // 执行 + **立刻成对落库**（dispatchShareExcerptToolCall 内部完成），
+                            // 不把「记录历史」押到整轮回复成功之后。
+                            const excerptOutcome = await dispatchShareExcerptToolCall({
+                                toolCall: tc,
+                                turn: shareExcerptTurn,
+                                recorder: shareExcerptRecorder,
+                            });
                             loopMessages.push(buildToolResultMessage(tc, excerptOutcome.text) as any);
                             continue;
                         }
@@ -2326,23 +2347,11 @@ export const useChatAI = ({
                 autonomyToldIds: payload.autonomyToldIds,
             });
 
-            // 链接分享按需读片段：把本轮真实的 call/result 成对挂到刚落库的那条助手消息上。
-            // 这样下一轮投影（messageFormat）能成对回放「问什么→读到什么」，片段确实会占未来
-            // 上下文（不承诺它们不占），但成对有界，不会只剩孤立片段让模型误以为读过更多。
-            // 只挂时间上属于本轮的那条 assistant；找不到就不挂（不往别的消息上硬塞）。
-            if (shareExcerptTurn && shareExcerptTurn.calls.length > 0) {
-                try {
-                    const recentAfterTurn = await DB.getRecentMessagesByCharId(char.id, 30);
-                    const anchorId = pickShareExcerptAnchor(recentAfterTurn as any[], turnStartedAt);
-                    if (anchorId != null) {
-                        const records = [...shareExcerptTurn.calls];
-                        await DB.updateMessageMetadata(anchorId, (prev: any) => attachShareExcerptPairs(prev, records));
-                    }
-                } catch (e) {
-                    // 记历史失败不影响这轮回复（片段已经是真实结果，只是下一轮回放会缺这对记录）。
-                    console.warn('[share-excerpt] 工具记录落历史失败:', e);
-                }
-            }
+            // 链接分享按需读片段：call/result 已在**每次工具执行后**成对写进「本轮触发消息」
+            // 的 metadata.shareExcerpts（ShareExcerptPairRecorder，逐次落库），下一轮投影
+            // （messageFormat）成对回放「问什么→读到什么」。这里只等最后排队的那次写入落地，
+            // 作为收尾保险——不再依赖「最终助手回复成功落库」，也不再用时间戳扫库猜锚点。
+            if (shareExcerptRecorder) await shareExcerptRecorder.flush();
 
             // B2 空回复可见化：正文空 + 无工具调用 + 漏斗没产出过可见消息时，
             // 落一条可重发的系统提示，而不是静默结束（用户看到"停了但没消息"）。
@@ -2401,6 +2410,9 @@ export const useChatAI = ({
             // 旧轮的错误不刷到新会话 UI（消息本身归属 char.id 存对了地方，只是不主动刷新）。
             if (turnAlive()) setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
         } finally {
+            // 分享片段记录兜底：成功/失败/中断都经过这里，等已排队的写入落地（逐次落库后通常是 no-op）。
+            // flush 永不 reject；写库失败的批次不会被标记为已写，下一轮同 id 记录会再写一次。
+            if (shareExcerptRecorder) await shareExcerptRecorder.flush();
             KeepAlive.stop();
             // 旧轮不碰 UI 状态：新轮活着时 typing 灯和预览属于它；切角色时灯已由 char?.id effect 熄过。
             // （卸载时组件已死，setter 皆为 no-op。）
