@@ -1,0 +1,15 @@
+{
+  "code": 0,
+  "message": "0",
+  "data": {
+    "subtitle": {
+      "subtitles": [
+        {
+          "lan": "zh-CN",
+          "lan_doc": "中文（中国）",
+          "subtitle_url": "//aisubtitle.hdslb.com/bfs/subtitle/fixture.json"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "bvid": "BV1xx411c7mD",
+    "aid": 170001,
+    "cid": 98765432,
+    "title": "夹具视频标题",
+    "desc": "这是虚构的简介。第一段说明主题。\n\n第二段给出结论，并提到 BV1xx411c7mD 这个编号。",
+    "pubdate": 1700000000,
+    "pic": "https://i0.hdslb.com/bfs/archive/fixture-cover.jpg",
+    "owner": { "mid": 10001, "name": "夹具UP主", "face": "https://i0.hdslb.com/bfs/face/fixture.jpg" },
+    "stat": { "like": 50000, "reply": 8000 },
+    "pages": [
+      { "cid": 98765432, "page": 1, "part": "第一段" },
+      { "cid": 98765433, "page": 2, "part": "第二段" }
+    ],
+    "duration": 600
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "font_size": 0.4,
+  "font_color": "#FFFFFF",
+  "background_alpha": 0.5,
+  "body": [
+    { "from": 0.5, "to": 2.5, "location": 2, "content": "第一句原生字幕" },
+    { "from": 2.5, "to": 5.0, "location": 2, "content": "第二句原生字幕" }
+  ]
+}
