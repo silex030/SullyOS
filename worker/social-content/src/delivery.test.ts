@@ -30,6 +30,7 @@ import {
   mergeShareAttachments,
   resolveSharesForMessage,
 } from '../../../utils/socialShare';
+import { normalizeMessageContent } from '../../../utils/messageFormat';
 import {
   createShareExcerptTurn,
   executeShareExcerptToolCall,
@@ -217,6 +218,26 @@ describe('真实响应 → 客户端 metadata → 模型投影 → 按需检索'
     expect(projection).toContain('字幕：平台未提供'); // 字幕语义到达模型，不再静默
     expect(projection).toContain(EXTERNAL_UNTRUSTED_NOTICE); // 外部内容低信任隔离
     expect(projection).toContain('<<<EXTERNAL_CONTENT');
+
+    // 2b) 再走一遍真实的 messageFormat 接线（模型上下文里的最终文本）
+    const formatted = normalizeMessageContent(
+      {
+        id: 1,
+        charId: 'char-1',
+        role: 'user',
+        type: 'text',
+        content: USER_TEXT,
+        timestamp: NOW,
+        metadata,
+      } as any,
+      '角色',
+      '我',
+    );
+    expect(formatted).toContain('[分享 shr_');
+    expect(formatted).not.toContain(`https://www.bilibili.com/video/${BV}`);
+    expect(formatted).toContain('交付链夹具标题');
+    expect(formatted).toContain('字幕：平台未提供');
+    expect(formatted).toContain(EXTERNAL_UNTRUSTED_NOTICE);
 
     const turn = createShareExcerptTurn([{ metadata }], { endpoint: ENDPOINT });
     expect(turn).not.toBeNull();
