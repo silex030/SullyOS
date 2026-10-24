@@ -1,0 +1,27 @@
+# t_984b3cfc 第五轮（架构审查 request_changes 第 5 轮）证据清单
+# 代码提交: 3d7551d1035d7e046c653a400b57b8b035ce5774（本清单为紧随其后的仅文档提交）
+# 生成时间(UTC): Sat Oct 24 10:37:14 PM UTC 2026
+# 说明: 本清单与 evidence/ 下全部原始日志在同一次提交内；本文列出 sha256 供逐字节复核。
+# 读取: gunzip -c <file>.gz | less
+
+7300cfe42644fb9e11cd8bc83aec772afb101db21128ed565513911fe773f6c4      3958  docs/autonomy-life/evidence/README.md
+7bba129cf0564a19a92087005760a0ac6a8e90245397e530c7617130f598124e      3418  docs/autonomy-life/evidence/build.log.gz
+4dc163c99a2166d761008008184af8d6b18d633d5b1c9996799d607d74ca5bb8       570  docs/autonomy-life/evidence/e2e-http-requests.json.gz
+49698a441c99f47cb709ab693c2521805019660d4ba07562dc481a0e41dd191c      2226  docs/autonomy-life/evidence/e2e-report.json.gz
+a1bda65cb4559b7b6c49d4e80dd32d023d25941c3be417f7cd8f62a4f79cf5d5      2467  docs/autonomy-life/evidence/e2e-run.log.gz
+3a7b0ef85676d066fefa26926d998b3e836d8494fb7fd8e83cc4d56976fa6391     15177  docs/autonomy-life/evidence/focused.log.gz
+906ccae4d6f2a45d12cf5e640aadb92fadbfc1172c1256b67124e3cb98ddf321      6814  docs/autonomy-life/evidence/legacy-grep.log.gz
+6b0f371897d0687d4b615a25239b7f1892bc7b8e41eb2337e8f911ee5cfd71d1      2392  docs/autonomy-life/evidence/tsc-baseline.log.gz
+dcba29c0b469d83faa49ec39313cbe5f27b1938a41f1840303c5576c40c8b658       227  docs/autonomy-life/evidence/tsc-compare.txt
+70c8aa5ecaeb63583c510c6770ba5d5c0e8d4ed1b44ecf55b8915cfc853f97a5      2368  docs/autonomy-life/evidence/tsc-current.log.gz
+b182e65bc1879f90df9af9f4208ef82f0a959cd9b5d08ae08f2f719839c65fd0     92340  docs/autonomy-life/evidence/vitest-full.log.gz
+
+# 运行命令（原始 stdout/stderr，未裁剪）:
+#   npx vitest run                                  -> 624 files / 7624 tests, EXIT 0
+#   npx vitest run <focused list>                   -> 42 files / 909 tests, EXIT 0
+#   npx tsc --noEmit -p tsconfig.json               -> 56 errors (baseline 56, diff empty), EXIT 2
+#   pnpm run build                                  -> EXIT 0 (vite built in 1m 33s)
+#   node scripts/autonomy-e2e/run.mjs               -> 40/40 checks, EXIT 0
+#   bash scripts/autonomy-legacy-grep-audit.sh      -> EXIT 0
+# 与附件的关系: evidence/ 在 HEAD 里（git-addressable）。durable attachments 保留上一轮大日志，
+# 本轮只补传本清单 + tsc 对照（体积原因）；复核请以 HEAD 内文件 sha256 为准。
