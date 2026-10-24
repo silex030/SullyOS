@@ -20,8 +20,13 @@
  *
  * 落历史：每次调用执行完**立刻**把 call（工具名/参数）与 result（状态/收费/文本）成对写进
  * 「本轮触发消息」（`contextMsgs` 的最后一条，发送前已落库、id 确定）的 metadata.shareExcerpts；
- * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。下一轮投影由 messageFormat
- * 读出这对记录（成对渲染，不单独回放孤立片段，≤600 token）。落库器见 ShareExcerptPairRecorder。
+ * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。写库失败的批**留在待补偿队列**
+ * （`ShareExcerptPairOutbox`），由下一次 dispatch / 收尾 flush 有界重试；重试仍失败就明确标为
+ * 「未保存」并上报，不冒充已保存。下一轮投影由 messageFormat 读出这对记录
+ * （成对渲染，不单独回放孤立片段，≤600 token）。落库器见 ShareExcerptPairRecorder。
+ *
+ * 无锚不读：拿不到本轮确定的持久化锚点时，生产路径在**读取前**就返回 `HISTORY_UNAVAILABLE`
+ * （`dispatchShareExcerptToolCall`），避免「读过却没有记录」。
  *
  * 引用契约：模型可见标识 = **完整 shareRef**（投影里 `[分享 shr_...]`）；执行器精确匹配，
  * 并容忍 ≥8 字符的唯一前缀。前缀命中多张卡时返回 SHARE_REF_AMBIGUOUS 并列出候选，
@@ -102,6 +107,7 @@ export type ShareExcerptToolCode =
   | 'INVALID_ARGUMENTS'
   | 'ARGUMENT_NOT_ALLOWED'
   | 'MISSING_TARGET'
+  | 'HISTORY_UNAVAILABLE'
   | 'SHARE_REF_INVALID'
   | 'SHARE_REF_AMBIGUOUS'
   | 'SHARE_TARGET_MISMATCH'
@@ -569,6 +575,12 @@ export interface ExecuteShareExcerptInput {
   args?: unknown;
   turn: ShareExcerptTurn;
   endpoint?: ShareEndpoint | null;
+  /**
+   * 本轮拿不到确定的持久化锚点时为 true：**不读**，直接返回 `HISTORY_UNAVAILABLE`。
+   * 生产路径由 `dispatchShareExcerptToolCall` 依据 recorder.anchorId 设置，
+   * 保证「返回给模型的片段」一定有成对落库的去处（卡片第 3 条）。
+   */
+  historyUnavailable?: boolean;
 }
 
 export interface ExecuteShareExcerptResult {
@@ -629,6 +641,20 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
   if (name !== SHARE_EXCERPTS_TOOL_NAME) {
     const text = failureText('UNKNOWN_TOOL', `本模块只处理 ${SHARE_EXCERPTS_TOOL_NAME}`);
     return finish(false, 'UNKNOWN_TOOL', text, 0, {});
+  }
+
+  // 历史必须成对留存（卡片第 3 条）：拿不到本轮确定的持久化锚点时**不读**。
+  // 读到了却写不进任何消息的 metadata，就成了「读过却没有记录」——下一轮既回放不出来，
+  // 模型只能凭记忆复述片段（等于给了它一个无法追溯的来源）。宁可不给片段，也不给不留痕的片段。
+  // 这个判定在预算/网络之前，所以拒绝时一次请求都不发。
+  if (input.historyUnavailable) {
+    return finish(
+      false,
+      'HISTORY_UNAVAILABLE',
+      failureText('HISTORY_UNAVAILABLE', '这一轮没有可确定的持久化位置（拿不到本轮消息 id），读到的片段无法成对记进历史，所以这次不读取'),
+      0,
+      {},
+    );
   }
 
   // 每轮调用次数硬顶：预算用完前先把「模型开始复读」这种情况挡住。
@@ -931,14 +957,121 @@ export function pickShareExcerptTurnAnchor(
 /** 成对记录写库的回调（测试注入；生产是 DB.updateMessageMetadata + attachShareExcerptPairs）。 */
 export type ShareExcerptPairSaver = (messageId: number, records: readonly ShareExcerptCallRecord[]) => Promise<void>;
 
+/**
+ * 待补偿队列与重试的上界（不是无限重试，也不会无限堆内存）。
+ *  - perAnchorRecords / anchors：失败批次最多留多少（本轮 + 最近几轮），超了丢最旧的并明确报错。
+ *  - flushAttempts：每次 flush 最多再尝试几轮写库；hook 有两个收尾点（成功尾部 + finally），
+ *    所以一整轮的尝试次数上界是 `2 × flushAttempts`，再加每次 dispatch 自带的那一次。
+ */
+export const SHARE_EXCERPT_OUTBOX_LIMITS = {
+  perAnchorRecords: 16,
+  anchors: 8,
+  flushAttempts: 3,
+} as const;
+
+export interface ShareExcerptOutboxEntry {
+  anchorId: number;
+  records: readonly ShareExcerptCallRecord[];
+}
+
+/**
+ * 未落库记录的**待补偿队列**。
+ *
+ * 语义（返工卡 t_38463abd P1 第 2 条）：写库失败的批次**留在这里**——不标成已保存，
+ * 也不靠 `console.warn` 就算完；之后的 `record`（下一次工具调用）与 `flush`（收尾路径）
+ * 会在 `SHARE_EXCERPT_OUTBOX_LIMITS` 的上界内重试同一批，成功后才移除。
+ * 于是「第一次失败、第二次会成功」的瞬时故障由**真实生产收尾路径**补上，而不是只有测试里
+ * 手动再调一次 `record` 才补。
+ *
+ * 每条记录带自己的 `anchorId`（原始触发消息 id），所以跨轮重试仍然写回同一条消息，
+ * 不会挂到后来的轮次上。容量有界：超限时丢最旧的锚点并 `console.error` 明确说丢了多少。
+ */
+export class ShareExcerptPairOutbox {
+  private readonly bins = new Map<number, Map<string, ShareExcerptCallRecord>>();
+
+  add(anchorId: number, records: readonly ShareExcerptCallRecord[]): void {
+    if (!Number.isFinite(anchorId)) return;
+    let bin = this.bins.get(anchorId);
+    if (!bin) {
+      bin = new Map();
+      this.bins.set(anchorId, bin);
+    }
+    for (const record of records ?? []) {
+      const id = typeof record?.toolCallId === 'string' ? record.toolCallId.trim() : '';
+      if (!id) continue;
+      if (!bin.has(id)) bin.set(id, record);
+    }
+    while (bin.size > SHARE_EXCERPT_OUTBOX_LIMITS.perAnchorRecords) {
+      const oldest = bin.keys().next().value as string | undefined;
+      if (oldest == null) break;
+      bin.delete(oldest);
+      console.error('[share-excerpt] 待补偿队列超过单消息上限，丢弃最旧的一条未落库记录:', oldest);
+    }
+    while (this.bins.size > SHARE_EXCERPT_OUTBOX_LIMITS.anchors) {
+      const oldestAnchor = this.bins.keys().next().value as number | undefined;
+      if (oldestAnchor == null) break;
+      this.bins.delete(oldestAnchor);
+      console.error('[share-excerpt] 待补偿队列超过消息数上限，丢弃最旧消息的未落库记录:', oldestAnchor);
+    }
+  }
+
+  /** 按锚点分组的待写批次（锚点顺序 = 加入顺序，便于日志与测试断言稳定）。 */
+  entries(): ShareExcerptOutboxEntry[] {
+    const out: ShareExcerptOutboxEntry[] = [];
+    for (const [anchorId, bin] of this.bins) {
+      if (bin.size === 0) continue;
+      out.push({ anchorId, records: [...bin.values()] });
+    }
+    return out;
+  }
+
+  clear(anchorId: number, toolCallIds: readonly string[]): void {
+    const bin = this.bins.get(anchorId);
+    if (!bin) return;
+    for (const id of toolCallIds) bin.delete(id);
+    if (bin.size === 0) this.bins.delete(anchorId);
+  }
+
+  /** 未落库条数：给绝对值就是某个锚点，不给就是全部（含往轮遗留）。 */
+  pendingCount(anchorId?: number): number {
+    if (typeof anchorId === 'number') return this.bins.get(anchorId)?.size ?? 0;
+    let total = 0;
+    for (const bin of this.bins.values()) total += bin.size;
+    return total;
+  }
+}
+
+/** 生产用的进程内待补偿队列（hook 显式传入；测试默认每个 recorder 私有，互不污染）。 */
+export const SHARE_EXCERPT_OUTBOX = new ShareExcerptPairOutbox();
+
 export interface ShareExcerptRecorderSnapshot {
   anchorId: number | null;
   /** 已成功写库的 toolCallId 数。 */
   recorded: number;
-  /** 写库失败次数（失败的那批不会被标记成已写，后续 flush 会重试）。 */
+  /** 写库失败次数（每轮失败计一次；失败批次留在待补偿队列，不会被标成已写）。 */
   failures: number;
-  /** 当前排队的写操作数（>0 表示还有没落地的记录）。 */
+  /** 当前排队的写操作数（>0 表示还有没落地的写入）。 */
   pendingWrites: number;
+  /** **本锚点**还没落库的记录条数（失败后在这里等 dispatch/flush 有界重试）。 */
+  pendingRecords: number;
+  /** 待补偿队列里所有锚点的未落库记录总数（含往轮遗留）。 */
+  outboxPending: number;
+  /** 收尾重试后仍未落库 → true。这时**不能对外声称已保存**。 */
+  unsaved: boolean;
+  lastError: string | null;
+}
+
+export interface ShareExcerptPairRecorderOptions {
+  anchorId: number | null;
+  savePairs: ShareExcerptPairSaver;
+  /** 跨轮共享的待补偿队列（生产传 SHARE_EXCERPT_OUTBOX；不传则本记录器私有）。 */
+  outbox?: ShareExcerptPairOutbox;
+  /** 每次 flush 最多再尝试几轮（默认且上限 SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts）。 */
+  maxAttemptsPerFlush?: number;
+  /** 两轮重试之间的等待（默认 0；本地 IDB 失败通常是即时的，不需要退避）。 */
+  retryDelayMs?: number;
+  /** 持续失败的可见上报（默认 console.error；测试可注入断言）。 */
+  reportUnsaved?: (info: { anchorId: number | null; pending: number; lastError: string }) => void;
 }
 
 /**
@@ -948,40 +1081,57 @@ export interface ShareExcerptRecorderSnapshot {
  *  - 成对：call 与 result 在同一批、同一次 metadata 写入里落盘，不存在只有一半。
  *  - 及时：读成功/失败/超限/取消都会立刻落，后续模型请求失败或用户中断都不影响已读过的调用。
  *  - 幂等：同一 toolCallId 只写一次（内存去重 + attachShareExcerptPairs 落库侧按 id 去重）。
- *  - 串行：写入排在同一条 promise 链上，避免并发 read-modify-write 把彼此覆盖。
- *  - 不抛：写库失败只记账（failures+1），工具结果照常回给模型；下次 flush 会重试同一批。
- *  - 无锚不猜：anchorId 为空时不写、不猜别的消息（宁缺勿错挂到别人的轮次）。
+ *  - 串行：同一记录器内的写入排在同一条 promise 链上，避免并发 read-modify-write 互相覆盖。
+ *  - **不丢**：写库失败只记账并把批次留在待补偿队列（`ShareExcerptPairOutbox`），
+ *    下一次 `record`/`flush` 有界重试；重试后仍失败 → `snapshot().unsaved === true` +
+ *    `console.error`，明确「没保存、在待补偿」，不再承诺已保存。
+ *  - 无锚不猜：anchorId 为空时既不写也不猜别的消息；生产路径在读取前就拒绝（见 dispatch）。
  */
 export class ShareExcerptPairRecorder {
   readonly anchorId: number | null;
   private readonly savePairs: ShareExcerptPairSaver;
+  private readonly outbox: ShareExcerptPairOutbox;
+  private readonly maxAttemptsPerFlush: number;
+  private readonly retryDelayMs: number;
+  private readonly reportUnsaved: (info: { anchorId: number | null; pending: number; lastError: string }) => void;
   private readonly done = new Set<string>();
   private queue: Promise<void> = Promise.resolve();
   private failures = 0;
   private writes = 0;
   private queued = 0;
+  private lastError: string | null = null;
+  private unsavedReported = false;
 
-  constructor(opts: { anchorId: number | null; savePairs: ShareExcerptPairSaver }) {
+  constructor(opts: ShareExcerptPairRecorderOptions) {
     this.anchorId = typeof opts.anchorId === 'number' && Number.isFinite(opts.anchorId) ? opts.anchorId : null;
     this.savePairs = opts.savePairs;
+    this.outbox = opts.outbox ?? new ShareExcerptPairOutbox();
+    const wanted = Math.floor(opts.maxAttemptsPerFlush ?? SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts);
+    this.maxAttemptsPerFlush = Math.max(1, Math.min(Number.isFinite(wanted) ? wanted : 1, SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts));
+    this.retryDelayMs = Math.max(0, Math.floor(opts.retryDelayMs ?? 0));
+    this.reportUnsaved = opts.reportUnsaved ?? ((info) => {
+      console.error(
+        `[share-excerpt] 工具记录未能写入历史（待补偿）：still-unpersisted=${info.pending} anchor=${info.anchorId ?? 'none'} lastError=${info.lastError}`,
+      );
+    });
   }
 
-  /** 落一批记录。可重复调用；返回的 promise 在本批写库尝试结束后 resolve（永不 reject）。 */
+  /**
+   * 落一批记录。可重复调用；返回的 promise 在**这一轮**写库尝试结束后 resolve（永不 reject）。
+   * 同一批里已经写成功过的 id 会被跳过；失败的留在待补偿队列里等 flush / 下一次 dispatch 重试。
+   */
   record(records: readonly ShareExcerptCallRecord[] | null | undefined): Promise<void> {
     const fresh = (records ?? []).filter((r) => typeof r?.toolCallId === 'string' && r.toolCallId && !this.done.has(r.toolCallId));
     if (this.anchorId == null || fresh.length === 0) return this.queue;
+    this.outbox.add(this.anchorId, fresh);
+    return this.enqueueAttempt();
+  }
+
+  private enqueueAttempt(): Promise<void> {
     this.queued += 1;
     this.queue = this.queue.then(async () => {
-      // 排队期间可能已被前一批写掉（同一批重复提交 / 并发调用），这里再筛一次。
-      const still = fresh.filter((r) => !this.done.has(r.toolCallId));
       try {
-        if (still.length === 0) return;
-        await this.savePairs(this.anchorId as number, still);
-        for (const r of still) this.done.add(r.toolCallId);
-        this.writes += 1;
-      } catch (e) {
-        this.failures += 1;
-        console.warn('[share-excerpt] 工具记录落历史失败（本轮继续，flush 时重试）:', e);
+        await this.writePending();
       } finally {
         this.queued = Math.max(0, this.queued - 1);
       }
@@ -989,9 +1139,60 @@ export class ShareExcerptPairRecorder {
     return this.queue;
   }
 
-  /** 等所有已排队的写入落地（失败不抛；调用方可看 snapshot 决定是否告警）。 */
-  flush(): Promise<void> {
-    return this.queue;
+  /**
+   * 写一轮：待补偿队列里的**所有**批次（本轮 pending + 之前失败留下的），按锚点合并成一次写。
+   * 所以后续的新调用不会遗漏旧的失败批次——它们还在同一个队列里按原始锚点重试。
+   */
+  private async writePending(): Promise<void> {
+    for (const entry of this.outbox.entries()) {
+      const still = entry.records.filter((r) => !this.done.has(r.toolCallId));
+      if (still.length === 0) {
+        this.outbox.clear(entry.anchorId, entry.records.map((r) => r.toolCallId));
+        continue;
+      }
+      try {
+        await this.savePairs(entry.anchorId, still);
+        for (const r of still) this.done.add(r.toolCallId);
+        this.outbox.clear(entry.anchorId, still.map((r) => r.toolCallId));
+        this.writes += 1;
+        this.unsavedReported = false;
+      } catch (e: any) {
+        this.failures += 1;
+        this.lastError = String(e?.message || e);
+        // 失败批次留在待补偿队列里（不丢、也不标成已写）。一个锚点失败不挡其它锚点继续写。
+        console.warn('[share-excerpt] 工具记录落历史失败（保留在待补偿队列，收尾 flush 有界重试）:', e);
+      }
+    }
+  }
+
+  /**
+   * 收尾：等已排队的写入落地，再对仍留在待补偿队列里的批次做**有界重试**。
+   * 重试次数用尽还失败 → `snapshot().unsaved === true`，并按 `reportUnsaved` 明确上报
+   * 「没保存、在待补偿」（默认 console.error）。flush 永不 reject。
+   */
+  async flush(): Promise<void> {
+    await this.queue;
+    for (let round = 0; round < this.maxAttemptsPerFlush; round++) {
+      if (this.outbox.pendingCount() === 0) return;
+      if (round > 0 && this.retryDelayMs > 0) await new Promise((r) => setTimeout(r, this.retryDelayMs));
+      await this.enqueueAttempt();
+    }
+    if (this.outbox.pendingCount() > 0) this.reportIfUnsaved();
+  }
+
+  private reportIfUnsaved(): void {
+    if (this.unsavedReported) return;
+    this.unsavedReported = true;
+    try {
+      this.reportUnsaved({
+        anchorId: this.anchorId,
+        pending: this.outbox.pendingCount(),
+        lastError: this.lastError ?? 'unknown',
+      });
+    } catch (e) {
+      // 上报本身不能把 flush 变成 reject（收尾路径不允许抛）。
+      console.error('[share-excerpt] 上报「未保存」失败:', e);
+    }
   }
 
   has(toolCallId: string): boolean {
@@ -999,11 +1200,16 @@ export class ShareExcerptPairRecorder {
   }
 
   snapshot(): ShareExcerptRecorderSnapshot {
+    const ownPending = this.anchorId == null ? 0 : this.outbox.pendingCount(this.anchorId);
     return {
       anchorId: this.anchorId,
       recorded: this.done.size,
       failures: this.failures,
       pendingWrites: this.queued,
+      pendingRecords: ownPending,
+      outboxPending: this.outbox.pendingCount(),
+      unsaved: ownPending > 0,
+      lastError: this.lastError,
     };
   }
 }
@@ -1011,14 +1217,24 @@ export class ShareExcerptPairRecorder {
 /**
  * 工具循环里的一处接线：执行一次 read_share_excerpts，**立刻**把这条 call/result 成对写库，
  * 再把结果文本交给调用方回填给模型。useChatAI 与测试都走这个函数，避免「hook 里另写一遍」分叉。
- * 落库失败不影响工具结果（recorder 内部吞掉异常并记账）。
+ *
+ * 两件事都在这里收口（返工卡 t_38463abd P1 第 2 条）：
+ *  1. **没有确定的本轮持久化锚点 → 不读**。历史必须成对留存；若读到了却没地方落库，
+ *     就等于给模型一个无法追溯的来源。所以 `recorder` 缺失或 `anchorId == null` 时
+ *     直接返回 `HISTORY_UNAVAILABLE`，预算与网络都不碰。
+ *  2. 落库失败不影响工具结果（recorder 内部吞掉异常、留在待补偿队列里重试）。
  */
 export async function dispatchShareExcerptToolCall(input: {
   toolCall: ShareExcerptToolCallLike | null | undefined;
   turn: ShareExcerptTurn;
   recorder?: ShareExcerptPairRecorder | null;
 }): Promise<ExecuteShareExcerptResult> {
-  const outcome = await executeShareExcerptToolCall({ toolCall: input.toolCall, turn: input.turn });
-  if (input.recorder) await input.recorder.record([outcome.record]);
+  const anchorId = input.recorder?.anchorId ?? null;
+  const outcome = await executeShareExcerptToolCall({
+    toolCall: input.toolCall,
+    turn: input.turn,
+    historyUnavailable: anchorId == null,
+  });
+  if (input.recorder && anchorId != null) await input.recorder.record([outcome.record]);
   return outcome;
 }

@@ -283,3 +283,76 @@ stat -c '%y' /root/.hermes/profiles/ds-executor/config.yaml
 cd /root/.hermes/kanban/workspaces/t_75dd49a5/repo && git status --short && git diff --stat 70cdd836
 ps -eo pid,lstart,cmd | grep 'hermes.*gateway run' | grep -v grep
 ```
+
+---
+
+## 8. 第 2 轮返工（run 76，2026-10-25 01:32 起）
+
+### 8.1 本 run 的模型 / provider（只读查询，命令可复跑）
+
+```bash
+python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect('file:/root/.hermes/profiles/ds-executor/state.db?mode=ro', uri=True)
+print(list(c.execute("select id, model, billing_provider, billing_base_url, profile_name, source, api_call_count from sessions order by started_at desc limit 4")))
+print(list(c.execute("select session_id, model, billing_provider, billing_base_url, api_call_count from session_model_usage order by first_seen desc limit 8")))
+PY
+```
+
+实测（2026-10-25 01:41 +08:00 读取）：
+
+```
+('20261025_013601_e70a16', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 'ds-executor', 'kanban', 24)  ← 本 run
+('20261025_011315_71b685', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 'ds-executor', 'kanban', 70)
+('20261025_010546_064951', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 'ds-executor', 'kanban', 105)
+('20261024_235558_956b2d', 'deepseek-v4.1-flash', 'opencode-go', 'https://opencode.ai/zen/go/v1', 'ds-executor', 'kanban', 164)
+session_model_usage 最近 8 行：全部 model=deepseek-v4.1-flash / provider=opencode-go /
+billing_base_url=https://opencode.ai/zen/go/v1（按 session 聚合，本 run 只有 1 行）
+```
+
+### 8.2 配置与边界（与第 1 轮同一份 config）
+
+```
+sha256sum /root/.hermes/profiles/ds-executor/config.yaml
+6b005711624c4adfd6d64bd77833c8e2d993e92967d926b5744c173a40176113   ← 与第 1 轮审计一致
+stat -c '%y' /root/.hermes/profiles/ds-executor/config.yaml
+2026-10-24 16:35:36.346548540 +0800                                  ← 早于本 run（01:32）
+```
+
+本 run 没有改模型/provider、没有 `--model/--provider`、没有改 approvals/delegation/kanban 配置、
+没有改任何一个 profile 的 config；改动只落在本卡 worktree 的 5 个文件（见 §8.4）。
+
+### 8.3 网关与主仓库
+
+```
+ps -eo pid,lstart,cmd | grep -E 'hermes.*gateway run' | grep -v grep
+1664081 Sat Oct 24 10:12:57 2026 ... gateway run   ← 既存 host 进程，早于本 run 15h+，本 run 未启动任何网关
+git -C /opt/sullyos/sullyos-repo status --short    → 空
+git -C /opt/sullyos/sullyos-repo rev-parse --short HEAD → 259626ae
+```
+
+### 8.4 本 run 改动范围（`git diff --numstat`，相对 HEAD 300cfa28）
+
+```
+56  17  docs/social-content/integration-v1.md
+24   7  hooks/useChatAI.ts
+187 35  utils/socialShareTool.test.ts
+240 24  utils/socialShareTool.ts
+19   2  utils/socialShareTool.wiring.test.ts
+```
+
+只有本卡 worktree 内 5 个文件；主仓库 clean；未部署（无 dist/、无 worker bundle 重建、无服务重启）。
+
+### 8.5 本 run 实际跑过的命令类别
+
+- 只读：`kanban_show`、`read_file`/`sed`/`grep`、`git status/diff/log/rev-parse`、`sha256sum`、`stat`、`ps`、
+  `python3` 以 `mode=ro` 读 `state.db`。
+- 写路径（仅本 worktree 内）：`patch`/写测试与文档、`npx vitest run ... > evidence/*-r2.log`、
+  `npx tsc -p tsconfig.json --noEmit > evidence/tsc-full-r2.log`、`npx esbuild`（语法检查，输出到 /tmp）。
+
+### 8.6 仍然无法自证的项
+
+1. provider 侧计费/受理回执（本机拿不到，同第 1 轮 §6）。
+2. 真实供应商模型是否会主动调用该工具（fixture 模型链路）。
+3. 真实平台内容（B 站 412 / 抖音登录墙 / XHS 停用）。
+4. 未部署、未合并。

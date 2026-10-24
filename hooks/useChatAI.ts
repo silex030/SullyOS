@@ -38,6 +38,7 @@ import {
     hasReadableShareExcerptTarget,
     pickShareExcerptTurnAnchor,
     ShareExcerptPairRecorder,
+    SHARE_EXCERPT_OUTBOX,
     SHARE_EXCERPTS_TOOL_NAME,
     type ShareExcerptTurn,
 } from '../utils/socialShareTool';
@@ -1230,6 +1231,11 @@ export const useChatAI = ({
                 : null;
             // 一张能读的卡都没有（全是解析中/失败）时不注入：只给一个注定报错的工具没有意义。
             if (shareExcerptTurn && !hasReadableShareExcerptTarget(shareExcerptTurn)) shareExcerptTurn = null;
+            // 历史必须成对留存（卡片第 3 条）：拿不到本轮触发消息 id 时**连工具都不注入**。
+            // 读到的片段没有确定的落库位置，就只能「读过却没有记录」；宁可不给这个工具。
+            // （dispatch 侧还有一道同口径的拒绝，防止将来别处绕过这里直接调用。）
+            const shareExcerptAnchorId = pickShareExcerptTurnAnchor(contextMsgs);
+            if (shareExcerptTurn && shareExcerptAnchorId == null) shareExcerptTurn = null;
             if (shareExcerptTurn) {
                 baseReqBody.tools = [...(baseReqBody.tools || []), buildShareExcerptsTool()];
                 if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
@@ -1256,12 +1262,16 @@ export const useChatAI = ({
             // 分享片段的 call/result 落库器（返工卡 t_38463abd P1 第 2 条）：
             // 锚在**本轮触发消息**（contextMsgs 最后一条，发送前就已落库、id 确定），每执行完一次
             // 工具就成对写一次库 —— 不依赖最终自然语言回复成功，模型失败/用户取消/后处理异常都不会丢；
-            // 也不按时间戳扫库猜锚点，所以不会挂到并发的其它轮次上。拿不到锚点就干脆不挂（不猜）。
+            // 也不按时间戳扫库猜锚点，所以不会挂到并发的其它轮次上。
+            // 拿不到锚点时上面已经把 turn 置空，这里只可能是确定 id。
             shareExcerptRecorder = shareExcerptTurn
                 ? new ShareExcerptPairRecorder({
-                    anchorId: pickShareExcerptTurnAnchor(contextMsgs),
+                    anchorId: shareExcerptAnchorId,
                     savePairs: (messageId, records) =>
                         DB.updateMessageMetadata(messageId, (prev: any) => attachShareExcerptPairs(prev, records)),
+                    // 跨轮待补偿队列：本轮写库失败的记录留在这里，下一次 dispatch / 收尾 flush
+                    // 还能按原始锚点有界重试（不是 console.warn 一下就算完）。
+                    outbox: SHARE_EXCERPT_OUTBOX,
                 })
                 : null;
             const chatLifeWorkflowToolsInjected = chatLifeWorkflowAvailability(mergeAutonomySettings(char)).allowed;
@@ -2349,8 +2359,8 @@ export const useChatAI = ({
 
             // 链接分享按需读片段：call/result 已在**每次工具执行后**成对写进「本轮触发消息」
             // 的 metadata.shareExcerpts（ShareExcerptPairRecorder，逐次落库），下一轮投影
-            // （messageFormat）成对回放「问什么→读到什么」。这里只等最后排队的那次写入落地，
-            // 作为收尾保险——不再依赖「最终助手回复成功落库」，也不再用时间戳扫库猜锚点。
+            // （messageFormat）成对回放「问什么→读到什么」。这里做一次收尾：等排队的写入落地，
+            // 并对写库失败留下的待补偿批次做有界重试——不再依赖「最终助手回复成功落库」。
             if (shareExcerptRecorder) await shareExcerptRecorder.flush();
 
             // B2 空回复可见化：正文空 + 无工具调用 + 漏斗没产出过可见消息时，
@@ -2410,9 +2420,16 @@ export const useChatAI = ({
             // 旧轮的错误不刷到新会话 UI（消息本身归属 char.id 存对了地方，只是不主动刷新）。
             if (turnAlive()) setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
         } finally {
-            // 分享片段记录兜底：成功/失败/中断都经过这里，等已排队的写入落地（逐次落库后通常是 no-op）。
-            // flush 永不 reject；写库失败的批次不会被标记为已写，下一轮同 id 记录会再写一次。
-            if (shareExcerptRecorder) await shareExcerptRecorder.flush();
+            // 分享片段记录兜底：成功/失败/中断都经过这里。flush 会等排队写入落地，并对失败批次
+            // 做有界重试；重试仍失败时 recorder 内部已 console.error 明确「未保存·待补偿」，
+            // 这里再把快照打到日志，便于按 anchor 追查（不再承诺「已保存」）。
+            if (shareExcerptRecorder) {
+                await shareExcerptRecorder.flush();
+                const excerptPersist = shareExcerptRecorder.snapshot();
+                if (excerptPersist.unsaved) {
+                    console.error('[share-excerpt] 本轮工具记录未写入历史，保留在待补偿队列：', excerptPersist);
+                }
+            }
             KeepAlive.stop();
             // 旧轮不碰 UI 状态：新轮活着时 typing 灯和预览属于它；切角色时灯已由 char?.id effect 熄过。
             // （卸载时组件已死，setter 皆为 no-op。）

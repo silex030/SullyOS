@@ -28,6 +28,7 @@ import {
   SHARE_EXCERPTS_TOOL_NAME,
   ShareExcerptBudget,
   ShareExcerptPairRecorder,
+  ShareExcerptPairOutbox,
   hasReadableShareExcerptTarget,
 } from './socialShareTool';
 
@@ -837,38 +838,6 @@ describe('read_share_excerpts · call/result 成对落历史（不依赖最终�
     expect(replayed[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
   });
 
-  it('落库失败不阻断工具结果，失败批次不标记已写（重试能补上）', async () => {
-    stubShareServer();
-    // 这条路径本来就会 console.warn（失败的可见信号），测试里静音以免污染输出
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    let attempts = 0;
-    const store = new Map<number, any>();
-    const saver = async (id: number, records: readonly any[]) => {
-      attempts += 1;
-      if (attempts === 1) throw new Error('IDB quota');
-      store.set(id, attachShareExcerptPairs(store.get(id), records));
-    };
-    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver });
-    const turn = makeTurn();
-    const outcome = await dispatchShareExcerptToolCall({
-      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
-      turn,
-      recorder,
-    });
-    // 工具结果照常给模型（落库失败只影响下一轮回放）
-    expect(outcome.ok).toBe(true);
-    expect(outcome.text).toContain('第一段字幕');
-    expect(recorder.snapshot()).toMatchObject({ recorded: 0, failures: 1 });
-    expect(recorder.has(outcome.record.toolCallId)).toBe(false);
-
-    await recorder.record([outcome.record]); // 重试同一批
-    expect(recorder.has(outcome.record.toolCallId)).toBe(true);
-    expect(attempts).toBe(2);
-    expect(store.get(101)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
-  });
-
   it('写入串行化：并发 record 的 read-modify-write 不互相覆盖', async () => {
     const store = new Map<number, any>();
     let inFlight = 0;
@@ -897,20 +866,203 @@ describe('read_share_excerpts · call/result 成对落历史（不依赖最终�
     expect(store.get(5)[SHARE_EXCERPT_META_KEY].pairs.map((p: any) => p.call.toolCallId)).toEqual(['a', 'b']);
   });
 
-  it('拿不到本轮触发消息 id 时不写、也不挂到别的消息上（宁缺勿错挂）', async () => {
+  it('瞬时写库失败：只走生产收尾 flush 就能补写（不需要再手工 record 一次）', async () => {
     stubShareServer();
-    const { store, writes, saver } = memoryStore();
-    const recorder = new ShareExcerptPairRecorder({ anchorId: null, savePairs: saver });
+    // 失败的这一轮会 console.warn（可见信号），测试里静音以免污染输出
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let attempts = 0;
+    const store = new Map<number, any>();
+    const saver = async (id: number, records: readonly any[]) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('IDB quota');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver });
     const turn = makeTurn();
     const outcome = await dispatchShareExcerptToolCall({
-      toolCall: toolCallFor({ shareRef: SHARE_REF }),
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }),
       turn,
       recorder,
     });
+
+    // 第一次写库失败：工具结果照常给模型，记录没被标成已写、也没被丢掉
     expect(outcome.ok).toBe(true);
+    expect(outcome.text).toContain('第一段字幕');
+    expect(recorder.snapshot()).toMatchObject({ recorded: 0, failures: 1, pendingRecords: 1, unsaved: true });
+    expect(recorder.has(outcome.record.toolCallId)).toBe(false);
+
+    // 生产收尾只有 flush（useChatAI 成功尾部/finally 就是这么调），这里不再手工 record
+    await recorder.flush();
+    expect(attempts).toBe(2);
+    expect(recorder.has(outcome.record.toolCallId)).toBe(true);
+    expect(recorder.snapshot()).toMatchObject({ recorded: 1, pendingRecords: 0, unsaved: false });
+    const pairs = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+    expect(pairs[0].call.args.shareRef).toBe(SHARE_REF);
+    expect(pairs[0].result.ok).toBe(true);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('收尾两个 flush 各自有界重试：第一次用尽仍失败、第二次（finally）补上', async () => {
+    stubShareServer();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const report = vi.fn();
+    let attempts = 0;
+    const store = new Map<number, any>();
+    const saver = async (id: number, records: readonly any[]) => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error('db busy');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const recorder = new ShareExcerptPairRecorder({
+      anchorId: 101,
+      savePairs: saver,
+      maxAttemptsPerFlush: 1,
+      reportUnsaved: report,
+    });
+    const turn = makeTurn();
+    await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: SHARE_REF }), turn, recorder });
+    await recorder.flush(); // 成功尾部：dispatch(1) + flush(1) 都失败
+    expect(attempts).toBe(2);
+    expect(recorder.snapshot().unsaved).toBe(true);
+    expect(report).toHaveBeenCalledTimes(1);
+
+    await recorder.flush(); // finally：第 3 次成功
+    expect(attempts).toBe(3);
+    expect(recorder.snapshot()).toMatchObject({ recorded: 1, pendingRecords: 0, unsaved: false });
+    expect(store.get(101)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+  });
+
+  it('后续新调用不遗漏旧失败批次：一次写成功把旧+新按顺序补上', async () => {
+    stubShareServer();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let attempts = 0;
+    const store = new Map<number, any>();
+    const saver = async (id: number, records: readonly any[]) => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error('db busy');
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const recorder = new ShareExcerptPairRecorder({ anchorId: 101, savePairs: saver, maxAttemptsPerFlush: 1 });
+    const turn = makeTurn();
+    const first = await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, fields: ['transcript'] }, 'call_a'),
+      turn,
+      recorder,
+    });
+    await recorder.flush(); // 生产收尾：仅 1 轮尝试 → 仍失败
+    expect(first.ok).toBe(true);
+    expect(store.size).toBe(0);
+    expect(recorder.snapshot()).toMatchObject({ recorded: 0, pendingRecords: 1 });
+
+    // 后一次工具调用（新调用）触发写入时，旧失败批次必须一起补上，且仍挂在原锚点上
+    await dispatchShareExcerptToolCall({
+      toolCall: toolCallFor({ shareRef: SHARE_REF, query: '第二段' }, 'call_b'),
+      turn,
+      recorder,
+    });
+    expect(recorder.snapshot()).toMatchObject({ recorded: 2, pendingRecords: 0, unsaved: false });
+    const pairs = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs.map((p: any) => p.call.toolCallId)).toEqual(['call_a', 'call_b']);
+    expect(pairs[0].call.args.fields).toEqual(['transcript']);
+    expect(pairs[0].result.text).toContain('第一段字幕');
+    expect(pairs[1].call.args.query).toBe('第二段');
+  });
+
+  it('持续写库失败：明确「未保存 + 待补偿」，由下一轮收尾写回原锚点（不挂新轮次）', async () => {
+    stubShareServer();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const reported: any[] = [];
+    const saverBad = async () => { throw new Error('quota exhausted'); };
+    const outbox = new ShareExcerptPairOutbox();
+    const recorder = new ShareExcerptPairRecorder({
+      anchorId: 101,
+      savePairs: saverBad,
+      outbox,
+      maxAttemptsPerFlush: 2,
+      reportUnsaved: (info) => reported.push(info),
+    });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: SHARE_REF }), turn, recorder });
+    await recorder.flush(); // dispatch 1 次 + flush 2 次 = 3 次全失败
+
+    expect(outcome.ok).toBe(true); // 工具结果不受落库失败影响
+    const snap = recorder.snapshot();
+    expect(snap).toMatchObject({ recorded: 0, pendingRecords: 1, outboxPending: 1, unsaved: true });
+    expect(snap.failures).toBe(3);
+    expect(snap.lastError).toContain('quota');
+    // 可见的失败/待补偿语义：不是只 console.warn 一下就当作保存成功
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toMatchObject({ anchorId: 101, pending: 1 });
+
+    // 下一轮（新 recorder / 新触发消息）用同一份待补偿队列收尾 → 写回**原来的**锚点
+    const store = new Map<number, any>();
+    const saverGood = async (id: number, records: readonly any[]) => {
+      store.set(id, attachShareExcerptPairs(store.get(id), records));
+    };
+    const nextTurn = new ShareExcerptPairRecorder({ anchorId: 404, savePairs: saverGood, outbox });
+    await nextTurn.flush();
+    expect(outbox.pendingCount()).toBe(0);
+    expect(store.has(404)).toBe(false); // 绝不挂到新轮次上
+    const pairs = store.get(101)[SHARE_EXCERPT_META_KEY].pairs;
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].call.toolCallId).toBe(outcome.record.toolCallId);
+    expect(pairs[0].call.args.shareRef).toBe(SHARE_REF);
+    expect(pairs[0].result.ok).toBe(true);
+    expect(pairs[0].result.text.length).toBeGreaterThan(0);
+  });
+
+  it('没有确定的本轮持久化锚点：读取前就拒绝（HISTORY_UNAVAILABLE），零请求零落库', async () => {
+    const { calls } = stubShareServer();
+    const { store, writes, saver } = memoryStore();
+    const recorder = new ShareExcerptPairRecorder({ anchorId: null, savePairs: saver });
+    const turn = makeTurn();
+    const outcome = await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: SHARE_REF }), turn, recorder });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.code).toBe('HISTORY_UNAVAILABLE');
+    expect(outcome.chargedTokens).toBe(0);
+    expect(outcome.text).toContain('HISTORY_UNAVAILABLE');
+    expect(calls).toHaveLength(0); // 一次网络请求都不发
     expect(writes).toHaveLength(0);
     expect(store.size).toBe(0);
+    expect(recorder.snapshot()).toMatchObject({ recorded: 0, pendingRecords: 0, outboxPending: 0 });
+    // 这次被拒的调用本身仍在 turn.calls（本轮内存可见），但没有任何“读到了”的片段
+    expect(turn.calls).toHaveLength(1);
+    expect(turn.calls[0].code).toBe('HISTORY_UNAVAILABLE');
+    expect(turn.calls[0].resultText).not.toContain('第一段字幕');
+
+    // 完全没有 recorder 也一样拒绝：生产路径不允许「读了却不落」
+    const bare = await dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: SHARE_REF }), turn });
+    expect(bare.code).toBe('HISTORY_UNAVAILABLE');
+    expect(calls).toHaveLength(0);
+    // 锚点推导本身不猜：非数值/零/负数 id 一律 null
     expect(pickShareExcerptTurnAnchor([{}, { id: 'oops' }, { id: null }])).toBeNull();
+  });
+
+  it('无锚点轮与有锚点轮并发：只写有锚点那条消息，拒绝轮零历史、不串轮', async () => {
+    stubShareServer(null, { [DUAL.idA]: cardRecord(DUAL.idA, 'A卡') });
+    const { store, saver } = memoryStore();
+    const msgA = { id: 301, metadata: { shares: { version: 1, attachments: [dualCardMessage().metadata.shares.attachments[0]] } }, role: 'user', type: 'text', content: 'A', charId: 'c' };
+    const turnA = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
+    const turnNoAnchor = createShareExcerptTurn([msgA], { endpoint, now: () => 1_000 })!;
+    const recA = new ShareExcerptPairRecorder({ anchorId: pickShareExcerptTurnAnchor([msgA]), savePairs: saver });
+    const recNoAnchor = new ShareExcerptPairRecorder({ anchorId: null, savePairs: saver });
+
+    const [withAnchor, rejected] = await Promise.all([
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_1'), turn: turnA, recorder: recA }),
+      dispatchShareExcerptToolCall({ toolCall: toolCallFor({ shareRef: DUAL.refA, fields: ['transcript'] }, 'call_1'), turn: turnNoAnchor, recorder: recNoAnchor }),
+    ]);
+
+    expect(withAnchor.ok).toBe(true);
+    expect(rejected.code).toBe('HISTORY_UNAVAILABLE');
+    expect([...store.keys()]).toEqual([301]);
+    expect(store.get(301)[SHARE_EXCERPT_META_KEY].pairs).toHaveLength(1);
+    expect(store.get(301)[SHARE_EXCERPT_META_KEY].pairs[0].result.text).toContain('A卡字幕片段内容');
+    expect(recNoAnchor.snapshot()).toMatchObject({ recorded: 0, outboxPending: 0 });
   });
 });
 

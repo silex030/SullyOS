@@ -197,7 +197,7 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 | 位置 | 改动 |
 | --- | --- |
 | `utils/socialShareTool.ts`（新） | 工具 schema、可读集合、引用解析、预算、执行、成对记录器（`ShareExcerptPairRecorder`）与投影 —— 纯逻辑，可单测 |
-| `hooks/useChatAI.ts` | 五处接线：注入工具、工具循环入口、按名分发（`dispatchShareExcerptToolCall`＝执行+立刻落库）、收尾 flush、降级提示 |
+| `hooks/useChatAI.ts` | 六处接线：注入工具（**拿不到持久化锚点时不注入**）、工具循环入口、按名分发（`dispatchShareExcerptToolCall`＝执行+立刻落库）、成功尾部与 `finally` 两处收尾 flush（有界重试，仍失败明确上报「未保存·待补偿」）、降级提示 |
 | `utils/messageFormat.ts` | `normalizeMessageContent` 把 `metadata.shareExcerpts` 成对投影进下一轮 |
 | `utils/socialShare.ts` | `fetchShareExcerpts` 未改；**只改了模型投影**：`[分享 …]` 用完整 shareRef（见 §8.6） |
 
@@ -238,6 +238,7 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 | `SHARE_REF_AMBIGUOUS` | 抄短的 shareRef 命中多张卡（结果里给候选完整值） | 照抄其中一个完整值重试，或基于简介回答 |
 | `SHARE_REF_INVALID` | shareRef 形状不对（URL/路径等） | 照抄上下文里的完整值，别再构造 |
 | `TURN_BUDGET_EXHAUSTED` / `TOOL_CALL_LIMIT` / `DUPLICATE_TOOL_CALL` | 超预算/超次数/复读 | 基于已有简介回答 |
+| `HISTORY_UNAVAILABLE` | 本轮拿不到确定的持久化锚点（没有触发消息 id），读到的片段没地方成对落库 | 不读取；基于已有简介回答 |
 | `VERSION_UNAVAILABLE` / `CONTENT_NOT_FOUND` / `TIMEOUT` / `NETWORK_ERROR` / `SHARE_LINKS_DISABLED` | 服务端透传的真实失败 | 如实说明片段不可用 |
 
 每种失败文本都带同一句收口：「片段没有读到……不要声称自己读过原文/字幕/评论」。
@@ -259,16 +260,25 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 
 - **请求内**：`assistant(tool_calls)` + `role:tool`（`tool_call_id` 相同）成对进消息数组，
   下一跳请求与最终回复都基于这份成对记录。
-- **落库时机**：每执行完一次工具就成对写一次（`dispatchShareExcerptToolCall` →
-  `ShareExcerptPairRecorder.record`），**不等**最终自然语言回复、也不等后处理成功。
+- **落库时机**：每执行完一次工具就成对写一次（`dispatchShareExcerptToolCall` → `ShareExcerptPairRecorder.record`），**不等**最终自然语言回复、也不等后处理成功。
   模型失败 / 用户取消 / 空回复 / 后处理抛错时，已经读过的调用都已经在库里。
 - **落库位置**：**本轮触发消息**（`contextMsgs` 最后一条，发送前就已落库、id 确定）的
   `metadata.shareExcerpts`。不用「生成开始后最近 30 条里找 assistant」这种时间戳猜锚点，
-  因此也不会挂到并发的其它轮次上。拿不到触发消息 id 时**不写也不猜**（宁缺勿错挂）。
+  因此也不会挂到并发的其它轮次上。
+- **无锚不读**（返工第 2 轮）：拿不到触发消息 id 时**不读**——`useChatAI` 直接不注入工具，
+  `dispatchShareExcerptToolCall` 也返回 `HISTORY_UNAVAILABLE` 且一次请求都不发。
+  理由：读到了却没有确定落库位置，就是「读过却没有记录」，下一轮回放不出来，模型只能凭记忆复述，
+  等于给了一个无法追溯的来源。宁可不给片段，也不给不留痕的片段。
 - **幂等与串行**：`toolCallId` 去重（内存 + `attachShareExcerptPairs` 落库侧各一次），
-  重复提交/DB 重试不产生重复对；写入排在同一条 promise 链上，避免并发 read-modify-write 互相覆盖。
-- **失败可见**：写库失败不阻断工具结果（`console.warn` + 计数），失败批次不标记已写，
-  下一批 `record`/`flush` 会重试。
+  重复提交/DB 重试不产生重复对；同一记录器内的写入排在同一条 promise 链上，避免并发
+  read-modify-write 互相覆盖。
+- **写库失败 = 未保存 + 待补偿**（返工第 2 轮，`ShareExcerptPairOutbox`）：
+  失败的批次**留在待补偿队列**里，不标记已写、也不当作已保存；下一次工具调用（`record`）
+  与收尾 `flush` 会按原始锚点**有界重试**（每次 flush 最多 `SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts = 3` 轮，
+  hook 有两个收尾点，所以一整轮最多 6 轮 + 每次调用自带 1 轮）。队列按「每条消息 ≤16 条 / ≤8 条消息」
+  封顶，超限丢最旧并 `console.error`。重试用尽仍失败 → `snapshot().unsaved === true` +
+  `console.error`「工具记录未能写入历史（待补偿）」，**不承诺已保存**；下一轮收尾还会用同一份队列补写。
+  待补偿队列是进程内内存结构：应用重启后这些记录确实会丢（这在日志里是可见的失败，不是静默）。
 - **下一轮投影**：`normalizeMessageContent` 把这对记录渲染成
   `[read_share_excerpts 记录 · N 次调用]`（≤600 token），`user` 与 `assistant` 角色都会投影
   （正常是 user——记录挂在触发消息上），`system`/`tool` 不背。
@@ -288,16 +298,16 @@ npx vitest run utils/socialShare.test.ts                      → 20 passed
 
 ```
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts
-                                            → 2 files / 45 passed（34 + 11）
+                                            → 2 files / 51 passed（38 + 13）
 npx vitest run $(ls utils/*[cC]hat*.test.ts) → 38 files / 354 passed
 npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.ts \
   utils/mcpToolBridge utils/agenticTools utils/messageFormat utils/socialShare \
   utils/chatRequestPayload worker/social-content utils/socialContent
-                                            → 29 files / 344 passed
+                                            → 29 files / 350 passed
 ```
 
-> 计数口径：返工卡 t_38463abd 的复跑（2026-10-25）为 45 / 354 / 344。
-> 执行卡当时记的 22 + 8 = 30 例、定向 329 例是返工前的数字；返工新增/改写的用例见下，
+> 计数口径：返工第 2 轮（2026-10-25，按 arch-reviewer 第 2 次复核意见）为 51 / 354 / 350。
+> 第 1 轮返工为 45 / 354 / 344；执行卡最初记的 22 + 8 = 30 例、定向 329 例是更早的数字，
 > 旧数字不再作为门禁依据。全量 `tsc` 与 `vite build` 结果记在 `evidence/`（提交内）。
 
 覆盖点：
@@ -311,11 +321,18 @@ npx vitest run utils/socialShareTool.test.ts utils/socialShareTool.wiring.test.t
   抄短成公共前缀 → `SHARE_REF_AMBIGUOUS` 且列出候选、零请求；唯一前缀 → 命中且读到的是
   **那张卡**的内容（断言不含另一张卡的字幕）；URL 形状 → `SHARE_REF_INVALID`；太短/集合外 →
   `SHARE_NOT_IN_CONTEXT`。
-- **落库（返工 P1 第 2 条）**：每执行一次就落一次（`dispatchShareExcerptToolCall`）；
+- **落库（返工 P1 第 2 条 + 第 2 轮）**：每执行一次就落一次（`dispatchShareExcerptToolCall`）；
   取消/网络失败（`AbortError` → `TIMEOUT`）也成对留；两轮并发各写各自触发消息、同 `toolCallId`
-  不串；重复提交与落库侧重放都只留一条；写库失败不阻断工具结果且失败批次可重试；
-  并发 `record` 的 read-modify-write 串行化（最大并发写 = 1，两条记录都在）；
-  无锚点时不写不猜。
+  不串；重复提交与落库侧重放都只留一条；并发 `record` 的 read-modify-write 串行化
+  （最大并发写 = 1，两条记录都在）。
+- **写库失败的收尾路径（返工第 2 轮，不再手工 record 代替生产行为）**：
+  ① dispatch → 首次 `savePairs` 失败 → 只调生产收尾 `flush()` → 第二次写成功并读回完整 call/result；
+  ② 收尾两个 flush 各自有界重试（第一次用尽仍失败、第二次补上）；
+  ③ 后续新调用不遗漏旧失败批次（一次写成功把旧+新按顺序补上，仍挂原锚点）；
+  ④ 持续失败 → `unsaved` + 上报「未保存·待补偿」，下一轮用同一队列写回**原**锚点、不挂新轮次。
+- **无锚点（返工第 2 轮）**：`anchorId = null` 时**读取前**就拒绝（`HISTORY_UNAVAILABLE`）——
+  零 HTTP 请求、零落库、`turn.calls` 里有这条被拒的调用但没有片段；无 recorder 同样拒绝；
+  无锚点轮与有锚点轮并发时只有有锚点那条消息被写，不串轮。
 - 预算：单次夹紧、轮次累计、并发不超卖、小额直接拒绝、同参去重、次数上限、收费按自身重算。
 - 权限：URL/baseUrl/token/scope 拒绝且不发请求；集合外 shareRef/contentId 拒绝；状态不符拒绝；
   cursor 格式校验；shareRef/contentId 映射与错配。
@@ -356,14 +373,36 @@ arch-reviewer 在 `70cdd836` 上发现三处阻塞验收的问题，本节记录
 - 记录不再挂在助手消息上，而是挂在**触发消息**上，因此 `user` 角色的消息也会带
   `[read_share_excerpts 记录]` 投影（≤600 token）。
 
+### 8.11 返工记录（第 2 轮，2026-10-25）
+
+arch-reviewer 在 `fd65b32e` 上复核，认定 P1-2 未闭环（另外两条 P1 已核验通过，保持不变）。修法与复验：
+
+| # | 问题 | 修法 | 复验 |
+| --- | --- | --- | --- |
+| P1-2a | `record` 在 `savePairs` 失败后只 `failures++ / console.warn`，失败批次没保存；`flush()` 只 `return this.queue`，hook 的两处 flush 与下一次 dispatch 都不会补写 → 瞬时故障下记录永久丢失，而文档却承诺「下一批会重试」 | 新增 `ShareExcerptPairOutbox`（待补偿队列）：失败批次留在队列、不标已写；`record` 与 `flush` 都从队列按**原始锚点**写；`flush` 做**有界重试**（每次最多 3 轮）；重试用尽仍失败 → `snapshot().unsaved = true` + `console.error`「未保存·待补偿」，不承诺已保存；队列有界（每消息 16 条 / 8 条消息，超限丢最旧并报错） | `utils/socialShareTool.test.ts`：首次失败→只走生产 `flush()` 补写；两个 flush 各自重试；新调用带走旧失败批次；持续失败→unsaved+上报→下一轮同队列写回原锚点。§8.8 计数 51 |
+| P1-2b | `anchorId = null` 时 `record` 直接跳过存储，`dispatch` 仍返回成功片段（旧测试把这种违约当成功断言） | 无确定锚点**不读**：hook 不注入工具 + `dispatchShareExcerptToolCall` 在读取前返回 `HISTORY_UNAVAILABLE`（零请求）；`snapshot().unsaved` 与 `pendingRecords` 让「没保存」可见 | 同文件：零锚点零请求零落库、无 recorder 同样拒绝、无锚点轮与有锚点轮并发不串轮 |
+
+本轮**未**改模型 / provider / 配置 / 审批 / 权限，未启动任何消息网关，未部署、未合并。
+`evidence/EXECUTION-AUDIT.md` 保持第 1 轮的口径（模型 `deepseek-v4.1-flash` / provider `opencode-go`，
+本 run 同样只有一条 `session_model_usage`），本轮新增证据是测试与构建日志（`evidence/*-r2.log`）。
+
+本轮新增的残余风险（与 §8.9 一起交付）：
+
+- 待补偿队列是**进程内内存**结构：应用重启后未落库的记录确实会丢；丢的时候日志里有明确的
+  `console.error`（不是静默），但不会自动补写到服务端。
+- 两次写库尝试之间没有事务锁：同一 `toolCallId` 若被两个记录器同时写，靠
+  `attachShareExcerptPairs` 落库侧按 id 去重，最多浪费一次写，不会产生重复对。
+
 ## 9. 已知限制（必须带着交付）
 
 1. **三平台真实内容读取未验证**：B 站 412、抖音登录墙、XHS 会话停用。代码遇到这些情况给
    `failed/partial` + 结构化错误，不编造内容。
 2. ~~**按需检索只有 HTTP API，没有注册成模型工具**~~ → **已由执行卡 t_75dd49a5 接上**，
-   并由返工卡 t_38463abd 修掉「可见引用不可执行」「记录只靠最终回复落库」两处缺陷（见 §8.6 / §8.10）：
+   并由返工卡 t_38463abd 修掉「可见引用不可执行」「记录只靠最终回复落库」「写库失败无补偿」
+   「无锚点仍返回片段」四处缺陷（见 §8.6 / §8.10 / §8.11）：
    单次 1200 / 轮次 2400 预算、只认上下文里的分享卡、引用歧义即拒绝、每次调用即时成对落库、
-   失败如实返回。仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
+   写库失败有界重试并在失败时明确「未保存·待补偿」、无锚点不读、失败如实返回。
+   仍未在真实供应商模型上验证「模型会不会主动调」，也仍未部署。
 3. **单进程租约**：租约+唯一约束能防重复建卡与重启卡死，但多进程/多副本同时解析同一内容仍可能
    各跑一次（结果幂等，浪费一次抓取）。真正的跨进程内容单飞未实现。
 4. **内容表是最小实现**：`social_content_items` 一行存整条 ContentRecord（JSON），没有拆

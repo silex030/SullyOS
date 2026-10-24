@@ -51,14 +51,27 @@ describe('read_share_excerpts · useChatAI 接线', () => {
     // 在 try 外声明：成功 / 失败 / 中断三条路径（含 finally）都能收尾
     expect(chatSrc).toMatch(/let shareExcerptRecorder: ShareExcerptPairRecorder \| null = null;/);
     expect(chatSrc).toMatch(/shareExcerptRecorder = shareExcerptTurn\s*\?\s*new ShareExcerptPairRecorder\(\{/);
-    expect(chatSrc).toMatch(/anchorId: pickShareExcerptTurnAnchor\(contextMsgs\)/);
+    expect(chatSrc).toMatch(/anchorId: shareExcerptAnchorId/);
     expect(chatSrc).toMatch(/DB\.updateMessageMetadata\(messageId, \(prev: any\) => attachShareExcerptPairs\(prev, records\)\)/);
     // 返工要求：不再用「最近 30 条里找 assistant」这种猜锚点
     expect(chatSrc).not.toContain('pickShareExcerptAnchor');
     expect(chatSrc).not.toContain('executeShareExcerptToolCall');
-    // 成功尾部与 finally 都等一次写入落地（幂等，重复 flush 是 no-op）
+    // 成功尾部与 finally 都收尾 flush（有界重试；重复 flush 幂等）
     const flushes = chatSrc.match(/await shareExcerptRecorder\.flush\(\)/g) || [];
     expect(flushes.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('写库失败有界重试走生产收尾：共享待补偿队列 + 未保存时明确上报', () => {
+    // 同一进程内跨轮共享的待补偿队列（失败批次下一次 dispatch/flush 还能补写）
+    expect(chatSrc).toMatch(/SHARE_EXCERPT_OUTBOX/);
+    expect(chatSrc).toMatch(/outbox: SHARE_EXCERPT_OUTBOX/);
+    // 收尾仍没落库 → 明确打日志（不静默当作已保存）
+    expect(chatSrc).toMatch(/if \(excerptPersist\.unsaved\) \{\s*console\.error\('\[share-excerpt\] 本轮工具记录未写入历史，保留在待补偿队列：'/);
+  });
+
+  it('拿不到本轮持久化锚点时不注入工具（读完却没地方落库的调用不该存在）', () => {
+    expect(chatSrc).toMatch(/const shareExcerptAnchorId = pickShareExcerptTurnAnchor\(contextMsgs\);/);
+    expect(chatSrc).toMatch(/if \(shareExcerptTurn && shareExcerptAnchorId == null\) shareExcerptTurn = null;/);
   });
 
   it('中转拒绝 tools 时这一轮退回无工具且明确不许假装读过', () => {
@@ -96,5 +109,9 @@ describe('read_share_excerpts · 可见标识与文档', () => {
     expect(doc).toContain('工具接入与预算');
     expect(doc).toContain('SHARE_REF_AMBIGUOUS');
     expect(doc).toContain('ShareExcerptPairRecorder');
+    // 返工第 2 轮：无锚点不读 + 写库失败的真实重试/未保存语义必须写进文档（不能只承诺「会重试」）
+    expect(doc).toContain('HISTORY_UNAVAILABLE');
+    expect(doc).toContain('ShareExcerptPairOutbox');
+    expect(doc).toContain('未保存·待补偿');
   });
 });
