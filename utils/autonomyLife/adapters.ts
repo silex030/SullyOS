@@ -476,7 +476,7 @@ export async function executeAction(
           query: args.query,
           items: read.items,
           fetchedAt: read.fetchedAt,
-          grantId: args.grantId,
+          grantId: `grant:${provider}:${ctx.nowMs}`,
         },
       }));
     }

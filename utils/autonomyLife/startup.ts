@@ -26,13 +26,8 @@ export const LEGACY_AUTONOMY_CONFIG_KEY = 'os_autonomy_guardrails';
 
 export interface LegacyCharacterLike {
   id: string;
-  phoneState?: {
-    autoRefresh?: boolean;
-    autoRefreshIntervalMin?: number;
-    lastAutoRefreshAt?: number;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
+  /** 旧字段类型不确定（不同版本存过 bool/int），运行时按 record 收窄。 */
+  phoneState?: unknown;
 }
 
 export interface LegacyRetirementOptions {
@@ -100,12 +95,13 @@ export async function retireLegacyAutonomyConfig(options: LegacyRetirementOption
   // 2) 角色上的旧自动刷新字段：不删就会跟着备份/旧 bundle 回来。
   for (const character of options.characters) {
     const phoneState = character.phoneState;
-    if (!phoneState) continue;
-    const hasLegacy = 'autoRefresh' in phoneState
-      || 'autoRefreshIntervalMin' in phoneState
-      || 'lastAutoRefreshAt' in phoneState;
+    if (!phoneState || typeof phoneState !== 'object' || Array.isArray(phoneState)) continue;
+    const record = phoneState as Record<string, unknown>;
+    const hasLegacy = 'autoRefresh' in record
+      || 'autoRefreshIntervalMin' in record
+      || 'lastAutoRefreshAt' in record;
     if (!hasLegacy) continue;
-    const { autoRefresh: _a, autoRefreshIntervalMin: _b, lastAutoRefreshAt: _c, ...rest } = phoneState;
+    const { autoRefresh: _a, autoRefreshIntervalMin: _b, lastAutoRefreshAt: _c, ...rest } = record;
     void _a; void _b; void _c;
     await options.saveCharacter({ ...character, phoneState: rest });
     strippedCharacters.push(character.id);

@@ -287,6 +287,13 @@ export function createFixtureAutonomyLifeApi(
     readEvents: async (): Promise<AutonomyLifeApiResult<EventsPayload>> =>
       ok({ items: events, nextSequence: events.length > 0 ? 9 : 0, hasMore: false, resyncRequired: false }),
     cancelAction: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    // 预览 fixture 不模拟执行链：这些方法只满足类型，调用即明确「不可用」。
+    registerDevice: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    claim: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    commitPermit: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    receipt: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    externalRead: async () => fail('CAPABILITY_UNAVAILABLE', 503),
+    submitWish: async () => fail('CAPABILITY_UNAVAILABLE', 503),
     resolveConfirmation: async (decision): Promise<AutonomyLifeApiResult<ActivityRecord>> => {
       if (decision.decision === 'approve') {
         return ok(activity({ id: 'a-5', kind: 'external.read', reasonSummary: '读到一条公开店铺信息', occurredAt: now() }));
