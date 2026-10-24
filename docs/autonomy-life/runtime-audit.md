@@ -6,7 +6,7 @@
 `~/.hermes/state.db`（只用于定位另一个 desktop 会话）与看板 run 表
 （`~/.hermes/kanban.db` 的 `task_runs`）。不是事后自述，也不含任何密钥。
 
-采集时间：2026-10-25 04:10（Asia/Shanghai）。
+采集时间：2026-10-25 07:45（Asia/Shanghai）。
 
 ## 1. run ↔ 会话 ↔ 模型/provider
 
@@ -22,7 +22,11 @@
 | 89 | arch-reviewer | ready / changes_requested | 2026-10-25 03:19:05 | 2026-10-25 03:21:36 | （arch-reviewer 审查 run，无实现会话） |
 | 90 | ds-executor | review / review_requested | 2026-10-25 03:23:10 | 2026-10-25 04:57:07 | `20261025_032319_1d928e` |
 | 94 | arch-reviewer | ready / changes_requested | 2026-10-25 04:57:29 | 2026-10-25 05:01:24 | （arch-reviewer 审查 run，无实现会话） |
-| 95 | ds-executor | running / running | 2026-10-25 05:03:18 | — | `20261025_050331_0ef5f1` |
+| 95 | ds-executor | review / review_requested | 2026-10-25 05:03:18 | 2026-10-25 05:45:34 | `20261025_050331_0ef5f1` |
+| 96 | arch-reviewer | ready / changes_requested | 2026-10-25 05:46:15 | 2026-10-25 05:48:57 | （arch-reviewer 审查 run，无实现会话） |
+| 97 | ds-executor | review / review_requested | 2026-10-25 05:50:13 | 2026-10-25 07:04:19 | `20261025_055024_c9739b` |
+| 98 | arch-reviewer | ready / changes_requested | 2026-10-25 07:04:53 | 2026-10-25 07:07:35 | （arch-reviewer 审查 run，无实现会话） |
+| 99 | ds-executor | running / running | 2026-10-25 07:08:51 | — | `20261025_070859_9c5a60` |
 
 会话库逐条（标题均命中本卡；`model` / `billing_provider` 是会话实际走的通道）：
 
@@ -33,10 +37,12 @@
 | `20261025_013601_e70a16` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 01:36:22 → 2026-10-25 02:20:41 | 123 | 141 | terminal×89, patch×25, read_file×17, write_file×5, browser_exec×4, kanban_show×1 |
 | `20261025_022126_6acdff` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 02:21:35 → 2026-10-25 03:19:22 | 165 | 185 | terminal×140, process_manage×16, kanban_attach×13, write_file×4, patch×3, kanban_show×2, tool_describe×1 |
 | `20261025_032319_1d928e` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 03:23:24 → 2026-10-25 04:59:35 | 187 | 188 | terminal×103, patch×60, read_file×16, execute_code×4, write_file×3, kanban_show×1 |
-| `20261025_050331_0ef5f1`（第四轮返工 run 95） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:03:40 → — | 142 | 142 | terminal×85, patch×26, read_file×13, execute_code×12, write_file×4, process_manage×1, kanban_show×1 |
+| `20261025_050331_0ef5f1`（第四轮返工 run 95） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:03:40 → 2026-10-25 05:46:08 | 340 | 169 | terminal×103, patch×29, execute_code×14, read_file×13, write_file×4, kanban_show×2, kanban_request_review×1, kanban_attachments×1 |
+| `20261025_055024_c9739b`（第五轮返工 run 97） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:50:35 → 2026-10-25 07:04:27 | 390 | 194 | terminal×84, execute_code×26, read_file×24, tool_call×24, patch×22, kanban_attach×6, write_file×3, kanban_show×1, kanban_request_review×1, kanban_comment×1 |
+| `20261025_070859_9c5a60`（第六轮返工 run 99，本轮，采集于送审前） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 07:09:06 → — | — | 115 | terminal×51, read_file×22, patch×20, tool_call×12, execute_code×8, kanban_show×2 |
 
-- 六个会话（含两个 **crashed** run 66 / 78 与返工 run 83 / 90 / 95）的 `model` 全部是
-  `deepseek-v4.1-flash`，`billing_provider` 全部是 `opencode-go`；
+- 八个实现会话（含两个 **crashed** run 66 / 78 与返工 run 83 / 90 / 95 / 97 / 99）的 `model`
+  全部是 `deepseek-v4.1-flash`，`billing_provider` 全部是 `opencode-go`；
 - 两张崩溃 run 的会话行还在（`end_reason=cli_close`）：崩溃后进程退出，改动留在工作树里，
   下一轮 run 接着做——不存在「换模型 / 换 provider 重跑」的痕迹；
 - `model_config` 里的 `reasoning_config.effort=high` 是本 profile 的既有配置
@@ -44,7 +50,7 @@
 
 ## 2. 工具操作范围（有没有越界）
 
-对上述五个会话的 `messages.tool_calls` 做精确正则扫描（不是模糊包含）：
+对上述八个实现会话的 `messages.tool_calls` 做精确正则扫描（不是模糊包含）：
 
 - `hermes\s+config\s+set`：**0 命中**
 - `hermes\s+gateway` / `gateway\s+(start|run)`：**0 次执行**（run 83 里的命中是
@@ -54,6 +60,10 @@
   `npm publish` 的 GLOB 命中各 1–2 条，**全部是本轮审计命令自身的字样**（就是上面那行扫描
   语句本身，出现在 `tool_calls` 里），没有一条是真正的执行；工具直方图见上表（无任何
   `config set` / 网关启动 / 部署类工具调用）。
+- run 97（第五轮返工）/ run 99（本轮，第六轮返工）按同一套正则逐条扫描：六类模式**全部 0 命中**
+  （含 `terminal` 参数原文与工具名两层）；本轮新增的唯一「系统级」动作是只读查询
+  `sqlite3 -readonly`（sessions / kanban.db）与仓库内 `pnpm run build` / `npx vitest` /
+  `node scripts/autonomy-e2e/run.mjs`。
 
 即：实现过程只做「读文件 / 改仓库文件 / 跑测试与构建 / 写看板」，没有改 Hermes 配置、
 没有启动消息网关、没有部署。工具直方图见上表（terminal / patch / read_file / write_file /

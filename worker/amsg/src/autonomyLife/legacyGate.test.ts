@@ -520,3 +520,105 @@ describe('旧链路效果：外部授权与核销原子条件（真 SQLite）', 
     expect(await kindCount()).toBe(0);
   });
 });
+
+/**
+ * 授权窗口额度的**最终核销**（第六轮返工）：kind 名额核销完 → 授权额度核销前的窗口。
+ *
+ * 以前这里按「读边界时拿到的 `grant.dailyQuota`」调 `consumeExternalQuota`，语句里既没有
+ * 边界 revision 也不看当前授权，所以在这两步之间收紧额度 / 撤权 / 暂停仍会返回成功效果。
+ * 现在额度、授权有效期与两层 revision 都在 `consumeExternalQuotaAtomic` 的同一条 WHERE 里。
+ */
+describe('旧链路效果：授权额度的最终核销必须原子（真 SQLite）', () => {
+  const externalUsed = async (): Promise<number> => Number(
+    (await db
+      .prepare('SELECT used FROM autonomy_life_external_usage WHERE owner_id = ? AND day_key = ? AND provider = ?')
+      .bind(USER, '2026-10-24', 'amap')
+      .first())?.used ?? 0,
+  );
+  const kindCount = async (): Promise<number> => {
+    const row = await db
+      .prepare('SELECT kind_counts FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+      .bind(USER, WINDOW, CHAR)
+      .first();
+    return Number(JSON.parse(String(row?.kind_counts ?? '{}'))['travel.wish'] ?? 0);
+  };
+
+  const travelBoundary = (overrides: Record<string, unknown> = {}) => seedNewBoundary({
+    allowedKinds: ['interaction.message', 'travel.wish'],
+    externalGrants: [amapGrant()],
+    ...overrides,
+  });
+
+  it('正向：一条愿望同时只扣 1 格 kind 与 1 次授权额度', async () => {
+    await travelBoundary();
+    await registerCharacter();
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(result).toEqual({ ok: true });
+    expect(await kindCount()).toBe(1);
+    expect(await externalUsed()).toBe(1);
+  });
+
+  it('kind 核销之后、额度 UPDATE 之前收紧到 0（同 revision）→ 按当前限额拒绝，额度零新增', async () => {
+    await travelBoundary();
+    await registerCharacter();
+    let injected = false;
+    db = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (!injected && text.includes('UPDATE autonomy_life_external_usage')) {
+          injected = true;
+          // 只改 payload 的额度、不 bump revision：证明不是按读边界时的旧 limit 放行。
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET payload = json_set(payload, '$.externalGrants[0].dailyQuota', 0)
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+
+    const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+    expect(injected).toBe(true);
+    expect(result).toEqual({ ok: false, reason: 'external_quota_exhausted' });
+    expect(await externalUsed()).toBe(0);
+  });
+
+  it('kind 核销之后、额度 UPDATE 之前撤权 / 暂停 → boundary_changed，额度零新增', async () => {
+    for (const scenario of ['revoke', 'pause'] as const) {
+      await travelBoundary();
+      await registerCharacter();
+      let injected = false;
+      db = createSqliteD1(sql, {
+        beforeStatement: (text) => {
+          if (!injected && text.includes('UPDATE autonomy_life_external_usage')) {
+            injected = true;
+            const payload = scenario === 'revoke'
+              ? "json_remove(payload, '$.externalGrants')"
+              : "json_set(payload, '$.globalPaused', json('true'))";
+            sql.prepare(`UPDATE autonomy_life_boundaries
+                SET revision = revision + 1, payload = ${payload}
+                WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+              .run(USER);
+          }
+        },
+      }) as unknown as LifeDb;
+      resetAutonomyLifeSchemaCacheForTesting();
+      await ensureAutonomyLifeSchema(db);
+
+      const result = await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' });
+      expect(result, scenario).toEqual({ ok: false, reason: 'boundary_changed' });
+      expect(await externalUsed(), scenario).toBe(0);
+    }
+  });
+
+  it('授权额度刚好用完时：同一条语句挡住第二次（不超卖）', async () => {
+    await travelBoundary({ externalGrants: [amapGrant({ dailyQuota: 1 })] });
+    await registerCharacter();
+    expect(await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' }))
+      .toEqual({ ok: true });
+    expect(await reserveLegacyEffect({ db, ownerId: USER, charId: CHAR, nowMs: NOW, kind: 'travel.wish' }))
+      .toEqual({ ok: false, reason: 'external_quota_exhausted' });
+    expect(await externalUsed()).toBe(1);
+    expect(await kindCount()).toBe(1);
+  });
+});

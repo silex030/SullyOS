@@ -1,0 +1,26 @@
+# t_984b3cfc 第六轮（架构审查 request_changes 第 6 轮）证据清单
+# 代码提交: 见送审 HEAD（本清单与代码同一提交；save 后由 git show 复核）
+# 生成时间(UTC): 2026-10-24 23:45:25 UTC
+# 说明: evidence/ 下全部原始日志与代码同源，均为原始 stdout/stderr（未裁剪）。sha256 供逐字节复核。
+# 读取: gunzip -c <file>.gz | less
+
+60077f48b47709ca0d3b27a4d7e00b0a15b672c1d1b0235a3481cf6776af1fce  README.md
+7b34302405ea6592e5a77ec1e44ee24c0624a65fafac6216004c080d9744a2d2  build.log.gz
+ef3acbd0630949802998fdab210e0288baba3c58dafc52152afac50798c6ac53  e2e-http-requests.json.gz
+14cdd14131b5122f53c2ded00a3bf4353869fe539019491083d4947af72ea118  e2e-report.json.gz
+e4fa87c013c635625cad75a8983ec4a5fe9275e8e20e6c5f0e7ffb75df2d71ee  e2e-run.log.gz
+5da00e2b3b57366ab3b4241be85b49fa7333cd1a5c8c6bbeaf4033d3d241545a  focused.log.gz
+458df6968c4a8cebc7e1a6b81de2c4a8738e29d3b9dc407b0651611478c31911  legacy-grep.log.gz
+12034c2cf4ca3c3f949de3f8a13ca76e72757532864630f1d92e77cb9e23f4f8  runtime-audit.md.gz
+08f3e4bd8d902f39980001e8af371ecc1c2d9db85f74924f4b3f183187dd319c  tsc-baseline.log.gz
+5128fce725ab93b3250dbef871d287df1c2e411e12a5588893c6c321ae18a46d  tsc-compare.txt
+114cb1444b132620fb7904b0f347b88b7addc56713199f7a746902bbb442c515  tsc-current.log.gz
+12fafb94e76377e2cbef96c289def9fbe230fa1ef44f4350a0a1448c252b605b  vitest-full.log.gz
+
+# 运行命令（原始 stdout/stderr，未裁剪）:
+#   npx vitest run                                  -> 624 files / 7636 tests, EXIT 0 (166.0s)
+#   npx vitest run <focused list>                   -> 42 files / 921 tests, EXIT 0
+#   npx tsc --noEmit -p tsconfig.json               -> 56 errors (baseline 56, diff empty), EXIT 2
+#   pnpm run build                                  -> EXIT 0 (vite built in 2m 5s)
+#   node scripts/autonomy-e2e/run.mjs               -> 40/40 checks, EXIT 0
+#   bash scripts/autonomy-legacy-grep-audit.sh      -> EXIT 0

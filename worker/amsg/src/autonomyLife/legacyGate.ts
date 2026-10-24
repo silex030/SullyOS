@@ -44,8 +44,13 @@ import {
 } from '../../../../utils/autonomyLife/budget';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
 import type { AutonomyTickPack } from '../autonomyScheduler';
-import { consumeExternalQuota } from './external';
-import { consumeLegacyQuotaAtomic, createD1BudgetPort, readBudgetRows, type LifeDb } from './store';
+import {
+  consumeExternalQuotaAtomic,
+  consumeLegacyQuotaAtomic,
+  createD1BudgetPort,
+  readBudgetRows,
+  type LifeDb,
+} from './store';
 
 /** 旧自主回合映射到新边界的 kind（它就是「角色发一条消息」）。 */
 export const LEGACY_AUTONOMY_KIND = 'interaction.message' as const;
@@ -222,6 +227,15 @@ export async function reserveLegacyRoundCall(args: {
   nowMs: number;
   kind?: string;
   reserveTokens?: number;
+  /**
+   * 是否把本次调用的 `kind` 计入角色层 per-kind 配额（默认 true）。
+   *
+   * 出行链路的模型调用必须传 `false`：它的 `kind`（`travel.wish`）只是用来判
+   * 「这条能力有没有被授权」，真正的业务效果计数由**效果核销**
+   * （`reserveLegacyEffect`）负责。两处都记 → 一条合法愿望占两格，
+   * `perKindActionsPerDay = 1` 时首条愿望永远落不了（上一轮退回的问题）。
+   */
+  countKind?: boolean;
 }): Promise<
   | { ok: true; permit: LegacyRoundPermit; boundary: EffectiveBoundaryV1 }
   | { ok: false; reason: LegacyAutonomySkipReason }
@@ -241,6 +255,7 @@ export async function reserveLegacyRoundCall(args: {
   const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
   if (!port.available()) return { ok: false, reason: 'budget_exhausted' };
   const windowId = windowIdAt({ now: () => args.nowMs }, boundary.timezone);
+  const gateKind = args.kind ?? LEGACY_AUTONOMY_KIND;
   const reservation = await reserveBudget(port, {
     nowMs: args.nowMs,
     windowTimezone: boundary.timezone,
@@ -249,7 +264,9 @@ export async function reserveLegacyRoundCall(args: {
     limits: boundary.limits,
     calls: 1,
     tokens: args.reserveTokens ?? LEGACY_ROUND_RESERVE_TOKENS,
-    kind: args.kind ?? LEGACY_AUTONOMY_KIND,
+    // `countKind === false` → 只保留「这次调用属于哪个 kind」的门禁语义（边界/授权已在
+    // 上面判过），**不**把 kind 计数写进预算行：效果配额由效果核销单独占一格。
+    kind: args.countKind === false ? undefined : gateKind,
     planRef: `legacy-round:${args.charId}:${windowId}`,
   });
   if (!reservation.ok) return { ok: false, reason: 'budget_exhausted' };
@@ -431,18 +448,27 @@ async function chargeLegacyQuota(args: {
     return { ok: false, reason: 'budget_exhausted' };
   }
 
-  // kind 名额已经占上；授权窗口的当日额度最后扣。扣不动 → 拒绝写效果（fail closed，
-  // 名额浪费一格是可接受的保守方向：宁可少发，也不越过授权窗口的限额）。
+  // kind 名额已经占上；授权窗口的当日额度最后扣。这一步同样必须**原子绑定当前边界**：
+  // 以前这里用「读边界时拿到的 grant.dailyQuota」去 `consumeExternalQuota`，语句里既没有
+  // 边界 revision 也不看当前授权 → 在这两步之间把额度收紧到 0 / 撤权 / 暂停仍会放行
+  // （上一轮退回的竞态）。现在额度、授权有效性与 revision 全在同一条条件语句里判，
+  // 0 行 → 拒绝写效果（fail closed；浪费一格 kind 名额是可接受的保守方向）。
   if (grant && dayKey) {
-    const quotaOk = await consumeExternalQuota({
+    const quota = await consumeExternalQuotaAtomic({
       db: args.db,
       ownerId: args.ownerId,
+      charId: args.charId,
       dayKey,
       provider: grant.provider,
-      limit: grant.dailyQuota,
       nowMs: args.nowMs,
+      expectedAccountRevision: boundary.accountRevision ?? null,
+      expectedCharacterRevision: boundary.characterRevision ?? null,
     });
-    if (!quotaOk) return { ok: false, reason: 'external_quota_exhausted' };
+    if (!quota.ok) {
+      if (quota.reason === 'boundary_changed') return { ok: false, reason: 'boundary_changed' };
+      if (quota.reason === 'external_quota_exhausted') return { ok: false, reason: 'external_quota_exhausted' };
+      return { ok: false, reason: 'budget_exhausted' };
+    }
   }
   return { ok: true };
 }

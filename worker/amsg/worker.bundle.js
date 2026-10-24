@@ -12184,192 +12184,6 @@ function windowIdAt(clock, timezone) {
   return budgetWindowId(clock.now(), timezone);
 }
 
-// worker/amsg/src/autonomyLife/external.ts
-var EXTERNAL_RESPONSE_FIELDS = {
-  xhs: ["title", "excerpt", "author", "likes", "url"],
-  amap: ["name", "address", "distanceM", "category"]
-};
-var EXTERNAL_TIMEOUT_MS = 8e3;
-var EXTERNAL_MAX_BYTES = 256 * 1024;
-var EXTERNAL_MAX_ITEMS = 5;
-var EXTERNAL_MAX_FIELD_CHARS = 200;
-var parseAllowedHosts = (raw, fallback = []) => {
-  const fromEnv = String(raw ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
-  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
-};
-function isHostAllowed(host, allowlist) {
-  const target = host.trim().toLowerCase();
-  if (!target) return false;
-  return allowlist.some((entry) => {
-    const rule = entry.toLowerCase();
-    if (!rule) return false;
-    if (rule.startsWith("*.")) return target === rule.slice(2) || target.endsWith(rule.slice(1));
-    return target === rule;
-  });
-}
-var IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
-var BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".home", ".lan"];
-var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
-  "localhost",
-  "metadata.google.internal",
-  "metadata.goog",
-  "instance-data"
-]);
-function assertFetchableUrl(raw) {
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    return { ok: false, reason: "invalid_url" };
-  }
-  if (url.protocol !== "https:") return { ok: false, reason: "https_required" };
-  if (url.username || url.password) return { ok: false, reason: "credentials_in_url_forbidden" };
-  if (url.port && url.port !== "443") return { ok: false, reason: "port_forbidden" };
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (!host) return { ok: false, reason: "host_required" };
-  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: "host_forbidden" };
-  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: "host_forbidden" };
-  if (IPV4.test(host)) return { ok: false, reason: "ip_literal_forbidden" };
-  if (host.includes(":")) return { ok: false, reason: "ip_literal_forbidden" };
-  return { ok: true, url };
-}
-function projectItem(raw, fields, allow) {
-  const out = {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
-    if (!allow.includes(field)) continue;
-    const value = raw[field];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      out[field] = value;
-    } else if (typeof value === "string") {
-      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}\u2026` : value;
-    }
-  }
-  return out;
-}
-var ITEM_ARRAY_KEYS = ["items", "data", "results", "pois"];
-function extractItems(payload) {
-  if (Array.isArray(payload)) return payload;
-  if (!payload || typeof payload !== "object") return [];
-  for (const key of ITEM_ARRAY_KEYS) {
-    const value = payload[key];
-    if (Array.isArray(value)) return value;
-  }
-  return [];
-}
-async function discardBody(response) {
-  try {
-    await response.body?.cancel();
-  } catch {
-  }
-}
-async function readBodyLimited(args) {
-  const body = args.response.body;
-  if (!body) return { ok: false, reason: "external_body_unreadable" };
-  const reader = body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: false });
-  let text = "";
-  let totalBytes = 0;
-  try {
-    for (; ; ) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > args.maxBytes) {
-        await reader.cancel().catch(() => void 0);
-        return { ok: false, reason: "response_too_large" };
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-  } catch {
-    await reader.cancel().catch(() => void 0);
-    return {
-      ok: false,
-      reason: args.signal.aborted ? "external_timeout" : "external_body_unreadable"
-    };
-  }
-  return { ok: true, text };
-}
-async function handleExternalRead(args) {
-  const endpoint = String(args.endpoint ?? "").trim();
-  if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
-  const safe = assertFetchableUrl(endpoint);
-  if (!safe.ok) return { ok: false, code: "POLICY_DENIED", reason: safe.reason };
-  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
-    return { ok: false, code: "POLICY_DENIED", reason: "host_not_allowed" };
-  }
-  const url = new URL(safe.url.toString());
-  url.searchParams.set("q", args.query);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
-  let response;
-  try {
-    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
-      method: "GET",
-      redirect: "manual",
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    });
-  } catch {
-    clearTimeout(timer);
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
-  }
-  try {
-    if (response.status >= 300 && response.status < 400) {
-      await discardBody(response);
-      return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
-    }
-    if (!response.ok) {
-      await discardBody(response);
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
-    }
-    const declared = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
-      await discardBody(response);
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
-    }
-    const limited = await readBodyLimited({
-      response,
-      signal: controller.signal,
-      maxBytes: EXTERNAL_MAX_BYTES
-    });
-    if (!limited.ok) {
-      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: limited.reason };
-    }
-    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-function finishRead(args) {
-  const text = args.text;
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_not_json" };
-  }
-  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
-  const fields = args.fields.filter((field) => allow.includes(field));
-  const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
-  return { ok: true, result: { items, fetchedAt: args.nowMs } };
-}
-async function consumeExternalQuota(args) {
-  const limit = Math.max(0, Math.trunc(args.limit));
-  if (limit <= 0) return false;
-  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
-  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
-  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
-  return Number.isFinite(changes) && changes > 0;
-}
-async function insertTravelWish2(args) {
-  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
-  return { wishId };
-}
-
 // utils/autonomyLife/localLedger.ts
 var AUTONOMY_BUSINESS_STORES = [
   "diaries",
@@ -14668,6 +14482,55 @@ async function consumeLegacyQuotaAtomic(input) {
     return { ok: false, reason: "store_unavailable" };
   }
 }
+async function consumeExternalQuotaAtomic(input) {
+  const { db, ownerId, charId, dayKey: dayKey2, provider, nowMs } = input;
+  if (!ownerId || !charId || !dayKey2 || !provider) return { ok: false, reason: "store_unavailable" };
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  const guardBindings = () => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const QUOTA_GUARD = `used < (
+      SELECT COALESCE(json_extract(ge.value, '$.dailyQuota'), 0)
+      FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+      WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+        AND json_extract(ge.value, '$.provider') = ?
+        AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+      LIMIT 1
+    )`;
+  const quotaBindings = () => [ownerId, provider, nowMs];
+  const bump = async () => {
+    const updated = await db.prepare(`UPDATE autonomy_life_external_usage
+        SET used = used + 1, updated_at = ?
+        WHERE owner_id = ? AND day_key = ? AND provider = ?
+          AND ${QUOTA_GUARD}
+          AND ${BOUNDARY_ATOMIC_GUARD}`).bind(nowMs, ownerId, dayKey2, provider, ...quotaBindings(), ...guardBindings()).run();
+    return changesOf4(updated) > 0;
+  };
+  try {
+    if (await bump()) return { ok: true };
+    const inserted = await db.prepare(`INSERT OR IGNORE INTO autonomy_life_external_usage
+        (owner_id, day_key, provider, used, updated_at)
+        SELECT ?, ?, ?, 1, ?
+        WHERE EXISTS (
+          SELECT 1 FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+          WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+            AND json_extract(ge.value, '$.provider') = ?
+            AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+            AND COALESCE(json_extract(ge.value, '$.dailyQuota'), 0) > 0
+        )
+          AND ${BOUNDARY_ATOMIC_GUARD}`).bind(ownerId, dayKey2, provider, nowMs, ...quotaBindings(), ...guardBindings()).run();
+    if (changesOf4(inserted) > 0) return { ok: true };
+    if (await bump()) return { ok: true };
+    const stillCurrent = await db.prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`).bind(ownerId, ownerId, charId).first().catch(() => null);
+    if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: "boundary_changed" };
+    }
+    return { ok: false, reason: "external_quota_exhausted" };
+  } catch {
+    return { ok: false, reason: "store_unavailable" };
+  }
+}
 async function claimTravelDecisionAtomic(input) {
   const { db, ownerId, charId, windowId, nowMs } = input;
   const claimRef = String(input.claimRef ?? "").trim();
@@ -14841,6 +14704,7 @@ async function reserveLegacyRoundCall(args) {
   const port = createD1BudgetPort({ db: args.db, ownerId: args.ownerId });
   if (!port.available()) return { ok: false, reason: "budget_exhausted" };
   const windowId = windowIdAt({ now: () => args.nowMs }, boundary.timezone);
+  const gateKind = args.kind ?? LEGACY_AUTONOMY_KIND;
   const reservation = await reserveBudget(port, {
     nowMs: args.nowMs,
     windowTimezone: boundary.timezone,
@@ -14849,7 +14713,9 @@ async function reserveLegacyRoundCall(args) {
     limits: boundary.limits,
     calls: 1,
     tokens: args.reserveTokens ?? LEGACY_ROUND_RESERVE_TOKENS,
-    kind: args.kind ?? LEGACY_AUTONOMY_KIND,
+    // `countKind === false` → 只保留「这次调用属于哪个 kind」的门禁语义（边界/授权已在
+    // 上面判过），**不**把 kind 计数写进预算行：效果配额由效果核销单独占一格。
+    kind: args.countKind === false ? void 0 : gateKind,
     planRef: `legacy-round:${args.charId}:${windowId}`
   });
   if (!reservation.ok) return { ok: false, reason: "budget_exhausted" };
@@ -14952,15 +14818,21 @@ async function chargeLegacyQuota(args) {
     return { ok: false, reason: "budget_exhausted" };
   }
   if (grant && dayKey2) {
-    const quotaOk = await consumeExternalQuota({
+    const quota = await consumeExternalQuotaAtomic({
       db: args.db,
       ownerId: args.ownerId,
+      charId: args.charId,
       dayKey: dayKey2,
       provider: grant.provider,
-      limit: grant.dailyQuota,
-      nowMs: args.nowMs
+      nowMs: args.nowMs,
+      expectedAccountRevision: boundary.accountRevision ?? null,
+      expectedCharacterRevision: boundary.characterRevision ?? null
     });
-    if (!quotaOk) return { ok: false, reason: "external_quota_exhausted" };
+    if (!quota.ok) {
+      if (quota.reason === "boundary_changed") return { ok: false, reason: "boundary_changed" };
+      if (quota.reason === "external_quota_exhausted") return { ok: false, reason: "external_quota_exhausted" };
+      return { ok: false, reason: "budget_exhausted" };
+    }
   }
   return { ok: true };
 }
@@ -26336,6 +26208,192 @@ async function ensureCharacterLife(runtime, charId, nowMs, timezone) {
   await runtime.store.putCharacterLife(emptyCharacterLife(charId, nowMs, timezone), 0);
 }
 
+// worker/amsg/src/autonomyLife/external.ts
+var EXTERNAL_RESPONSE_FIELDS = {
+  xhs: ["title", "excerpt", "author", "likes", "url"],
+  amap: ["name", "address", "distanceM", "category"]
+};
+var EXTERNAL_TIMEOUT_MS = 8e3;
+var EXTERNAL_MAX_BYTES = 256 * 1024;
+var EXTERNAL_MAX_ITEMS = 5;
+var EXTERNAL_MAX_FIELD_CHARS = 200;
+var parseAllowedHosts = (raw, fallback = []) => {
+  const fromEnv = String(raw ?? "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+  return fromEnv.length ? fromEnv : fallback.map((item) => item.toLowerCase());
+};
+function isHostAllowed(host, allowlist) {
+  const target = host.trim().toLowerCase();
+  if (!target) return false;
+  return allowlist.some((entry) => {
+    const rule = entry.toLowerCase();
+    if (!rule) return false;
+    if (rule.startsWith("*.")) return target === rule.slice(2) || target.endsWith(rule.slice(1));
+    return target === rule;
+  });
+}
+var IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+var BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost", ".home", ".lan"];
+var BLOCKED_HOSTS = /* @__PURE__ */ new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.goog",
+  "instance-data"
+]);
+function assertFetchableUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+  if (url.protocol !== "https:") return { ok: false, reason: "https_required" };
+  if (url.username || url.password) return { ok: false, reason: "credentials_in_url_forbidden" };
+  if (url.port && url.port !== "443") return { ok: false, reason: "port_forbidden" };
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return { ok: false, reason: "host_required" };
+  if (BLOCKED_HOSTS.has(host)) return { ok: false, reason: "host_forbidden" };
+  if (BLOCKED_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return { ok: false, reason: "host_forbidden" };
+  if (IPV4.test(host)) return { ok: false, reason: "ip_literal_forbidden" };
+  if (host.includes(":")) return { ok: false, reason: "ip_literal_forbidden" };
+  return { ok: true, url };
+}
+function projectItem(raw, fields, allow) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const field of fields.slice(0, EXTERNAL_MAX_ITEMS)) {
+    if (!allow.includes(field)) continue;
+    const value = raw[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      out[field] = value;
+    } else if (typeof value === "string") {
+      out[field] = value.length > EXTERNAL_MAX_FIELD_CHARS ? `${value.slice(0, EXTERNAL_MAX_FIELD_CHARS)}\u2026` : value;
+    }
+  }
+  return out;
+}
+var ITEM_ARRAY_KEYS = ["items", "data", "results", "pois"];
+function extractItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  for (const key of ITEM_ARRAY_KEYS) {
+    const value = payload[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+async function discardBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+  }
+}
+async function readBodyLimited(args) {
+  const body = args.response.body;
+  if (!body) return { ok: false, reason: "external_body_unreadable" };
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let text = "";
+  let totalBytes = 0;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > args.maxBytes) {
+        await reader.cancel().catch(() => void 0);
+        return { ok: false, reason: "response_too_large" };
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } catch {
+    await reader.cancel().catch(() => void 0);
+    return {
+      ok: false,
+      reason: args.signal.aborted ? "external_timeout" : "external_body_unreadable"
+    };
+  }
+  return { ok: true, text };
+}
+async function handleExternalRead(args) {
+  const endpoint = String(args.endpoint ?? "").trim();
+  if (!endpoint) return { ok: false, code: "CAPABILITY_UNAVAILABLE", reason: "external_endpoint_unconfigured" };
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, code: "POLICY_DENIED", reason: safe.reason };
+  if (!isHostAllowed(safe.url.hostname, args.allowedHosts)) {
+    return { ok: false, code: "POLICY_DENIED", reason: "host_not_allowed" };
+  }
+  const url = new URL(safe.url.toString());
+  url.searchParams.set("q", args.query);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? EXTERNAL_TIMEOUT_MS);
+  let response;
+  try {
+    response = await (args.fetch ?? globalThis.fetch)(url.toString(), {
+      method: "GET",
+      redirect: "manual",
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
+  } catch {
+    clearTimeout(timer);
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_fetch_failed" };
+  }
+  try {
+    if (response.status >= 300 && response.status < 400) {
+      await discardBody(response);
+      return { ok: false, code: "POLICY_DENIED", reason: "redirect_not_followed" };
+    }
+    if (!response.ok) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: `external_http_${response.status}` };
+    }
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > EXTERNAL_MAX_BYTES) {
+      await discardBody(response);
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "response_too_large" };
+    }
+    const limited = await readBodyLimited({
+      response,
+      signal: controller.signal,
+      maxBytes: EXTERNAL_MAX_BYTES
+    });
+    if (!limited.ok) {
+      return { ok: false, code: "SERVICE_UNAVAILABLE", reason: limited.reason };
+    }
+    return finishRead({ text: limited.text, provider: args.provider, fields: args.fields, nowMs: args.nowMs });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function finishRead(args) {
+  const text = args.text;
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE", reason: "external_not_json" };
+  }
+  const allow = EXTERNAL_RESPONSE_FIELDS[args.provider];
+  const fields = args.fields.filter((field) => allow.includes(field));
+  const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
+  return { ok: true, result: { items, fetchedAt: args.nowMs } };
+}
+async function consumeExternalQuota(args) {
+  const limit = Math.max(0, Math.trunc(args.limit));
+  if (limit <= 0) return false;
+  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
+  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
+  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
+  return Number.isFinite(changes) && changes > 0;
+}
+async function insertTravelWish2(args) {
+  const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
+  return { wishId };
+}
+
 // worker/amsg/src/autonomyLife/routes.ts
 var matchRoute = (request) => {
   const url = new URL(request.url);
@@ -27077,14 +27135,26 @@ async function travelModelAccess(args) {
 function gateTravelDecisionPort(port, deps) {
   if (!port) return null;
   const now = deps.now ?? (() => Date.now());
+  const budgetPort = createD1BudgetPort({ db: deps.db, ownerId: deps.ownerId });
   const gated = async (effect, run) => {
     const reservedAt = now();
+    if (effect === "intent") {
+      const quota = await intentKindQuota({
+        db: deps.db,
+        ownerId: deps.ownerId,
+        charId: deps.charId,
+        nowMs: reservedAt
+      });
+      if (!quota.ok) throw new Error(`autonomy-life-gate:${quota.reason}`);
+    }
     const reserved = await reserveLegacyRoundCall({
       db: deps.db,
       ownerId: deps.ownerId,
       charId: deps.charId,
       nowMs: reservedAt,
-      kind: TRAVEL_MODEL_KIND
+      kind: TRAVEL_MODEL_KIND,
+      // 只判「这条能力有没有被授权」，不记 kind 计数（见上）。
+      countKind: false
     });
     if (!reserved.ok) {
       throw new Error(`autonomy-life-gate:${reserved.reason}`);
@@ -27097,20 +27167,31 @@ function gateTravelDecisionPort(port, deps) {
         db: deps.db,
         permit: reserved.permit,
         actualTokens: null,
-        requestStarted: true
+        requestStarted: true,
+        nowMs: now()
       }).catch(() => void 0);
       throw error;
     }
+    const settleNowMs = now();
     const settled = await settleLegacyRoundCall({
       db: deps.db,
       permit: reserved.permit,
       actualTokens: port.lastUsageTokens?.() ?? null,
-      requestStarted: true
+      requestStarted: true,
+      nowMs: settleNowMs
     });
     if (!settled) {
       throw new Error("autonomy-life-gate:budget_settle_failed");
     }
-    const nowMs = now();
+    const hold = await verifyReservationHold(budgetPort, {
+      reservationId: reserved.permit.reservationId,
+      ownerId: deps.ownerId,
+      windowId: reserved.permit.windowId,
+      charId: deps.charId,
+      nowMs: settleNowMs
+    });
+    if (!hold.ok) throw new Error(`autonomy-life-gate:${hold.reason}`);
+    const nowMs = settleNowMs;
     const read = await readEffectiveBoundary(deps.db, {
       ownerId: deps.ownerId,
       charId: deps.charId,
@@ -27152,6 +27233,27 @@ function gateTravelDecisionPort(port, deps) {
     ...port.lastUsageTokens ? { lastUsageTokens: () => port.lastUsageTokens() } : {},
     ...port.proposeIntent ? { proposeIntent: (input) => gated("intent", () => port.proposeIntent(input)) } : {}
   };
+}
+async function intentKindQuota(args) {
+  const read = await readEffectiveBoundary(args.db, {
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs
+  });
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND) ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, args.nowMs);
+  if (denial) return { ok: false, reason: denial };
+  const windowId = windowIdAt({ now: () => args.nowMs }, read.boundary.timezone);
+  const rows = await readBudgetRows({
+    db: args.db,
+    ownerId: args.ownerId,
+    charId: args.charId,
+    windowId
+  }).catch(() => null);
+  if (!rows) return { ok: false, reason: "budget_exhausted" };
+  const limit = read.boundary.limits.perKindActionsPerDay ?? DEFAULT_ACCOUNT_LIMITS.perKindActionsPerDay;
+  const used = rows.char?.kindCounts?.[TRAVEL_MODEL_KIND] ?? 0;
+  return used >= limit ? { ok: false, reason: "budget_exhausted" } : { ok: true };
 }
 function effectClaimRef() {
   const webCrypto = globalThis.crypto;

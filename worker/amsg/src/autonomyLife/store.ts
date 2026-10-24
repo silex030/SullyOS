@@ -1197,6 +1197,106 @@ export async function consumeLegacyQuotaAtomic(
 }
 
 /**
+ * 授权窗口当日额度的**原子核销**（`/external/*` 与旧链路效果共用口径）。
+ *
+ * 为什么不能沿用「先读 `grant.dailyQuota`、再 `consumeExternalQuota(旧 limit)`」：
+ *   - 那个 limit 是读边界那一刻的旧值。用户如果在「kind 名额核销完 → 授权额度核销前」
+ *     把额度收紧到 0 / 撤权 / 暂停，旧实现仍会按旧 limit 放行并返回成功效果；
+ *   - 那条语句里也拿不到边界 revision，等于读边界与最终核销之间又开了一个竞态窗口。
+ *
+ * 这里把「当前边界 revision + 暂停/开关 + 未过期授权 + **payload 里的当前 dailyQuota**」
+ * 全放进同一条条件语句：
+ *   - `used < (SELECT json_extract(..., '$.dailyQuota'))` → 额度按**执行那一刻**的授权算；
+ *   - 授权被撤/过期 → 子查询为 NULL → 0 行；
+ *   - 边界 revision 变了（暂停/收紧限额/撤权都会 bump revision）→ 0 行；
+ *   - 行不存在时用同样条件的 INSERT 兜底，再 UPDATE 一次（并发下另一条已插入的情形）。
+ * 三条语句任何一条命中即成功；全部 0 行 = 拒绝，且不留下任何行。
+ */
+export async function consumeExternalQuotaAtomic(input: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  dayKey: string;
+  provider: 'amap' | 'xhs';
+  nowMs: number;
+  expectedAccountRevision: number | null;
+  expectedCharacterRevision: number | null;
+}): Promise<
+  | { ok: true }
+  | { ok: false; reason: 'boundary_changed' | 'external_quota_exhausted' | 'store_unavailable' }
+> {
+  const { db, ownerId, charId, dayKey, provider, nowMs } = input;
+  if (!ownerId || !charId || !dayKey || !provider) return { ok: false, reason: 'store_unavailable' };
+
+  const accountRevision = input.expectedAccountRevision ?? -1;
+  const characterRevision = input.expectedCharacterRevision ?? -1;
+  const guardBindings = (): unknown[] => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  // 当前授权额度（执行时读 payload，不看读边界时的旧值）；没有有效授权 → NULL → 条件不成立。
+  const QUOTA_GUARD = `used < (
+      SELECT COALESCE(json_extract(ge.value, '$.dailyQuota'), 0)
+      FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+      WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+        AND json_extract(ge.value, '$.provider') = ?
+        AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+      LIMIT 1
+    )`;
+  const quotaBindings = (): unknown[] => [ownerId, provider, nowMs];
+
+  const bump = async (): Promise<boolean> => {
+    const updated = await db
+      .prepare(`UPDATE autonomy_life_external_usage
+        SET used = used + 1, updated_at = ?
+        WHERE owner_id = ? AND day_key = ? AND provider = ?
+          AND ${QUOTA_GUARD}
+          AND ${BOUNDARY_ATOMIC_GUARD}`)
+      .bind(nowMs, ownerId, dayKey, provider, ...quotaBindings(), ...guardBindings())
+      .run();
+    return changesOf(updated) > 0;
+  };
+
+  try {
+    if (await bump()) return { ok: true };
+
+    const inserted = await db
+      .prepare(`INSERT OR IGNORE INTO autonomy_life_external_usage
+        (owner_id, day_key, provider, used, updated_at)
+        SELECT ?, ?, ?, 1, ?
+        WHERE EXISTS (
+          SELECT 1 FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
+          WHERE g.owner_id = ? AND g.scope = 'account' AND g.char_id = ''
+            AND json_extract(ge.value, '$.provider') = ?
+            AND COALESCE(json_extract(ge.value, '$.expiresAt'), 0) > ?
+            AND COALESCE(json_extract(ge.value, '$.dailyQuota'), 0) > 0
+        )
+          AND ${BOUNDARY_ATOMIC_GUARD}`)
+      .bind(ownerId, dayKey, provider, nowMs, ...quotaBindings(), ...guardBindings())
+      .run();
+    if (changesOf(inserted) > 0) return { ok: true };
+
+    // 另一条并发语句刚好插了行：再试一次条件 UPDATE（不重试就等于把并发放行改成拒绝，
+    // 但「行已存在」不该被误判成额度耗尽）。
+    if (await bump()) return { ok: true };
+
+    // 0 行：把原因说准（非原子，只用于返回码/日志；此刻已经确定「不许」）。
+    const stillCurrent = await db
+      .prepare(`SELECT
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = '') AS ar,
+          (SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?) AS cr`)
+      .bind(ownerId, ownerId, charId)
+      .first()
+      .catch(() => null);
+    if (!stillCurrent
+      || Number(stillCurrent.ar ?? -1) !== accountRevision
+      || Number(stillCurrent.cr ?? -1) !== characterRevision) {
+      return { ok: false, reason: 'boundary_changed' };
+    }
+    return { ok: false, reason: 'external_quota_exhausted' };
+  } catch {
+    return { ok: false, reason: 'store_unavailable' };
+  }
+}
+
+/**
  * 出行模型结果的**一次性效果许可**（`choose` / `nextSegment` 这类不占 kind 额度的决策位）。
  *
  * 一条 INSERT … SELECT 完成：账号/角色边界还是读它时那一版（revision + 暂停/开关）+

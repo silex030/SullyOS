@@ -50,6 +50,8 @@ beforeEach(async () => {
     'autonomy_life_budget',
     'autonomy_life_budget_reservations',
     'autonomy_life_round_claims',
+    'autonomy_life_effect_claims',
+    'autonomy_life_external_usage',
     'autonomy_life_actions',
     'client_state',
     'autonomy_experiences',
@@ -801,5 +803,39 @@ describe('旧自动回合的出行愿望：受统一边界与 kind 配额约束�
     await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
     expect(await countWishes()).toBe(0);
     expect(await countExperiences()).toBe(0);
+  });
+
+  it('kind 核销之后、授权额度核销之前把 amap 额度收紧到 0 → 零新增愿望（其余产物照常）', async () => {
+    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], externalGrants: [amapGrant()] });
+    await seedTravelWishPrereqs();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    let injected = false;
+    const hooked = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        // kind 名额已经占上、授权额度 UPDATE 还没执行：用户此时把额度收紧到 0。
+        if (!injected && text.includes('UPDATE autonomy_life_external_usage')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET revision = revision + 1, payload = json_set(payload, '$.externalGrants[0].dailyQuota', 0)
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    configureAutonomyFireDb(hooked as unknown as AutonomyDb);
+
+    const sink = makeSinkCtx(travelOutput(), { total_tokens: 30 });
+    await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    configureAutonomyFireDb(db as unknown as AutonomyDb);
+
+    expect(injected).toBe(true);
+    expect(await countWishes()).toBe(0);
+    expect(await countExperiences()).toBe(1);
+    expect(Number((await db
+      .prepare('SELECT used FROM autonomy_life_external_usage WHERE owner_id = ?')
+      .bind(USER)
+      .first())?.used ?? 0)).toBe(0);
   });
 });

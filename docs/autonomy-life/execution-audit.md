@@ -8,7 +8,17 @@
 > 更新（本卡）：`docs/autonomy-life/entry-migration.md` 里「后端 D1 端口与 worker 路由
 > 尚未接线」的限制已解除，见第 4 节。
 
-## 0. 本轮（第五轮）返工摘要（对应第五轮复审 comment 的四个阻断项）
+## 0. 本轮（第六轮）返工摘要（对应第六轮复审 comment 的三个阻断项）
+
+| 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler / 真 tick） |
+| --- | --- | --- |
+| 1. 出行探针一次愿望消耗两次 per-kind 额度（额度 1 时正常愿望永远落不了） | 区分「模型调用」与「业务 kind 效果」：`reserveLegacyRoundCall` 新增 `countKind`（默认 true，保持旧回合语义）；出行模型预留传 `countKind:false` —— `kind` 只用于门禁（边界/授权），**不写 kind 计数**；真正的效果配额只在模型返回、边界复核通过后由 `reserveLegacyEffect('travel.wish')` 占**一格**。另加只读预判 `intentKindQuota()`：额度 0/耗尽时意图探针**连模型都不问**（真硬门仍是效果核销） | `legacyGate.ts`、`travelGate.ts`；`travel/legacyGate.integration.test.ts` 新增：真 tick 额度 1 → 一条愿望 + `kind_counts['travel.wish']=1` + 授权额度 1（不是 2）；第二次端口直调在调模型前被拒；`none` / 端口抛错不占 kind；成功路径 `used_calls=1` 照记 |
+| 2. 最终授权配额扣账仍用读边界时的旧 `dailyQuota`，`external_usage` UPDATE 不带边界 revision / 授权 / 暂停 | 新增 `consumeExternalQuotaAtomic()`（`store.ts`）：`used < (SELECT json_extract(payload,'$.externalGrants[*].dailyQuota'))`（**执行时**的当前额度）+ 未过期授权 + 账号/角色 revision + 暂停/开关，全在同一条 UPDATE/INSERT 的 WHERE 里；`chargeLegacyQuota` 不再调旧的 `consumeExternalQuota(旧 limit)`。kind 名额先占、额度后扣的顺序保留（额度失败时浪费一格 kind，不写业务效果） | `store.ts`、`legacyGate.ts`；`legacyGate.test.ts` 新增 4 例：正向 kind=1/额度=1；`beforeStatement` 在额度 UPDATE 前**只改 payload 额度不 bump revision** → `external_quota_exhausted`、额度 0 新增；撤权/暂停（bump revision）→ `boundary_changed`、额度 0 新增；额度刚好 1 时第二笔被同一条语句挡住。另有真 tick 三例 + 真 handler 一例（`autonomyFire.integration.test.ts`）断言**零愿望**、`autonomy_life_external_usage` 零新增 |
+| 3. 出行新效果门在结算/换新 claim 时不校验原预留凭据到期（模型/队列跨过 6h TTL 仍可结算并落愿望/行程） | `gated()` 的结算改传**当前服务端时钟** `nowMs`（成功与异常两条路径都传），`settleBudget` 因此会拒绝过期 held 凭据；结算通过后再用 `verifyReservationHold()` 按 id 复核原凭据（存在/owner/角色/窗口/未释放/未过期/预算行在），通过才允许签效果；效果门与 `claimTravelDecisionAtomic` 使用同一个当前时刻 | `travelGate.ts`；`travel/legacyGate.integration.test.ts` 新增：intent 真 tick 在模型 Promise 内把执行时钟推过 7h（state/`expires_at` 一字节不改）→ 零愿望、凭据仍 `held`、`used_calls=0`；`choose` / `nextSegment` 同口径负例（零效果许可、零已用）；保留期限内正向（choose + nextSegment 各签出一次许可） |
+
+上一轮（第五轮）的返工摘要保留在下面，便于对照。
+
+## 0.1 第五轮返工摘要（对应第五轮复审 comment 的四个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler / 真 tick） |
 | --- | --- | --- |
@@ -19,7 +29,7 @@
 
 上一轮（第四轮）的返工摘要保留在下面，便于对照。
 
-## 0.1 第四轮返工摘要（对应第四轮复审 comment 的四个阻断项）
+## 0.2 第四轮返工摘要（对应第四轮复审 comment 的四个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler） |
 | --- | --- | --- |
@@ -30,7 +40,7 @@
 
 上一轮（第三轮）的返工摘要保留在下面，便于对照。
 
-## 0.2 第三轮返工摘要（第三轮复审 comment 的四条）
+## 0.3 第三轮返工摘要（第三轮复审 comment 的四条）
 
 | 复审意见 | 本轮改动 | 证据 |
 | --- | --- | --- |
@@ -285,7 +295,8 @@ worker/amsg/src/autonomyScheduler.test.ts
    `effectiveGrantFor`）：`travel.wish` / `external.read` 分别要求当前生效边界里有未过期的
    `amap` / `xhs` grant。出行 tick 的 `travelModelAccess`、旧回合的 `reserveLegacyRoundCall`
    （`kind` 参数）与 `reserveLegacyEffect` 都走这道闸；`reserveLegacyEffect` 另外用
-   `consumeExternalQuota` 原子扣授权窗口的 `dailyQuota`（0 / 耗尽 → 拒）。
+   `consumeExternalQuotaAtomic` 原子扣授权窗口的 `dailyQuota`（0 / 耗尽 → 拒；第六轮起额度、
+   授权有效性与边界 revision 在同一条条件语句里，见 §5.3）。
    授权窗口的当日额度用完时，`travelModelAccess` 在**建 wiring 时**就直接不装 `decisionPort`
    ——连模型都不问（问了也落不了愿望，白烧一次调用）。
 2. **出行模型返回后的当前效果门**（`travelGate.ts` 的 `gated`）：
@@ -300,6 +311,23 @@ worker/amsg/src/autonomyScheduler.test.ts
 4. **配额核销的原子条件**（`store.ts` 的 `consumeLegacyQuotaAtomic`）：通知 / per-kind 效果
    的「判额 + 占额」与「账号/角色 revision + 暂停/开关标志 + amap 授权」在同一条
    条件 UPDATE/INSERT 的 WHERE 里；读完边界之后发生的收紧/暂停/撤权会让语句 0 行。
+
+### 5.3 第六轮补的三道闸（复现用例见 §7 与 `evidence/`）
+
+1. **模型调用 ≠ 业务效果计数**（`legacyGate.ts` / `travelGate.ts`）：`reserveLegacyRoundCall`
+   新增 `countKind`（默认 true）。出行模型的 `kind` 只做门禁，`countKind:false` → 不写
+   `kind_counts`；愿望真正落库前由 `reserveLegacyEffect('travel.wish')` 占**一格**。
+   `travelGate.ts` 另加只读预判 `intentKindQuota()`：`perKindActionsPerDay` 为 0 / 已耗尽时
+   意图探针连模型都不问（硬门仍是返回后的效果核销）。
+2. **授权额度最终核销的原子条件**（`store.ts` 的 `consumeExternalQuotaAtomic`）：
+   `used < (SELECT json_extract(payload,'$.externalGrants[*].dailyQuota'))` 用的是**执行时**
+   payload 里的当前额度（不是读边界时的旧值），并与未过期授权 + 账号/角色 revision +
+   暂停/开关写进同一条 UPDATE/INSERT；行不存在时用同样条件的 INSERT 兜底再重试一次 UPDATE。
+   语句 0 行 = 拒绝，且不新增 `autonomy_life_external_usage` 行。
+3. **出行效果门的凭据有效期**（`travelGate.ts` 的 `gated`）：结算传**当前服务端时钟**
+   （成功/异常两条路径都传），`settleBudget` 因此拒过期 held 凭据；结算后再
+   `verifyReservationHold()` 按 id 复核原凭据（owner/角色/窗口/未释放/未过期/预算行在），
+   通过才签效果，`choose`/`nextSegment` 的一次性 claim 与效果门用同一个当前时刻。
 
 
 ## 6. 仍未覆盖（residual risk，交付时如实列出）
@@ -340,29 +368,36 @@ worker/amsg/src/autonomyScheduler.test.ts
 13. **D1 无跨语句事务的结算残影**：`settleBudget` 先推进预留记录、再写预算行；若预算行
     写入失败（存储异常），预留记录可能已是 `settled` 而预算行仍是 `reserved_calls`。
     两种状态都**不可再用**（fail closed），但对账时需要按预留记录核对；不会超额。
+14. **出行模型调用跨过 TTL 返回时不记 `used_calls`**：结算按当前时钟拒绝过期凭据后，
+    这次模型调用的 token/次数**不会**记成 used（凭据停在 `held`，`reserved_calls` 仍占着本窗口，
+    直到 TTL/日切）。这是有意的 fail closed：过期凭据不可再结算、也不可再换效果；
+    代价是「真实花了但账上看在途」，方向是少花不是多花。与 residual 7 同属 pending 对账项。
+15. **授权额度与 kind 名额分别核销**：`travel.wish` 先占 kind 名额、再原子扣授权额度；
+    第二步失败（额度收紧/撤权/暂停）时 kind 名额已消耗（业务效果为零）。
+    选择「先业务配额、后授权额度」是为了不越过授权窗口；反过来会浪费授权额度。
 
 ## 7. 验证日志（本机真实输出，日志作为本任务 durable attachments）
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 909 用例全通过，EXIT 0**（`focused.log.gz`） |
-| 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7624 用例全通过，EXIT 0**（214.3s，`vitest-full.log.gz`，未裁剪） |
+| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 921 用例全通过，EXIT 0**（`focused.log.gz`） |
+| 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7636 用例全通过，EXIT 0**（166.0s，`vitest-full.log.gz`，未裁剪） |
 | 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **两边各 56 条；归一化 worktree / 基线临时路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
-| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 50s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5；`build.log.gz`） |
-| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=/tmp/r5-e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
+| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 2m 5s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5，`consumeExternalQuotaAtomic` = 2；`build.log.gz`） |
+| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=<scratch>/r6/e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
 | 旧入口完整审计（按实际入口） | `bash scripts/autonomy-legacy-grep-audit.sh` | 见 `legacy-grep.log.gz`：旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client.ts` 均 **0 命中**；AIRP 回合、出行 tick 的模型调用与效果落库都有**执行期**统一闸 |
-| 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署 |
+| 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90/95/97/99 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署 |
 
-本轮（第五轮）新增的可复现用例（都在上面两份日志里，真 SQLite / 真 handler / 真 tick）：
+本轮（第六轮）新增的可复现用例（都在上面两份日志里，真 SQLite / 真 handler / 真 tick）：
 
-- `autonomyFire.integration.test.ts`：执行期时钟越 6h TTL → 零经历/零下发；跨日执行 → 通知落在
-  `w:2026-10-25`；读完边界后收紧通知额度+暂停 → 零提醒（私人活动照落）；无 amap 授权 / 读完边界后
-  撤授权 → 零愿望。
-- `legacyGate.test.ts`：缺 amap 授权 / 授权到期 / 授权窗口额度 0 / 额度耗尽 → 拒且零预算行；
-  `beforeStatement` 注入收紧通知额度+暂停 / 撤 amap 授权 → `boundary_changed`。
-- `travel/legacyGate.integration.test.ts`：没有 amap 授权（allowedKinds 与旧设置开着）→ 零模型请求、
-  零愿望；授权到期 → 同上；额度 0 → 模型可问但愿望不落；**模型返回那一刻暂停 / 关角色 / 新增禁区 /
-  撤授权** → 零愿望（`used_calls` 仍为 1）；结算失败 fail closed。
+- `travel/legacyGate.integration.test.ts`：真 tick per-kind 额度 1 → 一条愿望只记 1 格（含授权额度 1、
+  `used_calls=1`），第二次在调模型前被拒；`none` / 端口抛错不占格；intent 真 tick 只推进执行时钟
+  越过 6h TTL → 零愿望、凭据仍 `held`；`choose` / `nextSegment` 的 TTL 负例与期限内正向；
+  kind 核销后收紧授权额度（同 revision）/ 撤权 / 暂停 → 零愿望、`external_usage` 零新增。
+- `legacyGate.test.ts`：授权额度最终核销的正向（kind=1、额度=1）、收紧额度不 bump revision →
+  按当前 payload 额度拒、撤权/暂停 → `boundary_changed`、额度 1 时第二笔被同一条语句挡。
+- `autonomyFire.integration.test.ts`：handler 级同口径（kind 核销后收紧 amap 额度 → 零愿望、
+  其余产物照常）。
 
 第四轮的可复现用例（同样仍在上面两份日志里）：
 

@@ -173,6 +173,23 @@ const budgetRows = async () => {
   return rows.results ?? [];
 };
 
+/** 角色层 `travel.wish` 的 per-kind 计数（一条真实愿望只该占 1 格）。 */
+const kindCount = async (): Promise<number> => {
+  const row = await lifeDb
+    .prepare('SELECT kind_counts FROM autonomy_life_budget WHERE owner_id = ? AND window_id = ? AND scope = ?')
+    .bind(USER, WINDOW, CHAR)
+    .first();
+  return Number(JSON.parse(String(row?.kind_counts ?? '{}'))['travel.wish'] ?? 0);
+};
+
+/** 授权窗口的当日已用（`/external/*` 与效果核销共用这张表）。 */
+const externalUsed = async (dayKey = '2026-10-24'): Promise<number> => Number(
+  (await lifeDb
+    .prepare('SELECT used FROM autonomy_life_external_usage WHERE owner_id = ? AND day_key = ? AND provider = ?')
+    .bind(USER, dayKey, 'amap')
+    .first())?.used ?? 0,
+);
+
 describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () => {
   const denials: Array<{ name: string; seed: () => Promise<void> }> = [
     {
@@ -531,5 +548,256 @@ describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () 
     expect(Number(account?.used_tokens)).toBe(321);
     expect(Number(account?.reserved_calls)).toBe(0);
     expect(Number(account?.reserved_tokens)).toBe(0);
+    // 一条真实愿望只占 1 格 per-kind（模型调用不重复计数），授权额度也只扣 1。
+    expect(await kindCount()).toBe(1);
+    expect(await externalUsed()).toBe(1);
+  });
+
+  it('per-kind 额度 1：一条真实愿望只占 1 格；第二条连模型都不问', async () => {
+    await seedNewBoundary({ limits: { perKindActionsPerDay: 1 } });
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(access.ok).toBe(true);
+
+    // 第一跳：真 tick → 一条愿望，模型调用 1 次，kind 计数只 +1。
+    const outcome = await runTravelTickForSubject(db, subject, buildWiring(counter, access));
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(1);
+    expect(outcome.skipped).not.toContain('llm_unavailable');
+    expect(await kindCount()).toBe(1);
+    expect(await externalUsed()).toBe(1);
+
+    // 第二次（额度已用完）：端口在**调模型之前**就拒，不再问模型。
+    // 注：同一个 tick 窗口里 `claimIntentProbe` 本身也不会再问一次，所以这条用端口直调来盯闸。
+    const again = gateTravelDecisionPort(
+      {
+        async choose() { counter.calls += 1; return { kind: 'wait' }; },
+        async proposeIntent() { counter.calls += 1; return { want: 'wander', wish: '又想去公园' }; },
+        lastUsageTokens: () => 99,
+      },
+      { db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW },
+    );
+    await expect(again!.proposeIntent!({ homeLabel: null, minutesSinceLastOuting: null }))
+      .rejects.toThrow('autonomy-life-gate:budget_exhausted');
+    expect(counter.calls).toBe(1);
+    expect(await kindCount()).toBe(1);
+    expect(await externalUsed()).toBe(1);
+  });
+
+  it('模型说「不想出门」（none）/ 端口抛错 → 不占 kind 配额、不落愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    let calls = 0;
+    const port = gateTravelDecisionPort(
+      {
+        async choose() { throw new Error('unused'); },
+        async proposeIntent() {
+          calls += 1;
+          if (calls === 1) return { want: 'none' };
+          throw new Error('provider exploded');
+        },
+        lastUsageTokens: () => 12,
+      },
+      { db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW },
+    );
+
+    await expect(port!.proposeIntent!({ homeLabel: null, minutesSinceLastOuting: null }))
+      .resolves.toEqual({ want: 'none' });
+    await expect(port!.proposeIntent!({ homeLabel: null, minutesSinceLastOuting: null }))
+      .rejects.toThrow('provider exploded');
+
+    expect(calls).toBe(2);
+    expect(await kindCount()).toBe(0);
+    expect(await externalUsed()).toBe(0);
+    expect(await countWishes()).toBe(0);
+  });
+
+  it('预留凭据跨过 6h TTL 才返回（只推进执行时钟）→ 结算被拒、零愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    let clock = NOW;
+    const counter = { calls: 0 };
+    const decisionPort = gateTravelDecisionPort(
+      {
+        async choose() { return { kind: 'wait' }; },
+        async proposeIntent() {
+          counter.calls += 1;
+          // 模型「跑」了 7 小时才回来：state/expires_at 一个字节都不改，只推进执行时钟。
+          clock = NOW + 7 * 60 * 60 * 1000;
+          return { want: 'wander', wish: '想去公园走走' };
+        },
+        lastUsageTokens: () => 200,
+      },
+      { db: lifeDb, ownerId: USER, charId: CHAR, now: () => clock },
+    );
+
+    const outcome = await runTravelTickForSubject(db, subject, {
+      now: () => clock,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    });
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+    // 凭据按真实 TTL 过期：没有被结算成 used，仍是 held（留给对账），额度不重复花。
+    const record = await lifeDb
+      .prepare('SELECT state, expires_at, created_at FROM autonomy_life_budget_reservations WHERE owner_id = ?')
+      .bind(USER)
+      .first();
+    expect(record?.state).toBe('held');
+    expect(Number(record?.created_at)).toBe(NOW);
+    expect(Number(record?.expires_at)).toBe(NOW + 6 * 60 * 60 * 1000);
+    const rows = await budgetRows();
+    expect(Number(rows.find((row) => row.scope === 'account')?.used_calls ?? 0)).toBe(0);
+  });
+
+  it('choose / nextSegment：模型返回后跨过 TTL → 拒，签不出一致性效果许可', async () => {
+    for (const method of ['choose', 'nextSegment'] as const) {
+      await seedNewBoundary();
+      let clock = NOW;
+      const rawPort = {
+        async choose() {
+          clock = NOW + 7 * 60 * 60 * 1000;
+          return { kind: 'choose', candidateId: 'poi-1' };
+        },
+        async nextSegment() {
+          clock = NOW + 7 * 60 * 60 * 1000;
+          return { kind: 'home' };
+        },
+        lastUsageTokens: () => 42,
+      };
+      const port = gateTravelDecisionPort(rawPort, {
+        db: lifeDb, ownerId: USER, charId: CHAR, now: () => clock,
+      });
+      const pending = method === 'choose'
+        ? port!.choose({} as never)
+        : port!.nextSegment!({} as never);
+      await expect(pending).rejects.toThrow('autonomy-life-gate:');
+      // 没签出任何效果许可；模型调用也没被结算成 used。
+      const claims = await lifeDb
+        .prepare('SELECT COUNT(*) AS n FROM autonomy_life_effect_claims WHERE owner_id = ?')
+        .bind(USER)
+        .first();
+      expect(Number(claims?.n ?? 0), method).toBe(0);
+      const rows = await budgetRows();
+      expect(Number(rows.find((row) => row.scope === 'account')?.used_calls ?? 0), method).toBe(0);
+    }
+  });
+
+  it('期限内 choose / nextSegment → 正常签出一次性效果许可（保留正向路径）', async () => {
+    await seedNewBoundary();
+    const port = gateTravelDecisionPort(
+      {
+        async choose() { return { kind: 'choose', candidateId: 'poi-1' }; },
+        async nextSegment() { return { kind: 'home' }; },
+        lastUsageTokens: () => 33,
+      },
+      { db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW },
+    );
+    await expect(port!.choose({ wishText: '散步', candidates: [], batchIndex: 0, rerollsUsed: 0 }))
+      .resolves.toMatchObject({ kind: 'choose' });
+    await expect(port!.nextSegment!({} as never)).resolves.toMatchObject({ kind: 'home' });
+    const claims = await lifeDb
+      .prepare('SELECT COUNT(*) AS n FROM autonomy_life_effect_claims WHERE owner_id = ?')
+      .bind(USER)
+      .first();
+    expect(Number(claims?.n ?? 0)).toBe(2);
+  });
+
+  it('kind 核销之后、授权额度核销之前把 amap 额度收紧到 0（同一 revision）→ 零愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    let injected = false;
+    // 只改额度、**不** bump revision：证明额度按执行时的 payload 判，不是按读边界时的旧值。
+    const hooked = createSqliteD1(sql, {
+      beforeStatement: (text) => {
+        if (!injected && text.includes('UPDATE autonomy_life_external_usage')) {
+          injected = true;
+          sql.prepare(`UPDATE autonomy_life_boundaries
+              SET payload = json_set(payload, '$.externalGrants[0].dailyQuota', 0)
+              WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+            .run(USER);
+        }
+      },
+    }) as unknown as LifeDb;
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(hooked);
+
+    const counter = { calls: 0 };
+    const decisionPort = gateTravelDecisionPort(
+      {
+        async choose() { return { kind: 'wait' }; },
+        async proposeIntent() { counter.calls += 1; return { want: 'wander', wish: '想去公园走走' }; },
+        lastUsageTokens: () => 66,
+      },
+      { db: hooked, ownerId: USER, charId: CHAR, now: () => NOW },
+    );
+    const outcome = await runTravelTickForSubject(db, subject, {
+      now: () => NOW,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    });
+    expect(injected).toBe(true);
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+    expect(await externalUsed()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+  });
+
+  it('kind 核销之后、授权额度核销之前撤权 / 暂停 → 零愿望（授权额度不按旧 limit 发放）', async () => {
+    for (const scenario of ['revoke', 'pause'] as const) {
+      await seedNewBoundary();
+      await seedTravelAuthorization();
+      let injected = false;
+      const hooked = createSqliteD1(sql, {
+        beforeStatement: (text) => {
+          if (!injected && text.includes('UPDATE autonomy_life_external_usage')) {
+            injected = true;
+            if (scenario === 'revoke') {
+              sql.prepare(`UPDATE autonomy_life_boundaries
+                  SET revision = revision + 1, payload = json_remove(payload, '$.externalGrants')
+                  WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+                .run(USER);
+            } else {
+              sql.prepare(`UPDATE autonomy_life_boundaries
+                  SET revision = revision + 1, payload = json_set(payload, '$.globalPaused', json('true'))
+                  WHERE owner_id = ? AND scope = 'account' AND char_id = ''`)
+                .run(USER);
+            }
+          }
+        },
+      }) as unknown as LifeDb;
+      resetAutonomyLifeSchemaCacheForTesting();
+      await ensureAutonomyLifeSchema(hooked);
+
+      const counter = { calls: 0 };
+      const decisionPort = gateTravelDecisionPort(
+        {
+          async choose() { return { kind: 'wait' }; },
+          async proposeIntent() { counter.calls += 1; return { want: 'wander', wish: '想去公园走走' }; },
+          lastUsageTokens: () => 55,
+        },
+        { db: hooked, ownerId: USER, charId: CHAR, now: () => NOW },
+      );
+      await runTravelTickForSubject(db, subject, {
+        now: () => NOW,
+        providers: [],
+        region: 'CN' as const,
+        readAnchor: async () => anchor,
+        decisionPort,
+        intentWindowMs: 3 * 60 * 60 * 1000,
+      });
+      expect(injected, scenario).toBe(true);
+      expect(counter.calls, scenario).toBe(1);
+      expect(await countWishes(), scenario).toBe(0);
+      expect(await externalUsed(), scenario).toBe(0);
+    }
   });
 });

@@ -1,3 +1,4 @@
 no differences after path normalization (56 errors both sides)
 current: EXIT:2, 56 errors; baseline f7f040c7: EXIT:2, 56 errors
-normalization: /root/SullyOS/.worktrees/<task>/ -> <ROOT>/ and the baseline scratch dir -> <ROOT>/
+normalization: the worktree prefix /root/SullyOS/.worktrees/t_984b3cfc -> <ROOT>/ and the baseline worktree prefix /root/.hermes/profiles/ds-executor/cache/scratch/r6/base -> <ROOT>/
+in-scope new errors: 0

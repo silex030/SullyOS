@@ -27,8 +27,8 @@ import type { TravelDecisionPort } from '../travel/decision';
 import { parseInteyProposal } from '../travel/decision';
 import { getTravelBudget } from '../travel/budget';
 import { getTravelCharSettings, getTravelSettings, type TravelDb } from '../travel/store';
-import { windowIdAt } from '../../../../utils/autonomyLife/budget';
-import type { EffectiveBoundaryV1 } from '../../../../contracts/autonomyLife';
+import { verifyReservationHold, windowIdAt } from '../../../../utils/autonomyLife/budget';
+import { DEFAULT_ACCOUNT_LIMITS, type EffectiveBoundaryV1 } from '../../../../contracts/autonomyLife';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
 import {
   LEGACY_TRAVEL_KIND,
@@ -42,7 +42,12 @@ import {
   settleLegacyRoundCall,
   type LegacyAutonomySkipReason,
 } from './legacyGate';
-import { claimTravelDecisionAtomic, type LifeDb } from './store';
+import {
+  claimTravelDecisionAtomic,
+  createD1BudgetPort,
+  readBudgetRows,
+  type LifeDb,
+} from './store';
 
 /** 出行模型调用在统一边界里的 kind（与 `contracts/autonomyLife.ts` 的受控外部窗口一致）。 */
 export const TRAVEL_MODEL_KIND = LEGACY_TRAVEL_KIND;
@@ -150,15 +155,32 @@ export function gateTravelDecisionPort(
 ): TravelDecisionPort | null {
   if (!port) return null;
   const now = deps.now ?? (() => Date.now());
+  const budgetPort = createD1BudgetPort({ db: deps.db, ownerId: deps.ownerId });
 
   const gated = async <T>(effect: TravelEffectKind, run: () => Promise<T>): Promise<T> => {
     const reservedAt = now();
+
+    // 意图探针的产出会占一格 `travel.wish` kind 配额。模型调用本身**不**占这一格
+    // （`countKind: false`），由下面返回后的效果核销占——否则一条真实愿望会记两次。
+    // 但额度已经用完就没必要再问模型：问了也只会被效果门拒，白烧一次调用。
+    if (effect === 'intent') {
+      const quota = await intentKindQuota({
+        db: deps.db,
+        ownerId: deps.ownerId,
+        charId: deps.charId,
+        nowMs: reservedAt,
+      });
+      if (!quota.ok) throw new Error(`autonomy-life-gate:${quota.reason}`);
+    }
+
     const reserved = await reserveLegacyRoundCall({
       db: deps.db,
       ownerId: deps.ownerId,
       charId: deps.charId,
       nowMs: reservedAt,
       kind: TRAVEL_MODEL_KIND,
+      // 只判「这条能力有没有被授权」，不记 kind 计数（见上）。
+      countKind: false,
     });
     if (!reserved.ok) {
       throw new Error(`autonomy-life-gate:${reserved.reason}`);
@@ -170,30 +192,45 @@ export function gateTravelDecisionPort(
     } catch (error) {
       // 端口抛错时无法证明请求**没有**发出 → 按「已发出」结算（与旧行为一致的保守口径：
       // 宁可多记一次消耗，也不让一次真实调用白嫖额度）。结算失败也只影响账本，错误继续往外抛，
-      // 本轮不产生任何业务效果。
+      // 本轮不产生任何业务效果。结算按**当前服务端时钟**，不看排队时间。
       await settleLegacyRoundCall({
         db: deps.db,
         permit: reserved.permit,
         actualTokens: null,
         requestStarted: true,
+        nowMs: now(),
       }).catch(() => undefined);
       throw error;
     }
 
-    // 请求已经发出去了：先按真实 usage 记账。结算被拒（重复结算 / 存储不可用）
-    // → fail closed：结果是**不可信**的，不交给业务侧写任何东西。
+    // 请求已经发出去了：先按真实 usage 记账。结算被拒（重复结算 / 存储不可用 /
+    // **按当前时钟已过期**）→ fail closed：结果是**不可信**的，不交给业务侧写任何东西。
+    const settleNowMs = now();
     const settled = await settleLegacyRoundCall({
       db: deps.db,
       permit: reserved.permit,
       actualTokens: port.lastUsageTokens?.() ?? null,
       requestStarted: true,
+      nowMs: settleNowMs,
     });
     if (!settled) {
       throw new Error('autonomy-life-gate:budget_settle_failed');
     }
 
+    // 结算通过还不够：这张预留凭据必须**仍然可信可追溯**——按 id 能查到记录、属于本
+    // owner/角色/窗口、没被释放、按当前服务端时钟没过 6h TTL。只有这样的凭据才能换取
+    // 业务效果（以前这里直接签发新 claim，模型/队列跨过 TTL 返回时照样落愿望）。
+    const hold = await verifyReservationHold(budgetPort, {
+      reservationId: reserved.permit.reservationId,
+      ownerId: deps.ownerId,
+      windowId: reserved.permit.windowId,
+      charId: deps.charId,
+      nowMs: settleNowMs,
+    });
+    if (!hold.ok) throw new Error(`autonomy-life-gate:${hold.reason}`);
+
     // ── 模型回来之后的效果门（以前这里直接 return，暂停/撤权后照样落愿望）──
-    const nowMs = now();
+    const nowMs = settleNowMs;
     const read = await readEffectiveBoundary(deps.db, {
       ownerId: deps.ownerId,
       charId: deps.charId,
@@ -241,6 +278,42 @@ export function gateTravelDecisionPort(
     ...(port.lastUsageTokens ? { lastUsageTokens: () => port.lastUsageTokens!() } : {}),
     ...(port.proposeIntent ? { proposeIntent: (input) => gated('intent', () => port.proposeIntent!(input)) } : {}),
   };
+}
+
+/**
+ * 意图探针的 kind 额度预判（只读，不写任何东西）。
+ *
+ * 为什么单独判：模型调用本身已不占 kind 计数（一条愿望只该占一格），所以
+ * `reserveBudget` 不会替我们挡「perKindActionsPerDay 已用完」。额度为 0 / 已耗尽时
+ * 提前返回 → 连模型都不问。真正的硬门仍是模型返回后的 `reserveLegacyEffect`。
+ */
+async function intentKindQuota(args: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+  nowMs: number;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const read = await readEffectiveBoundary(args.db, {
+    ownerId: args.ownerId,
+    charId: args.charId,
+    nowMs: args.nowMs,
+  });
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const denial = legacyBoundaryDenial(read.boundary, TRAVEL_MODEL_KIND)
+    ?? legacyGrantDenial(read.boundary, TRAVEL_MODEL_KIND, args.nowMs);
+  if (denial) return { ok: false, reason: denial };
+
+  const windowId = windowIdAt({ now: () => args.nowMs }, read.boundary.timezone);
+  const rows = await readBudgetRows({
+    db: args.db,
+    ownerId: args.ownerId,
+    charId: args.charId,
+    windowId,
+  }).catch(() => null);
+  if (!rows) return { ok: false, reason: 'budget_exhausted' };
+  const limit = read.boundary.limits.perKindActionsPerDay ?? DEFAULT_ACCOUNT_LIMITS.perKindActionsPerDay;
+  const used = rows.char?.kindCounts?.[TRAVEL_MODEL_KIND] ?? 0;
+  return used >= limit ? { ok: false, reason: 'budget_exhausted' } : { ok: true };
 }
 
 /** 效果许可的稳定唯一引用（worker/浏览器都有 crypto）。 */
