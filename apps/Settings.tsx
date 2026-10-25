@@ -58,6 +58,17 @@ import { probeApiConfig, probeAgent, probeBridge, probeAmsgWorker, probeVisionAp
 import { classifyFetchFailure, probeOriginReachability, describeReachabilityProbe, parseTargetUrl, toSameOriginProxyUrl } from '../utils/networkFailureDiagnosis';
 import type { StatusEntry } from '../utils/statusPanel';
 import { PERCEPTION_CAPABILITIES, perceptionRenderState } from '../utils/perceptionRegistry';
+import { getMapReadinessSnapshot, refreshMapReadiness, subscribeMapReadiness, type MapReadinessPhase } from '../utils/travel/mapReadiness';
+
+/** 宫格第二行的短标签（长说明在 title 里，避免格子撑破四列）。 */
+const MAP_READINESS_LABEL: Record<MapReadinessPhase, string> = {
+    'pending-approval': '待批准',
+    unconnected: '未连接',
+    error: '读取失败',
+    unconfigured: '未配置',
+    partial: '部分就绪',
+    ready: '已就绪',
+};
 import { readAgentRoutingConfig } from '../utils/agentRouting';
 import type { APIConfig, BridgeConfig, TtsProvider } from '../types';
 import { getEffectiveBridges, normalizeBridges, makeBridgeId } from '../utils/bridgeRegistry';
@@ -754,6 +765,37 @@ const Settings: React.FC = () => {
   const [showPresetModal, setShowPresetModal] = useState(false);
   const [showApiCallLog, setShowApiCallLog] = useState(false);
   const [showRealtimeModal, setShowRealtimeModal] = useState(false);
+  // 地图就绪：父层自己订阅并首屏初始化（不等详情卡挂载），全页只打一次后端存在性读回。
+  const mapReadiness = React.useSyncExternalStore(subscribeMapReadiness, getMapReadinessSnapshot, getMapReadinessSnapshot);
+  const [realtimeMapFocus, setRealtimeMapFocus] = useState(false);
+  const realtimeMapGroupRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+      // 没开过弹窗、没有会话、没有 Key 也要有灰态可看：这里主动读一次。
+      void refreshMapReadiness();
+  }, []);
+  useEffect(() => {
+      if (!showRealtimeModal || !realtimeMapFocus) return;
+      // 弹窗自己的滚动容器不一定是 window：先找最近的纵向滚动父级，直接改 scrollTop；
+      // 找不到才退回 scrollIntoView。等两帧，避开弹窗首帧高度未定的抖动。
+      const scrollToGroup = () => {
+          const el = realtimeMapGroupRef.current;
+          if (!el) return;
+          let parent: HTMLElement | null = el.parentElement;
+          while (parent) {
+              const style = window.getComputedStyle(parent);
+              if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 8) {
+                  parent.scrollTop = el.offsetTop - parent.clientTop - 24;
+                  return;
+              }
+              parent = parent.parentElement;
+          }
+          try { el.scrollIntoView({ block: 'center' }); } catch { /* jsdom 无布局，忽略 */ }
+      };
+      let inner = 0;
+      const outer = requestAnimationFrame(() => { inner = requestAnimationFrame(scrollToGroup); });
+      const timer = setTimeout(() => setRealtimeMapFocus(false), 1600);
+      return () => { cancelAnimationFrame(outer); cancelAnimationFrame(inner); clearTimeout(timer); };
+  }, [showRealtimeModal, realtimeMapFocus]);
   const [showMcpModal, setShowMcpModal] = useState(false);
   const [showMcpHelp, setShowMcpHelp] = useState(false);
   const [showBleModal, setShowBleModal] = useState(false);
@@ -3818,14 +3860,32 @@ const Settings: React.FC = () => {
 
             <div className="grid grid-cols-4 gap-2 text-center">
                 {PERCEPTION_CAPABILITIES.map((cap) => {
-                    const st = perceptionRenderState(cap, realtimeConfig);
+                    const isMap = cap.externalReadiness === 'map';
+                    const st = perceptionRenderState(
+                        cap,
+                        realtimeConfig,
+                        isMap ? { known: mapReadiness.known, ready: mapReadiness.fullyReady } : undefined,
+                    );
+                    // 地图没有「角色级开关」这种真实语义（凭据是账号级服务配置），所以不造假开关：
+                    // 只显示服务就绪状态项 + 一处配置入口，文案说清「未连接/未配置/部分/失败」。
+                    const phaseLabel = isMap
+                        ? (MAP_READINESS_LABEL[mapReadiness.phase] ?? '未读取')
+                        : st === 'pending' ? '未配置完成' : st === 'off' ? '已关闭' : '已启用';
                     return (
                         <div
                             key={cap.id}
-                            title={`${cap.label}：${cap.description}${st === 'pending' ? '（已启用但未配置完成）' : ''}`}
-                            className={`py-3 rounded-xl text-xs font-bold flex flex-col items-center justify-center gap-0.5 ${st === 'on' ? cap.tint : cap.tintIdle}`}
+                            data-testid={`perception-${cap.id}`}
+                            data-state={isMap ? mapReadiness.phase : st}
+                            role={isMap ? 'button' : undefined}
+                            tabIndex={isMap ? 0 : undefined}
+                            onClick={isMap ? () => { setRealtimeMapFocus(true); setShowRealtimeModal(true); } : undefined}
+                            title={isMap
+                                ? `${cap.label} · ${mapReadiness.detail}（点开可填写服务端凭据）`
+                                : `${cap.label}：${cap.description}${st === 'pending' ? '（已启用但未配置完成）' : ''}`}
+                            className={`py-3 rounded-xl text-xs font-bold flex flex-col items-center justify-center gap-0.5 ${st === 'on' ? cap.tint : cap.tintIdle}${isMap ? ' cursor-pointer active:scale-95 transition-transform' : ''}`}
                         >
                             <span>{cap.label}</span>
+                            <span className="text-[9px] font-normal opacity-70 leading-none">{phaseLabel}</span>
                         </div>
                     );
                 })}
@@ -4593,7 +4653,12 @@ const Settings: React.FC = () => {
               </div>
 
               {/* 真实地点（高德） */}
-              <div className="bg-teal-50/50 p-4 rounded-2xl space-y-3">
+              <div
+                  ref={realtimeMapGroupRef}
+                  data-testid="realtime-map-group"
+                  data-focused={showRealtimeModal && realtimeMapFocus ? 'true' : 'false'}
+                  className="bg-teal-50/50 p-4 rounded-2xl space-y-3 ring-2 ring-transparent data-[focused=true]:ring-teal-300"
+              >
                   <div className="flex items-center gap-2">
                       <MapPin size={20} weight="fill" />
                       <span className="text-sm font-bold text-teal-700">真实地点</span>

@@ -24,6 +24,11 @@ export interface PerceptionCapability {
     enabled: (rc: RealtimeConfig) => boolean;
     /** 必备凭据/参数是否已填齐（开着但没填齐 => pending 灰态） */
     configured: (rc: RealtimeConfig) => boolean;
+    /**
+     * 该能力的就绪不来自 RealtimeConfig，而由调用方注入（地图：凭据在服务端按账号加密）。
+     * 有这一项的能力，`enabled/configured` 不参与判定，必须传 readiness。
+     */
+    externalReadiness?: 'map';
     iconKey?: 'binoculars';
 }
 
@@ -36,6 +41,20 @@ export const PERCEPTION_CAPABILITIES: PerceptionCapability[] = [
         tintIdle: 'bg-slate-50 text-slate-400',
         enabled: (rc) => !!rc.weatherEnabled,
         configured: (rc) => !!(rc.weatherCity && rc.weatherCity.trim()),
+    },
+    {
+        // 地图以前不在这张表里 —— 宫格物理上不可能出现它，所以「灰态缺失」不是样式问题，
+        // 是登记缺失：设置页只能看到卡片，看不到父层任何状态。
+        id: 'map',
+        label: '地图',
+        description: '真实地点与地图底图（高德 amap / Mapbox；凭据存服务端，不存本机）',
+        tint: 'bg-teal-50 text-teal-600',
+        tintIdle: 'bg-slate-50 text-slate-400',
+        // 账号级服务：没有「角色级开关」这种真实语义，不造假开关；恒为可进入配置。
+        enabled: () => true,
+        // 就绪恒为 false —— 唯一权威是注入的 externalReadiness（见 utils/travel/mapReadiness.ts）。
+        configured: () => false,
+        externalReadiness: 'map',
     },
     {
         id: 'news',
@@ -115,5 +134,20 @@ export const PERCEPTION_CAPABILITIES: PerceptionCapability[] = [
 /** 宫格渲染态：on=启用且已配置；off=停用；pending=开着但没配好（灰态提示「未配置」） */
 export type PerceptionRenderState = 'on' | 'off' | 'pending';
 
-export const perceptionRenderState = (cap: PerceptionCapability, rc: RealtimeConfig): PerceptionRenderState =>
-    !cap.enabled(rc) ? 'off' : cap.configured(rc) ? 'on' : 'pending';
+/** 外部就绪注入（地图专用）：known=false 表示「没读到」，不能算就绪也不能算未配置。 */
+export interface PerceptionExternalReadiness {
+    known: boolean;
+    ready: boolean;
+}
+
+export const perceptionRenderState = (
+    cap: PerceptionCapability,
+    rc: RealtimeConfig,
+    readiness?: PerceptionExternalReadiness,
+): PerceptionRenderState => {
+    if (cap.externalReadiness) {
+        // 读不到 / 部分就绪 / 未配置一律灰态；只有两类凭据都齐才是 on。
+        return readiness?.known === true && readiness.ready === true ? 'on' : 'pending';
+    }
+    return !cap.enabled(rc) ? 'off' : cap.configured(rc) ? 'on' : 'pending';
+};
