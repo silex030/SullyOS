@@ -1,3 +1,32 @@
+# 验证原始日志（本卡 t_33546864 第九轮整改）
+
+全部是**命令的原始 stdout / stderr**（不是手工汇总），跑在交付 HEAD `56d82eeb` 的工作树上
+（`worker/amsg/worker.bundle.js` 由同一次 `pnpm run build` 重新生成）。读取方式：
+`gunzip -c <file>.gz`。清单与 sha256 见 `MANIFEST-r9.txt`（r5–r8 保留对照）。
+
+| 文件 | 命令 | 结果 |
+| --- | --- | --- |
+| `focused-r9.log.gz` | 定向：`vitest run utils/autonomyLife worker/amsg/src/autonomyLife` + 既有 42 文件集合 | **49 文件 / 987 用例通过，`EXIT:0`** |
+| `vitest-full-r9.log.gz` | 全仓 `vitest run`（默认 5s 超时，共享机器负载 ~18） | **631 文件 / 7698 通过 / 4 超时失败**（`storageOptimize` ×3、`travelBackupSecrets` ×1，均为 5s 超时/维护锁，两个模块与本次改动无依赖；见下行） |
+| `vitest-full-r9-timeout60.log.gz` | 全仓 `vitest run --testTimeout=60000`（同一份代码、同一时刻） | **631 文件 / 7702 用例通过，`EXIT:0`**（证明那 4 条只是 5s 超时抖动，不是逻辑失败） |
+| `tsc-current-r9.log.gz` / `tsc-compare-r9.diff` | `npx tsc --noEmit -p tsconfig.json`（与 r8 基线 `tsc-baseline.log.gz` 对比） | 两边各 **56 条 `error TS`**；归一化绝对路径后逐行 diff **为空**（`tsc-compare-r9.diff` 0 字节）；本卡新增 **0** |
+| `build-r9.log.gz` | `pnpm run build` | `EXIT:0`（worker bundle 重新生成；vite built in 2m 8s） |
+| `e2e-run-r9.log.gz` / `e2e-report-r9.json.gz` / `e2e-http-requests-r9.json.gz` | `node scripts/autonomy-e2e/run.mjs`（真 Chromium + 真 worker 路由 + node:sqlite + 原生 IndexedDB + 真实 https 只读） | **74/74 checks，`EXIT:0`**；含两条**不 seed 目标动作**的生产链路场景（6：真实目录候选 → tick → 执行 → 既有业务表/UI；7：外部只读配置+授权+可达） |
+
+第九轮新增/加强的用例（全部从生产入口进，不注入预设 profile/候选）：
+
+- `worker/amsg/src/autonomyLife/productionChain.test.ts`（9）：`handleAutonomyLifeScheduled`
+  同角色/同种子/同时间早鸟 vs 夜猫 → 睡眠窗与下次机会不同；换当天日程 profile 落库更新；
+  空模板 fallback；`POST /proposals` → 生产 tick 排出外卖/购物（参数逐字一致、额度核销、候选回收）；
+  超上限/类目/kind/暂停 422/422/403/409；外部只读三者成立才排出、三种不成立都排不出。
+- `utils/autonomyLife/engine.personaMarket.test.ts`（10）：人设失效重建、`personaFor` 抛错不判死、
+  模型失败 + 设备候选仍排单、消费额度计划期核销、超单笔上限零写入、外部候选的能力门。
+- `utils/autonomyLife/marketCatalog.test.ts`（10）/ `marketProposalSource.test.ts`（6）/
+  `worker/amsg/src/autonomyLife/proposals.test.ts`（7）：真实目录价格、额度门槛、上报节流、
+  服务端整包校验、D1 幂等/隔离/过期/回收。
+- `utils/autonomyLife/personaSignal.test.ts`（7）/ `ambientCandidates.test.ts`（4）：日程→睡眠窗
+  （「睡觉」不能变成「起床」）、人设哈希、外部候选只取兴趣标签。
+
 # 验证原始日志（本卡 t_984b3cfc 第八轮返工）
 
 全部是**命令的原始 stdout / stderr**（不是手工汇总），跑在本次送审 HEAD 前的工作树上
