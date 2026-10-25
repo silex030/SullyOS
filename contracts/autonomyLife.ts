@@ -35,6 +35,44 @@ export const CONTROLLED_EXTERNAL_KINDS = ['travel.wish', 'external.read'] as con
 export const ACTIVITY_KINDS = [...CORE_ACTIVITY_KINDS, ...CONTROLLED_EXTERNAL_KINDS] as const;
 export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
 
+/**
+ * 需要**真实目录 + 真实价格 + 钱包余额**的消费类窗口。
+ *
+ * 这两类刻意不交给模型编参数（模型编一个价格 = 伪造消费）：参数由绑定设备从既有
+ * 外卖/购物目录里确定性选出（真实 shopId / dishId / 单价），经 `/proposals` 上报，
+ * 引擎只负责「选不选它」，并在计划期核销消费额度、执行期核销一次性许可。
+ */
+export const MARKET_PROPOSAL_KINDS = ['takeout.order', 'shopping.order'] as const;
+export type MarketProposalKind = (typeof MARKET_PROPOSAL_KINDS)[number];
+
+export function isMarketProposalKind(value: unknown): value is MarketProposalKind {
+  return typeof value === 'string' && (MARKET_PROPOSAL_KINDS as readonly string[]).includes(value);
+}
+
+/** 一次上报最多几条本地真实候选（多了就是刷接口，不是生活）。 */
+export const MAX_CLIENT_PROPOSALS = 4;
+
+/** 本地候选的有效期：真实目录/余额会变，过期的候选不许再被排上。 */
+export const CLIENT_PROPOSAL_TTL_MS = 2 * 60 * 60_000;
+
+/** 本地候选 id：稳定、可幂等重传（同一角色/同一天/同一目录指纹）。 */
+export const CLIENT_PROPOSAL_ID_RE = /^mp_[a-z0-9]{4,40}$/;
+
+/** 绑定设备上报的「真实目录候选」（参数已带真实店/商品/单价/地址）。 */
+export interface ClientProposalInput {
+  proposalId: string;
+  kind: MarketProposalKind;
+  semanticPurpose: string;
+  args: Record<string, unknown>;
+  contentFingerprint?: string;
+}
+
+export interface ClientProposal extends ClientProposalInput {
+  charId: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export type ExecutionMode = 'cloud' | 'local';
 export type ActionScope = 'os_simulation' | 'external_read';
 export type ActionBasis = 'virtual' | 'inference';

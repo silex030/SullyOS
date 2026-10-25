@@ -18,6 +18,7 @@ import {
   actionDedupeKey,
   hashArgs,
   hashString,
+  isMarketProposalKind,
   isTerminalActionStatus,
   PERMIT_TTL_MS,
   type ActivityKind,
@@ -32,9 +33,13 @@ import {
   type LifeEvent,
   type LifePhase,
   type LifeReasonCode,
+  type MarketProposalKind,
 } from '../../contracts/autonomyLife';
 import { boundaryGate } from './boundary';
 import { describeCapabilities, type CapabilityProbeState } from './adapters';
+import { buildAmbientCandidates } from './ambientCandidates';
+import { orderTotalMinorFromArgs } from './marketCatalog';
+import { normalizePersonaSignal, personaHashOf, type PersonaSignal } from './personaSignal';
 import { checkIntentPolicy } from './policy';
 import {
   projectBudgetUsage,
@@ -279,6 +284,20 @@ export interface EngineDeps {
   boundaryFor: (charId: string) => Promise<EffectiveBoundaryV1>;
   /** 允许的候选（由模型提议，引擎只做选择；测试可注入固定候选）。 */
   candidatesFor?: (charId: string) => Candidate[];
+  /**
+   * 真实人设/日程来源（worker 从 fire_pack 模板 + 当天日程读出）。
+   * 缺省 / 返回 null / 读失败 → 没有信号，profile 按「暂用基础作息」确定性回退。
+   * 这是一条**只读信号**：引擎只拿它建 profile，不把它当成内容候选。
+   */
+  personaFor?: (charId: string) => Promise<Partial<PersonaSignal> | null>;
+  /**
+   * 绑定设备上报的**真实目录候选**（外卖/购物：真实店/商品/单价/收货地址，来自
+   * `/autonomy-life/v1/proposals`）。它们与模型候选一起参与打分，但绝不因此放宽
+   * 边界/额度/许可；读到空列表 = 这一轮没有本地候选，不是错误。
+   */
+  localCandidatesFor?: (charId: string) => Promise<Candidate[]>;
+  /** 已经排上动作后回收对应的本地候选（避免同一份候选在 TTL 内再被排一次）。 */
+  consumeLocalCandidates?: (charId: string, kind: MarketProposalKind) => Promise<void>;
   policyVersion?: string;
   accountId?: string;
 }
@@ -316,7 +335,7 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
   const accountId = deps.accountId ?? 'account';
   const stored = await deps.store.getCharacterLife(charId);
   const boundaryRow = stored ?? emptyCharacterLife(charId, nowMs, 'UTC');
-  const row = stored ?? boundaryRow;
+  let row = stored ?? boundaryRow;
 
   const accountPause = await deps.store.getAccountPause(accountId);
   const paused = accountPause.paused || row.pauseRequestedAt !== null;
@@ -353,20 +372,29 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     return { ...baseResult('model_failed', ['MODEL_FAILED']), nextOpportunityAt: row.retryAt };
   }
 
+  // 人设/日程是 profile 的唯一来源。真实人设改了就重建并立刻落库（不等下一次
+  // 到期），这样「同一天改了角色设定」不会拖到下一轮机会才生效。没有信号 → 基础作息。
+  const personaSignal = await readPersonaSignal(deps, charId);
+  const resolved = resolveProfile(row, charId, nowMs, personaSignal);
+  const profile = resolved.profile;
+  if (resolved.rebuilt) {
+    const next = nextRevision({ ...row, profile, scheduleConfidence: profile.confidence });
+    if (await deps.store.putCharacterLife(next, row.revision)) row = next;
+  }
+
   // 未到期：零模型调用。
   if (row.nextOpportunityAt !== null && nowMs < row.nextOpportunityAt) {
     return baseResult('not_due', row.reasonCodes);
   }
 
-  const phase = resolvePhase(row.profile ?? fallbackProfile(charId, row, nowMs), nowMs);
+  const phase = resolvePhase(profile, nowMs);
   const needs = updateNeeds(row.needs, {
     elapsedMs: nowMs - row.lastEvaluatedAt,
     phase: phase.phase,
-    traits: (row.profile ?? fallbackProfile(charId, row, nowMs)).traits,
+    traits: profile.traits,
     sinceInteractionMs: row.lastInteractionAt ? nowMs - row.lastInteractionAt : undefined,
   });
 
-  const profile = ensureProfile(row, nowMs);
   if (needsAreLow(needs)) {
     const plan = planNextOpportunity({
       profile,
@@ -422,13 +450,40 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     return { ...baseResult('resting', ['SLEEPING']), nextOpportunityAt: plan.nextOpportunityAt };
   }
 
+  // 真实目录候选（外卖/购物）不依赖模型：设备侧目录/价格/余额先备好，这边只是读。
+  // 读失败 = 这一轮没有本地候选（不是模型失败，也不放宽任何门）。
+  const localCandidates = deps.localCandidatesFor
+    ? await deps.localCandidatesFor(charId).catch(() => [] as Candidate[])
+    : [];
+
+  const boundary = await deps.boundaryFor(charId);
+
+  /*
+   * 能力门（不只是 UI 文案）：外部窗口/外部只读是否**现在真的可用**由能力探测给出
+   * （端点在 + 主机白名单在 + 授权未过期 + 可达）。探测不可用/读不到 → 只保留
+   * 本地窗口，绝不让一个「配了但连不上」的外部能力进入候选打分。
+   */
+  const probes = await deps.probes(charId).catch(() => null);
+  const capabilities = probes ? describeCapabilities({ boundary, probes, nowMs }) : null;
+  const capabilityReady = (kind: ActivityKind): boolean =>
+    capabilities === null ? boundary.allowedKinds.includes(kind) : capabilities.some((cap) => cap.kind === kind && cap.available);
+
+  // 受控外部窗口的自主候选：来自人设兴趣 + 真实城市，只在「配置 + 授权 + 可达」都成立时
+  // 才生成；它和模型/设备候选一起打分，没有任何额外放行。
+  const ambient = buildAmbientCandidates({
+    profile,
+    externalReadAvailable: capabilityReady('external.read'),
+    travelAvailable: capabilityReady('travel.wish'),
+    city: personaSignal.city,
+  });
+
   // 统一预算门：先预留，再调模型；预不了就明确 BUDGET_EXHAUSTED，不「先发后补账」。
   const reservation = await reserveBudget(deps.budget, {
     nowMs,
     windowTimezone: row.windowTimezone,
     accountId,
     charId,
-    limits: (await deps.boundaryFor(charId)).limits,
+    limits: boundary.limits,
     calls: 1,
     tokens: deps.reserveTokensPerRun ?? 1600,
     planRef: `rhythm-plan:${charId}:${localDateKey(nowMs, row.windowTimezone)}`,
@@ -449,7 +504,7 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     };
   }
 
-  const proposal = await deps.model.request({
+  let proposal = await deps.model.request({
     charId,
     grant: reservation.grant,
     kind: 'plan',
@@ -460,6 +515,13 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     actualTokens: proposal?.usageUnknown ? null : proposal?.tokensUsed ?? null,
     requestStarted: true,
   });
+
+  // 模型失败但手里有**真实候选**（设备上报的目录候选 / 人设兴趣推出的外部只读）：
+  // 不把整轮判死（真实店/真实价格的生活不需要模型点头），照常进入选择；
+  // 模型失败本身仍按一次调用计入用量。
+  if (!proposal && (localCandidates.length > 0 || ambient.length > 0)) {
+    proposal = { candidates: [...localCandidates, ...ambient] };
+  }
 
   if (!proposal) {
     const failStreak = row.failStreak + 1;
@@ -487,13 +549,17 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     };
   }
 
-  const candidates = deps.candidatesFor ? deps.candidatesFor(charId) : proposal.candidates;
+  const modelCandidates = deps.candidatesFor ? deps.candidatesFor(charId) : proposal.candidates;
   const recent = await deps.store.recentActivities(charId, nowMs - DAY_MS);
-  const boundary = await deps.boundaryFor(charId);
   const rng = planRng(deps.seed, charId, profile, nowMs);
+  const schedulableKinds = capabilities
+    ? boundary.allowedKinds.filter((kind) => capabilities.some((cap) => cap.kind === kind && cap.available))
+    : boundary.allowedKinds;
+  const candidates = dedupeCandidates([...modelCandidates, ...localCandidates, ...ambient]);
+
   const chosen = chooseActivity({
     candidates,
-    allowedKinds: boundary.allowedKinds,
+    allowedKinds: schedulableKinds,
     profile,
     needs,
     phase: phase.phase,
@@ -599,6 +665,67 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     return { ...baseResult('skipped', ['NO_CANDIDATE'], 1), nextOpportunityAt: plan.nextOpportunityAt };
   }
 
+  /*
+   * 消费类动作（外卖/购物）：计划期就核销**这次消费**的额度与同类计数。
+   *
+   * 为什么必须在计划期：`virtualOrderMaxMinor` / `virtualSpendPerDayMinor` /
+   * `perKindActionsPerDay` 是用户设的硬上限。以前只有模型调用过预算门，订单金额
+   * 从来没进过账本——「上限」写在界面上却管不住钱。这里用同一次原子预留把
+   * (kind 计数 + 消费金额) 一起占住；预不了就明确 BUDGET_EXHAUSTED，不落动作。
+   * 金额口径与执行侧一致：Σ 单价×数量 + 配送费（都是目录里的真实价格）。
+   */
+  if (isMarketProposalKind(chosen.kind)) {
+    const totalMinor = orderTotalMinorFromArgs(candidateArgs);
+    if (totalMinor === null) {
+      const next = nextRevision({
+        ...row,
+        needs: nextNeeds,
+        lastEvaluatedAt: nowMs,
+        lastModelCallAt: nowMs,
+        availability: 'ready',
+        lifePhase: 'idle',
+        reasonCodes: ['NO_CANDIDATE'],
+        nextOpportunityAt: plan.nextOpportunityAt,
+        nextCheckAt: plan.nextCheckAt,
+        opportunityId: plan.opportunityId,
+        profile,
+      });
+      await deps.store.putCharacterLife(next, row.revision);
+      return { ...baseResult('skipped', ['NO_CANDIDATE'], 1), nextOpportunityAt: plan.nextOpportunityAt, budgetDimension: 'bad_order_args' };
+    }
+    const spend = await reserveBudget(deps.budget, {
+      nowMs,
+      windowTimezone: row.windowTimezone,
+      accountId,
+      charId,
+      limits: boundary.limits,
+      calls: 0,
+      tokens: 0,
+      kind: chosen.kind,
+      spendMinor: totalMinor,
+      planRef: `rhythm-order:${charId}:${localDateKey(nowMs, row.windowTimezone)}`,
+    });
+    if (!spend.ok) {
+      const next = nextRevision({
+        ...row,
+        needs: nextNeeds,
+        lastEvaluatedAt: nowMs,
+        lastModelCallAt: nowMs,
+        availability: 'limited',
+        reasonCodes: ['BUDGET_EXHAUSTED'],
+        nextOpportunityAt: plan.nextOpportunityAt,
+        nextCheckAt: plan.nextCheckAt,
+        opportunityId: plan.opportunityId,
+        profile,
+      });
+      await deps.store.putCharacterLife(next, row.revision);
+      return { ...baseResult('budget_exhausted', ['BUDGET_EXHAUSTED'], 1), nextOpportunityAt: plan.nextOpportunityAt, budgetDimension: spend.dimension };
+    }
+    // 金额在预留时已计入消费行（不是「预留待还」）；把这张 0/0 凭据结清，
+    // 免得它在 TTL 里被当成「在途许可」。
+    await settleBudget(deps.budget, spend.grant, { requestStarted: true, actualTokens: 0 });
+  }
+
   const installation = await deps.store.getBoundInstallation(accountId);
   const online = await deps.deviceOnline(installation);
   const action = buildActionRow({
@@ -636,6 +763,10 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
     return { ...baseResult('model_failed', ['MODEL_FAILED'], 1), budgetDimension: 'reservation_not_bound' };
   }
   await deps.store.insertAction(action);
+  // 这份本地候选已经变成动作：回收掉，别在 TTL 内被下一轮再排一次（同一笔钱）。
+  if (isMarketProposalKind(chosen.kind) && deps.consumeLocalCandidates) {
+    await deps.consumeLocalCandidates(charId, chosen.kind).catch(() => undefined);
+  }
 
   const next = nextRevision({
     ...row,
@@ -671,25 +802,54 @@ export async function tickCharacter(deps: EngineDeps, charId: string): Promise<T
   };
 }
 
-function fallbackProfile(charId: string, row: CharacterLifeRow, nowMs: number): RhythmProfile {
-  return buildRhythmProfile({
-    personaText: '',
-    scheduleText: '',
-    timezone: row.windowTimezone,
-    personaHash: `${charId}:fallback`,
-    nowMs,
-  });
+/** 读真实人设信号：读失败/没配 = 没有信号（不把「读不到」当成「人设没变」）。 */
+async function readPersonaSignal(deps: EngineDeps, charId: string): Promise<PersonaSignal> {
+  if (!deps.personaFor) return normalizePersonaSignal(null);
+  const raw = await deps.personaFor(charId).catch(() => null);
+  return normalizePersonaSignal(raw);
 }
 
-function ensureProfile(row: CharacterLifeRow, nowMs: number): RhythmProfile {
-  if (row.profile && !isProfileStale(row.profile, {
-    personaHash: row.profile.personaHash,
+/**
+ * profile 的失效比较必须拿**当前真实信号**的哈希比，而不是拿旧 profile 自己的哈希
+ * 跟自己比（那样人设改了也永远「没变」）。三方比较：人设身份哈希 / 时区 / 摘要哈希。
+ */
+function resolveProfile(
+  row: CharacterLifeRow,
+  charId: string,
+  nowMs: number,
+  signal: PersonaSignal,
+): { profile: RhythmProfile; rebuilt: boolean } {
+  const identity = {
+    personaHash: personaHashOf(charId, signal),
     timezone: row.windowTimezone,
-    summaryHash: row.profile.summaryHash,
-  })) {
-    return row.profile;
+    summaryHash: hashString(`${signal.personaText}\n${signal.scheduleText}`),
+  };
+  if (row.profile && !isProfileStale(row.profile, identity)) {
+    return { profile: row.profile, rebuilt: false };
   }
-  return fallbackProfile(row.charId, row, nowMs);
+  return {
+    profile: buildRhythmProfile({
+      personaText: signal.personaText,
+      scheduleText: signal.scheduleText,
+      timezone: row.windowTimezone,
+      personaHash: identity.personaHash,
+      nowMs,
+    }),
+    rebuilt: true,
+  };
+}
+
+/** 同类同语义候选只留第一条：模型与设备候选撞车时不重复计分。 */
+function dedupeCandidates(list: Candidate[]): Candidate[] {
+  const seen = new Set<string>();
+  const out: Candidate[] = [];
+  for (const candidate of list) {
+    const key = `${candidate.kind}|${candidate.semanticPurpose}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
 }
 
 function planRng(seed: string, charId: string, profile: RhythmProfile, nowMs: number) {

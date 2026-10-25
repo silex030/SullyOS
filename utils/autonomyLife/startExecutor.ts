@@ -18,6 +18,7 @@ import { createDefaultAutonomyLifeApi } from './endpoint';
 import type { AutonomyLifeApi } from './api';
 import { createAutonomyLifeExecutor } from './executor';
 import { getAutonomyInstallationId } from './installation';
+import { submitMarketProposals } from './marketProposalSource';
 
 export interface StartAutonomyLifeExecutorOptions {
   /** 测试注入；缺省用 worker 默认实例。 */
@@ -28,6 +29,11 @@ export interface StartAutonomyLifeExecutorOptions {
   isLocallyPaused?: () => boolean;
   isVisible?: () => boolean;
   intervalMs?: number;
+  /**
+   * 是否上报「真实目录候选」（外卖/购物）。缺省开启：设备侧有目录 + 角色地址 + 角色卡
+   * 才能组成一单；缺任何一样就自动跳过。关掉它只是不上报，不影响执行已有的动作。
+   */
+  marketProposals?: boolean;
   onError?: (error: unknown) => void;
 }
 
@@ -60,6 +66,11 @@ export function startAutonomyLifeExecutor(options: StartAutonomyLifeExecutorOpti
     if (stopped || running || !isVisible()) return;
     running = true;
     try {
+      // 先把「真实目录候选」上报给服务端（角色侧选单发生在设备上：目录/地址/钱包都在这）。
+      // 节流在 submitMarketProposals 内部（同一角色 10 分钟一次）；失败静默，下一轮再来。
+      if (options.marketProposals !== false) {
+        await submitMarketProposals(options.getCharIds(), { api }).catch(() => undefined);
+      }
       await executor.runOnce();
     } catch (error) {
       options.onError?.(error);

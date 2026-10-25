@@ -66,7 +66,7 @@ describe('禁止方向：跨 App 统一类目（§5.3）', () => {
     for (const category of ['娱乐', '游戏充值', '彩票', '金融']) {
       const decision = checkIntentPolicy({
         kind: 'shopping.order',
-        args: { shopId: 's1', shopName: '某店', items: [], addressText: '家', category },
+        args: { shopId: 's1', shopName: '某店', items: [], addressText: '家', category, orderId: 'ord_1', cardId: 'card-1', shopCat: '美食外卖' },
         purpose: 'buy_snack',
         boundary: view(boundary()),
       }, NOW);
@@ -81,7 +81,7 @@ describe('禁止方向：跨 App 统一类目（§5.3）', () => {
     expect(isApprovedShoppingCategory(mapShoppingCategory('美食').category)).toBe(true);
     const decision = checkIntentPolicy({
       kind: 'takeout.order',
-      args: { shopId: 's1', shopName: '某店', items: [], addressText: '家', category: '神秘道具' },
+      args: { shopId: 's1', shopName: '某店', items: [], addressText: '家', category: '神秘道具', orderId: 'ord_1', cardId: 'card-1' },
       purpose: 'dinner',
       boundary: view(boundary()),
     }, NOW);
@@ -180,7 +180,7 @@ describe('分类器：不可用即 fail closed（不用提示词当唯一门）'
   it('高风险 kind 要求分类器，拿不到就拒绝', () => {
     const decision = checkIntentPolicy({
       kind: 'shopping.order',
-      args: { shopId: 's1', shopName: '便利店', items: [], addressText: '家', category: '美食' },
+      args: { shopId: 's1', shopName: '便利店', items: [], addressText: '家', category: '美食', orderId: 'ord_1', cardId: 'card-1' },
       purpose: 'buy',
       boundary: view(boundary()),
       requireClassifier: true,
@@ -190,7 +190,7 @@ describe('分类器：不可用即 fail closed（不用提示词当唯一门）'
   });
 
   it('分类器报错按不可用处理；分类器说 blocked 也拒绝', () => {
-    const args = { shopId: 's1', shopName: '便利店', items: [], addressText: '家', category: '美食' };
+    const args = { shopId: 's1', shopName: '便利店', items: [], addressText: '家', category: '美食', orderId: 'ord_1', cardId: 'card-1' };
     expect(checkIntentPolicy({
       kind: 'shopping.order', args, purpose: 'buy', boundary: view(boundary()),
       requireClassifier: true, classify: () => ({ error: 'timeout' }),

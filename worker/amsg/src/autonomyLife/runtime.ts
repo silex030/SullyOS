@@ -23,6 +23,8 @@ import {
 import { createAutonomyLifeService, type AutonomyLifeServiceDeps, type BoundaryRepo } from '../../../../utils/autonomyLife/service';
 import { windowIdAt } from '../../../../utils/autonomyLife/budget';
 import type { CapabilityProbeState } from '../../../../utils/autonomyLife/adapters';
+import { normalizePersonaSignal } from '../../../../utils/autonomyLife/personaSignal';
+import type { Candidate } from '../../../../utils/autonomyLife/rhythm';
 import {
   createD1BoundaryRepo,
   createD1BudgetPort,
@@ -72,6 +74,15 @@ export interface RuntimeOptions {
   probes?: CapabilityProbeState;
   /** 角色时区（用于预算窗口与提示词）；缺省取账号边界时区。 */
   timezone?: string;
+  /**
+   * 真实人设/日程信号（cron 从 fire_pack 模板 + 当天日程整理；路由层不传）。
+   * 缺省 = 没有信号 → 基础作息；引擎里的人设哈希由这份文本算出。
+   */
+  persona?: { personaText?: string; scheduleText?: string; city?: string } | null;
+  /** 绑定设备上报的真实目录候选（外卖/购物）；缺省 = 这一轮没有本地候选。 */
+  localCandidates?: (charId: string) => Promise<Candidate[]>;
+  /** 动作排上后回收本地候选（按角色 + kind）。 */
+  consumeLocalCandidates?: (charId: string, kind: string) => Promise<void>;
   requestId?: () => string;
 }
 
@@ -139,6 +150,9 @@ export function createAutonomyLifeRuntime(options: RuntimeOptions): AutonomyLife
     probes: async () => probes,
     boundaryFor,
     policyVersion: DEFAULT_POLICY_VERSION,
+    personaFor: async () => normalizePersonaSignal(options.persona ?? null),
+    ...(options.localCandidates ? { localCandidatesFor: options.localCandidates } : {}),
+    ...(options.consumeLocalCandidates ? { consumeLocalCandidates: options.consumeLocalCandidates } : {}),
   };
 
   const serviceDeps: AutonomyLifeServiceDeps = {

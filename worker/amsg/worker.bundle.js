@@ -11401,6 +11401,13 @@ var CORE_ACTIVITY_KINDS = [
 ];
 var CONTROLLED_EXTERNAL_KINDS = ["travel.wish", "external.read"];
 var ACTIVITY_KINDS = [...CORE_ACTIVITY_KINDS, ...CONTROLLED_EXTERNAL_KINDS];
+var MARKET_PROPOSAL_KINDS = ["takeout.order", "shopping.order"];
+function isMarketProposalKind(value) {
+  return typeof value === "string" && MARKET_PROPOSAL_KINDS.includes(value);
+}
+var MAX_CLIENT_PROPOSALS = 4;
+var CLIENT_PROPOSAL_TTL_MS = 2 * 60 * 6e4;
+var CLIENT_PROPOSAL_ID_RE = /^mp_[a-z0-9]{4,40}$/;
 function isActivityKind(value) {
   return typeof value === "string" && ACTIVITY_KINDS.includes(value);
 }
@@ -12376,13 +12383,20 @@ var KIND_ARG_SCHEMA = {
     optional: ["channel", "durationMinutes", "fictionalNpc"],
     enums: { channel: ["chat", "call", "sms"] }
   },
+  /*
+   * 外卖/购物：除了目录内容（店/商品/单价/地址），还需要三样**执行期身份**：
+   *   - orderId：设备侧确定性生成的订单号（幂等凭证 tx-order-<orderId> 的主键）；
+   *   - cardId：付款的角色卡（执行事务里核归属与余额，换卡即失败）；
+   *   - shopCat：目录里的原始类目（订单记录用；策略判定看映射后的 category）。
+   * 它们不改变金额口径，也不接受任何 URL/权限类键。
+   */
   "takeout.order": {
-    required: ["shopId", "shopName", "items", "addressText"],
-    optional: ["category", "deliveryFeeMinor", "note"]
+    required: ["shopId", "shopName", "items", "addressText", "orderId", "cardId"],
+    optional: ["category", "shopCat", "deliveryFeeMinor", "note"]
   },
   "shopping.order": {
-    required: ["shopId", "shopName", "items", "addressText"],
-    optional: ["category", "deliveryFeeMinor", "note"]
+    required: ["shopId", "shopName", "items", "addressText", "orderId", "cardId"],
+    optional: ["category", "shopCat", "deliveryFeeMinor", "note"]
   },
   "interaction.message": {
     required: ["text"],
@@ -12587,6 +12601,134 @@ function describeCapabilities(input) {
       ...unavailableReason ? { unavailableReason } : {}
     };
   });
+}
+
+// utils/autonomyLife/ambientCandidates.ts
+var isSafeQuery = (text) => text.length >= 2 && text.length <= 24 && !/(https?:\/\/|@|地址|电话|身份证|密码|token)/i.test(text);
+function buildAmbientCandidates(input) {
+  const limit = Math.max(0, Math.trunc(input.maxCandidates ?? 2));
+  if (limit === 0) return [];
+  const interests = input.profile.interestTags.map((tag) => tag.trim()).filter((tag) => tag.length > 0 && isSafeQuery(tag)).slice(0, 4);
+  const candidates = [];
+  if (input.externalReadAvailable) {
+    for (const tag of interests) {
+      if (candidates.length >= limit) break;
+      candidates.push({
+        kind: "external.read",
+        semanticPurpose: `external_interest:${tag}`,
+        contentFingerprint: `external:${tag}`,
+        interestTags: [tag],
+        args: { query: tag, fields: ["title", "excerpt", "url"] }
+      });
+    }
+  }
+  const city = (input.city ?? "").trim();
+  if (input.travelAvailable && city && city.length <= 20 && interests.length > 0 && candidates.length < limit) {
+    const tag = interests[0];
+    candidates.push({
+      kind: "travel.wish",
+      semanticPurpose: `travel_wish:${tag}`,
+      contentFingerprint: `travel:${city}:${tag}`,
+      interestTags: [tag],
+      args: { wishText: `\u60F3\u53BB${city}\u7684${tag}\u76F8\u5173\u7684\u5730\u65B9\u770B\u770B`, placeHint: city }
+    });
+  }
+  return candidates;
+}
+
+// utils/autonomyLife/marketCatalog.ts
+function orderTotalMinorFromArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const row = args;
+  if (!Array.isArray(row.items) || row.items.length === 0) return null;
+  let subtotal = 0;
+  for (const item of row.items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const unit = item.unitPriceMinor;
+    const qty = item.qty;
+    if (typeof unit !== "number" || !Number.isInteger(unit) || unit < 0) return null;
+    if (typeof qty !== "number" || !Number.isInteger(qty) || qty <= 0) return null;
+    const line = unit * qty;
+    if (!Number.isSafeInteger(line)) return null;
+    subtotal += line;
+    if (!Number.isSafeInteger(subtotal)) return null;
+  }
+  const fee = row.deliveryFeeMinor === void 0 ? 0 : row.deliveryFeeMinor;
+  if (typeof fee !== "number" || !Number.isInteger(fee) || fee < 0) return null;
+  const total = subtotal + fee;
+  return Number.isSafeInteger(total) && total > 0 ? total : null;
+}
+
+// utils/autonomyLife/personaSignal.ts
+var PERSONA_MAX_CHARS = 4e3;
+var SCHEDULE_MAX_CHARS = 2e3;
+var CITY_MAX_CHARS = 20;
+function normalizePersonaSignal(input) {
+  const personaText = typeof input?.personaText === "string" ? input.personaText.slice(0, PERSONA_MAX_CHARS) : "";
+  const scheduleText = typeof input?.scheduleText === "string" ? input.scheduleText.slice(0, SCHEDULE_MAX_CHARS) : "";
+  const city = typeof input?.city === "string" ? input.city.trim().slice(0, CITY_MAX_CHARS) : "";
+  return { personaText, scheduleText, city };
+}
+function personaSignalIsEmpty(signal) {
+  return !signal.personaText.trim() && !signal.scheduleText.trim();
+}
+function personaHashOf(charId, signal) {
+  if (personaSignalIsEmpty(signal)) return `${charId}:fallback`;
+  return hashString(`${signal.personaText}
+${signal.scheduleText}`);
+}
+var HHMM_RE = /^([01]?\d|2[0-3])[:：]([0-5]\d)$/;
+var SLOT_END_LIMIT = 24 * 60;
+var toMinutes = (raw) => {
+  if (typeof raw !== "string") return null;
+  const match = HHMM_RE.exec(raw.trim());
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+};
+var toHhmm = (minutes) => {
+  const clamped = Math.max(0, Math.min(SLOT_END_LIMIT, Math.round(minutes)));
+  const hour = Math.floor(clamped / 60);
+  const minute = clamped % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+};
+var SLEEP_SLOT_RE = /睡觉|就寝|入睡|睡眠|休息/;
+function scheduleTextFromSlots(slots) {
+  if (!Array.isArray(slots) || slots.length === 0) return "";
+  const rows = [];
+  for (const slot of slots) {
+    const start = toMinutes(slot?.startTime);
+    if (start === null) continue;
+    const activity = typeof slot?.activity === "string" ? slot.activity.trim() : "";
+    if (!activity) continue;
+    if (activity.length > 40) continue;
+    rows.push({ start, end: SLOT_END_LIMIT, activity });
+  }
+  if (rows.length === 0) return "";
+  rows.sort((a, b) => a.start === b.start ? a.activity < b.activity ? -1 : 1 : a.start - b.start);
+  const seen = /* @__PURE__ */ new Set();
+  const ordered = [];
+  for (const row of rows) {
+    if (seen.has(row.start)) continue;
+    seen.add(row.start);
+    ordered.push(row);
+  }
+  for (let i = 0; i < ordered.length; i += 1) {
+    ordered[i].end = i + 1 < ordered.length ? ordered[i + 1].start : SLOT_END_LIMIT;
+  }
+  const sleepIndex = ordered.findIndex((row) => SLEEP_SLOT_RE.test(row.activity));
+  if (sleepIndex < 0) {
+    return ordered.slice(0, 12).map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`).join("\uFF1B");
+  }
+  const sleep2 = ordered[sleepIndex];
+  const sleepEnd = sleepIndex === ordered.length - 1 ? ordered[0].start < 12 * 60 ? ordered[0].start : SLOT_END_LIMIT : sleep2.end;
+  const sleepLine = `${toHhmm(sleep2.start)}-${toHhmm(sleepEnd)} \u7761\u89C9`;
+  const others = ordered.filter((_, index) => index !== sleepIndex).slice(0, 11);
+  return [sleepLine, ...others.map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`)].join("\uFF1B");
+}
+function scheduleTextFromScene(scene, todayKey) {
+  if (!scene || typeof scene.dateKey !== "string" || scene.dateKey !== todayKey) return "";
+  const slots = scene.schedule?.slots;
+  return Array.isArray(slots) ? scheduleTextFromSlots(slots) : "";
 }
 
 // utils/autonomyLife/rhythm.ts
@@ -13060,7 +13202,7 @@ async function tickCharacter(deps, charId) {
   const accountId = deps.accountId ?? "account";
   const stored = await deps.store.getCharacterLife(charId);
   const boundaryRow = stored ?? emptyCharacterLife(charId, nowMs, "UTC");
-  const row = stored ?? boundaryRow;
+  let row = stored ?? boundaryRow;
   const accountPause = await deps.store.getAccountPause(accountId);
   const paused = accountPause.paused || row.pauseRequestedAt !== null;
   const baseResult = (status, reasonCodes, modelCalls = 0) => ({
@@ -13091,17 +13233,23 @@ async function tickCharacter(deps, charId) {
   if (row.retryAt !== null && nowMs < row.retryAt) {
     return { ...baseResult("model_failed", ["MODEL_FAILED"]), nextOpportunityAt: row.retryAt };
   }
+  const personaSignal = await readPersonaSignal(deps, charId);
+  const resolved = resolveProfile(row, charId, nowMs, personaSignal);
+  const profile = resolved.profile;
+  if (resolved.rebuilt) {
+    const next2 = nextRevision({ ...row, profile, scheduleConfidence: profile.confidence });
+    if (await deps.store.putCharacterLife(next2, row.revision)) row = next2;
+  }
   if (row.nextOpportunityAt !== null && nowMs < row.nextOpportunityAt) {
     return baseResult("not_due", row.reasonCodes);
   }
-  const phase = resolvePhase(row.profile ?? fallbackProfile(charId, row, nowMs), nowMs);
+  const phase = resolvePhase(profile, nowMs);
   const needs = updateNeeds(row.needs, {
     elapsedMs: nowMs - row.lastEvaluatedAt,
     phase: phase.phase,
-    traits: (row.profile ?? fallbackProfile(charId, row, nowMs)).traits,
+    traits: profile.traits,
     sinceInteractionMs: row.lastInteractionAt ? nowMs - row.lastInteractionAt : void 0
   });
-  const profile = ensureProfile(row, nowMs);
   if (needsAreLow(needs)) {
     const plan2 = planNextOpportunity({
       profile,
@@ -13154,12 +13302,23 @@ async function tickCharacter(deps, charId) {
     await deps.store.putCharacterLife(next2, row.revision);
     return { ...baseResult("resting", ["SLEEPING"]), nextOpportunityAt: plan2.nextOpportunityAt };
   }
+  const localCandidates = deps.localCandidatesFor ? await deps.localCandidatesFor(charId).catch(() => []) : [];
+  const boundary = await deps.boundaryFor(charId);
+  const probes = await deps.probes(charId).catch(() => null);
+  const capabilities = probes ? describeCapabilities({ boundary, probes, nowMs }) : null;
+  const capabilityReady = (kind) => capabilities === null ? boundary.allowedKinds.includes(kind) : capabilities.some((cap) => cap.kind === kind && cap.available);
+  const ambient = buildAmbientCandidates({
+    profile,
+    externalReadAvailable: capabilityReady("external.read"),
+    travelAvailable: capabilityReady("travel.wish"),
+    city: personaSignal.city
+  });
   const reservation = await reserveBudget(deps.budget, {
     nowMs,
     windowTimezone: row.windowTimezone,
     accountId,
     charId,
-    limits: (await deps.boundaryFor(charId)).limits,
+    limits: boundary.limits,
     calls: 1,
     tokens: deps.reserveTokensPerRun ?? 1600,
     planRef: `rhythm-plan:${charId}:${localDateKey(nowMs, row.windowTimezone)}`
@@ -13179,7 +13338,7 @@ async function tickCharacter(deps, charId) {
       budgetDimension: reservation.dimension
     };
   }
-  const proposal = await deps.model.request({
+  let proposal = await deps.model.request({
     charId,
     grant: reservation.grant,
     kind: "plan",
@@ -13189,6 +13348,9 @@ async function tickCharacter(deps, charId) {
     actualTokens: proposal?.usageUnknown ? null : proposal?.tokensUsed ?? null,
     requestStarted: true
   });
+  if (!proposal && (localCandidates.length > 0 || ambient.length > 0)) {
+    proposal = { candidates: [...localCandidates, ...ambient] };
+  }
   if (!proposal) {
     const failStreak = row.failStreak + 1;
     const backoffIndex = Math.min(failStreak - 1, FAILURE_BACKOFF_MS.length - 1);
@@ -13214,13 +13376,14 @@ async function tickCharacter(deps, charId) {
       nextOpportunityAt: retryAt
     };
   }
-  const candidates = deps.candidatesFor ? deps.candidatesFor(charId) : proposal.candidates;
+  const modelCandidates = deps.candidatesFor ? deps.candidatesFor(charId) : proposal.candidates;
   const recent = await deps.store.recentActivities(charId, nowMs - DAY_MS2);
-  const boundary = await deps.boundaryFor(charId);
   const rng = planRng(deps.seed, charId, profile, nowMs);
+  const schedulableKinds = capabilities ? boundary.allowedKinds.filter((kind) => capabilities.some((cap) => cap.kind === kind && cap.available)) : boundary.allowedKinds;
+  const candidates = dedupeCandidates([...modelCandidates, ...localCandidates, ...ambient]);
   const chosen = chooseActivity({
     candidates,
-    allowedKinds: boundary.allowedKinds,
+    allowedKinds: schedulableKinds,
     profile,
     needs,
     phase: phase.phase,
@@ -13318,6 +13481,55 @@ async function tickCharacter(deps, charId) {
     await deps.store.putCharacterLife(next2, row.revision);
     return { ...baseResult("skipped", ["NO_CANDIDATE"], 1), nextOpportunityAt: plan.nextOpportunityAt };
   }
+  if (isMarketProposalKind(chosen.kind)) {
+    const totalMinor = orderTotalMinorFromArgs(candidateArgs);
+    if (totalMinor === null) {
+      const next2 = nextRevision({
+        ...row,
+        needs: nextNeeds,
+        lastEvaluatedAt: nowMs,
+        lastModelCallAt: nowMs,
+        availability: "ready",
+        lifePhase: "idle",
+        reasonCodes: ["NO_CANDIDATE"],
+        nextOpportunityAt: plan.nextOpportunityAt,
+        nextCheckAt: plan.nextCheckAt,
+        opportunityId: plan.opportunityId,
+        profile
+      });
+      await deps.store.putCharacterLife(next2, row.revision);
+      return { ...baseResult("skipped", ["NO_CANDIDATE"], 1), nextOpportunityAt: plan.nextOpportunityAt, budgetDimension: "bad_order_args" };
+    }
+    const spend = await reserveBudget(deps.budget, {
+      nowMs,
+      windowTimezone: row.windowTimezone,
+      accountId,
+      charId,
+      limits: boundary.limits,
+      calls: 0,
+      tokens: 0,
+      kind: chosen.kind,
+      spendMinor: totalMinor,
+      planRef: `rhythm-order:${charId}:${localDateKey(nowMs, row.windowTimezone)}`
+    });
+    if (!spend.ok) {
+      const next2 = nextRevision({
+        ...row,
+        needs: nextNeeds,
+        lastEvaluatedAt: nowMs,
+        lastModelCallAt: nowMs,
+        availability: "limited",
+        reasonCodes: ["BUDGET_EXHAUSTED"],
+        nextOpportunityAt: plan.nextOpportunityAt,
+        nextCheckAt: plan.nextCheckAt,
+        opportunityId: plan.opportunityId,
+        profile
+      });
+      await deps.store.putCharacterLife(next2, row.revision);
+      return { ...baseResult("budget_exhausted", ["BUDGET_EXHAUSTED"], 1), nextOpportunityAt: plan.nextOpportunityAt, budgetDimension: spend.dimension };
+    }
+    await settleBudget(deps.budget, spend.grant, { requestStarted: true, actualTokens: 0 });
+  }
   const installation = await deps.store.getBoundInstallation(accountId);
   const online = await deps.deviceOnline(installation);
   const action = buildActionRow({
@@ -13351,6 +13563,9 @@ async function tickCharacter(deps, charId) {
     return { ...baseResult("model_failed", ["MODEL_FAILED"], 1), budgetDimension: "reservation_not_bound" };
   }
   await deps.store.insertAction(action);
+  if (isMarketProposalKind(chosen.kind) && deps.consumeLocalCandidates) {
+    await deps.consumeLocalCandidates(charId, chosen.kind).catch(() => void 0);
+  }
   const next = nextRevision({
     ...row,
     needs: nextNeeds,
@@ -13383,24 +13598,42 @@ async function tickCharacter(deps, charId) {
     nextOpportunityAt: plan.nextOpportunityAt
   };
 }
-function fallbackProfile(charId, row, nowMs) {
-  return buildRhythmProfile({
-    personaText: "",
-    scheduleText: "",
-    timezone: row.windowTimezone,
-    personaHash: `${charId}:fallback`,
-    nowMs
-  });
+async function readPersonaSignal(deps, charId) {
+  if (!deps.personaFor) return normalizePersonaSignal(null);
+  const raw = await deps.personaFor(charId).catch(() => null);
+  return normalizePersonaSignal(raw);
 }
-function ensureProfile(row, nowMs) {
-  if (row.profile && !isProfileStale(row.profile, {
-    personaHash: row.profile.personaHash,
+function resolveProfile(row, charId, nowMs, signal) {
+  const identity = {
+    personaHash: personaHashOf(charId, signal),
     timezone: row.windowTimezone,
-    summaryHash: row.profile.summaryHash
-  })) {
-    return row.profile;
+    summaryHash: hashString(`${signal.personaText}
+${signal.scheduleText}`)
+  };
+  if (row.profile && !isProfileStale(row.profile, identity)) {
+    return { profile: row.profile, rebuilt: false };
   }
-  return fallbackProfile(row.charId, row, nowMs);
+  return {
+    profile: buildRhythmProfile({
+      personaText: signal.personaText,
+      scheduleText: signal.scheduleText,
+      timezone: row.windowTimezone,
+      personaHash: identity.personaHash,
+      nowMs
+    }),
+    rebuilt: true
+  };
+}
+function dedupeCandidates(list) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const candidate of list) {
+    const key = `${candidate.kind}|${candidate.semanticPurpose}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
 }
 function planRng(seed, charId, profile, nowMs) {
   return createRng("choose", seed, charId, profile.scheduleRevision, localDateKey(nowMs, profile.timezone));
@@ -13773,6 +14006,21 @@ var AUTONOMY_LIFE_DDL = [
     created_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, id)
   )`,
+  // 绑定设备上报的真实目录候选（外卖/购物）。参数里带真实店/商品/单价/收货地址，
+  // 由设备侧从既有目录与钱包选出来；worker 只校验形状/类目/单笔上限后落库，供 tick 打分。
+  // 过期即不可用（真实价格与余额会变），排上动作后按 (char, kind) 回收。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_proposals (
+    owner_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, proposal_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_proposals_char
+    ON autonomy_life_proposals (owner_id, char_id, kind, expires_at)`,
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget (
     owner_id TEXT NOT NULL,
     window_id TEXT NOT NULL,
@@ -26243,7 +26491,10 @@ function createAutonomyLifeRuntime(options) {
     },
     probes: async () => probes,
     boundaryFor,
-    policyVersion: DEFAULT_POLICY_VERSION
+    policyVersion: DEFAULT_POLICY_VERSION,
+    personaFor: async () => normalizePersonaSignal(options.persona ?? null),
+    ...options.localCandidates ? { localCandidatesFor: options.localCandidates } : {},
+    ...options.consumeLocalCandidates ? { consumeLocalCandidates: options.consumeLocalCandidates } : {}
   };
   const serviceDeps = {
     engine,
@@ -26453,6 +26704,159 @@ async function insertTravelWish2(args) {
   return { wishId };
 }
 
+// worker/amsg/src/autonomyLife/proposals.ts
+var PROPOSAL_ADDRESS_MAX_CHARS = 200;
+var PROPOSAL_NAME_MAX_CHARS = 120;
+var PROPOSAL_MAX_ITEMS = 8;
+var SEMANTIC_PURPOSE_RE = /^[a-z0-9_:-]{1,48}$/i;
+var FINGERPRINT_RE = /^[a-f0-9]{1,64}$/i;
+var ORDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+var CARD_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+var nonEmptyString2 = (value, max) => typeof value === "string" && value.trim().length > 0 && value.trim().length <= max ? value.trim() : null;
+function validateOne(raw, ctx) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "proposal_not_object" };
+  const row = raw;
+  const proposalId = typeof row.proposalId === "string" ? row.proposalId.trim() : "";
+  if (!CLIENT_PROPOSAL_ID_RE.test(proposalId)) return { ok: false, reason: "proposal_id_invalid" };
+  if (!isMarketProposalKind(row.kind)) return { ok: false, reason: "kind_not_proposable" };
+  const kind = row.kind;
+  const semanticPurpose = typeof row.semanticPurpose === "string" ? row.semanticPurpose.trim() : "";
+  if (!SEMANTIC_PURPOSE_RE.test(semanticPurpose)) return { ok: false, reason: "semantic_purpose_invalid" };
+  if (row.args === null || typeof row.args !== "object" || Array.isArray(row.args)) {
+    return { ok: false, reason: "args_not_object" };
+  }
+  const args = row.args;
+  const shape = validateArgsForKind(kind, args);
+  if (!shape.ok) return { ok: false, reason: `args_${shape.reasonCode ?? "invalid"}` };
+  const shopId = nonEmptyString2(args.shopId, PROPOSAL_NAME_MAX_CHARS);
+  const shopName = nonEmptyString2(args.shopName, PROPOSAL_NAME_MAX_CHARS);
+  const addressText = nonEmptyString2(args.addressText, PROPOSAL_ADDRESS_MAX_CHARS);
+  if (!shopId || !shopName) return { ok: false, reason: "shop_invalid" };
+  if (!addressText) return { ok: false, reason: "address_invalid" };
+  const orderId = nonEmptyString2(args.orderId, 64);
+  if (!orderId || !ORDER_ID_RE.test(orderId)) return { ok: false, reason: "order_id_invalid" };
+  const cardId = nonEmptyString2(args.cardId, 64);
+  if (!cardId || !CARD_ID_RE.test(cardId)) return { ok: false, reason: "card_id_invalid" };
+  if (args.shopCat !== void 0 && (typeof args.shopCat !== "string" || args.shopCat.length > 40)) {
+    return { ok: false, reason: "shop_cat_invalid" };
+  }
+  const mapped = mapShoppingCategory(args.category);
+  if (mapped.restricted || !isApprovedShoppingCategory(mapped.category)) {
+    return { ok: false, reason: "category_not_approved" };
+  }
+  if (!Array.isArray(args.items) || args.items.length === 0 || args.items.length > PROPOSAL_MAX_ITEMS) {
+    return { ok: false, reason: "items_invalid" };
+  }
+  for (const item of args.items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { ok: false, reason: "item_invalid" };
+    const entry = item;
+    if (!nonEmptyString2(entry.dishId, PROPOSAL_NAME_MAX_CHARS)) return { ok: false, reason: "item_id_invalid" };
+    if (!nonEmptyString2(entry.name, PROPOSAL_NAME_MAX_CHARS)) return { ok: false, reason: "item_name_invalid" };
+    if (typeof entry.unitPriceMinor !== "number" || !Number.isInteger(entry.unitPriceMinor) || entry.unitPriceMinor < 0) {
+      return { ok: false, reason: "item_price_invalid" };
+    }
+    if (typeof entry.qty !== "number" || !Number.isInteger(entry.qty) || entry.qty <= 0 || entry.qty > 20) {
+      return { ok: false, reason: "item_qty_invalid" };
+    }
+  }
+  if (args.deliveryFeeMinor !== void 0) {
+    if (typeof args.deliveryFeeMinor !== "number" || !Number.isInteger(args.deliveryFeeMinor) || args.deliveryFeeMinor < 0) {
+      return { ok: false, reason: "delivery_fee_invalid" };
+    }
+  }
+  if (args.note !== void 0 && (typeof args.note !== "string" || args.note.length > 120)) {
+    return { ok: false, reason: "note_invalid" };
+  }
+  const totalMinor = orderTotalMinorFromArgs(args);
+  if (totalMinor === null || totalMinor <= 0) return { ok: false, reason: "order_total_invalid" };
+  if (ctx.orderMaxMinor <= 0) return { ok: false, reason: "orders_disabled" };
+  if (totalMinor > ctx.orderMaxMinor) return { ok: false, reason: "order_over_max" };
+  const fingerprint = row.contentFingerprint;
+  if (fingerprint !== void 0 && (typeof fingerprint !== "string" || !FINGERPRINT_RE.test(fingerprint))) {
+    return { ok: false, reason: "fingerprint_invalid" };
+  }
+  return {
+    ok: true,
+    value: {
+      proposalId,
+      kind,
+      semanticPurpose,
+      args,
+      ...typeof fingerprint === "string" ? { contentFingerprint: fingerprint } : {}
+    }
+  };
+}
+function validateClientProposals(raw, ctx) {
+  if (!Array.isArray(raw) || raw.length === 0) return { ok: false, reason: "proposals_required", index: null };
+  if (raw.length > MAX_CLIENT_PROPOSALS) return { ok: false, reason: "too_many_proposals", index: null };
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const one = validateOne(raw[index], ctx);
+    if (!one.ok) return { ok: false, reason: one.reason, index };
+    if (seen.has(one.value.proposalId)) return { ok: false, reason: "duplicate_proposal_id", index };
+    seen.add(one.value.proposalId);
+    out.push(one.value);
+  }
+  return { ok: true, proposals: out };
+}
+async function upsertClientProposals(input) {
+  const ttl = Math.max(6e4, Math.trunc(input.ttlMs ?? CLIENT_PROPOSAL_TTL_MS));
+  let written = 0;
+  for (const proposal of input.proposals) {
+    const payload = {
+      ...proposal,
+      charId: input.charId,
+      createdAt: input.nowMs,
+      expiresAt: input.nowMs + ttl
+    };
+    const result = await input.db.prepare(
+      `INSERT INTO autonomy_life_proposals (owner_id, proposal_id, char_id, kind, payload, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner_id, proposal_id) DO UPDATE SET payload = excluded.payload,
+           kind = excluded.kind, created_at = excluded.created_at, expires_at = excluded.expires_at`
+    ).bind(input.ownerId, proposal.proposalId, input.charId, proposal.kind, JSON.stringify(payload), input.nowMs, payload.expiresAt).run();
+    if (result) written += 1;
+  }
+  return written;
+}
+var parsePayload = (raw) => {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (!isMarketProposalKind(parsed.kind)) return null;
+    if (!parsed.args || typeof parsed.args !== "object" || Array.isArray(parsed.args)) return null;
+    if (typeof parsed.proposalId !== "string" || typeof parsed.semanticPurpose !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+async function listClientProposals(input) {
+  const result = await input.db.prepare(
+    `SELECT payload FROM autonomy_life_proposals
+       WHERE owner_id = ? AND char_id = ? AND expires_at > ?
+       ORDER BY created_at ASC LIMIT 8`
+  ).bind(input.ownerId, input.charId, input.nowMs).all().catch(() => null);
+  const rows = result?.results ?? [];
+  return rows.map((row) => parsePayload(row.payload)).filter((row) => row !== null);
+}
+async function deleteClientProposals(input) {
+  await input.db.prepare("DELETE FROM autonomy_life_proposals WHERE owner_id = ? AND char_id = ? AND kind = ?").bind(input.ownerId, input.charId, input.kind).run().catch(() => void 0);
+}
+async function pruneClientProposals(input) {
+  await input.db.prepare("DELETE FROM autonomy_life_proposals WHERE owner_id = ? AND expires_at < ?").bind(input.ownerId, input.nowMs - Math.max(0, input.keepMs ?? 0)).run().catch(() => void 0);
+}
+function proposalToCandidate(proposal) {
+  return {
+    kind: proposal.kind,
+    semanticPurpose: proposal.semanticPurpose,
+    ...proposal.contentFingerprint ? { contentFingerprint: proposal.contentFingerprint } : {},
+    args: proposal.args
+  };
+}
+
 // worker/amsg/src/autonomyLife/routes.ts
 var matchRoute = (request) => {
   const url = new URL(request.url);
@@ -26595,6 +26999,77 @@ async function handleAutonomyLifeRequest(request, env, deps) {
       serverTime: nowMs,
       ...page,
       resyncRequired: false
+    });
+  }
+  if (match.method === "POST" && first === "proposals" && !second) {
+    const body = await readJson2(request);
+    if (!body) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "body_required", { requestId: "proposals", serverTime: nowMs }));
+    const charId = str(body.charId);
+    if (!charId) return deps.respond(400, buildErrorBody("VALIDATION_FAILED", "charId_required", { requestId: "proposals", serverTime: nowMs }));
+    const runtime = await runtimeFor(charId);
+    await registerCharacter(runtime, charId, nowMs);
+    const effective = await runtime.boundaryFor(charId);
+    if (!effective.enabled || effective.globalPaused) {
+      return deps.respond(409, buildErrorBody("GLOBAL_PAUSED", "autonomy_paused", { requestId: "proposals", serverTime: nowMs }));
+    }
+    if (!effective.charEnabled) {
+      return deps.respond(403, buildErrorBody("CHAR_DISABLED", "character_disabled", { requestId: "proposals", serverTime: nowMs }));
+    }
+    const validation = validateClientProposals(body.proposals, {
+      orderMaxMinor: effective.limits.virtualOrderMaxMinor ?? 0
+    });
+    if (!validation.ok) {
+      return deps.respond(422, buildErrorBody("VALIDATION_FAILED", validation.reason, {
+        requestId: "proposals",
+        serverTime: nowMs,
+        details: validation.index === null ? {} : { index: validation.index }
+      }));
+    }
+    for (const proposal of validation.proposals) {
+      if (!effective.allowedKinds.includes(proposal.kind)) {
+        return deps.respond(403, buildErrorBody("POLICY_DENIED", "kind_not_allowed", {
+          requestId: "proposals",
+          serverTime: nowMs,
+          details: { kind: proposal.kind }
+        }));
+      }
+      const decision = checkIntentPolicy(
+        {
+          kind: proposal.kind,
+          args: proposal.args,
+          purpose: proposal.semanticPurpose,
+          boundary: {
+            forbiddenCategories: effective.forbiddenCategories,
+            avoidTopics: effective.avoidTopics,
+            allowFictionalNpc: effective.allowFictionalNpc,
+            externalGrants: effective.externalGrants
+          }
+        },
+        nowMs
+      );
+      if (!decision.allowed) {
+        return deps.respond(403, buildErrorBody("POLICY_DENIED", decision.reasonCode ?? "policy_denied", {
+          requestId: "proposals",
+          serverTime: nowMs,
+          details: { kind: proposal.kind, categories: decision.categories ?? [] }
+        }));
+      }
+    }
+    const written = await upsertClientProposals({
+      db,
+      ownerId: owner.userId,
+      charId,
+      proposals: validation.proposals,
+      nowMs
+    });
+    await pruneClientProposals({ db, ownerId: owner.userId, nowMs });
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? "proposals",
+      serverTime: nowMs,
+      charId,
+      accepted: written,
+      expiresAt: nowMs + CLIENT_PROPOSAL_TTL_MS
     });
   }
   if (match.method === "POST" && first === "external" && (second === "read" || second === "wish")) {
@@ -27064,8 +27539,72 @@ ${persona}` : "\u3010\u89D2\u8272\u8BBE\u5B9A\u3011\u672A\u63D0\u4F9B\uFF08\u630
   };
 }
 
+// worker/amsg/src/autonomyLife/capabilityProbes.ts
+function externalConfigFromInput(input) {
+  const hosts = Array.isArray(input?.readHosts) ? input.readHosts.map((host) => String(host).trim().toLowerCase()).filter(Boolean) : parseAllowedHosts(typeof input?.readHosts === "string" ? input.readHosts : void 0);
+  return {
+    xhsUrl: String(input?.xhsUrl ?? "").trim(),
+    amapUrl: String(input?.amapUrl ?? "").trim(),
+    readHosts: hosts
+  };
+}
+function isEndpointConfigured(url, hosts) {
+  const raw = String(url ?? "").trim();
+  if (!raw || hosts.length === 0) return false;
+  return assertFetchableUrl(raw).ok;
+}
+var REACHABILITY_TIMEOUT_MS = 3e3;
+var REACHABILITY_TTL_MS = 10 * 6e4;
+var nowMsDefault = () => Date.now();
+async function probeEndpointOnce(url, options) {
+  const safe = assertFetchableUrl(url);
+  if (!safe.ok) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(500, options?.timeoutMs ?? REACHABILITY_TIMEOUT_MS));
+  try {
+    const response = await (options?.fetch ?? globalThis.fetch)(safe.url.toString(), {
+      method: "GET",
+      redirect: "manual",
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    });
+    try {
+      await response.body?.cancel();
+    } catch {
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function createReachabilityProbe(options) {
+  const ttl = Math.max(1e3, options?.ttlMs ?? REACHABILITY_TTL_MS);
+  const now = options?.now ?? nowMsDefault;
+  const maxEntries = Math.max(1, options?.maxEntries ?? 16);
+  const cache = /* @__PURE__ */ new Map();
+  return async (url) => {
+    const key = String(url ?? "").trim();
+    if (!key) return false;
+    const hit = cache.get(key);
+    const at = now();
+    if (hit && at - hit.at < ttl) return hit.reachable;
+    const reachable = await probeEndpointOnce(key, { fetch: options?.fetch, timeoutMs: options?.timeoutMs });
+    cache.set(key, { at, reachable });
+    while (cache.size > maxEntries) {
+      const oldest = cache.keys().next().value;
+      if (oldest === void 0) break;
+      cache.delete(oldest);
+    }
+    return reachable;
+  };
+}
+var defaultReachabilityProbe = createReachabilityProbe();
+
 // worker/amsg/src/autonomyLife/tick.ts
 var AUTONOMY_LIFE_MAX_SUBJECTS_PER_TICK = 12;
+var grantActive2 = (grants, provider, nowMs) => grants.some((grant) => grant.provider === provider && grant.expiresAt > nowMs);
 async function handleAutonomyLifeScheduled(input) {
   const { db, packs, nowMs } = input;
   await ensureAutonomyLifeSchema(db);
@@ -27076,6 +27615,8 @@ async function handleAutonomyLifeScheduled(input) {
     charId,
     masterKey: input.masterKey
   }));
+  const externalConfig = externalConfigFromInput(input.external ?? null);
+  const reachability = input.reachability ?? defaultReachabilityProbe;
   for (const pack of packs.slice(0, AUTONOMY_LIFE_MAX_SUBJECTS_PER_TICK)) {
     const { userId, charId } = pack;
     const registered = await db.prepare("SELECT 1 AS ok FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'character' AND char_id = ?").bind(userId, charId).first().catch(() => null);
@@ -27084,21 +27625,21 @@ async function handleAutonomyLifeScheduled(input) {
       continue;
     }
     const timezone = typeof pack.pack?.tzId === "string" && pack.pack.tzId.trim() ? pack.pack.tzId : "UTC";
-    const runtime = createAutonomyLifeRuntime({
+    const persona = {
+      personaText: typeof pack.pack?.template === "string" ? pack.pack.template : "",
+      scheduleText: scheduleTextFromScene(pack.pack?.scene ?? null, localDateKey(nowMs, timezone)),
+      city: typeof pack.pack?.scene?.charCity === "string" ? pack.pack.scene.charCity : ""
+    };
+    const baseRuntime = createAutonomyLifeRuntime({
       db,
       userId,
       charId,
       now: () => nowMs,
       timezone,
-      probes: {
-        localStoresReady: true,
-        deviceBound: true,
-        hasModelCredentials: true,
-        externalRead: { configured: false, reachable: false },
-        map: { configured: false, reachable: false }
-      }
+      persona,
+      probes: emptyProbes()
     });
-    const effective = await runtime.boundaryFor(charId);
+    const effective = await baseRuntime.boundaryFor(charId);
     if (!effective.enabled || effective.globalPaused) {
       outcomes.push({ charId, status: "skipped", reason: "account_disabled" });
       continue;
@@ -27112,9 +27653,18 @@ async function handleAutonomyLifeScheduled(input) {
       outcomes.push({ charId, status: "skipped", reason: "missing_credentials" });
       continue;
     }
+    const boundInstallation = await baseRuntime.store.getBoundInstallation(userId).catch(() => null);
+    const probes = await resolveProbes({
+      external: externalConfig,
+      grants: effective.externalGrants,
+      allowedKinds: effective.allowedKinds,
+      nowMs,
+      deviceBound: !!boundInstallation,
+      reachability
+    });
     const model = createAutonomyLifeModelPort({
       credentials,
-      persona: pack.pack?.template,
+      persona: persona.personaText,
       charName: pack.charName,
       allowedKinds: effective.allowedKinds,
       timezone,
@@ -27128,12 +27678,14 @@ async function handleAutonomyLifeScheduled(input) {
       now: () => nowMs,
       timezone,
       model,
-      probes: {
-        localStoresReady: true,
-        deviceBound: true,
-        hasModelCredentials: true,
-        externalRead: { configured: false, reachable: false },
-        map: { configured: false, reachable: false }
+      persona,
+      probes,
+      localCandidates: async (targetCharId) => {
+        const rows = await listClientProposals({ db, ownerId: userId, charId: targetCharId, nowMs });
+        return rows.map(proposalToCandidate);
+      },
+      consumeLocalCandidates: async (targetCharId, kind) => {
+        await deleteClientProposals({ db, ownerId: userId, charId: targetCharId, kind });
       }
     });
     await ensureCharacterLife(withModel, charId, nowMs, timezone);
@@ -27141,6 +27693,31 @@ async function handleAutonomyLifeScheduled(input) {
     outcomes.push({ charId, status: "ticked", tick: tick.status });
   }
   return { outcomes };
+}
+function emptyProbes() {
+  return {
+    localStoresReady: false,
+    deviceBound: false,
+    hasModelCredentials: false,
+    externalRead: { configured: false, reachable: false },
+    map: { configured: false, reachable: false }
+  };
+}
+async function resolveProbes(args) {
+  const { external, grants, allowedKinds, nowMs, deviceBound, reachability } = args;
+  const externalConfigured = isEndpointConfigured(external.xhsUrl, external.readHosts);
+  const mapConfigured = isEndpointConfigured(external.amapUrl, external.readHosts);
+  const wantExternal = externalConfigured && allowedKinds.includes("external.read") && grantActive2(grants, "xhs", nowMs);
+  const wantMap = mapConfigured && allowedKinds.includes("travel.wish") && grantActive2(grants, "amap", nowMs);
+  const externalReachable = wantExternal ? await reachability(external.xhsUrl).catch(() => false) : false;
+  const mapReachable = wantMap ? await reachability(external.amapUrl).catch(() => false) : false;
+  return {
+    localStoresReady: true,
+    deviceBound,
+    hasModelCredentials: true,
+    externalRead: { configured: externalConfigured, reachable: externalReachable },
+    map: { configured: mapConfigured, reachable: mapReachable }
+  };
 }
 function summariseAutonomyLifeOutcomes(outcomes) {
   return {
@@ -29701,7 +30278,13 @@ var src_default = {
         db: env.DB,
         packs: lifePacks.packs,
         nowMs: lifeNowMs,
-        masterKey: env.AMSG_MASTER_KEY
+        masterKey: env.AMSG_MASTER_KEY,
+        // 外部窗口的真实配置：端点 + 服务端出口主机白名单。未配置 = 能力不可用（不猜）。
+        external: {
+          xhsUrl: env.AUTONOMY_EXTERNAL_XHS_URL,
+          amapUrl: env.AUTONOMY_EXTERNAL_AMAP_URL,
+          readHosts: env.AUTONOMY_EXTERNAL_READ_HOSTS
+        }
       });
       const lifeSummary = summariseAutonomyLifeOutcomes(lifeResult.outcomes);
       if (lifeSummary.scheduled > 0 || lifeSummary.skipped.length > 0) {

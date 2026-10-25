@@ -18,7 +18,7 @@
  */
 
 import { build } from 'esbuild';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -132,6 +132,115 @@ const JSON_HEADERS = {
 
 const respond = (status, body) => new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 
+// ── 生产链路：可控模型响应（真实模型端口 → 本机 mock /chat/completions） ─────
+let mockModelMode = 'journal';
+const mockCandidates = [
+  { kind: 'journal.write', semanticPurpose: 'daily_note', args: { title: '联调日记', body: '这是可控模型响应给出的候选。' } },
+];
+
+function mockModelResponse() {
+  if (mockModelMode === 'fail') {
+    return new Response(JSON.stringify({ error: { message: 'mock model failure' } }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+  return new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ candidates: mockCandidates }) } }],
+    usage: { total_tokens: 120 },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+}
+
+function readStaticJson(relativePath) {
+  const file = join(ROOT, 'public', 'shopping', relativePath);
+  if (!existsSync(file)) return null;
+  return readFileSync(file, 'utf8');
+}
+
+/** 写账号/角色边界（生产里由 UI 保存；这里直接落 D1，等价于用户在设置页点过）。 */
+async function setupBoundary(input = {}) {
+  const nowMs = input.nowMs ?? Date.now();
+  const userId = input.userId ?? USER;
+  const charId = input.charId ?? CHAR;
+  await core.ensureAutonomyLifeSchema(d1);
+  const previous = sqlite
+    .prepare("SELECT revision FROM autonomy_life_boundaries WHERE owner_id = ? AND scope = 'account' AND char_id = ''")
+    .get(userId);
+  const revision = Number(previous?.revision ?? 0) + 1;
+  const account = core.normalizeBoundary(
+    {
+      enabled: input.enabled !== false,
+      globalPaused: input.globalPaused === true,
+      timezone: 'Asia/Shanghai',
+      allowedKinds: input.allowedKinds ?? [],
+      externalGrants: input.grants ?? [],
+      ...(input.limits ? { limits: input.limits } : {}),
+    },
+    { scope: 'account', nowMs, revision },
+  );
+  sqlite
+    .prepare('INSERT OR REPLACE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, 'account', '', account.revision, JSON.stringify(account), nowMs);
+  const character = core.normalizeBoundary({}, { scope: 'character', nowMs, revision: 0 });
+  sqlite
+    .prepare('INSERT OR IGNORE INTO autonomy_life_boundaries (owner_id, scope, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(userId, 'character', charId, character.revision, JSON.stringify(character), nowMs);
+  const runtime = core.createAutonomyLifeRuntime({ db: d1, userId, charId, now: () => nowMs, timezone: 'Asia/Shanghai' });
+  await runtime.store.bindInstallation(userId, input.installationId ?? INSTALLATION, nowMs);
+  // `/pause` 的权威来源是 accounts.paused 与角色 payload.pauseRequestedAt（不在 boundaries）：
+  // /setup 明确「恢复运行」，两处都清掉，避免场景之间互相污染。
+  await runtime.store.setAccountPause(userId, false, nowMs);
+  await d1
+    .prepare("UPDATE autonomy_life_characters SET payload = json_set(payload, '$.pauseRequestedAt', json('null')) WHERE owner_id = ? AND char_id = ?")
+    .bind(userId, charId)
+    .run()
+    .catch(() => undefined);
+  return account;
+}
+
+/**
+ * 生产入口 tick：调**真实** handleAutonomyLifeScheduled（cron 唯一入口）。
+ * 模型请求走本机 mock /chat/completions（可控响应），外部窗口用 env 里的真实端点。
+ */
+async function runProductionTick(input = {}) {
+  const nowMs = input.nowMs ?? Date.now();
+  const userId = input.userId ?? USER;
+  const charId = input.charId ?? CHAR;
+  await core.ensureAutonomyLifeSchema(d1);
+  // 联调「把时钟推到下一次机会」：只清调度时间指针，不注 profile/不造候选。
+  if (input.forceDue) {
+    await d1
+      .prepare("UPDATE autonomy_life_characters SET payload = json_set(payload, '$.nextOpportunityAt', json('null'), '$.retryAt', json('null'), '$.circuitOpenedAt', json('null')) WHERE owner_id = ? AND char_id = ?")
+      .bind(userId, charId)
+      .run()
+      .catch(() => undefined);
+  }
+  const pack = {
+    userId,
+    charId,
+    charName: input.charName ?? '小夏',
+    pack: {
+      template: input.template ?? '你叫小夏，喜欢天文，作息规律。',
+      tzId: 'Asia/Shanghai',
+      ...(input.scene ? { scene: input.scene } : {}),
+    },
+  };
+  const result = await core.handleAutonomyLifeScheduled({
+    db: d1,
+    packs: [pack],
+    nowMs,
+    credentialsFor: async () => ({
+      baseUrl: `http://127.0.0.1:${PORT}/mock-llm/v1`,
+      apiKey: 'mock-key',
+      model: 'mock-model',
+    }),
+    fetch: globalThis.fetch,
+    external: {
+      xhsUrl: process.env.AUTONOMY_EXTERNAL_XHS_URL ?? '',
+      readHosts: process.env.AUTONOMY_EXTERNAL_READ_HOSTS ?? '',
+    },
+    ...(input.reachability === 'unreachable' ? { reachability: async () => false } : {}),
+  });
+  return result;
+}
+
 // ── seed：把工程侧「计划产物」落成真实动作行（隔离环境没有真实 LLM 凭据） ─────
 async function seedAction(input) {
   const nowMs = input.nowMs ?? Date.now();
@@ -221,6 +330,7 @@ function inspect(ownerId = USER) {
         kind: payload.kind,
         status: payload.status,
         revision: payload.revision,
+        args: payload.args,
         argsHash: payload.argsHash,
         permitIssuedAt: payload.permitIssuedAt,
         permitConsumedAt: payload.permitConsumedAt,
@@ -237,10 +347,27 @@ function inspect(ownerId = USER) {
     .all(ownerId)
     .map((row) => ({ dayKey: row.day_key, provider: row.provider, used: row.used }));
   const budget = sqlite
-    .prepare('SELECT window_id, scope, used_calls, reserved_calls FROM autonomy_life_budget WHERE owner_id = ? ORDER BY window_id, scope')
+    .prepare('SELECT window_id, scope, used_calls, reserved_calls, spend_minor, kind_counts FROM autonomy_life_budget WHERE owner_id = ? ORDER BY window_id, scope')
     .all(ownerId)
-    .map((row) => ({ windowId: row.window_id, scope: row.scope, usedCalls: row.used_calls, reservedCalls: row.reserved_calls }));
-  return { dbPath, actions, wishes, usage, budget };
+    .map((row) => ({
+      windowId: row.window_id,
+      scope: row.scope,
+      usedCalls: row.used_calls,
+      reservedCalls: row.reserved_calls,
+      spendMinor: row.spend_minor,
+      kindCounts: row.kind_counts,
+    }));
+  const proposals = sqlite
+    .prepare('SELECT proposal_id, char_id, kind, payload, expires_at FROM autonomy_life_proposals WHERE owner_id = ? ORDER BY created_at ASC')
+    .all(ownerId)
+    .map((row) => ({
+      proposalId: row.proposal_id,
+      charId: row.char_id,
+      kind: row.kind,
+      expiresAt: row.expires_at,
+      args: JSON.parse(row.payload).args,
+    }));
+  return { dbPath, actions, wishes, usage, budget, proposals };
 }
 
 // ── HTTP ─────────────────────────────────────────────────────────────────────
@@ -282,6 +409,38 @@ window.__ready = true;
     }
     if (url.pathname === '/inspect') {
       send(200, inspect());
+      return;
+    }
+    if (url.pathname.startsWith('/shopping/')) {
+      const text = readStaticJson(url.pathname.slice('/shopping/'.length));
+      if (text === null) {
+        send(404, { error: 'not_found' }, JSON_HEADERS);
+        return;
+      }
+      send(200, text, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      return;
+    }
+    if (url.pathname === '/mock-llm-config' && method === 'POST') {
+      const body = await readJson(req);
+      mockModelMode = body.mode === 'fail' ? 'fail' : 'journal';
+      send(200, { ok: true, mode: mockModelMode }, JSON_HEADERS);
+      return;
+    }
+    if (url.pathname.startsWith('/mock-llm/') && method === 'POST') {
+      // 真实模型端口的对端：可控响应（journal 候选 / 500）。请求体不落日志。
+      send(200, await mockModelResponse().text(), { 'Content-Type': 'application/json' });
+      return;
+    }
+    if (url.pathname === '/setup' && method === 'POST') {
+      const body = await readJson(req);
+      const account = await setupBoundary(body);
+      send(200, { ok: true, boundary: account }, JSON_HEADERS);
+      return;
+    }
+    if (url.pathname === '/tick' && method === 'POST') {
+      const body = await readJson(req);
+      const result = await runProductionTick(body);
+      send(200, { ok: true, outcomes: result.outcomes, inspect: inspect(body.userId ?? USER) }, JSON_HEADERS);
       return;
     }
     if (url.pathname === '/seed' && method === 'POST') {

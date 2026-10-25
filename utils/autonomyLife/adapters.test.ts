@@ -140,7 +140,8 @@ describe('能力表：逐 kind 如实上报（§2 / §10-J）', () => {
 describe('validateAndPrepare：执行前的只读预计算（§4.2 / §5.3）', () => {
   const orderItems = [{ dishId: 'd1', name: '饭团', unitPriceMinor: 650, qty: 2 }];
   const order = (patch: Record<string, unknown> = {}) => ({
-    shopId: 's1', shopName: '便利店', items: orderItems, addressText: '模拟地址', deliveryFeeMinor: 300, category: '超市', ...patch,
+    shopId: 's1', shopName: '便利店', items: orderItems, addressText: '模拟地址', deliveryFeeMinor: 300, category: '超市',
+    orderId: 'ord_adapters_1', cardId: 'card-char-1', shopCat: '超市便利', ...patch,
   });
 
   it('订单总额含配送费（分），并以最小货币整数给出 spendMinor', () => {

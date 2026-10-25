@@ -32,6 +32,7 @@ import {
   type BudgetUsage,
   type Capability,
   type CharacterLifeState,
+  type ClientProposalInput,
   type EffectiveBoundaryV1,
   type ExternalGrant,
   type LifeAvailability,
@@ -62,6 +63,7 @@ export const AUTONOMY_LIFE_PATHS = {
   receipt: (id: string) => `${AUTONOMY_LIFE_API_BASE}/actions/${encodeURIComponent(id)}/receipt`,
   externalRead: () => `${AUTONOMY_LIFE_API_BASE}/external/read`,
   externalWish: () => `${AUTONOMY_LIFE_API_BASE}/external/wish`,
+  proposals: () => `${AUTONOMY_LIFE_API_BASE}/proposals`,
 } as const;
 
 /** 客户端本地失败码（不是服务端错误码，永不发给服务端）。 */
@@ -218,6 +220,13 @@ export interface ExternalPermitWire {
   nonce: string;
 }
 
+/** 上报真实目录候选的回执（只代表「已登记为候选」，不代表下单/扣款）。 */
+export interface ProposalSubmitPayload {
+  charId: string;
+  accepted: number;
+  expiresAt: number;
+}
+
 export interface AutonomyLifeApi {
   readLife: (charId: string) => Promise<AutonomyLifeApiResult<LifeStatePayload>>;
   readBoundaries: (charId?: string) => Promise<AutonomyLifeApiResult<LifeBoundaryPayload>>;
@@ -276,6 +285,17 @@ export interface AutonomyLifeApi {
     /** 一次性许可绑定（服务端核销后才能落库）。 */
     permit: ExternalPermitWire;
   }) => Promise<AutonomyLifeApiResult<{ wishId: string }>>;
+  /**
+   * 上报**真实目录候选**（外卖/购物）：参数由设备侧从既有目录 + 角色地址 + 模拟钱包
+   * 选好（真实店/商品/单价），服务端只校验形状/类目/单笔上限后落库供 tick 打分。
+   *
+   * 注意：这不是「提交订单」——它不产生任何订单或扣款，也不签发许可；真正执行仍要
+   * claim + commit-permit + 本地事务 + 回执。
+   */
+  submitProposals: (input: {
+    charId: string;
+    proposals: ClientProposalInput[];
+  }) => Promise<AutonomyLifeApiResult<ProposalSubmitPayload>>;
 }
 
 // ── 形状校验 ────────────────────────────────────────────────────────────────
@@ -877,6 +897,24 @@ export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeAp
       const wishId = raw.data.wishId;
       if (typeof wishId !== 'string' || !wishId) return malformed();
       return { ok: true, data: { wishId } };
+    },
+
+    submitProposals: async (input) => {
+      const charId = String(input.charId ?? '').trim();
+      if (!charId) return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'charId_required' };
+      if (!Array.isArray(input.proposals) || input.proposals.length === 0) {
+        return { ok: false, code: 'NOT_CONFIGURED', status: 0, message: 'proposals_required' };
+      }
+      const raw = await request(AUTONOMY_LIFE_PATHS.proposals(), {
+        method: 'POST',
+        body: { charId, proposals: input.proposals },
+        purpose: '上报真实目录候选',
+      });
+      if (!raw.ok) return raw;
+      const accepted = raw.data.accepted;
+      const expiresAt = raw.data.expiresAt;
+      if (!isFiniteNumber(accepted) || !isFiniteNumber(expiresAt)) return malformed();
+      return { ok: true, data: { charId, accepted, expiresAt } };
     },
   };
 }

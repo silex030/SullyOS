@@ -16,6 +16,7 @@
 import {
   AUTONOMY_LIFE_API_BASE,
   buildErrorBody,
+  CLIENT_PROPOSAL_TTL_MS,
   type ActivityKind,
 } from '../../../../contracts/autonomyLife';
 import type { CapabilityProbeState } from '../../../../utils/autonomyLife/adapters';
@@ -35,6 +36,11 @@ import {
 } from './external';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
 import { consumeExternalPermitAtomic, consumeExternalQuotaAtomic } from './store';
+import {
+  pruneClientProposals,
+  upsertClientProposals,
+  validateClientProposals,
+} from './proposals';
 
 export const AUTONOMY_LIFE_REQUIRED_TOKEN_ENV = 'AMSG_SERVER_TOKEN';
 
@@ -234,6 +240,81 @@ export async function handleAutonomyLifeRequest(
       serverTime: nowMs,
       ...page,
       resyncRequired: false,
+    });
+  }
+
+  // ── POST /proposals（绑定设备上报真实目录候选：外卖/购物）───────────────
+  //
+  // 这是「真实价格」的唯一入口：设备侧从既有目录选出店/商品/单价/地址后上报。
+  // 服务端只做三件事：形状与单笔上限校验、边界/平台策略预检、落库供 tick 打分。
+  // 任何一条不合法整包 422（不「收下能收的」），也不因此给任何执行许可。
+  if (match.method === 'POST' && first === 'proposals' && !second) {
+    const body = await readJson(request);
+    if (!body) return deps.respond(400, buildErrorBody('VALIDATION_FAILED', 'body_required', { requestId: 'proposals', serverTime: nowMs }));
+    const charId = str(body.charId);
+    if (!charId) return deps.respond(400, buildErrorBody('VALIDATION_FAILED', 'charId_required', { requestId: 'proposals', serverTime: nowMs }));
+    const runtime = await runtimeFor(charId);
+    await registerCharacter(runtime, charId, nowMs);
+    const effective = await runtime.boundaryFor(charId);
+    if (!effective.enabled || effective.globalPaused) {
+      return deps.respond(409, buildErrorBody('GLOBAL_PAUSED', 'autonomy_paused', { requestId: 'proposals', serverTime: nowMs }));
+    }
+    if (!effective.charEnabled) {
+      return deps.respond(403, buildErrorBody('CHAR_DISABLED', 'character_disabled', { requestId: 'proposals', serverTime: nowMs }));
+    }
+    const validation = validateClientProposals(body.proposals, {
+      orderMaxMinor: effective.limits.virtualOrderMaxMinor ?? 0,
+    });
+    if (!validation.ok) {
+      return deps.respond(422, buildErrorBody('VALIDATION_FAILED', validation.reason, {
+        requestId: 'proposals',
+        serverTime: nowMs,
+        details: validation.index === null ? {} : { index: validation.index },
+      }));
+    }
+    for (const proposal of validation.proposals) {
+      if (!effective.allowedKinds.includes(proposal.kind)) {
+        return deps.respond(403, buildErrorBody('POLICY_DENIED', 'kind_not_allowed', {
+          requestId: 'proposals', serverTime: nowMs, details: { kind: proposal.kind },
+        }));
+      }
+      const decision = checkIntentPolicy(
+        {
+          kind: proposal.kind,
+          args: proposal.args,
+          purpose: proposal.semanticPurpose,
+          boundary: {
+            forbiddenCategories: effective.forbiddenCategories,
+            avoidTopics: effective.avoidTopics,
+            allowFictionalNpc: effective.allowFictionalNpc,
+            externalGrants: effective.externalGrants,
+          },
+        },
+        nowMs,
+      );
+      if (!decision.allowed) {
+        return deps.respond(403, buildErrorBody('POLICY_DENIED', decision.reasonCode ?? 'policy_denied', {
+          requestId: 'proposals',
+          serverTime: nowMs,
+          details: { kind: proposal.kind, categories: decision.categories ?? [] },
+        }));
+      }
+    }
+    const written = await upsertClientProposals({
+      db,
+      ownerId: owner.userId,
+      charId,
+      proposals: validation.proposals,
+      nowMs,
+    });
+    await pruneClientProposals({ db, ownerId: owner.userId, nowMs });
+    return deps.respond(200, {
+      schemaVersion: 1,
+      requestId: deps.requestId?.() ?? 'proposals',
+      serverTime: nowMs,
+      charId,
+      accepted: written,
+      expiresAt: nowMs + CLIENT_PROPOSAL_TTL_MS,
     });
   }
 

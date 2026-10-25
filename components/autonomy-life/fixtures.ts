@@ -28,6 +28,7 @@ import type {
   LifeBoundaryPayload,
   LifeStatePayload,
   PausePayload,
+  ProposalSubmitPayload,
   AutonomyLifeApiErrorCode,
 } from '../../utils/autonomyLife/api';
 
@@ -246,6 +247,8 @@ export function createFixtureAutonomyLifeApi(
     : [];
 
   return {
+    // 真实设备候选上报不属于「读状态」夹具：明确不实现（UI 预览不依赖它）。
+    submitProposals: async (): Promise<AutonomyLifeApiResult<ProposalSubmitPayload>> => fail('NOT_CONFIGURED', 0),
     readLife: async (): Promise<AutonomyLifeApiResult<LifeStatePayload>> => {
       if (scenario === 'load_error') return fail('NETWORK', 0);
       return ok({ state, capabilities: capabilities(scenario === 'capability_unavailable' ? {} : {}) });

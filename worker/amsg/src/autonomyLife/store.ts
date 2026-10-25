@@ -157,6 +157,21 @@ export const AUTONOMY_LIFE_DDL = [
     created_at INTEGER NOT NULL,
     PRIMARY KEY (owner_id, id)
   )`,
+  // 绑定设备上报的真实目录候选（外卖/购物）。参数里带真实店/商品/单价/收货地址，
+  // 由设备侧从既有目录与钱包选出来；worker 只校验形状/类目/单笔上限后落库，供 tick 打分。
+  // 过期即不可用（真实价格与余额会变），排上动作后按 (char, kind) 回收。
+  `CREATE TABLE IF NOT EXISTS autonomy_life_proposals (
+    owner_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    char_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, proposal_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_autonomy_life_proposals_char
+    ON autonomy_life_proposals (owner_id, char_id, kind, expires_at)`,
   `CREATE TABLE IF NOT EXISTS autonomy_life_budget (
     owner_id TEXT NOT NULL,
     window_id TEXT NOT NULL,

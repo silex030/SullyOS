@@ -262,6 +262,13 @@ interface Env extends NativeFcmEnv {
   SULLYOS_RUNTIME?: string;
   /** D1 binding（factory 默认 createD1Adapter(env.DB)，这里只是标注存在）。 */
   DB: unknown;
+  /* ── 自主生活受控外部窗口（全部可选；缺一项 = 能力不可用，不做默认放行）── */
+  /** 小红书式只读端点（运营配置的完整 URL；必须同时出现在下面的主机白名单里）。 */
+  AUTONOMY_EXTERNAL_XHS_URL?: string;
+  /** 地图只读端点（出行窗口用；同样受白名单约束）。 */
+  AUTONOMY_EXTERNAL_AMAP_URL?: string;
+  /** 服务端出口主机白名单（逗号分隔，必须与用户 grant.allowedHosts 同时满足）。 */
+  AUTONOMY_EXTERNAL_READ_HOSTS?: string;
   /** 以下三项给 /self-update 用，都可选；没配 CF_API_TOKEN 就是不开自更新。见 ./selfUpdate。 */
   CF_API_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
@@ -4150,6 +4157,12 @@ export default {
         packs: lifePacks.packs,
         nowMs: lifeNowMs,
         masterKey: env.AMSG_MASTER_KEY,
+        // 外部窗口的真实配置：端点 + 服务端出口主机白名单。未配置 = 能力不可用（不猜）。
+        external: {
+          xhsUrl: env.AUTONOMY_EXTERNAL_XHS_URL,
+          amapUrl: env.AUTONOMY_EXTERNAL_AMAP_URL,
+          readHosts: env.AUTONOMY_EXTERNAL_READ_HOSTS,
+        },
       });
       const lifeSummary = summariseAutonomyLifeOutcomes(lifeResult.outcomes);
       if (lifeSummary.scheduled > 0 || lifeSummary.skipped.length > 0) {

@@ -159,6 +159,20 @@ async function readLocal() {
   return page.evaluate(async () => window.__AUTONOMY_E2E__.readLocal());
 }
 
+const CONFIG = {
+  baseUrl: BASE,
+  token: TOKEN,
+  userId: USER,
+  installationId: INSTALLATION,
+  charId: CHAR,
+};
+
+/** 页面内调用真实浏览器模块（harness-entry 暴露的入口）。 */
+async function pageCall(name, arg = CONFIG) {
+  return page.evaluate(async ({ fn, config }) => window.__AUTONOMY_E2E__[fn](config), { fn: name, config: arg });
+}
+
+
 // ── 场景 ────────────────────────────────────────────────────────────────────
 const grantFor = (provider, overrides = {}) => ({
   provider,
@@ -433,6 +447,146 @@ async function scenarioTravelWish() {
   check('配额耗尽后第二笔动作没有 succeeded', inspect2.actions.find((row) => row.id === actionId2)?.status !== 'succeeded', inspect2.actions.find((row) => row.id === actionId2)?.status);
 }
 
+
+async function scenarioProductionMarket() {
+  section('场景 6：生产链路（外卖/购物）—— 人设 + 真实目录候选 → cron tick → 执行 → 既有业务数据');
+  const setup = await call('/setup', {
+    method: 'POST',
+    body: {
+      allowedKinds: ['takeout.order', 'shopping.order', 'journal.write'],
+      limits: { accountModelCallsPerDay: 30, charModelCallsPerDay: 30, perKindActionsPerDay: 3, virtualSpendPerDayMinor: 20_000, virtualOrderMaxMinor: 5_000 },
+    },
+  });
+  check('账号边界由「用户设定」允许外卖/购物', setup.status === 200 && Array.isArray(setup.json?.boundary?.allowedKinds), setup.json?.boundary?.allowedKinds);
+
+  await page.evaluate(async () => window.__AUTONOMY_E2E__.resetLocal());
+  const identity = await pageCall('seedLocalIdentity');
+  check('设备本地有角色收货地址（真实执行前置）', typeof identity.address === 'string' && identity.address.includes('联调'), identity.address);
+  check('设备本地有角色卡余额（模拟钱包）', identity.cardBalance > 0, identity.cardBalance);
+
+  const market = await pageCall('submitCatalogProposals');
+  check('从既有真实目录（public/shopping/*.json）选出候选', market.catalogShops > 0 && market.proposals.length > 0, {
+    catalogShops: market.catalogShops,
+    proposals: market.proposals.map((item) => item.kind),
+  });
+  const priceOk = (market.proposals ?? []).every((proposal) => {
+    const items = proposal.args.items ?? [];
+    const total = items.reduce((sum, item) => sum + item.unitPriceMinor * item.qty, 0) + (proposal.args.deliveryFeeMinor ?? 0);
+    return items.length > 0
+      && items.every((item) => Number.isInteger(item.unitPriceMinor) && item.unitPriceMinor > 0 && Number.isInteger(item.qty))
+      && total > 0
+      && total <= market.budget.orderMaxMinor
+      && total <= market.budget.walletBalanceMinor;
+  });
+  check('候选价格全部来自目录（整数分、总额不超单笔上限与卡余额）', priceOk, market.budget);
+  check('候选已通过真实 POST /proposals 登记', market.submitted?.ok === true && market.submitted.data.accepted >= 1, market.submitted);
+
+  const beforeActions = ((await call('/inspect')).json?.actions ?? []).map((row) => row.id);
+  await call('/mock-llm-config', { method: 'POST', body: { mode: 'fail' } });
+  const tick = await call('/tick', { method: 'POST', body: { template: '你叫小夏，作息规律，喜欢天文。', forceDue: true } });
+  check('tick 走真实 handleAutonomyLifeScheduled（不是 seed 出来的动作）', tick.status === 200 && tick.json?.outcomes?.[0]?.status === 'ticked', tick.json?.outcomes?.[0]);
+  const scheduled = (tick.json?.inspect?.actions ?? []).find((row) => !beforeActions.includes(row.id));
+  check('模型不可用时仍按真实目录候选排出消费动作', !!scheduled && ['takeout.order', 'shopping.order'].includes(scheduled.kind), scheduled?.kind);
+  const proposalMatch = (market.proposals ?? []).find((proposal) => scheduled && proposal.kind === scheduled.kind);
+  check('动作参数与设备上报的候选完全一致（价格没被模型改写过）',
+    !!proposalMatch && JSON.stringify(scheduled?.args ?? null) === JSON.stringify(proposalMatch.args ?? null),
+    { kind: proposalMatch?.kind, total: proposalMatch ? (proposalMatch.args.items ?? []).reduce((sum, item) => sum + item.unitPriceMinor * item.qty, 0) + (proposalMatch.args.deliveryFeeMinor ?? 0) : null });
+  const spendRow = (tick.json?.inspect?.budget ?? []).find((row) => row.scope === CHAR);
+  check('计划期已核销消费额度（spend_minor > 0）', Number(spendRow?.spendMinor ?? 0) > 0, spendRow);
+
+  const exec = await pageCall('runExecutorOnce');
+  const outcome = (exec ?? []).find((item) => item.charId === CHAR);
+  check('真实执行器 claim → permit → 本地事务 → 回执成功', outcome?.result?.status === 'succeeded', outcome?.result?.status ?? outcome?.note);
+
+  const local = await pageCall('readLocal');
+  const order = (local.shoppingOrders ?? []).find((row) => row.actionId === scheduled.id);
+  check('本地既有业务表 shopping_orders 落单（不是新造影子表）', !!order && order.simulated === true, order?.id);
+  check('订单总额与目录价格一致（写入本地订单）', Number(order?.totalMinor ?? 0) > 0, order?.totalMinor);
+  const txn = (local.bankTransactions ?? []).find((row) => row.linkedPurchaseId === order?.id);
+  check('本地钱包扣款流水（bank_transactions）同事务写入', !!txn && Number(txn.amount) < 0, txn?.amount);
+  const cardAfter = (local.bankData ?? []).find((row) => row.id === 'main_state')?.cards?.find((card) => card.ownerId === CHAR);
+  check('卡余额按目录总额扣减（真实钱包口径）', cardAfter && Math.round(cardAfter.balance * 100) === Math.round(identity.cardBalance * 100) - Number(order?.totalMinor ?? 0), { before: identity.cardBalance, after: cardAfter?.balance });
+  check('本地回执已写（actionId 对得上）', (local.receipts ?? []).some((row) => row.actionId === scheduled.id));
+
+  const inspectAfter = (await call('/inspect')).json;
+  check('服务端动作收敛 succeeded 且许可已核销', inspectAfter.actions.find((row) => row.id === scheduled.id)?.status === 'succeeded', inspectAfter.actions.find((row) => row.id === scheduled.id)?.status);
+  const remainingKinds = (inspectAfter.proposals ?? []).map((row) => row.kind);
+  check('被排上的那份候选已回收（同一笔钱不会排两次）', !remainingKinds.includes(scheduled.kind), remainingKinds);
+
+  const view = await pageCall('readUiView');
+  const uiItem = (view.items ?? []).find((item) => item.id === scheduled.id);
+  check('UI 数据源（GET /activities + view.ts）读到这次活动', !!uiItem, uiItem);
+  check('UI 显示的是既有 App 文案（点外卖/买东西）', uiItem && ['点外卖', '买东西'].includes(uiItem.label), uiItem?.label);
+  check('UI 读到 effectVerified=true（有本地回执才算做过）', uiItem?.effectVerified === true, uiItem?.effectVerified);
+
+  // 边界生效：暂停后设备候选立刻被拒，tick 也不再排动作。
+  const revision = (await call(`${API}/boundaries?charId=${CHAR}`)).json?.account?.revision
+    ?? (await call(`${API}/boundaries?charId=${CHAR}`)).json?.revision;
+  const paused = await call(`${API}/pause`, { method: 'POST', body: { scope: 'account', paused: true, expectedRevision: revision } });
+  check('账号总暂停生效（/pause 200）', paused.status === 200, paused.status);
+  const proposalAfterPause = await call(`${API}/proposals`, {
+    method: 'POST',
+    body: { charId: CHAR, proposals: market.proposals },
+  });
+  check('暂停后设备候选被拒（409，边界控制真的生效）', proposalAfterPause.status === 409, proposalAfterPause.status);
+  const tickPaused = await call('/tick', { method: 'POST', body: { template: '你叫小夏，作息规律。' } });
+  check('暂停后 tick 不再产生动作', (tickPaused.json?.inspect?.actions ?? []).length === inspectAfter.actions.length, tickPaused.json?.outcomes?.[0]);
+}
+
+async function scenarioProductionExternal() {
+  section('场景 7：生产链路（外部只读）—— 配置 + 授权 + 可达 → 自主排出 external.read → 真实出网');
+  // 用**另一个角色**：场景 3/4 已经用同一角色真实读过外部内容，同类冷却（2 小时硬闸）会挡住
+  // 新动作；换角色既尊重冷却，也不需要删历史。
+  const CHAR2 = 'e2e-char-ext';
+  const CONFIG2 = { ...CONFIG, charId: CHAR2 };
+  const setup = await call('/setup', {
+    method: 'POST',
+    body: {
+      charId: CHAR2,
+      allowedKinds: ['external.read'],
+      grants: [grantFor('xhs')],
+      limits: { accountModelCallsPerDay: 30, charModelCallsPerDay: 30 },
+    },
+  });
+  check('账号边界允许外部只读且用户已授权', setup.status === 200, setup.json?.boundary?.allowedKinds);
+  await call('/mock-llm-config', { method: 'POST', body: { mode: 'fail' } });
+
+  const beforeIds = ((await call('/inspect')).json?.actions ?? []).map((row) => row.id);
+  const unreachable = await call('/tick', {
+    method: 'POST',
+    body: { charId: CHAR2, charName: '小夏二号', template: '你叫小夏二号，喜欢天文。', reachability: 'unreachable', forceDue: true },
+  });
+  const afterUnreachable = (unreachable.json?.inspect?.actions ?? []).filter((row) => !beforeIds.includes(row.id) && row.id);
+  check('端点不可达 → 不排外部动作（可达性是硬门）', afterUnreachable.length === 0 && unreachable.json?.outcomes?.[0]?.tick !== 'scheduled', unreachable.json?.outcomes?.[0]);
+
+  const tick = await call('/tick', {
+    method: 'POST',
+    body: { charId: CHAR2, charName: '小夏二号', template: '你叫小夏二号，喜欢天文。', forceDue: true },
+  });
+  check('配置 + 授权 + 可达 → 正常 tick 排出 external.read', tick.json?.outcomes?.[0]?.tick === 'scheduled', tick.json?.outcomes?.[0]);
+  const action = (tick.json?.inspect?.actions ?? []).find((row) => !beforeIds.includes(row.id));
+  check('动作是外部只读，且查询词来自人设兴趣', action?.kind === 'external.read', { kind: action?.kind, query: action?.args?.query });
+
+  const exec = await pageCall('runExecutorOnce', CONFIG2);
+  const outcome = (exec ?? []).find((item) => item.charId === CHAR2);
+  check('外部只读执行成功（真实 https 出网 + 字段投影 + 本地落库）', outcome?.result?.status === 'succeeded', outcome?.result?.status ?? outcome?.note);
+
+  const local = await pageCall('readLocal');
+  const readRow = (local.localLife ?? []).find((row) => row.actionId === action?.id);
+  check('本地写入只读结果（白名单字段，真实响应非空）',
+    !!readRow
+      && Array.isArray(readRow.items)
+      && readRow.items.length > 0
+      && readRow.items.every((item) => Object.keys(item).every((key) => ['title', 'excerpt', 'author', 'likes', 'url'].includes(key))),
+    readRow?.items?.[0]);
+  const inspect = (await call('/inspect')).json;
+  check('服务端外部配额 +1（真实出网）', (inspect.usage ?? []).some((row) => row.provider === 'xhs' && row.used >= 1), inspect.usage);
+  check('服务端动作 succeeded', inspect.actions.find((row) => row.id === action?.id)?.status === 'succeeded');
+  const view = await pageCall('readUiView', CONFIG2);
+  const uiItem = (view.items ?? []).find((item) => item.id === action?.id);
+  check('UI 数据源读到「看外部内容」活动', uiItem?.label === '看外部内容', uiItem?.label);
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 async function main() {
   const started = Date.now();
@@ -450,6 +604,8 @@ async function main() {
     await scenarioExternalRead();
     await scenarioRevokeAndPause();
     await scenarioTravelWish();
+    await scenarioProductionMarket();
+    await scenarioProductionExternal();
   } finally {
     if (browser) await browser.close().catch(() => {});
     await stopServer();

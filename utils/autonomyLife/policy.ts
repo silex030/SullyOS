@@ -229,13 +229,20 @@ export const KIND_ARG_SCHEMA: Record<ActivityKind, ArgSpec> = {
     optional: ['channel', 'durationMinutes', 'fictionalNpc'],
     enums: { channel: ['chat', 'call', 'sms'] },
   },
+  /*
+   * 外卖/购物：除了目录内容（店/商品/单价/地址），还需要三样**执行期身份**：
+   *   - orderId：设备侧确定性生成的订单号（幂等凭证 tx-order-<orderId> 的主键）；
+   *   - cardId：付款的角色卡（执行事务里核归属与余额，换卡即失败）；
+   *   - shopCat：目录里的原始类目（订单记录用；策略判定看映射后的 category）。
+   * 它们不改变金额口径，也不接受任何 URL/权限类键。
+   */
   'takeout.order': {
-    required: ['shopId', 'shopName', 'items', 'addressText'],
-    optional: ['category', 'deliveryFeeMinor', 'note'],
+    required: ['shopId', 'shopName', 'items', 'addressText', 'orderId', 'cardId'],
+    optional: ['category', 'shopCat', 'deliveryFeeMinor', 'note'],
   },
   'shopping.order': {
-    required: ['shopId', 'shopName', 'items', 'addressText'],
-    optional: ['category', 'deliveryFeeMinor', 'note'],
+    required: ['shopId', 'shopName', 'items', 'addressText', 'orderId', 'cardId'],
+    optional: ['category', 'shopCat', 'deliveryFeeMinor', 'note'],
   },
   'interaction.message': {
     required: ['text'],
