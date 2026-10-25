@@ -18,6 +18,8 @@ const DIST = join(ROOT, 'dist');
 const TGZ_LOCAL = join(ROOT, '.tmp-frontend-dist.tgz');
 const TGZ_REMOTE = '/tmp/frontend-dist.tgz';
 const REMOTE_DIR = '/opt/sullyos/frontend-dist';
+// 线上正式地址（2026-10-25：ethernet.bot.cd 那份 Vercel 已弃用，VPS 自托管走 link 子域）
+const PUBLIC_URL = process.env.SULLYOS_PUBLIC_URL || 'https://link.ethernet.bot.cd/';
 
 function sh(cmd, args) {
   const r = run(cmd, args, { cwd: ROOT });
@@ -40,7 +42,7 @@ if (!out.includes('STATIC_OK')) {
   console.error('REMOTE VERIFY FAILED: STATIC_OK missing, stop.');
   process.exit(1);
 }
-const remoteHtml = run(process.platform === 'win32' ? 'curl.exe' : 'curl', ['-s', '--noproxy', '*', 'https://ethernet.bot.cd/'], { cwd: ROOT });
+const remoteHtml = run(process.platform === 'win32' ? 'curl.exe' : 'curl', ['-s', '--noproxy', '*', PUBLIC_URL], { cwd: ROOT });
 const cmp = compareAssetSets(readFileSync(join(DIST, 'index.html'), 'utf8'), remoteHtml.stdout);
 if (!cmp.ok) {
   console.error('ASSET MISMATCH, stop. onlyLocal=' + JSON.stringify(cmp.onlyLocal) + ' onlyRemote=' + JSON.stringify(cmp.onlyRemote));
