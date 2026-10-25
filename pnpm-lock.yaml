@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@rei-standard/amsg-shared': 0.4.0-next.8
+
 importers:
 
   .:
@@ -130,11 +133,11 @@ importers:
   worker/instant-push:
     dependencies:
       '@rei-standard/amsg-instant':
-        specifier: 0.9.1
-        version: 0.9.1
+        specifier: 0.11.0-next.6
+        version: 0.11.0-next.6
       '@rei-standard/amsg-shared':
-        specifier: 0.2.0
-        version: 0.2.0
+        specifier: 0.4.0-next.8
+        version: 0.4.0-next.8
     devDependencies:
       wrangler:
         specifier: ^3.78.0
@@ -944,10 +947,6 @@ packages:
     resolution: {integrity: sha512-jpOmxbsVcRejhQLFJ9bJsjvXiO56z7ET95UU3GX3iUY2afVLK4xbdmt0DK0hPKCZlRBBppqMfz2beoutfLBeaQ==}
     engines: {node: '>=20'}
 
-  '@rei-standard/amsg-instant@0.9.1':
-    resolution: {integrity: sha512-GsLzRvSXsp5cbJ/vNwQP+yHoZ4LJiilOvws0LemrzaFoG45ApQ7WW3YHux58DXdXOSN36prT5CsmipA3wUAmQQ==}
-    engines: {node: '>=18'}
-
   '@rei-standard/amsg-server@2.6.0-next.23':
     resolution: {integrity: sha512-2VDkC2ljVCS5JA7fK127qSW0cHf0v02okUBB2ZFdxdGo7AhNyGKCnR5V+zWr2tU9MaNjWZMJEA51Jv5OgFH38Q==}
     engines: {node: '>=20'}
@@ -959,14 +958,6 @@ packages:
         optional: true
       pg:
         optional: true
-
-  '@rei-standard/amsg-shared@0.2.0':
-    resolution: {integrity: sha512-tAGoanWMEEGIadB47doerirymqHdpTKA81MRSHv13FRAJuDcsixtTu3iPFy1OIww6jPyUBCFloCm8LZ/f/fGeg==}
-    engines: {node: '>=20'}
-
-  '@rei-standard/amsg-shared@0.4.0-next.7':
-    resolution: {integrity: sha512-RmkLWk23+MmK92Y4Z56/3yvvFznQo5RdzfWYJVSMrFJaYbySw4Xse1tynvwvldPqv0HkPPuGFaKWspTdVSnEtg==}
-    engines: {node: '>=20'}
 
   '@rei-standard/amsg-shared@0.4.0-next.8':
     resolution: {integrity: sha512-jyxIbrNR8XPvVLEu7pAyiDnfECKByOhO0zu3zMtxbN7Jf5Ui1rKpX3qQbWRL6WidOTyXYO8jLjkzrCib4wDkgg==}
@@ -1067,7 +1058,6 @@ packages:
     resolution: {integrity: sha512-mcEl6CUT5IAUmQf1m9FYSmVqCJlpQ8r8eyftFUHG8i9OhY7BkBXSUdnLH5DOf0wCOjcP9v/QO93zpmF1SptCCw==}
     cpu: [riscv64]
     os: [linux]
-    libc: [musl]
 
   '@rollup/rollup-linux-s390x-gnu@4.60.4':
     resolution: {integrity: sha512-ynt3JxVd2w2buzoKDWIyiV1pJW93xlQic1THVLXilz429oijRpSHivZAgp65KBu+cMcgf1eVVjdnTLvPxgCuoQ==}
@@ -3376,15 +3366,11 @@ snapshots:
 
   '@rei-standard/amsg-client@2.9.0-next.12':
     dependencies:
-      '@rei-standard/amsg-shared': 0.4.0-next.7
+      '@rei-standard/amsg-shared': 0.4.0-next.8
 
   '@rei-standard/amsg-instant@0.11.0-next.6':
     dependencies:
       '@rei-standard/amsg-shared': 0.4.0-next.8
-
-  '@rei-standard/amsg-instant@0.9.1':
-    dependencies:
-      '@rei-standard/amsg-shared': 0.2.0
 
   '@rei-standard/amsg-server@2.6.0-next.23(@neondatabase/serverless@1.1.0)(pg@8.22.0)':
     dependencies:
@@ -3396,10 +3382,6 @@ snapshots:
       pg: 8.22.0
     transitivePeerDependencies:
       - supports-color
-
-  '@rei-standard/amsg-shared@0.2.0': {}
-
-  '@rei-standard/amsg-shared@0.4.0-next.7': {}
 
   '@rei-standard/amsg-shared@0.4.0-next.8': {}
 
