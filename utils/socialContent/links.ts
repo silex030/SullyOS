@@ -80,7 +80,7 @@ const SCHEMELESS_HOSTS = ['xhslink.com', 'www.xhslink.com', 'b23.tv', 'v.douyin.
 
 const URL_IN_TEXT = /(?:https?:\/\/|www\.)[^\s<>"'`，。！？；：、（）【】《》「」『』“”‘’…]+/giu;
 // 前导边界不用正则后行断言 (?<!…)：iOS Safari <16.4 的 JSC 不支持，旧设备 new RegExp 直接抛错
-// （仓库守卫见 utils/noLookbehind.test.ts）。改为取到 match.index 后手查前一个字符（见 collectFound）。
+// （仓库守卫见 utils/noLookbehind.test.ts）。改为取到 match.index 后手查前一个字符（见 findRawLinks）。
 const SCHEMELESS_IN_TEXT = new RegExp(
   `(?:${SCHEMELESS_HOSTS.map((h) => h.replace(/\./g, '\\.')).join('|')})/[^\\s<>"'\`，。！？；：、（）【】《》「」『』“”‘’…]*`,
   'giu',
