@@ -1075,4 +1075,198 @@ describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一�
     expect(res?.status).toBe(409);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+
+  /**
+   * 上一轮退回的第 1 项：正式端点的**最终授权额度核销**也必须带当前边界条件。
+   *
+   * 场景固定为「许可 CAS 已经成功 → external_usage 语句执行之前」，用真 SQLite 的
+   * `beforeStatement` 钩子插入另一台设备的写入（收紧额度 / 撤权 / 暂停）。
+   * 期望：本轮零出网、零愿望；额度行不被占用；不是按「读边界时的旧 grant.dailyQuota」放行。
+   */
+  const injectBeforeQuotaStatement = async (statements: string[]) => {
+    let permitConsumed = false;
+    const injected = { value: false };
+    fresh({
+      beforeStatement: (text) => {
+        if (/UPDATE autonomy_life_actions/.test(text)) {
+          permitConsumed = true;
+          return;
+        }
+        if (!injected.value && permitConsumed && /autonomy_life_external_usage/.test(text)) {
+          injected.value = true;
+          for (const statement of statements) sql.prepare(statement).run(USER);
+        }
+      },
+    });
+    resetAutonomyLifeSchemaCacheForTesting();
+    await ensureAutonomyLifeSchema(db);
+    return injected;
+  };
+
+  const usageRows = async (provider: 'xhs' | 'amap') => Number(
+    (await db.prepare('SELECT COALESCE(SUM(used), 0) AS used FROM autonomy_life_external_usage WHERE owner_id = ? AND provider = ?')
+      .bind(USER, provider).first())?.used ?? 0,
+  );
+  const wishRows = async () => Number(
+    (await db.prepare('SELECT COUNT(*) AS n FROM autonomy_life_wishes WHERE owner_id = ?').bind(USER).first())?.n ?? 0,
+  );
+  const readEnv = { AUTONOMY_EXTERNAL_XHS_URL: 'https://xhs.example/read', AUTONOMY_EXTERNAL_READ_HOSTS: 'xhs.example' };
+
+  it('许可 CAS 之后把授权额度收紧到 0（不动 revision）→ 终局核销拒绝、零出网、零额度占用', async () => {
+    const binding = await prepareExternalAction({
+      kind: 'external.read',
+      args: readArgs,
+      actionId: 'act-read-quota-tighten',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const injected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET payload = json_set(payload, '$.externalGrants[0].dailyQuota', 0)
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const res = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...binding }, readEnv);
+    expect(injected.value).toBe(true);
+    // 旧实现会按读边界时的 dailyQuota=5 放行；现在按执行那一刻的额度判 → 429。
+    expect(res?.status).toBe(429);
+    expect((await res!.json() as any).error.message).toBe('external_daily_quota_exhausted');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await usageRows('xhs')).toBe(0);
+    // 许可 CAS 已成功、额度这一关才拒：许可被烧掉，动作不可重放（fail closed，执行器按失败回执）。
+    // 这是有意的保守方向：宁可这一笔作废，也不让「许可已核销 → 效果被拒」的窗口可重试。
+    const burned = await createD1LifeStore({ db, ownerId: USER, now: () => NOW }).getAction('act-read-quota-tighten');
+    expect(burned?.permitConsumedAt).toBe(NOW);
+  });
+
+  it('许可 CAS 之后撤销授权（bump revision）→ 409，读取零出网、愿望零新增', async () => {
+    const readBinding = await prepareExternalAction({
+      kind: 'external.read',
+      args: readArgs,
+      actionId: 'act-read-grant-revoked-race',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const readInjected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET revision = revision + 1,
+            payload = json_set(payload, '$.externalGrants', json('[]'))
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const readRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...readBinding }, readEnv);
+    expect(readInjected.value).toBe(true);
+    expect(readRes?.status).toBe(409);
+    expect((await readRes!.json() as any).error.message).toBe('boundary_changed');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await usageRows('xhs')).toBe(0);
+
+    const wishBinding = await prepareExternalAction({
+      kind: 'travel.wish',
+      args: wishArgs,
+      actionId: 'act-wish-grant-revoked-race',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const wishInjected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET revision = revision + 1,
+            payload = json_set(payload, '$.externalGrants', json('[]'))
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const wishRes = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...wishBinding });
+    expect(wishInjected.value).toBe(true);
+    expect(wishRes?.status).toBe(409);
+    expect(await wishRows()).toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('许可 CAS 之后账号总暂停（bump revision）→ 读取 409 零出网、愿望零新增', async () => {
+    const readBinding = await prepareExternalAction({
+      kind: 'external.read',
+      args: readArgs,
+      actionId: 'act-read-pause-race',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const readInjected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET revision = revision + 1,
+            payload = json_set(payload, '$.globalPaused', json('true'))
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const readRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...readBinding }, readEnv);
+    expect(readInjected.value).toBe(true);
+    expect(readRes?.status).toBe(409);
+    expect((await readRes!.json() as any).error.message).toBe('boundary_changed');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await usageRows('xhs')).toBe(0);
+
+    const binding = await prepareExternalAction({
+      kind: 'travel.wish',
+      args: wishArgs,
+      actionId: 'act-wish-pause-race',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const injected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET revision = revision + 1,
+            payload = json_set(payload, '$.globalPaused', json('true'))
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const res = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...binding });
+    expect(injected.value).toBe(true);
+    expect(res?.status).toBe(409);
+    expect((await res!.json() as any).error.message).toBe('boundary_changed');
+    expect(await wishRows()).toBe(0);
+    expect(await usageRows('amap')).toBe(0);
+  });
+
+  it('许可 CAS 之后把出行授权额度收紧到 0（不动 revision）→ 429，愿望零新增', async () => {
+    const binding = await prepareExternalAction({
+      kind: 'travel.wish',
+      args: wishArgs,
+      actionId: 'act-wish-quota-tighten',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const injected = await injectBeforeQuotaStatement([
+      `UPDATE autonomy_life_boundaries
+        SET payload = json_set(payload, '$.externalGrants[0].dailyQuota', 0)
+        WHERE owner_id = ? AND scope = 'account' AND char_id = ''`,
+    ]);
+    const res = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...binding });
+    expect(injected.value).toBe(true);
+    expect(res?.status).toBe(429);
+    expect((await res!.json() as any).error.message).toBe('external_daily_quota_exhausted');
+    expect(await wishRows()).toBe(0);
+    expect(await usageRows('amap')).toBe(0);
+  });
+
+  it('正向：授权额度 1 时第一次读取成功并出网一次，第二次 429 且不再出网', async () => {
+    fetchSpy.mockImplementation(async () => new Response(JSON.stringify({ items: [{ title: '咖啡地图' }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }) as never);
+    const first = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-quota-first' });
+    const firstRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...first }, readEnv);
+    expect(firstRes?.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(await usageRows('xhs')).toBe(1);
+
+    const second = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-quota-second' });
+    const secondRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...second }, readEnv);
+    expect(secondRes?.status).toBe(429);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(await usageRows('xhs')).toBe(1);
+  });
+
+  it('并发抢授权窗口的最后一格：只允许一笔出网，额度不超卖', async () => {
+    fetchSpy.mockImplementation(async () => new Response(JSON.stringify({ items: [{ title: '咖啡地图' }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }) as never);
+    const a = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-race-quota-a' });
+    const b = await prepareExternalAction({ kind: 'external.read', args: readArgs, actionId: 'act-read-race-quota-b' });
+    const results = await Promise.all([
+      call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...a }, readEnv),
+      call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...b }, readEnv),
+    ]);
+    expect(results.map((res) => res?.status).sort()).toEqual([200, 429]);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(await usageRows('xhs')).toBe(1);
+  });
 });

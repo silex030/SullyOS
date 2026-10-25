@@ -12,7 +12,6 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqlite';
 import {
-  consumeExternalQuota,
   handleExternalRead,
   isHostAllowed,
   parseAllowedHosts,
@@ -135,19 +134,9 @@ describe('响应处理', () => {
   });
 });
 
-describe('配额', () => {
-  it('按 (owner, 日, provider) 原子自增，超过上限拒绝', async () => {
-    const args = { db, ownerId: 'u1', dayKey: '2026-10-24', provider: 'xhs' as const, limit: 2, nowMs: NOW };
-    expect(await consumeExternalQuota(args)).toBe(true);
-    expect(await consumeExternalQuota(args)).toBe(true);
-    expect(await consumeExternalQuota(args)).toBe(false);
-    // 其他用户 / 其他天的额度不受影响。
-    expect(await consumeExternalQuota({ ...args, ownerId: 'u2' })).toBe(true);
-    expect(await consumeExternalQuota({ ...args, dayKey: '2026-10-25' })).toBe(true);
-    // limit=0 是硬零。
-    expect(await consumeExternalQuota({ ...args, ownerId: 'u3', limit: 0 })).toBe(false);
-  });
-});
+// 配额核销的用例在 `store`/`legacyGate`/`wiring` 里覆盖：只有一个原子入口
+// `consumeExternalQuotaAtomic`（额度、未过期授权、边界 revision、暂停同一条条件语句），
+// 这里不再单独测已被删除的 `consumeExternalQuota(旧 limit)`。
 
 /**
  * 资源限制的真实性：超时覆盖 body、按字节限长、提前拒绝清理响应体。

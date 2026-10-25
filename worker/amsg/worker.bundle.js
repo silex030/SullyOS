@@ -26380,14 +26380,6 @@ function finishRead(args) {
   const items = extractItems(payload).slice(0, EXTERNAL_MAX_ITEMS).map((row) => projectItem(row, fields, allow)).filter((row) => Object.keys(row).length > 0);
   return { ok: true, result: { items, fetchedAt: args.nowMs } };
 }
-async function consumeExternalQuota(args) {
-  const limit = Math.max(0, Math.trunc(args.limit));
-  if (limit <= 0) return false;
-  await args.db.prepare("INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)").bind(args.ownerId, args.dayKey, args.provider, args.nowMs).run();
-  const updated = await args.db.prepare("UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?").bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit).run();
-  const changes = Number(updated?.meta?.changes ?? updated?.changes ?? 0);
-  return Number.isFinite(changes) && changes > 0;
-}
 async function insertTravelWish2(args) {
   const wishId = `wish_${args.nowMs.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   await args.db.prepare("INSERT INTO autonomy_life_wishes (owner_id, id, char_id, text, grant_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(args.ownerId, wishId, args.charId, args.text, args.grantId, args.nowMs).run();
@@ -26759,15 +26751,23 @@ async function handleExternalWindowAction(args) {
     const status = consumed.code === "NOT_FOUND" ? 404 : consumed.code === "FORBIDDEN" ? 403 : consumed.code === "GLOBAL_PAUSED" ? 409 : 409;
     return deps.respond(status, buildErrorBody(consumed.code, "permit_not_consumable", { requestId: "external", serverTime: nowMs }));
   }
-  const quotaOk = await consumeExternalQuota({
+  const quota = await consumeExternalQuotaAtomic({
     db: args.db,
     ownerId,
+    charId,
     dayKey: localDateKey(nowMs, effective.timezone),
     provider,
-    limit: grant.dailyQuota,
-    nowMs
+    nowMs,
+    expectedAccountRevision: effective.accountRevision ?? null,
+    expectedCharacterRevision: effective.characterRevision ?? null
   });
-  if (!quotaOk) {
+  if (!quota.ok) {
+    if (quota.reason === "boundary_changed") {
+      return deps.respond(409, buildErrorBody("STATE_CONFLICT", "boundary_changed", { requestId: "external", serverTime: nowMs }));
+    }
+    if (quota.reason === "store_unavailable") {
+      return deps.respond(503, buildErrorBody("SERVICE_UNAVAILABLE", "external_quota_store_unavailable", { requestId: "external", serverTime: nowMs }));
+    }
     return deps.respond(429, buildErrorBody("RATE_LIMITED", "external_daily_quota_exhausted", { requestId: "external", serverTime: nowMs }));
   }
   if (mode === "wish") {

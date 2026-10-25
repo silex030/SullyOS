@@ -28,14 +28,13 @@ import { createAutonomyLifeRuntime, defaultCharacterBoundary, type AutonomyLifeR
 import { ensureAutonomyLifeSchema, type LifeDb } from './store';
 import {
   EXTERNAL_RESPONSE_FIELDS,
-  consumeExternalQuota,
   handleExternalRead,
   insertTravelWish,
   isHostAllowed,
   parseAllowedHosts,
 } from './external';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
-import { consumeExternalPermitAtomic } from './store';
+import { consumeExternalPermitAtomic, consumeExternalQuotaAtomic } from './store';
 
 export const AUTONOMY_LIFE_REQUIRED_TOKEN_ENV = 'AMSG_SERVER_TOKEN';
 
@@ -523,16 +522,29 @@ async function handleExternalWindowAction(args: {
     return deps.respond(status, buildErrorBody(consumed.code, 'permit_not_consumable', { requestId: 'external', serverTime: nowMs }));
   }
 
-  // 每日配额：核销之后扣（核销失败不浪费额度；重放在核销那一步就被拒）。
-  const quotaOk = await consumeExternalQuota({
+  // 每日授权额度：**与许可核销同一口径**的原子核销。
+  // 以前这里传的是「读边界时拿到的 grant.dailyQuota」，语句里也只有 used < 旧 limit ——
+  // 于是在「许可 CAS 成功 → 额度语句执行前」把额度收紧到 0 / 撤权 / 暂停（bump revision）
+  // 仍会按旧值放行并出网/落库。现在额度、授权有效期、账号/角色 revision 与暂停/开关全在
+  // `consumeExternalQuotaAtomic` 的同一条条件语句里按**执行那一刻**的边界判。
+  // 许可已经消费掉、这一步拒绝 → 本轮无出网/无落库（fail closed，执行器按失败回执）。
+  const quota = await consumeExternalQuotaAtomic({
     db: args.db,
     ownerId,
+    charId,
     dayKey: localDateKey(nowMs, effective.timezone),
     provider,
-    limit: grant.dailyQuota,
     nowMs,
+    expectedAccountRevision: effective.accountRevision ?? null,
+    expectedCharacterRevision: effective.characterRevision ?? null,
   });
-  if (!quotaOk) {
+  if (!quota.ok) {
+    if (quota.reason === 'boundary_changed') {
+      return deps.respond(409, buildErrorBody('STATE_CONFLICT', 'boundary_changed', { requestId: 'external', serverTime: nowMs }));
+    }
+    if (quota.reason === 'store_unavailable') {
+      return deps.respond(503, buildErrorBody('SERVICE_UNAVAILABLE', 'external_quota_store_unavailable', { requestId: 'external', serverTime: nowMs }));
+    }
     return deps.respond(429, buildErrorBody('RATE_LIMITED', 'external_daily_quota_exhausted', { requestId: 'external', serverTime: nowMs }));
   }
 

@@ -1,0 +1,26 @@
+# t_984b3cfc 第七轮（架构审查 request_changes 第 7 轮）证据清单
+# HEAD: 见本清单所在提交（git log -1 -- docs/autonomy-life/evidence）
+# 生成时间(UTC): 2026-10-25 00:25:03 UTC
+# 说明: evidence/ 下全部原始日志与代码同源，均为原始 stdout/stderr（未裁剪）。sha256 供逐字节复核。
+# 读取: gunzip -c <file>.gz | less
+
+08cc63878b7aa6fa08fab48c2cf895c4df0b84934f5a15d6be958b29656ee931  README.md
+5c790678e0909c5ca729655469c949178a97c69b098ec79afc64cc4edbf85d09  build.log.gz
+d0aa43c0098ef9cd89efec845fc08d737c17e355e0ca80ee214bb096697c93aa  e2e-http-requests.json.gz
+6509f861599da99350ef9fd599869104b24ea51fa11a6549911d80ef80b748cd  e2e-report.json.gz
+53e3bc829d233768ba674cc9f3fda3bedd56967a339ddc6862d01ad741e3550a  e2e-run.log.gz
+da9322df6386d755bf6e04f6aae6ca8ebef90bc4e87e47d64e7bf7dd78b30bbe  focused.log.gz
+e57cdcd0817a55e23383990ecdc8a1d8ef7932f5ba50b146945c39f437fdb462  legacy-grep.log.gz
+a7a571dafc9140282277b2d3dfa283909cad3def97b10fc39c2a66787ea5c356  runtime-audit.md.gz
+e379bb8b6f664e8d84b7c9a2a456920ec794de172b9cb19f0b3391538859a7c1  tsc-baseline.log.gz
+f4e0a01aa2e77895a28f3a0e2c5bc58948395c873a52b5ab5fb010518368c30f  tsc-compare.txt
+60e1b21c09382a7a612ba833d2c30a23ac148c2bdf9af966357efb109047c8be  tsc-current.log.gz
+97d31a8de2bbfe106d276d33bfb2eb57b47633502e14dead917a416695fbf357  vitest-full.log.gz
+
+# 运行命令（原始 stdout/stderr，未裁剪）:
+#   npx vitest run                                  -> 624 files / 7641 tests, EXIT 0 (115.2s)
+#   npx vitest run <focused list>                   -> 42 files / 926 tests, EXIT 0
+#   npx tsc --noEmit -p tsconfig.json               -> 56 errors (baseline 56, diff empty), EXIT 2
+#   pnpm run build                                  -> EXIT 0 (vite built in 1m 12s)
+#   node scripts/autonomy-e2e/run.mjs               -> 40/40 checks, EXIT 0
+#   bash scripts/autonomy-legacy-grep-audit.sh      -> EXIT 0 (第 12 项旧 consumeExternalQuota 定义/调用 0 命中)

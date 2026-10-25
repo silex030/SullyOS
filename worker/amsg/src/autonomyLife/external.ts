@@ -266,30 +266,13 @@ function finishRead(args: {
   return { ok: true, result: { items, fetchedAt: args.nowMs } };
 }
 
-/** 配额原子自增：超限返回 false（先写 0 行再条件 UPDATE，并发不会超卖）。 */
-export async function consumeExternalQuota(args: {
-  db: { prepare(sql: string): { bind(...values: unknown[]): { run(): Promise<unknown> } } };
-  ownerId: string;
-  dayKey: string;
-  provider: ExternalProvider;
-  limit: number;
-  nowMs: number;
-}): Promise<boolean> {
-  const limit = Math.max(0, Math.trunc(args.limit));
-  if (limit <= 0) return false;
-  await args.db
-    .prepare('INSERT OR IGNORE INTO autonomy_life_external_usage (owner_id, day_key, provider, used, updated_at) VALUES (?, ?, ?, 0, ?)')
-    .bind(args.ownerId, args.dayKey, args.provider, args.nowMs)
-    .run();
-  const updated = await args.db
-    .prepare('UPDATE autonomy_life_external_usage SET used = used + 1, updated_at = ? WHERE owner_id = ? AND day_key = ? AND provider = ? AND used < ?')
-    .bind(args.nowMs, args.ownerId, args.dayKey, args.provider, limit)
-    .run();
-  const changes = Number((updated as { meta?: { changes?: unknown }; changes?: unknown })?.meta?.changes
-    ?? (updated as { changes?: unknown })?.changes
-    ?? 0);
-  return Number.isFinite(changes) && changes > 0;
-}
+/*
+ * 配额核销**只**有 `store.consumeExternalQuotaAtomic` 一个入口（`/external/*` 与旧链路共用）。
+ * 早先这里还有一个 `consumeExternalQuota({ limit })`：额度由调用方读边界时的旧
+ * `grant.dailyQuota` 传入，语句里既没有边界 revision 也没有「未过期授权」条件，
+ * 于是「许可核销之后、额度语句执行之前」收紧额度/撤权/暂停仍会按旧值放行。
+ * 该函数已删除，不留第二套不安全入口。
+ */
 
 export async function insertTravelWish(args: {
   db: { prepare(sql: string): { bind(...values: unknown[]): { run(): Promise<unknown> } } };

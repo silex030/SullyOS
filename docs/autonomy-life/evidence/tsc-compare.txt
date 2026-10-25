@@ -1,4 +1,5 @@
-no differences after path normalization (56 errors both sides)
-current: EXIT:2, 56 errors; baseline f7f040c7: EXIT:2, 56 errors
-normalization: the worktree prefix /root/SullyOS/.worktrees/t_984b3cfc -> <ROOT>/ and the baseline worktree prefix /root/.hermes/profiles/ds-executor/cache/scratch/r6/base -> <ROOT>/
-in-scope new errors: 0
+# 第七轮：当前 HEAD vs 基线 f7f040c7 的 tsc 归一化比较
+# 命令: npx tsc --noEmit -p tsconfig.json（两边各 56 条，EXIT:2 与基线同值）
+# 归一化: 去掉 worktree 绝对路径前缀后逐行 diff
+
+(diff 为空：两边错误集合逐行相同)

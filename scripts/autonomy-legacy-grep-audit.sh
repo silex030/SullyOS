@@ -44,6 +44,8 @@ scan "8. 旧 15/30/60/120 分钟频率编辑" '\[15, 30, 60, 120\]'
 scan "9. 「外部窗口未实现」占位" 'external_window_not_implemented'
 scan "10. 旧 autonomyLife/client.ts" "autonomyLife/client'"
 scan "11. 统一闸自己的落点（新代码，供对照）" 'reserveLegacyRoundCall\|reserveLegacyNotification\|reserveLegacyEffect\|claimRoundEffect\|travelModelAccess\|gateTravelDecisionPort'
+scan "12. 旧「按读边界时的 grant.dailyQuota 扣额度」的定义与调用（必须 0 命中）" 'export async function consumeExternalQuota\b\|await consumeExternalQuota('
+scan "13. 授权窗口额度核销的唯一入口（新代码，供对照）" 'consumeExternalQuotaAtomic'
 
 printf '\n### 结论（人工核对项）\n'
 printf '  - AIRP 旧回合：cron 建任务前 gateLegacyAutonomyPacks；每次调模型前 reserveLegacyRoundCall（beforeFire）；\n'
@@ -51,3 +53,5 @@ printf '    输出效果前 claimRoundEffect + settle + 现读边界（llmOutput
 printf '  - 出行：index.ts buildTravelSubjectWiring 先 travelModelAccess（新边界+旧出行授权），\n'
 printf '    再 gateTravelDecisionPort（每次模型调用前原子预留/结算）；回合内 travelIntent 走 reserveLegacyEffect。\n'
 printf '  - 手机自动刷新 / 旧频率编辑 / 外部窗口占位：0 命中。\n'
+printf '  - 授权窗口额度：唯一入口 consumeExternalQuotaAtomic（/external/read、/external/wish 与旧链路共用）；\n'
+printf '    旧 consumeExternalQuota(limit) 的定义与调用 0 命中（源码里只剩注释中的历史说明）。\n'
