@@ -17,7 +17,7 @@
   `seedLocalIdentity/submitCatalogProposals/runExecutorOnce/readUiView`。
 - `public/shopping/*.json`（仓库里的真实目录）由 server 原样提供；页面用真实
   `marketCatalog.buildMarketProposal` 选单，价格全部来自目录。
-- `run.mjs` —— 驱动：起 server、开 Chromium、按 5 个场景断言并写证据。
+- `run.mjs` —— 驱动：起 server、开 Chromium、按场景断言并写证据（当前 8 个场景，91 项）。
 
 `./.data/`（SQLite + 打包产物）已在 `.gitignore` 里，可随时删掉重跑。
 
@@ -44,7 +44,8 @@ AUTONOMY_E2E_EVIDENCE=/tmp/autonomy-e2e node scripts/autonomy-e2e/run.mjs
 ```
 
 - `--port 4321` 可换端口（只监听 `127.0.0.1`）。
-- 产物：`e2e-run.log`、`e2e-report.json`（逐条 check）、`e2e-http-requests.json`（真实请求路径/状态）。
+- 产物：`e2e-run.log`、`e2e-report.json`（逐条 check）、`e2e-http-requests.json`（真实请求路径/状态）
+  和场景 8 的三张截图。
 - 退出码 0 = 全部 check 通过。
 
 ## 场景
@@ -64,5 +65,16 @@ AUTONOMY_E2E_EVIDENCE=/tmp/autonomy-e2e node scripts/autonomy-e2e/run.mjs
 7. **生产链路（外部只读）**：`/setup` 配好外部只读 + 授权 → 不可达时排不出动作 →
    可达时由真实 tick 排出 `external.read`（查询词来自人设兴趣）→ 真实 https 出网 +
    字段投影 + 本地落库 + 配额 +1。用另一个角色避免与场景 3 的同类冷却冲突。
+8. **真实 UI 组件**（在场景 6 之后、7 之前跑）：`createRoot` 挂载仓库里的
+   `components/autonomy-life/AutonomyLifePanel`（活动页/边界页都由组件自己渲染），
+   读本轮真实 worker API 与本轮真实业务数据：
+   - 活动页 DOM 出现场景 6 生产链排出的「点外卖」卡片，且该动作的 `reasonSummary`
+     出现在组件文本里（不是「有任意一条活动」）；
+   - 边界页没有任何频率/间隔输入控件；点组件自己的 `role=switch`「总暂停」→ 真的
+     发出 `POST /pause` 200 → 开关翻转「已暂停」；随后设备候选 409、`/tick` 跳过、
+     动作数不变；再点一次恢复；
+   - 截图写 `ui-autonomy-activity.png` / `ui-autonomy-boundary-allowed.png` /
+     `ui-autonomy-boundary-paused.png`。**页面没有引入 Tailwind CSS**，截图的版式
+     不代表 App 外观，验收以 DOM 断言与请求日志为准。
 
 不部署、不连生产 worker、不读任何密钥。

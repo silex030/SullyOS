@@ -176,8 +176,8 @@ function bytesToBase64Url(buf) {
 }
 function base64UrlToBytes(input) {
   const s = String(input).replace(/-/g, "+").replace(/_/g, "/");
-  const pad3 = (4 - s.length % 4) % 4;
-  const padded = s + "=".repeat(pad3);
+  const pad = (4 - s.length % 4) % 4;
+  const padded = s + "=".repeat(pad);
   const bin = typeof atob === "function" ? atob(padded) : Buffer.from(padded, "base64").toString("binary");
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
@@ -12667,7 +12667,14 @@ function normalizePersonaSignal(input) {
   const personaText = typeof input?.personaText === "string" ? input.personaText.slice(0, PERSONA_MAX_CHARS) : "";
   const scheduleText = typeof input?.scheduleText === "string" ? input.scheduleText.slice(0, SCHEDULE_MAX_CHARS) : "";
   const city = typeof input?.city === "string" ? input.city.trim().slice(0, CITY_MAX_CHARS) : "";
-  return { personaText, scheduleText, city };
+  return { personaText, scheduleText, city, sleepWindow: normalizeSleepWindow(input?.sleepWindow) };
+}
+function normalizeSleepWindow(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const start = toMinutes(raw.start);
+  const end = toMinutes(raw.end);
+  if (start === null || end === null || start === end) return null;
+  return { start: toHhmm(start), end: toHhmm(end) };
 }
 function personaSignalIsEmpty(signal) {
   return !signal.personaText.trim() && !signal.scheduleText.trim();
@@ -12691,9 +12698,11 @@ var toHhmm = (minutes) => {
   const minute = clamped % 60;
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 };
-var SLEEP_SLOT_RE = /睡觉|就寝|入睡|睡眠|休息/;
-function scheduleTextFromSlots(slots) {
-  if (!Array.isArray(slots) || slots.length === 0) return "";
+var EXPLICIT_SLEEP_RE = /睡觉|就寝|入睡|睡眠|睡下|熟睡|安睡/;
+var REST_SLOT_RE = /休息|小憩|打盹|眯/;
+var isNightish = (minuteOfDay) => minuteOfDay >= 20 * 60 || minuteOfDay <= 6 * 60;
+function scheduleRows(slots) {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
   const rows = [];
   for (const slot of slots) {
     const start = toMinutes(slot?.startTime);
@@ -12703,7 +12712,7 @@ function scheduleTextFromSlots(slots) {
     if (activity.length > 40) continue;
     rows.push({ start, end: SLOT_END_LIMIT, activity });
   }
-  if (rows.length === 0) return "";
+  if (rows.length === 0) return [];
   rows.sort((a, b) => a.start === b.start ? a.activity < b.activity ? -1 : 1 : a.start - b.start);
   const seen = /* @__PURE__ */ new Set();
   const ordered = [];
@@ -12715,20 +12724,49 @@ function scheduleTextFromSlots(slots) {
   for (let i = 0; i < ordered.length; i += 1) {
     ordered[i].end = i + 1 < ordered.length ? ordered[i + 1].start : SLOT_END_LIMIT;
   }
-  const sleepIndex = ordered.findIndex((row) => SLEEP_SLOT_RE.test(row.activity));
-  if (sleepIndex < 0) {
-    return ordered.slice(0, 12).map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`).join("\uFF1B");
+  return ordered;
+}
+function sleepWindowFromSlots(slots) {
+  const rows = scheduleRows(slots);
+  if (rows.length === 0) return null;
+  const candidates = rows.map((row2, index2) => ({ row: row2, index: index2 })).filter(({ row: row2 }) => EXPLICIT_SLEEP_RE.test(row2.activity) || REST_SLOT_RE.test(row2.activity) && isNightish(row2.start));
+  if (candidates.length === 0) return null;
+  const explicit = (row2) => EXPLICIT_SLEEP_RE.test(row2.activity) ? 1 : 0;
+  const duration = (row2) => row2.end > row2.start ? row2.end - row2.start : row2.end + SLOT_END_LIMIT - row2.start;
+  candidates.sort((a, b) => explicit(b.row) - explicit(a.row) || Number(isNightish(b.row.start)) - Number(isNightish(a.row.start)) || duration(b.row) - duration(a.row) || a.row.start - b.row.start);
+  const { row, index } = candidates[0];
+  let end;
+  if (index + 1 < rows.length) {
+    end = rows[index + 1].start;
+    if (end <= row.start) end += SLOT_END_LIMIT;
+  } else {
+    const nextMorning = rows[0].start;
+    if (nextMorning > row.start || nextMorning > 12 * 60) return null;
+    end = nextMorning + SLOT_END_LIMIT;
   }
-  const sleep2 = ordered[sleepIndex];
-  const sleepEnd = sleepIndex === ordered.length - 1 ? ordered[0].start < 12 * 60 ? ordered[0].start : SLOT_END_LIMIT : sleep2.end;
-  const sleepLine = `${toHhmm(sleep2.start)}-${toHhmm(sleepEnd)} \u7761\u89C9`;
-  const others = ordered.filter((_, index) => index !== sleepIndex).slice(0, 11);
-  return [sleepLine, ...others.map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`)].join("\uFF1B");
+  if (end - row.start < 60) return null;
+  return { start: toHhmm(row.start), end: toHhmm(end % SLOT_END_LIMIT) };
+}
+function scheduleTextFromSlots(slots) {
+  const ordered = scheduleRows(slots);
+  if (ordered.length === 0) return "";
+  const sleep2 = sleepWindowFromSlots(slots);
+  const lines = ordered.slice(0, 12).map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`);
+  if (!sleep2) return lines.join("\uFF1B");
+  const sleepLine = `${sleep2.start}-${sleep2.end} \u7761\u89C9`;
+  const sleepStart = toMinutes(sleep2.start);
+  const others = ordered.filter((row) => row.start !== sleepStart).slice(0, 11).map((row) => `${toHhmm(row.start)}-${toHhmm(row.end)} ${row.activity}`);
+  return [sleepLine, ...others].join("\uFF1B");
 }
 function scheduleTextFromScene(scene, todayKey) {
   if (!scene || typeof scene.dateKey !== "string" || scene.dateKey !== todayKey) return "";
   const slots = scene.schedule?.slots;
   return Array.isArray(slots) ? scheduleTextFromSlots(slots) : "";
+}
+function sleepWindowFromScene(scene, todayKey) {
+  if (!scene || typeof scene.dateKey !== "string" || scene.dateKey !== todayKey) return null;
+  const slots = scene.schedule?.slots;
+  return Array.isArray(slots) ? sleepWindowFromSlots(slots) : null;
 }
 
 // utils/autonomyLife/rhythm.ts
@@ -12776,7 +12814,20 @@ var INTEREST_HINTS = [
   "\u4E66\u6CD5"
 ];
 var TIME_RANGE_RE = /([01]?\d|2[0-3])[:：]([0-5]\d)\s*[-–~至到]\s*([01]?\d|2[0-3])[:：]([0-5]\d)/;
-var pad = (value) => String(value).padStart(2, "0");
+var SLEEP_TEXT_RE = /睡|就寝|入睡|作息|卧床|安眠/;
+function sleepWindowFromScheduleText(scheduleText) {
+  if (!scheduleText) return null;
+  for (const line of scheduleText.split(/[；;\n\r]+/)) {
+    if (!SLEEP_TEXT_RE.test(line)) continue;
+    const match = TIME_RANGE_RE.exec(line);
+    if (!match) continue;
+    const start = `${String(Number(match[1])).padStart(2, "0")}:${match[2]}`;
+    const end = `${String(Number(match[3])).padStart(2, "0")}:${match[4]}`;
+    if (hhmmToMinutes(start) === null || hhmmToMinutes(end) === null || start === end) continue;
+    return { start, end };
+  }
+  return null;
+}
 function buildRhythmProfile(input) {
   const personaText = (input.personaText ?? "").slice(0, 4e3);
   const scheduleText = (input.scheduleText ?? "").slice(0, 2e3);
@@ -12796,14 +12847,9 @@ ${scheduleText}`;
     impulsiveness: clamp013(0.5 + 0.1 * impulsive)
   };
   const sleepWindows = [];
-  const rangeMatch = TIME_RANGE_RE.exec(scheduleText || personaText);
-  if (rangeMatch) {
-    const start = `${pad(Number(rangeMatch[1]))}:${rangeMatch[2]}`;
-    const end = `${pad(Number(rangeMatch[3]))}:${rangeMatch[4]}`;
-    if (hhmmToMinutes(start) !== null && hhmmToMinutes(end) !== null && start !== end) {
-      sleepWindows.push({ start, end });
-    }
-  }
+  const structured = input.scheduleSleepWindow;
+  const fromSchedule = structured && hhmmToMinutes(structured.start) !== null && hhmmToMinutes(structured.end) !== null && structured.start !== structured.end ? { ...structured } : sleepWindowFromScheduleText(scheduleText) ?? sleepWindowFromScheduleText(personaText);
+  if (fromSchedule) sleepWindows.push(fromSchedule);
   if (!sleepWindows.length) {
     if (night > morning) sleepWindows.push({ start: "01:30", end: "09:30" });
     else if (morning > night) sleepWindows.push({ start: "22:30", end: "06:30" });
@@ -13617,6 +13663,8 @@ ${signal.scheduleText}`)
     profile: buildRhythmProfile({
       personaText: signal.personaText,
       scheduleText: signal.scheduleText,
+      // 结构化睡眠窗优先：文本里的普通时段（上班/起床/午休）不会被当成整段睡眠。
+      scheduleSleepWindow: signal.sleepWindow,
       timezone: row.windowTimezone,
       personaHash: identity.personaHash,
       nowMs
@@ -22662,9 +22710,9 @@ var toBase64Url2 = (bytes) => {
 var fromBase64Url2 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad3);
+    const binary = atob(padded + pad);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -23009,9 +23057,9 @@ var toBase64Url3 = (bytes) => {
 var fromBase64Url3 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad3);
+    const binary = atob(padded + pad);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -25107,9 +25155,9 @@ var toBase64Url4 = (bytes) => {
 var fromBase64Url4 = (text) => {
   if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
   const padded = text.replace(/-/g, "+").replace(/_/g, "/");
-  const pad3 = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - padded.length % 4);
   try {
-    const binary = atob(padded + pad3);
+    const binary = atob(padded + pad);
     const out = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
     return out;
@@ -26224,7 +26272,25 @@ function createAutonomyLifeService(deps) {
   const effectiveFor = async (charId) => {
     const account = await deps.boundaries.getAccount();
     const character = await deps.boundaries.getCharacter(charId);
-    return mergeEffectiveBoundary({ account, character, charId, nowMs: deps.now() });
+    const merged = mergeEffectiveBoundary({ account, character, charId, nowMs: deps.now() });
+    const accountId = deps.engine.accountId ?? "account";
+    const [pause, life] = await Promise.all([
+      deps.store.getAccountPause(accountId),
+      charId ? deps.store.getCharacterLife(charId) : Promise.resolve(null)
+    ]);
+    const realPause = pause.paused || life?.pauseRequestedAt != null;
+    return realPause ? { ...merged, globalPaused: true } : merged;
+  };
+  const buildState = async (charId) => {
+    const row = await deps.store.getCharacterLife(charId);
+    if (!row) return null;
+    const nowMs = deps.now();
+    const effective = await effectiveFor(charId);
+    const probes = await deps.probes(charId);
+    const capabilities = describeCapabilities({ boundary: effective, probes, nowMs });
+    const rows = await deps.budgetRows(charId, nowMs);
+    const projected = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+    return effective.globalPaused ? { ...projected, availability: "paused", reasonCodes: ["GLOBAL_PAUSED"] } : projected;
   };
   return {
     /** GET /characters/{charId}/state */
@@ -26255,14 +26321,15 @@ function createAutonomyLifeService(deps) {
         };
         return ok(deps, { state: empty, capabilities });
       }
-      const state = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+      const projected = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+      const state = effective.globalPaused ? { ...projected, availability: "paused", reasonCodes: ["GLOBAL_PAUSED"] } : projected;
       return ok(deps, { state, capabilities });
     },
     /** GET /boundaries?charId= */
     async getBoundaries(charId) {
       const account = await deps.boundaries.getAccount();
       const character = charId ? await deps.boundaries.getCharacter(charId) : null;
-      const effective = mergeEffectiveBoundary({ account, character, charId: charId ?? "", nowMs: deps.now() });
+      const effective = await effectiveFor(charId ?? "");
       const meta = boundaryMetadata();
       return ok(deps, {
         account,
@@ -26317,14 +26384,21 @@ function createAutonomyLifeService(deps) {
           row.revision
         );
         if (!saved) return fail6(deps, "REVISION_CONFLICT", "state_conflict");
-        return ok(deps, { acknowledged: true, quiesced: input.paused ? await deps.store.inflightPermits(deps.engine.accountId ?? "account", deps.now()) === 0 : true, paused: input.paused, revision: row.revision + 1 });
+        const state2 = await buildState(input.charId);
+        return ok(deps, {
+          acknowledged: true,
+          quiesced: input.paused ? await deps.store.inflightPermits(deps.engine.accountId ?? "account", deps.now()) === 0 : true,
+          paused: input.paused,
+          revision: row.revision + 1,
+          ...state2 ? { state: state2 } : {}
+        });
       }
       const result = await requestPause(deps.engine, {
         accountId: deps.engine.accountId ?? "account",
         paused: input.paused,
         nowMs: deps.now()
       });
-      const state = input.charId ? await deps.store.getCharacterLife(input.charId) : null;
+      const state = input.charId ? await buildState(input.charId) : null;
       return ok(deps, {
         acknowledged: result.acknowledged,
         quiesced: result.quiesced,
@@ -27551,7 +27625,37 @@ function externalConfigFromInput(input) {
 function isEndpointConfigured(url, hosts) {
   const raw = String(url ?? "").trim();
   if (!raw || hosts.length === 0) return false;
-  return assertFetchableUrl(raw).ok;
+  const safe = assertFetchableUrl(raw);
+  if (!safe.ok) return false;
+  return isHostAllowed(safe.url.hostname, hosts);
+}
+function authorizeProbe(input) {
+  if (input.paused) return { ok: false, reason: "paused" };
+  if (!input.allowedKinds.includes(input.kind)) return { ok: false, reason: "kind_not_allowed" };
+  const endpoint = String(input.endpoint ?? "").trim();
+  if (!endpoint || input.readHosts.length === 0) return { ok: false, reason: "unconfigured" };
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, reason: "unsafe_url" };
+  const host = safe.url.hostname.toLowerCase();
+  if (!isHostAllowed(host, input.readHosts)) return { ok: false, reason: "operator_host_not_allowed" };
+  const grant = input.grant;
+  if (!grant || grant.provider !== void 0 && grant.provider !== input.provider) {
+    return { ok: false, reason: "grant_missing" };
+  }
+  const expiresAt = typeof grant.expiresAt === "number" ? grant.expiresAt : Number.NaN;
+  if (!Number.isFinite(expiresAt) || expiresAt <= input.nowMs) return { ok: false, reason: "grant_expired" };
+  const grantHosts = Array.isArray(grant.allowedHosts) ? grant.allowedHosts : [];
+  if (!isHostAllowed(host, grantHosts)) return { ok: false, reason: "grant_host_not_allowed" };
+  const scopes = Array.isArray(grant.scopes) ? grant.scopes : [];
+  if (input.mode === "read" && scopes.length > 0 && !scopes.includes("read:search")) {
+    return { ok: false, reason: "scope_not_granted" };
+  }
+  return {
+    ok: true,
+    url: safe.url.toString(),
+    host,
+    signature: hashString(`${host}|${expiresAt}|${grantHosts.join(",")}|${scopes.join(",")}|${input.mode}`)
+  };
 }
 var REACHABILITY_TIMEOUT_MS = 3e3;
 var REACHABILITY_TTL_MS = 10 * 6e4;
@@ -27584,14 +27688,15 @@ function createReachabilityProbe(options) {
   const now = options?.now ?? nowMsDefault;
   const maxEntries = Math.max(1, options?.maxEntries ?? 16);
   const cache = /* @__PURE__ */ new Map();
-  return async (url) => {
+  return async (url, authKey) => {
     const key = String(url ?? "").trim();
     if (!key) return false;
-    const hit = cache.get(key);
+    const cacheKey = `${key}|${authKey ?? ""}`;
+    const hit = cache.get(cacheKey);
     const at = now();
     if (hit && at - hit.at < ttl) return hit.reachable;
     const reachable = await probeEndpointOnce(key, { fetch: options?.fetch, timeoutMs: options?.timeoutMs });
-    cache.set(key, { at, reachable });
+    cache.set(cacheKey, { at, reachable });
     while (cache.size > maxEntries) {
       const oldest = cache.keys().next().value;
       if (oldest === void 0) break;
@@ -27604,7 +27709,6 @@ var defaultReachabilityProbe = createReachabilityProbe();
 
 // worker/amsg/src/autonomyLife/tick.ts
 var AUTONOMY_LIFE_MAX_SUBJECTS_PER_TICK = 12;
-var grantActive2 = (grants, provider, nowMs) => grants.some((grant) => grant.provider === provider && grant.expiresAt > nowMs);
 async function handleAutonomyLifeScheduled(input) {
   const { db, packs, nowMs } = input;
   await ensureAutonomyLifeSchema(db);
@@ -27628,7 +27732,8 @@ async function handleAutonomyLifeScheduled(input) {
     const persona = {
       personaText: typeof pack.pack?.template === "string" ? pack.pack.template : "",
       scheduleText: scheduleTextFromScene(pack.pack?.scene ?? null, localDateKey(nowMs, timezone)),
-      city: typeof pack.pack?.scene?.charCity === "string" ? pack.pack.scene.charCity : ""
+      city: typeof pack.pack?.scene?.charCity === "string" ? pack.pack.scene.charCity : "",
+      sleepWindow: sleepWindowFromScene(pack.pack?.scene ?? null, localDateKey(nowMs, timezone))
     };
     const baseRuntime = createAutonomyLifeRuntime({
       db,
@@ -27660,6 +27765,9 @@ async function handleAutonomyLifeScheduled(input) {
       allowedKinds: effective.allowedKinds,
       nowMs,
       deviceBound: !!boundInstallation,
+      // 暂停是硬门：暂停中一个外部探测都不发（即便调用方已判过，这里再显式传一次）。
+      // 账号关闭/角色关闭在更上面已经 continue，这里只剩暂停这一种「停」。
+      paused: effective.globalPaused,
       reachability
     });
     const model = createAutonomyLifeModelPort({
@@ -27705,18 +27813,49 @@ function emptyProbes() {
 }
 async function resolveProbes(args) {
   const { external, grants, allowedKinds, nowMs, deviceBound, reachability } = args;
+  const paused = args.paused === true;
   const externalConfigured = isEndpointConfigured(external.xhsUrl, external.readHosts);
   const mapConfigured = isEndpointConfigured(external.amapUrl, external.readHosts);
-  const wantExternal = externalConfigured && allowedKinds.includes("external.read") && grantActive2(grants, "xhs", nowMs);
-  const wantMap = mapConfigured && allowedKinds.includes("travel.wish") && grantActive2(grants, "amap", nowMs);
-  const externalReachable = wantExternal ? await reachability(external.xhsUrl).catch(() => false) : false;
-  const mapReachable = wantMap ? await reachability(external.amapUrl).catch(() => false) : false;
+  const xhsGrant = grants.find((grant) => grant.provider === "xhs");
+  const amapGrant = grants.find((grant) => grant.provider === "amap");
+  const externalAuth = authorizeProbe({
+    endpoint: external.xhsUrl,
+    readHosts: external.readHosts,
+    grant: xhsGrant,
+    provider: "xhs",
+    mode: "read",
+    kind: "external.read",
+    allowedKinds,
+    paused,
+    nowMs
+  });
+  const mapAuth = authorizeProbe({
+    endpoint: external.amapUrl,
+    readHosts: external.readHosts,
+    grant: amapGrant,
+    provider: "amap",
+    mode: "read",
+    kind: "travel.wish",
+    allowedKinds,
+    paused,
+    nowMs
+  });
+  const externalReachable = externalAuth.ok ? await reachability(externalAuth.url, externalAuth.signature).catch(() => false) : false;
+  const mapReachable = mapAuth.ok ? await reachability(mapAuth.url, mapAuth.signature).catch(() => false) : false;
   return {
     localStoresReady: true,
     deviceBound,
     hasModelCredentials: true,
-    externalRead: { configured: externalConfigured, reachable: externalReachable },
-    map: { configured: mapConfigured, reachable: mapReachable }
+    externalRead: {
+      configured: externalConfigured,
+      reachable: externalReachable,
+      ...externalAuth.ok || !externalConfigured ? {} : { reason: externalAuth.reason }
+    },
+    map: {
+      configured: mapConfigured,
+      reachable: mapReachable,
+      ...mapAuth.ok || !mapConfigured ? {} : { reason: mapAuth.reason }
+    }
   };
 }
 function summariseAutonomyLifeOutcomes(outcomes) {

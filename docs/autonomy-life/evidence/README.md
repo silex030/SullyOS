@@ -1,4 +1,65 @@
-# 验证原始日志（本卡 t_33546864 第九轮整改）
+# 验证原始日志（本卡 t_33546864 第十轮整改）
+
+全部是**命令的原始 stdout / stderr**（不是手工汇总），跑在交付 HEAD 的工作树上
+（`worker/amsg/worker.bundle.js` 由同一次 `pnpm run build` 重新生成）。读取方式：
+`gunzip -c <file>.gz`。清单与 sha256 见 `MANIFEST-r10.txt`（r5–r9 保留对照）。
+
+| 文件 | 命令 | 结果 |
+| --- | --- | --- |
+| `focused-r10.log.gz` | 定向：`vitest run` 覆盖 `utils/autonomyLife`、`worker/amsg/src/autonomyLife`、`autonomyFire*`、`travel`、`autonomyScheduler/Store/Retry`、`planLifecycle.wiring`、`index`、`components/autonomy-life` | **52 文件 / 1024 用例通过，`EXIT:0`** |
+| `vitest-full-r10.log.gz` | 全仓 `vitest run`（默认 5s 超时） | **632 文件 / 7718 用例通过，`EXIT:0`**（本轮无超时抖动） |
+| `tsc-current-r10.log.gz` / `tsc-compare-r10.diff` | `npx tsc --noEmit -p tsconfig.json`（与 `tsc-baseline.log.gz` = `f7f040c7` 基线对比） | 两边各 **56 条 `error TS`**；只归一化两处工作树根路径后逐行 diff **为空**（`tsc-compare-r10.diff` 0 字节）；本卡新增 **0**。**不是类型检查全绿** |
+| `build-r10.log.gz` | `pnpm run build`（`build:workers` + `vite build`） | `EXIT:0`（vite built in 54.9s；worker bundle 重新生成且入库） |
+| `e2e-run-r10.log.gz` / `e2e-report-r10.json.gz` / `e2e-http-requests-r10.json.gz` | `node scripts/autonomy-e2e/run.mjs`（真 Chromium + 真 worker 路由 + node:sqlite + 原生 IndexedDB + 真实 https 只读） | **91/91 checks，`EXIT:0`**；保留 r9 的 74 项，新增 17 项（见下） |
+| `ui-autonomy-activity-r10.png` / `ui-autonomy-boundary-allowed-r10.png` / `ui-autonomy-boundary-paused-r10.png` | 场景 8 的三张截图（无 CSS 的 headless 页面，**版式不代表 App 真机外观**，证据以 DOM 断言为准） | 活动页含生产链那一单；边界页「总暂停」允许→点击→已暂停 |
+| `legacy-grep-r10.log.gz` | `bash scripts/autonomy-legacy-grep-audit.sh` | 旧频率编辑 / `phoneAutoRefresh` / `external_window_not_implemented` / 旧 `autonomyLife/client.ts` / 旧 `consumeExternalQuota(limit)` 全 **0 命中**；`EXIT:0` |
+
+## 第十轮（复审第 2 轮）新增 / 加强的用例
+
+1. **日程 → 睡眠窗的结构化解析**（`utils/autonomyLife/personaSignal.test.ts` 13、`rhythm.ts`）
+   - `sleepWindowFromSlots` 只认「明确睡眠活动」或「夜间休息」；午休/白天休息/普通上班/起床
+     永远不产生睡眠窗；跨零点按次日早间锚点算结束；推不出结束或不足 1 小时 → 不硬造。
+   - `buildRhythmProfile` 不再「取日程文本第一段 HH:mm-HH:mm」：只认带睡眠标记的段
+     （`睡觉/就寝/入睡/作息/卧床`），并优先使用结构化睡眠窗。
+   - `worker/amsg/src/autonomyLife/productionChain.test.ts`（11）从 `handleAutonomyLifeScheduled`
+     入口跑三类真实日程：只有工作/起床（→ 23:00–08:00 兜底，白天 `isAsleep=false`、夜间 true）、
+     午休+夜睡（→ 23:30–07:00）、跨午夜（22:00–07:00），并验证「人设说早睡早起也不能覆盖
+     日程里的明确睡眠」。
+2. **能力探测的主机/授权边界**（`worker/amsg/src/autonomyLife/capabilityProbes.test.ts` 8；`tick.ts`）
+   - 新增 `authorizeProbe`：暂停、kind 未开、端点未配、URL 不安全、**运营白名单不含目标主机**、
+     授权缺失/过期、**grant.allowedHosts 不含目标主机**、read 模式无 `read:search` → 一律不探。
+   - `isEndpointConfigured` 现在也要求目标主机在运营白名单里（此前只看「白名单非空」）。
+   - 可达性缓存按「端点 + 授权指纹」分键：换授权/撤权后不会命中上一次的「可达」。
+   - `productionChain.test.ts` 用真实调度入口 + spy fetch 证明：上面 6 类拒绝场景
+     **零网络请求**（同时断言 tick 真的执行到模型失败，不是被 `not_registered` 短路），
+     合法配置才有 1 次 GET，10 分钟 TTL 内第二次 tick 不重复出网。
+3. **真实 UI 组件证据**（`scripts/autonomy-e2e/harness-entry.ts`、`run.mjs` 场景 8）
+   - 联调页现在 `createRoot` 挂载仓库里的 `components/autonomy-life/AutonomyLifePanel`
+     （活动页 + 边界页都是组件本身渲染的 DOM），API 是本轮真实 worker 路由。
+   - 断言：`role=dialog` 标题、活动页出现场景 6 生产链排出的「点外卖」卡片、
+     「OS 内模拟订单，不是现实订单」徽标、以及该动作 `reasonSummary` 出现在组件文本里
+     （不是「有任意一条活动」）。
+   - 边界页：无任何频率/间隔输入控件（控件层证据）+ 只读提示；点组件自己的 `role=switch`
+     「总暂停」→ 真的发出 `POST /pause` 200 → 开关 `aria-checked=false`、文案「已暂停」；
+     随后设备候选 409、`/tick` 跳过（`account_disabled`）、动作数不变；再点一次恢复
+     （第二次 `/pause` 200）。
+
+## 第十轮顺带修掉的两个阻塞「UI 边界交互」的真实缺陷
+
+- `utils/autonomyLife/service.ts`：`/pause` 以前把 store 原始行当 `state` 回包（缺
+  `schemaVersion`/`budget`），客户端按契约判 `malformed`，于是用户按了暂停界面报格式错误；
+  账号级暂停也不回状态。现在统一投影成合法的 `CharacterLifeState`，并把真实暂停
+  （`accounts.paused` / `pauseRequestedAt`）叠到 `availability`/`reasonCodes` 与
+  `GET /boundaries` 的 `effective.globalPaused` 上（与 `runtime.boundaryFor` 同一口径）。
+- `utils/autonomyLife/api.ts` + `store.ts` + `contracts`：`PausePayload.state` 允许缺省
+  （账号级暂停且该角色还没有状态行时服务端确实没有那一行），客户端不再因此判格式错误；
+  store 在账号级暂停时也带上 `charId`，以便拿到这个角色的最新状态。
+
+第九轮及更早的日志、清单原样保留（下面这份是历史记录，未覆盖）。
+
+---
+
+# 验证原始日志（本卡 t_33546864 第九轮整改：历史，保留对照）
 
 全部是**命令的原始 stdout / stderr**（不是手工汇总），跑在交付 HEAD `56d82eeb` 的工作树上
 （`worker/amsg/worker.bundle.js` 由同一次 `pnpm run build` 重新生成）。读取方式：

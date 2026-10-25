@@ -19,10 +19,10 @@
  *      不再写死 false。
  */
 
-import type { ActivityKind } from '../../../../contracts/autonomyLife';
+import type { ActivityKind, ExternalGrant } from '../../../../contracts/autonomyLife';
 import { tickCharacter } from '../../../../utils/autonomyLife/engine';
 import { localDateKey } from '../../../../utils/autonomyLife/time';
-import { scheduleTextFromScene } from '../../../../utils/autonomyLife/personaSignal';
+import { scheduleTextFromScene, sleepWindowFromScene } from '../../../../utils/autonomyLife/personaSignal';
 import type { CapabilityProbeState } from '../../../../utils/autonomyLife/adapters';
 import { createAutonomyLifeModelPort, isUsableLifeCredentials, type LifeModelCredentials } from './model';
 import { ensureCharacterLife, createAutonomyLifeRuntime } from './runtime';
@@ -35,6 +35,7 @@ import {
   proposalToCandidate,
 } from './proposals';
 import {
+  authorizeProbe,
   externalConfigFromInput,
   isEndpointConfigured,
   defaultReachabilityProbe,
@@ -63,12 +64,6 @@ export interface AutonomyLifeScheduledInput {
 export type AutonomyLifeTickOutcome =
   | { charId: string; status: 'ticked'; tick: Awaited<ReturnType<typeof tickCharacter>>['status'] }
   | { charId: string; status: 'skipped'; reason: 'not_registered' | 'account_disabled' | 'char_disabled' | 'missing_credentials' };
-
-const grantActive = (
-  grants: readonly { provider: string; expiresAt: number }[],
-  provider: 'xhs' | 'amap',
-  nowMs: number,
-): boolean => grants.some((grant) => grant.provider === provider && grant.expiresAt > nowMs);
 
 export async function handleAutonomyLifeScheduled(
   input: AutonomyLifeScheduledInput,
@@ -104,10 +99,12 @@ export async function handleAutonomyLifeScheduled(
     const timezone = typeof pack.pack?.tzId === 'string' && pack.pack.tzId.trim() ? pack.pack.tzId : 'UTC';
 
     // 人设/日程（真实信号）：模板 = 角色设定；scene = **当天**日程（跨天整段不用）。
+    // 睡眠窗从 slots 结构化推导（普通上班/起床/午休不会被当成整夜睡眠）。
     const persona = {
       personaText: typeof pack.pack?.template === 'string' ? pack.pack.template : '',
       scheduleText: scheduleTextFromScene(pack.pack?.scene ?? null, localDateKey(nowMs, timezone)),
       city: typeof pack.pack?.scene?.charCity === 'string' ? pack.pack.scene.charCity : '',
+      sleepWindow: sleepWindowFromScene(pack.pack?.scene ?? null, localDateKey(nowMs, timezone)),
     };
 
     const baseRuntime = createAutonomyLifeRuntime({
@@ -147,6 +144,9 @@ export async function handleAutonomyLifeScheduled(
       allowedKinds: effective.allowedKinds,
       nowMs,
       deviceBound: !!boundInstallation,
+      // 暂停是硬门：暂停中一个外部探测都不发（即便调用方已判过，这里再显式传一次）。
+      // 账号关闭/角色关闭在更上面已经 continue，这里只剩暂停这一种「停」。
+      paused: effective.globalPaused,
       reachability,
     });
 
@@ -197,37 +197,75 @@ function emptyProbes(): CapabilityProbeState {
 }
 
 /**
- * 真实能力值 = 配置（端点 + 出口白名单）∧ 授权（用户 grant 未过期）∧ 可达性探测。
- * 只有**该角色当前允许且已授权**的外部窗口才去探测（不替用户敲没授权的门）。
+ * 真实能力值 = 配置（端点 + 运营白名单）∧ 授权（用户 grant 的主机/scope/有效期）∧ 可达性探测。
+ *
+ * 关键：**探测前先过 authorizeProbe**——与正式 `/external/read` 同一套主机/scope/暂停边界。
+ * 任何一项不成立就一个网络请求都不发（不是「先探一下再说」）；显式传 paused，避免依赖调用方
+ * 已经判过暂停这件事。探测本身是有界健康检查（见 capabilityProbes 的调用上限说明），
+ * 不消耗外部读取额度，也不写入任何内容。
  */
 export async function resolveProbes(args: {
   external: ExternalRuntimeConfig;
-  grants: readonly { provider: string; expiresAt: number }[];
+  grants: readonly ExternalGrant[];
   allowedKinds: readonly string[];
   nowMs: number;
   deviceBound: boolean;
+  /** 当前生效的暂停状态（账号总暂停/角色暂停）；true = 一个探测都不做。 */
+  paused?: boolean;
   reachability: ReachabilityProbe;
 }): Promise<CapabilityProbeState> {
   const { external, grants, allowedKinds, nowMs, deviceBound, reachability } = args;
+  const paused = args.paused === true;
   const externalConfigured = isEndpointConfigured(external.xhsUrl, external.readHosts);
   const mapConfigured = isEndpointConfigured(external.amapUrl, external.readHosts);
 
-  const wantExternal = externalConfigured
-    && allowedKinds.includes('external.read')
-    && grantActive(grants, 'xhs', nowMs);
-  const wantMap = mapConfigured
-    && allowedKinds.includes('travel.wish')
-    && grantActive(grants, 'amap', nowMs);
+  const xhsGrant = grants.find((grant) => grant.provider === 'xhs');
+  const amapGrant = grants.find((grant) => grant.provider === 'amap');
 
-  const externalReachable = wantExternal ? await reachability(external.xhsUrl).catch(() => false) : false;
-  const mapReachable = wantMap ? await reachability(external.amapUrl).catch(() => false) : false;
+  const externalAuth = authorizeProbe({
+    endpoint: external.xhsUrl,
+    readHosts: external.readHosts,
+    grant: xhsGrant,
+    provider: 'xhs',
+    mode: 'read',
+    kind: 'external.read',
+    allowedKinds,
+    paused,
+    nowMs,
+  });
+  const mapAuth = authorizeProbe({
+    endpoint: external.amapUrl,
+    readHosts: external.readHosts,
+    grant: amapGrant,
+    provider: 'amap',
+    mode: 'read',
+    kind: 'travel.wish',
+    allowedKinds,
+    paused,
+    nowMs,
+  });
+
+  const externalReachable = externalAuth.ok
+    ? await reachability(externalAuth.url, externalAuth.signature).catch(() => false)
+    : false;
+  const mapReachable = mapAuth.ok
+    ? await reachability(mapAuth.url, mapAuth.signature).catch(() => false)
+    : false;
 
   return {
     localStoresReady: true,
     deviceBound,
     hasModelCredentials: true,
-    externalRead: { configured: externalConfigured, reachable: externalReachable },
-    map: { configured: mapConfigured, reachable: mapReachable },
+    externalRead: {
+      configured: externalConfigured,
+      reachable: externalReachable,
+      ...(externalAuth.ok || !externalConfigured ? {} : { reason: externalAuth.reason }),
+    },
+    map: {
+      configured: mapConfigured,
+      reachable: mapReachable,
+      ...(mapAuth.ok || !mapConfigured ? {} : { reason: mapAuth.reason }),
+    },
   };
 }
 

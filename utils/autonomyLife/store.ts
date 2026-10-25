@@ -324,13 +324,16 @@ export function createAutonomyLifeStore(deps: AutonomyLifeStoreDeps): AutonomyLi
     });
     const res = await deps.api.setPause({
       scope,
-      ...(scope === 'character' ? { charId: snapshot.charId } : {}),
+      // 账号级暂停也要带上角色：服务端据此回一份**这个角色**的最新状态，
+      // 界面才能立刻显示「已暂停」/「正在停止」。不带 charId 时服务端回包没有
+      // state，客户端按契约会判成 malformed —— 用户点了暂停却看到格式错误。
+      charId: snapshot.charId,
       paused,
       expectedRevision: current.revision,
     });
     if (res.ok) {
       patch({
-        state: res.data.state,
+        ...(res.data.state ? { state: res.data.state } : {}),
         pause: {
           phase: 'idle',
           acknowledged: res.data.acknowledged,

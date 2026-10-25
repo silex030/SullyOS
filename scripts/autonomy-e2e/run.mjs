@@ -531,6 +531,107 @@ async function scenarioProductionMarket() {
   check('暂停后设备候选被拒（409，边界控制真的生效）', proposalAfterPause.status === 409, proposalAfterPause.status);
   const tickPaused = await call('/tick', { method: 'POST', body: { template: '你叫小夏，作息规律。' } });
   check('暂停后 tick 不再产生动作', (tickPaused.json?.inspect?.actions ?? []).length === inspectAfter.actions.length, tickPaused.json?.outcomes?.[0]);
+  return { scheduledId: scheduled.id, proposals: market.proposals, actionCount: inspectAfter.actions.length };
+}
+
+/**
+ * 场景 8（真实 UI）：把**仓库里的 AutonomyLifePanel**（角色页那个组件）挂到联调页上，
+ * 读真实 worker API / 真实本轮业务数据，断言渲染出来的 DOM，并直接操作边界控件。
+ *
+ * 与场景 6 的关系：动作不是为 UI 单独 seed 的，用的就是场景 6 生产链（真实目录 → tick →
+ * 执行器 → 既有表）排出来、执行完的那一单；这里只负责「用户打开界面看到它」。
+ */
+async function scenarioRealUiPanel({ scheduledId, proposals, actionCount }) {
+  section('场景 8：真实 UI 组件 AutonomyLifePanel —— 生产链动作可见 + 边界控件真的发出请求并生效');
+
+  // 场景 6 结束时账号是暂停的（那是它的边界证据）。这里先由「用户」恢复，再从界面重新暂停。
+  const revision = (await call(`${API}/boundaries?charId=${CHAR}`)).json?.account?.revision ?? 0;
+  const resume = await call(`${API}/pause`, { method: 'POST', body: { scope: 'account', paused: false, expectedRevision: revision } });
+  check('UI 前置：账号恢复运行（/pause false 200）', resume.status === 200, resume.status);
+
+  await page.evaluate(async (config) => window.__AUTONOMY_E2E__.mountPanel(config, 'activity'), CONFIG);
+  await page.waitForFunction(() => {
+    const host = document.getElementById('autonomy-ui-root');
+    return Boolean(host && host.innerText.includes('点外卖'));
+  }, null, { timeout: 20_000 });
+  const panel = await page.evaluate(() => window.__AUTONOMY_E2E__.readPanel());
+  check('真实 AutonomyLifePanel 已挂载（role=dialog + 角色名）', panel.mounted === true && String(panel.dialogLabel ?? '').includes('小夏'), panel.dialogLabel);
+  check('活动页 DOM 渲染出生产链那一单（点外卖）',
+    Array.isArray(panel.activityButtons) && panel.activityButtons.some((label) => label.startsWith('点外卖')),
+    panel.activityButtons);
+  check('活动页 DOM 带「OS 内模拟订单，不是现实订单」标注', panel.text.includes('OS 内模拟订单，不是现实订单'));
+
+  // DOM 里那一条必须就是本轮生产链产生的动作（按 reasonSummary 对齐，不是「有任意一条活动」）。
+  const view = await pageCall('readUiView');
+  const uiItem = (view.items ?? []).find((item) => item.id === scheduledId);
+  check('DOM 中的活动与生产链动作一致（reasonSummary 出现在真实组件文本里）',
+    Boolean(uiItem && panel.text.includes(uiItem.reasonSummary)),
+    { scheduledId, reasonSummary: uiItem?.reasonSummary });
+  const activityShot = join(EVIDENCE, 'ui-autonomy-activity.png');
+  await page.screenshot({ path: activityShot });
+
+  // 切到边界页（点组件自己的 role=tab），确认开关是「允许」状态。
+  const switched = await page.evaluate(() => window.__AUTONOMY_E2E__.clickPanelTab('边界'));
+  check('点击真实组件的「边界」标签', switched === true);
+  await page.waitForFunction(() => {
+    const host = document.getElementById('autonomy-ui-root');
+    const toggle = host?.querySelector('[role="switch"][aria-label="总暂停"]');
+    return Boolean(toggle);
+  }, null, { timeout: 15_000 });
+  const boundaryBefore = await page.evaluate(() => window.__AUTONOMY_E2E__.readPanel());
+  const pauseSwitchBefore = (boundaryBefore.switches ?? []).find((item) => item.label === '总暂停');
+  check('边界页 DOM 有「总暂停」开关且当前为允许', pauseSwitchBefore?.checked === 'true', pauseSwitchBefore);
+  // 「没有人工频率」用控件层证据：组件里所有 input/select/textarea 的标签都不涉及频率/间隔。
+  const frequencyInputs = (boundaryBefore.inputs ?? []).filter((input) =>
+    /频率|间隔|每\s*\d+\s*分|每小时/.test(String(input.label ?? '')));
+  check('边界页 DOM 没有任何频率/间隔输入控件', frequencyInputs.length === 0, { inputs: (boundaryBefore.inputs ?? []).length, frequencyInputs });
+  check('边界页明确说明频率不由人工设置（只读提示）', boundaryBefore.text.includes('不提供人工频率输入'));
+  const boundaryShot = join(EVIDENCE, 'ui-autonomy-boundary-allowed.png');
+  await page.screenshot({ path: boundaryShot });
+
+  // 在真实组件上点「总暂停」：必须真的发出 POST /pause，并把界面切到「已暂停」。
+  const pauseCallsBefore = readRequestLog().filter((entry) => entry.path === `${API}/pause`).length;
+  const clicked = await page.evaluate(() => window.__AUTONOMY_E2E__.clickPanelSwitch('总暂停'));
+  check('点击真实组件的「总暂停」开关', clicked === true);
+  await page.waitForFunction(() => {
+    const host = document.getElementById('autonomy-ui-root');
+    const toggle = host?.querySelector('[role="switch"][aria-label="总暂停"]');
+    return toggle?.getAttribute('aria-checked') === 'false';
+  }, null, { timeout: 15_000 });
+  const pauseCalls = readRequestLog().filter((entry) => entry.path === `${API}/pause`);
+  check('UI 开关真的发出 POST /pause（200）', pauseCalls.length === pauseCallsBefore + 1 && pauseCalls.at(-1)?.status === 200, pauseCalls.at(-1));
+  const boundaryAfter = await page.evaluate(() => window.__AUTONOMY_E2E__.readPanel());
+  check('UI 切到「已暂停」（开关 aria-checked=false + 文案）',
+    (boundaryAfter.switches ?? []).find((item) => item.label === '总暂停')?.checked === 'false'
+      && boundaryAfter.text.includes('已暂停'));
+  const pausedShot = join(EVIDENCE, 'ui-autonomy-boundary-paused.png');
+  await page.screenshot({ path: pausedShot });
+
+  // 界面点出来的暂停对后端是生效的：设备候选被拒、tick 整跳跳过、不再产生新动作。
+  const proposalAfterUiPause = await call(`${API}/proposals`, { method: 'POST', body: { charId: CHAR, proposals } });
+  check('UI 暂停后设备候选被拒（409）', proposalAfterUiPause.status === 409, proposalAfterUiPause.status);
+  const tickAfterUiPause = await call('/tick', { method: 'POST', body: { template: '你叫小夏，作息规律。', forceDue: true } });
+  check('UI 暂停后 tick 被跳过（account_disabled）',
+    tickAfterUiPause.json?.outcomes?.[0]?.status === 'skipped' && tickAfterUiPause.json?.outcomes?.[0]?.reason === 'account_disabled',
+    tickAfterUiPause.json?.outcomes?.[0]);
+  check('UI 暂停后没有新增动作', (tickAfterUiPause.json?.inspect?.actions ?? []).length === actionCount,
+    (tickAfterUiPause.json?.inspect?.actions ?? []).length);
+
+  // 再点一次恢复：同样的控件双向可用，且发的是第二次 /pause。
+  await page.evaluate(() => window.__AUTONOMY_E2E__.clickPanelSwitch('总暂停'));
+  await page.waitForFunction(() => {
+    const host = document.getElementById('autonomy-ui-root');
+    const toggle = host?.querySelector('[role="switch"][aria-label="总暂停"]');
+    return toggle?.getAttribute('aria-checked') === 'true';
+  }, null, { timeout: 15_000 });
+  const resumeCalls = readRequestLog().filter((entry) => entry.path === `${API}/pause`);
+  check('UI 再次点击恢复（第二次 POST /pause 200）', resumeCalls.length === pauseCallsBefore + 2 && resumeCalls.at(-1)?.status === 200, resumeCalls.at(-1));
+
+  await page.evaluate(() => window.__AUTONOMY_E2E__.unmountPanel());
+  const afterUnmount = await page.evaluate(() => window.__AUTONOMY_E2E__.readPanel());
+  check('卸载真实组件后 DOM 里没有残留面板', afterUnmount.mounted === false, afterUnmount);
+
+  return { screenshots: [activityShot, boundaryShot, pausedShot] };
 }
 
 async function scenarioProductionExternal() {
@@ -604,7 +705,8 @@ async function main() {
     await scenarioExternalRead();
     await scenarioRevokeAndPause();
     await scenarioTravelWish();
-    await scenarioProductionMarket();
+    const marketRun = await scenarioProductionMarket();
+    await scenarioRealUiPanel(marketRun);
     await scenarioProductionExternal();
   } finally {
     if (browser) await browser.close().catch(() => {});

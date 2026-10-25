@@ -14,7 +14,8 @@
  * 这里的结果只用于「能不能把外部窗口放进候选」。
  */
 
-import { assertFetchableUrl, parseAllowedHosts } from './external';
+import { assertFetchableUrl, isHostAllowed, parseAllowedHosts } from './external';
+import { hashString } from '../../../../contracts/autonomyLife';
 
 export interface ExternalRuntimeConfig {
   /** 小红书式只读端点（运营配置）。 */
@@ -58,11 +59,95 @@ export function externalConfigFromInput(input: ExternalConfigInput | null | unde
   };
 }
 
-/** 端点配置完整才算 configured：URL 存在 + 主机白名单非空 + URL 结构安全。 */
+/** 端点配置完整才算 configured：URL 存在 + 主机白名单非空 + URL 结构安全 + **目标主机真的在白名单里**。 */
 export function isEndpointConfigured(url: string, hosts: readonly string[]): boolean {
   const raw = String(url ?? '').trim();
   if (!raw || hosts.length === 0) return false;
-  return assertFetchableUrl(raw).ok;
+  const safe = assertFetchableUrl(raw);
+  if (!safe.ok) return false;
+  // 只判断「白名单非空」是不够的：端点可以指向白名单外的主机，下面的探测就成了绕过
+  // 运营白名单的新出网口。结构安全 + 主机在白名单里，两者都成立才算配好。
+  return isHostAllowed(safe.url.hostname, hosts);
+}
+
+/**
+ * 探测授权判定（**任何网络请求之前**必须过这一关，与正式 `/external/read` 同一套边界）：
+ *   - 暂停 / kind 未开 → 不探；
+ *   - 运营白名单（`AUTONOMY_EXTERNAL_READ_HOSTS`）为空或不含目标主机 → 不探；
+ *   - 用户授权缺失 / 过期 / 没授权这个主机 / read 模式没有 `read:search` scope → 不探。
+ *
+ * 通过的返回值里带一个 `signature`：缓存必须按「端点 + 这份授权」分键，
+ * 撤权/换授权/改主机之后不会命中上一次的「可达」结果。
+ */
+export type ProbeDenyReason =
+  | 'paused'
+  | 'kind_not_allowed'
+  | 'unconfigured'
+  | 'unsafe_url'
+  | 'operator_host_not_allowed'
+  | 'grant_missing'
+  | 'grant_expired'
+  | 'grant_host_not_allowed'
+  | 'scope_not_granted';
+
+export interface ProbeGrantLike {
+  provider?: string;
+  scopes?: readonly string[];
+  allowedHosts?: readonly string[];
+  expiresAt?: number;
+}
+
+export interface ProbeAuthorizationInput {
+  endpoint: string;
+  /** 运营白名单（`AUTONOMY_EXTERNAL_READ_HOSTS`）。 */
+  readHosts: readonly string[];
+  grant: ProbeGrantLike | null | undefined;
+  provider: 'xhs' | 'amap';
+  /** read = external.read；wish = travel.wish（后者只落愿望，不出网读）。 */
+  mode: 'read' | 'wish';
+  kind: 'external.read' | 'travel.wish';
+  allowedKinds: readonly string[];
+  paused: boolean;
+  nowMs: number;
+}
+
+export type ProbeAuthorization =
+  | { ok: true; url: string; host: string; signature: string }
+  | { ok: false; reason: ProbeDenyReason };
+
+export function authorizeProbe(input: ProbeAuthorizationInput): ProbeAuthorization {
+  if (input.paused) return { ok: false, reason: 'paused' };
+  if (!input.allowedKinds.includes(input.kind)) return { ok: false, reason: 'kind_not_allowed' };
+
+  const endpoint = String(input.endpoint ?? '').trim();
+  if (!endpoint || input.readHosts.length === 0) return { ok: false, reason: 'unconfigured' };
+  const safe = assertFetchableUrl(endpoint);
+  if (!safe.ok) return { ok: false, reason: 'unsafe_url' };
+  const host = safe.url.hostname.toLowerCase();
+  if (!isHostAllowed(host, input.readHosts)) return { ok: false, reason: 'operator_host_not_allowed' };
+
+  const grant = input.grant;
+  if (!grant || (grant.provider !== undefined && grant.provider !== input.provider)) {
+    return { ok: false, reason: 'grant_missing' };
+  }
+  const expiresAt = typeof grant.expiresAt === 'number' ? grant.expiresAt : Number.NaN;
+  if (!Number.isFinite(expiresAt) || expiresAt <= input.nowMs) return { ok: false, reason: 'grant_expired' };
+
+  const grantHosts = Array.isArray(grant.allowedHosts) ? grant.allowedHosts : [];
+  if (!isHostAllowed(host, grantHosts)) return { ok: false, reason: 'grant_host_not_allowed' };
+
+  const scopes = Array.isArray(grant.scopes) ? grant.scopes : [];
+  // 与正式 read 出口同一口径：scopes 为空视为「未细化」，非空必须含 read:search。
+  if (input.mode === 'read' && scopes.length > 0 && !scopes.includes('read:search')) {
+    return { ok: false, reason: 'scope_not_granted' };
+  }
+
+  return {
+    ok: true,
+    url: safe.url.toString(),
+    host,
+    signature: hashString(`${host}|${expiresAt}|${grantHosts.join(',')}|${scopes.join(',')}|${input.mode}`),
+  };
 }
 
 export const REACHABILITY_TIMEOUT_MS = 3_000;
@@ -103,10 +188,24 @@ export async function probeEndpointOnce(
 }
 
 export interface ReachabilityProbe {
-  (url: string): Promise<boolean>;
+  /**
+   * 探测端点是否可达。`authKey` 是**授权指纹**（authorizeProbe 的 signature）：
+   * 缓存按「端点 + 授权指纹」分键，撤权/换授权后不会命中旧结果。
+   */
+  (url: string, authKey?: string): Promise<boolean>;
 }
 
-/** 带 TTL 缓存的探测：同一端点 10 分钟内只探一次（含失败结果，避免每分钟重试）。 */
+/**
+ * 带 TTL 缓存的探测：同一「端点 + 授权指纹」10 分钟内只探一次（含失败结果）。
+ *
+ * 调用上限（为什么不计量：这是健康检查，不是一次角色外部读取）
+ *   - 只发 GET、不跟随重定向、不读 body、不带 query，不落任何内容；
+ *   - 每端点每授权最多 10 分钟 1 次（TTL），每次 3 秒超时；
+ *   - 每跳 cron 最多两个端点（一个 provider 一个，见 resolveProbes），且只在
+ *     「未暂停 + kind 允许 + 运营白名单 + 用户授权都成立」时才调用；
+ *   - 因此它不消耗 `external_usage` 的每日读取额度，也不进入模型预算。
+ * 换句话说：**未授权/撤销/暂停时零网络请求**，授权成立时才是有界的健康检查。
+ */
 export function createReachabilityProbe(options?: {
   fetch?: typeof globalThis.fetch;
   ttlMs?: number;
@@ -119,14 +218,15 @@ export function createReachabilityProbe(options?: {
   const maxEntries = Math.max(1, options?.maxEntries ?? 16);
   const cache = new Map<string, { at: number; reachable: boolean }>();
 
-  return async (url: string): Promise<boolean> => {
+  return async (url: string, authKey?: string): Promise<boolean> => {
     const key = String(url ?? '').trim();
     if (!key) return false;
-    const hit = cache.get(key);
+    const cacheKey = `${key}|${authKey ?? ''}`;
+    const hit = cache.get(cacheKey);
     const at = now();
     if (hit && at - hit.at < ttl) return hit.reachable;
     const reachable = await probeEndpointOnce(key, { fetch: options?.fetch, timeoutMs: options?.timeoutMs });
-    cache.set(key, { at, reachable });
+    cache.set(cacheKey, { at, reachable });
     while (cache.size > maxEntries) {
       const oldest = cache.keys().next().value;
       if (oldest === undefined) break;

@@ -294,7 +294,7 @@ describe('自主生活客户端 · 写请求', () => {
     if (res.ok) {
       expect(res.data.acknowledged).toBe(true);
       expect(res.data.quiesced).toBe(false);
-      expect(res.data.state.availability).toBe('pausing');
+      expect(res.data.state?.availability).toBe('pausing');
     }
   });
 });

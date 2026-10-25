@@ -8,7 +8,7 @@
  *   3. 配置 + 授权 + 可达都成立 → 正常 tick 排出 external.read；任一不成立 → 排不出来。
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqlite';
 import { normalizeBoundary } from '../../../../utils/autonomyLife/boundary';
@@ -18,6 +18,8 @@ import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './routes
 import { handleAutonomyLifeScheduled, resolveProbes } from './tick';
 import { createAutonomyLifeRuntime } from './runtime';
 import { listClientProposals } from './proposals';
+import { isAsleep, resolvePhase } from '../../../../utils/autonomyLife/rhythm';
+import { createReachabilityProbe } from './capabilityProbes';
 
 const NOW = Date.UTC(2026, 9, 23, 17, 0, 0); // 2026-10-24 01:00 +08:00
 const NOON = Date.UTC(2026, 9, 24, 4, 0, 0); // 2026-10-24 12:00 +08:00
@@ -254,6 +256,62 @@ describe('生产入口：真实人设/日程 → profile', () => {
     expect(third?.profile?.summaryHash).not.toBe(second?.profile?.summaryHash);
   });
 
+  it('日程睡眠窗三类：只有工作/起床、午休+夜睡、跨午夜 —— 都不误判白天', async () => {
+    const runSchedule = async (slots: unknown, nowMs: number, template = '你叫小夏。') => {
+      await handleAutonomyLifeScheduled({
+        db,
+        packs: [pack({ template, scene: { charId: CHAR, dateKey: '2026-10-24', schedule: { slots }, songPool: [] } })],
+        nowMs,
+        credentialsFor,
+        fetch: modelReturning([{ kind: 'journal.write', semanticPurpose: 'daily_note', args: { title: '今天', body: '记录一下。' } }]),
+      });
+      const row = await characterLifeRow();
+      return row!.profile;
+    };
+
+    // 1) 只有工作/起床：不能被当成 09:00-18:00 睡眠；白天醒着、深夜在睡。
+    await freshWorld({ allowedKinds: ['journal.write'] });
+    const onlyWork = await runSchedule([
+      { startTime: '07:00', activity: '起床洗漱' },
+      { startTime: '09:00', activity: '上班' },
+      { startTime: '18:00', activity: '下班' },
+    ], NOON);
+    expect(onlyWork.sleepWindows[0]).toEqual({ start: '23:00', end: '08:00' });
+    expect(isAsleep(onlyWork, NOON)).toBe(false);
+    expect(resolvePhase(onlyWork, NOON).phase).not.toBe('resting');
+    expect(isAsleep(onlyWork, NOW)).toBe(true);
+
+    // 2) 午间休息 + 夜间睡觉：取夜间那段（23:30-07:00），午休不抢整夜。
+    await freshWorld({ allowedKinds: ['journal.write'] });
+    const napAndNight = await runSchedule([
+      { startTime: '07:00', activity: '起床' },
+      { startTime: '09:00', activity: '上班' },
+      { startTime: '12:00', activity: '午休' },
+      { startTime: '18:00', activity: '下班' },
+      { startTime: '23:30', activity: '睡觉' },
+    ], NOON);
+    expect(napAndNight.sleepWindows[0]).toEqual({ start: '23:30', end: '07:00' });
+    expect(isAsleep(napAndNight, NOON)).toBe(false);
+    expect(isAsleep(napAndNight, NOW)).toBe(true);
+    // 人设说「早睡早起」也不能覆盖日程里明确的睡眠窗（结构化优先）。
+    const precedence = await runSchedule([
+      { startTime: '07:00', activity: '起床' },
+      { startTime: '23:30', activity: '睡觉' },
+    ], NOON, '你叫小夏，早睡早起，作息规律。');
+    expect(precedence.sleepWindows[0]).toEqual({ start: '23:30', end: '07:00' });
+
+    // 3) 跨午夜：22:00 睡觉 → 次日 07:00 起床。
+    await freshWorld({ allowedKinds: ['journal.write'] });
+    const crossMidnight = await runSchedule([
+      { startTime: '07:00', activity: '起床' },
+      { startTime: '09:00', activity: '上班' },
+      { startTime: '22:00', activity: '睡觉' },
+    ], NOON);
+    expect(crossMidnight.sleepWindows[0]).toEqual({ start: '22:00', end: '07:00' });
+    expect(isAsleep(crossMidnight, NOON)).toBe(false);
+    expect(isAsleep(crossMidnight, Date.UTC(2026, 9, 23, 15, 0, 0))).toBe(true); // 23:00 当地
+  });
+
   it('没有模板/日程 → 明确 fallback（不是编一个人设）', async () => {
     await seedBoundary({ allowedKinds: ['journal.write'] });
     await registerCharacter();
@@ -452,6 +510,127 @@ describe('生产入口：外部只读窗口受配置/授权/可达约束', () =>
     expect(await actionsOf()).toEqual([]);
   });
 
+  it('探测前先过主机/scope/暂停边界：不该探的场景一次网络请求都没有（真实调度入口 + spy fetch）', async () => {
+    const grantOf = (overrides: Record<string, unknown> = {}) => ({ ...grant, ...overrides });
+    const fetchSpy = vi.fn(async () => new Response('{}', { status: 200 }));
+    const tickWith = async (args: {
+      external: { xhsUrl: string; readHosts: string[] };
+      grants?: unknown[];
+      allowedKinds?: string[];
+      paused?: boolean;
+      charId?: string;
+      probe?: ReturnType<typeof createReachabilityProbe>;
+    }) => {
+      const charId = args.charId ?? CHAR;
+      await seedBoundary({
+        allowedKinds: args.allowedKinds ?? ['external.read'],
+        externalGrants: (args.grants ?? [grant]) as never,
+        globalPaused: args.paused === true,
+      });
+      await registerCharacter(charId);
+      await bindDevice();
+      resetAutonomyLifeSchemaCacheForTesting();
+      await ensureAutonomyLifeSchema(db);
+      const probe = args.probe ?? createReachabilityProbe({ fetch: fetchSpy as unknown as typeof fetch, now: () => NOW });
+      return handleAutonomyLifeScheduled({
+        db,
+        packs: [{
+          userId: USER,
+          charId,
+          charName: '小夏',
+          pack: { template: '你叫小夏，喜欢天文，是个安静的人。', tzId: TZ },
+        }] as never,
+        nowMs: NOON,
+        credentialsFor,
+        fetch: modelFailing,
+        external: args.external,
+        reachability: probe,
+      });
+    };
+
+    // 1) 运营白名单 = allowed.example，端点却指向 other.example → 不能探。
+    const operatorHost = await tickWith({ external: { xhsUrl: 'https://other.example/read', readHosts: ['allowed.example'] }, charId: 'char-host-operator' });
+    expect(operatorHost.outcomes[0]).toMatchObject({ status: 'ticked' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 2) 运营白名单放行 other.example，但 grant 只授权 allowed.example → 不能探。
+    const grantHost = await tickWith({
+      external: { xhsUrl: 'https://other.example/read', readHosts: ['other.example'] },
+      grants: [grantOf({ allowedHosts: ['allowed.example'] })],
+      charId: 'char-host-grant',
+    });
+    expect(grantHost.outcomes[0]).toMatchObject({ status: 'ticked' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 3) scope 不符（grant 只有 read:note）→ 不能探。
+    const scope = await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      grants: [grantOf({ scopes: ['read:note'] })],
+      charId: 'char-scope',
+    });
+    expect(scope.outcomes[0]).toMatchObject({ status: 'ticked' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 4) 授权过期 → 不能探。
+    const expired = await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      grants: [grantOf({ expiresAt: NOW })],
+      charId: 'char-expired',
+    });
+    expect(expired.outcomes[0]).toMatchObject({ status: 'ticked' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 5) 已撤权（没有 grant）→ 不能探。
+    const revoked = await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      grants: [],
+      charId: 'char-revoked',
+    });
+    expect(revoked.outcomes[0]).toMatchObject({ status: 'ticked' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 6) 账号暂停 → 整跳跳过，更不会探。
+    const paused = await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      paused: true,
+      charId: 'char-paused',
+    });
+    expect(paused.outcomes[0]).toMatchObject({ status: 'skipped', reason: 'account_disabled' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 7) resolveProbes 显式 paused：即便调用方没先判，也不发请求。
+    const probes = await resolveProbes({
+      external: { xhsUrl: 'https://allowed.example/read', amapUrl: '', readHosts: ['allowed.example'] },
+      grants: [grantOf()] as never,
+      allowedKinds: ['external.read'],
+      nowMs: NOW,
+      deviceBound: true,
+      paused: true,
+      reachability: createReachabilityProbe({ fetch: fetchSpy as unknown as typeof fetch, now: () => NOW }),
+    });
+    expect(probes.externalRead).toMatchObject({ configured: true, reachable: false, reason: 'paused' });
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // 8) 全部成立：有界探测 —— 一次 tick 一次 GET；10 分钟 TTL 内再 tick 不重复出网。
+    const allowedProbe = createReachabilityProbe({ fetch: fetchSpy as unknown as typeof fetch, now: () => NOW });
+    const allowedGrant = grantOf({ allowedHosts: ['allowed.example'] });
+    await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      grants: [allowedGrant],
+      charId: 'char-allowed',
+      probe: allowedProbe,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String((fetchSpy.mock.calls[0] as unknown as [string])[0])).toBe('https://allowed.example/read');
+    await tickWith({
+      external: { xhsUrl: 'https://allowed.example/read', readHosts: ['allowed.example'] },
+      grants: [allowedGrant],
+      charId: 'char-allowed',
+      probe: allowedProbe,
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('resolveProbes：没授权就不去探端点（不替用户敲没授权的门）', async () => {
     const probed: string[] = [];
     const probes = await resolveProbes({
@@ -462,7 +641,7 @@ describe('生产入口：外部只读窗口受配置/授权/可达约束', () =>
       deviceBound: true,
       reachability: async (url: string) => { probed.push(url); return true; },
     });
-    expect(probes.externalRead).toEqual({ configured: true, reachable: false });
+    expect(probes.externalRead).toMatchObject({ configured: true, reachable: false, reason: 'grant_missing' });
     expect(probed).toEqual([]);
   });
 });

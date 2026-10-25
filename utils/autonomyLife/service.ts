@@ -93,7 +93,42 @@ export function createAutonomyLifeService(deps: AutonomyLifeServiceDeps) {
   const effectiveFor = async (charId: string): Promise<EffectiveBoundaryV1> => {
     const account = await deps.boundaries.getAccount();
     const character = await deps.boundaries.getCharacter(charId);
-    return mergeEffectiveBoundary({ account, character, charId, nowMs: deps.now() });
+    const merged = mergeEffectiveBoundary({ account, character, charId, nowMs: deps.now() });
+    /*
+     * 真实暂停的权威来源是 `/pause` 写入的 `autonomy_life_accounts.paused` 与
+     * 角色 `payload.pauseRequestedAt`，它们**不写** boundaries。tick 与路由闸都读
+     * `runtime.boundaryFor`（已叠加暂停），服务层的读接口也必须叠加同一份，否则
+     * 「用户按了暂停，界面 still 显示允许」，同一个状态出现两个口径。
+     */
+    const accountId = deps.engine.accountId ?? 'account';
+    const [pause, life] = await Promise.all([
+      deps.store.getAccountPause(accountId),
+      charId ? deps.store.getCharacterLife(charId) : Promise.resolve(null),
+    ]);
+    const realPause = pause.paused || life?.pauseRequestedAt != null;
+    return realPause ? { ...merged, globalPaused: true } : merged;
+  };
+
+  /**
+   * 对外的一份角色状态（契约 §7.2 的 CharacterLifeState，**带 schemaVersion 与预算**）。
+   *
+   * 以前 `/pause` 直接把 store 里的原始行当 state 回包：缺 schemaVersion、缺 budget，
+   * 客户端按契约判定为 malformed，于是「点了暂停 → 界面报格式错误、开关不翻」。
+   * 这里统一投影，并把**真实暂停**叠到 availability/reasonCodes 上（与 boundaries 的
+   * globalPaused 同一口径）。
+   */
+  const buildState = async (charId: string): Promise<CharacterLifeState | null> => {
+    const row = await deps.store.getCharacterLife(charId);
+    if (!row) return null;
+    const nowMs = deps.now();
+    const effective = await effectiveFor(charId);
+    const probes = await deps.probes(charId);
+    const capabilities = describeCapabilities({ boundary: effective, probes, nowMs });
+    const rows = await deps.budgetRows(charId, nowMs);
+    const projected = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+    return effective.globalPaused
+      ? { ...projected, availability: 'paused', reasonCodes: ['GLOBAL_PAUSED'] }
+      : projected;
   };
 
   return {
@@ -127,7 +162,11 @@ export function createAutonomyLifeService(deps: AutonomyLifeServiceDeps) {
         };
         return ok(deps, { state: empty, capabilities });
       }
-      const state = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+      const projected = projectCharacterState({ row, capabilities, budgetRows: rows, limits: effective.limits, nowMs });
+      // 账号级暂停不写角色行：对外状态与 boundaries/globalPaused 保持同一口径。
+      const state = effective.globalPaused
+        ? { ...projected, availability: 'paused' as const, reasonCodes: ['GLOBAL_PAUSED'] }
+        : projected;
       return ok(deps, { state, capabilities });
     },
 
@@ -135,7 +174,8 @@ export function createAutonomyLifeService(deps: AutonomyLifeServiceDeps) {
     async getBoundaries(charId?: string | null): Promise<ServiceResponse> {
       const account = await deps.boundaries.getAccount();
       const character = charId ? await deps.boundaries.getCharacter(charId) : null;
-      const effective = mergeEffectiveBoundary({ account, character, charId: charId ?? '', nowMs: deps.now() });
+      // 与 tick/路由闸同一口径：叠加真实暂停（accounts.paused / pauseRequestedAt）。
+      const effective = await effectiveFor(charId ?? '');
       const meta = boundaryMetadata();
       return ok(deps, {
         account,
@@ -204,14 +244,22 @@ export function createAutonomyLifeService(deps: AutonomyLifeServiceDeps) {
           row.revision,
         );
         if (!saved) return fail(deps, 'REVISION_CONFLICT', 'state_conflict');
-        return ok(deps, { acknowledged: true, quiesced: input.paused ? (await deps.store.inflightPermits(deps.engine.accountId ?? 'account', deps.now())) === 0 : true, paused: input.paused, revision: row.revision + 1 });
+        const state = await buildState(input.charId);
+        return ok(deps, {
+          acknowledged: true,
+          quiesced: input.paused ? (await deps.store.inflightPermits(deps.engine.accountId ?? 'account', deps.now())) === 0 : true,
+          paused: input.paused,
+          revision: row.revision + 1,
+          ...(state ? { state } : {}),
+        });
       }
       const result = await requestPause(deps.engine, {
         accountId: deps.engine.accountId ?? 'account',
         paused: input.paused,
         nowMs: deps.now(),
       });
-      const state = input.charId ? await deps.store.getCharacterLife(input.charId) : null;
+      // 契约要求回一份合法的 CharacterLifeState（不是 store 原始行）。
+      const state = input.charId ? await buildState(input.charId) : null;
       return ok(deps, {
         acknowledged: result.acknowledged,
         quiesced: result.quiesced,

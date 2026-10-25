@@ -23,6 +23,9 @@ import {
   type MarketCatalog,
 } from '../../utils/autonomyLife/marketCatalog';
 import { KIND_LABELS, latestActivity, sortActivities } from '../../utils/autonomyLife/view';
+import React from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import AutonomyLifePanel, { type AutonomyTab } from '../../components/autonomy-life/AutonomyLifePanel';
 
 export interface E2EConfig {
   baseUrl: string;
@@ -43,6 +46,12 @@ declare global {
       submitCatalogProposals: (config: E2EConfig) => Promise<unknown>;
       runExecutorOnce: (config: E2EConfig) => Promise<unknown>;
       readUiView: (config: E2EConfig) => Promise<unknown>;
+      // 真实 UI 组件（AutonomyLifePanel）挂载与操作
+      mountPanel: (config: E2EConfig, tab?: AutonomyTab) => Promise<unknown>;
+      unmountPanel: () => Promise<void>;
+      readPanel: () => unknown;
+      clickPanelTab: (label: string) => boolean;
+      clickPanelSwitch: (label: string) => boolean;
     };
   }
 }
@@ -300,6 +309,108 @@ async function readUiView(config: E2EConfig) {
   };
 }
 
+// ── 真实 UI 组件：把仓库里的 AutonomyLifePanel 挂到真实 API / 真实数据上 ──────────
+// 这不是「把 API 数据映射成对象再断言」：这里 createRoot 挂的就是角色页用的同一个组件，
+// 断言读的是它渲染出的 DOM（活动卡片、徽标、开关），点的是它自己的 role=tab / role=switch。
+let panelRoot: Root | null = null;
+
+function panelContainer(): HTMLElement {
+  return document.getElementById('autonomy-ui-root') as HTMLElement;
+}
+
+async function mountPanel(config: E2EConfig, tab: AutonomyTab = 'activity') {
+  if (panelRoot) {
+    // 先换掉容器再卸载旧根：避免在同一个容器上重复 createRoot。
+    const previous = panelContainer();
+    const root = panelRoot;
+    panelRoot = null;
+    if (previous) previous.remove();
+    try { root.unmount(); } catch { /* 已经卸载 */ }
+  }
+  const host = document.createElement('div');
+  host.id = 'autonomy-ui-root';
+  document.body.appendChild(host);
+  panelRoot = createRoot(host);
+  const api = makeApi(config);
+  panelRoot.render(
+    React.createElement(AutonomyLifePanel, {
+      charId: config.charId,
+      charName: '小夏',
+      onClose: () => undefined,
+      onOpenApp: () => undefined,
+      onOpenSettings: () => undefined,
+      api,
+      initialTab: tab,
+      nowMs: Date.now(),
+    }),
+  );
+  // 等 React 把首帧提交掉（组件自己再异步 load）。
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  return { mounted: true, tab };
+}
+
+async function unmountPanel() {
+  const host = panelContainer();
+  const root = panelRoot;
+  panelRoot = null;
+  if (host) host.remove();
+  if (root) {
+    try { root.unmount(); } catch { /* 已经卸载 */ }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function readPanel() {
+  const host = panelContainer();
+  if (!host) return { mounted: false };
+  const switches = Array.from(host.querySelectorAll('[role="switch"]')).map((el) => ({
+    label: el.getAttribute('aria-label'),
+    checked: el.getAttribute('aria-checked'),
+    disabled: (el as HTMLButtonElement).disabled,
+  }));
+  const tabs = Array.from(host.querySelectorAll('[role="tab"]')).map((el) => ({
+    label: (el.textContent ?? '').trim(),
+    selected: el.getAttribute('aria-selected'),
+  }));
+  const inputs = Array.from(host.querySelectorAll('input, select, textarea')).map((el) => ({
+    tag: el.tagName.toLowerCase(),
+    type: (el as HTMLInputElement).type ?? null,
+    label: el.getAttribute('aria-label') ?? el.getAttribute('placeholder') ?? (el as HTMLInputElement).name ?? null,
+    value: (el as HTMLInputElement).value ?? null,
+  }));
+  const activityButtons = Array.from(host.querySelectorAll('button[aria-label]'))
+    .map((el) => el.getAttribute('aria-label') ?? '')
+    .filter((label) => label.startsWith('点外卖') || label.startsWith('买东西') || label.startsWith('看外部内容') || label.startsWith('写日记'));
+  return {
+    mounted: true,
+    text: (host as HTMLElement).innerText ?? '',
+    textLength: ((host as HTMLElement).innerText ?? '').length,
+    switches,
+    tabs,
+    inputs,
+    activityButtons,
+    dialogLabel: host.querySelector('[role="dialog"]')?.getAttribute('aria-label') ?? null,
+  };
+}
+
+function clickPanelTab(label: string): boolean {
+  const host = panelContainer();
+  if (!host) return false;
+  const target = Array.from(host.querySelectorAll('[role="tab"]')).find((el) => (el.textContent ?? '').trim() === label);
+  if (!target) return false;
+  (target as HTMLElement).click();
+  return true;
+}
+
+function clickPanelSwitch(label: string): boolean {
+  const host = panelContainer();
+  if (!host) return false;
+  const target = Array.from(host.querySelectorAll('[role="switch"]')).find((el) => el.getAttribute('aria-label') === label);
+  if (!target) return false;
+  (target as HTMLElement).click();
+  return true;
+}
+
 window.__AUTONOMY_E2E__ = {
   run,
   readLocal: async () => {
@@ -319,4 +430,9 @@ window.__AUTONOMY_E2E__ = {
   submitCatalogProposals,
   runExecutorOnce,
   readUiView,
+  mountPanel,
+  unmountPanel,
+  readPanel,
+  clickPanelTab,
+  clickPanelSwitch,
 };

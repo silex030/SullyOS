@@ -78,7 +78,13 @@ export interface RuntimeOptions {
    * 真实人设/日程信号（cron 从 fire_pack 模板 + 当天日程整理；路由层不传）。
    * 缺省 = 没有信号 → 基础作息；引擎里的人设哈希由这份文本算出。
    */
-  persona?: { personaText?: string; scheduleText?: string; city?: string } | null;
+  persona?: {
+    personaText?: string;
+    scheduleText?: string;
+    city?: string;
+    /** 日程 slots 的结构化睡眠窗（见 personaSignal.sleepWindowFromSlots）；文本只作投影。 */
+    sleepWindow?: { start: string; end: string } | null;
+  } | null;
   /** 绑定设备上报的真实目录候选（外卖/购物）；缺省 = 这一轮没有本地候选。 */
   localCandidates?: (charId: string) => Promise<Candidate[]>;
   /** 动作排上后回收本地候选（按角色 + kind）。 */

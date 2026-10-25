@@ -831,6 +831,8 @@ function resolveProfile(
     profile: buildRhythmProfile({
       personaText: signal.personaText,
       scheduleText: signal.scheduleText,
+      // 结构化睡眠窗优先：文本里的普通时段（上班/起床/午休）不会被当成整段睡眠。
+      scheduleSleepWindow: signal.sleepWindow,
       timezone: row.windowTimezone,
       personaHash: identity.personaHash,
       nowMs,

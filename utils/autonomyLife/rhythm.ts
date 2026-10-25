@@ -100,11 +100,32 @@ const INTEREST_HINTS = [
 
 const TIME_RANGE_RE = /([01]?\d|2[0-3])[:：]([0-5]\d)\s*[-–~至到]\s*([01]?\d|2[0-3])[:：]([0-5]\d)/;
 
-const pad = (value: number): string => String(value).padStart(2, '0');
+/** 文本里「这一段是睡眠」的标记。刻意不含单独的「休息」：午休不是整夜睡眠。 */
+const SLEEP_TEXT_RE = /睡|就寝|入睡|作息|卧床|安眠/;
+
+/** 文本里的时间段 → 睡眠窗；**只有带睡眠标记的段**才算，普通上班/起床/午休范围一律跳过。 */
+function sleepWindowFromScheduleText(scheduleText: string): { start: string; end: string } | null {
+  if (!scheduleText) return null;
+  for (const line of scheduleText.split(/[；;\n\r]+/)) {
+    if (!SLEEP_TEXT_RE.test(line)) continue;
+    const match = TIME_RANGE_RE.exec(line);
+    if (!match) continue;
+    const start = `${String(Number(match[1])).padStart(2, '0')}:${match[2]}`;
+    const end = `${String(Number(match[3])).padStart(2, '0')}:${match[4]}`;
+    if (hhmmToMinutes(start) === null || hhmmToMinutes(end) === null || start === end) continue;
+    return { start, end };
+  }
+  return null;
+}
 
 export interface BuildProfileInput {
   personaText?: string;
   scheduleText?: string;
+  /**
+   * 结构化睡眠窗（来自日程 slots 的语义判定；缺省 = 从文本里找**带睡眠标记**的那一段）。
+   * 传递这一份的目的：日程文本里的普通时段（上班/起床/午休）永远不能被当成整段睡眠。
+   */
+  scheduleSleepWindow?: { start: string; end: string } | null;
   timezone: string;
   personaHash: string;
   nowMs: number;
@@ -142,14 +163,23 @@ export function buildRhythmProfile(input: BuildProfileInput): RhythmProfile {
   };
 
   const sleepWindows: SleepWindow[] = [];
-  const rangeMatch = TIME_RANGE_RE.exec(scheduleText || personaText);
-  if (rangeMatch) {
-    const start = `${pad(Number(rangeMatch[1]))}:${rangeMatch[2]}`;
-    const end = `${pad(Number(rangeMatch[3]))}:${rangeMatch[4]}`;
-    if (hhmmToMinutes(start) !== null && hhmmToMinutes(end) !== null && start !== end) {
-      sleepWindows.push({ start, end });
-    }
-  }
+  /*
+   * 睡眠窗来源（按可信度）：
+   *   1. 日程 slots 的结构化结果（sleepWindowFromSlots 判过活动语义与时段的）；
+   *   2. 日程文本里**明确标了睡眠**的那一段（例如「23:30-07:00 睡觉」或「作息 01:30-09:30」）；
+   *   3. 人设词表（夜猫 / 晨型）；
+   *   4. 保守作息。
+   * 第 2 步以前是「取任意第一段时间范围」，结果「09:00-18:00 上班」被当成整段睡眠；这里只认
+   * 带睡眠标记的段，「上班/起床/午休/休息」一律不算。
+   */
+  const structured = input.scheduleSleepWindow;
+  const fromSchedule = structured
+    && hhmmToMinutes(structured.start) !== null
+    && hhmmToMinutes(structured.end) !== null
+    && structured.start !== structured.end
+    ? { ...structured }
+    : (sleepWindowFromScheduleText(scheduleText) ?? sleepWindowFromScheduleText(personaText));
+  if (fromSchedule) sleepWindows.push(fromSchedule);
   if (!sleepWindows.length) {
     if (night > morning) sleepWindows.push({ start: '01:30', end: '09:30' });
     else if (morning > night) sleepWindows.push({ start: '22:30', end: '06:30' });

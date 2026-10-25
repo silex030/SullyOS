@@ -130,7 +130,8 @@ export interface LifeBoundaryPayload {
 export interface PausePayload {
   acknowledged: boolean;
   quiesced: boolean;
-  state: CharacterLifeState;
+  /** 账号级暂停且该角色还没有状态行时缺省（见 contracts PausePayload 注释）。 */
+  state?: CharacterLifeState;
   revision: number;
 }
 
@@ -701,8 +702,11 @@ export function createAutonomyLifeApi(deps: AutonomyLifeApiDeps): AutonomyLifeAp
       if (!raw.ok) return raw;
       const { acknowledged, quiesced, state, revision } = raw.data;
       if (typeof acknowledged !== 'boolean' || typeof quiesced !== 'boolean') return malformed();
-      if (!isCharacterLifeState(state) || !isFiniteNumber(revision)) return malformed();
-      return { ok: true, data: { acknowledged, quiesced, state, revision } };
+      if (!isFiniteNumber(revision)) return malformed();
+      // state 可以缺省（账号级暂停且该角色还没有状态行）；给了就必须是合法形状。
+      if (state !== undefined && state !== null && !isCharacterLifeState(state)) return malformed();
+      const payload: PausePayload = { acknowledged, quiesced, ...(state ? { state } : {}), revision };
+      return { ok: true, data: payload };
     },
 
     readActivities: async (opts) => {
