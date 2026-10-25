@@ -13,6 +13,7 @@
 | `build.log.gz` | `pnpm run build`（= `build:workers` + `vite build`） | `EXIT:0`（worker bundle 重新生成，vite built in 1m 12s；`grep -c consumeExternalQuotaAtomic worker/amsg/worker.bundle.js` = 3） |
 | `e2e-run.log.gz` / `e2e-report.json.gz` / `e2e-http-requests.json.gz` | `AUTONOMY_E2E_EVIDENCE=<scratch>/r7/e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks，`EXIT:0`**（真 Chromium + 真 HTTP + 真 SQLite/IDB；含第三方只读窗口正向、「撤权/暂停后同一许可被拒」、授权额度耗尽第二笔 429） |
 | `legacy-grep.log.gz` | `bash scripts/autonomy-legacy-grep-audit.sh` | 按**实际入口**逐个列（本轮新增第 12/13 项）：旧 `consumeExternalQuota(limit)` 的定义与调用 **0 命中**，唯一入口 `consumeExternalQuotaAtomic`；旧频率编辑 / `external_window_not_implemented` / 旧 `autonomyLife/client.ts` 仍 0 命中 |
+| `mutation-old-quota.log.gz` | 把 `routes.ts` 的额度核销临时改回「旧 `grant.dailyQuota` + `used < limit`」，再跑 `npx vitest run worker/amsg/src/autonomyLife/wiring.test.ts -t "许可 CAS 之后"` | **4 failed / 28 skipped，`EXIT:1`**（RED：收紧额度/撤权/暂停四个用例全部失败）→ 还原后同一命令 **4 passed，`EXIT:0`**（GREEN）。证明这些用例真的钉住本轮修复，而不是恒真断言 |
 | `runtime-audit.md.gz` | 见 [`../runtime-audit.md`](../runtime-audit.md) | 实现/返工会话（含崩溃 run 与 run 101）的 `model` = `deepseek-v4.1-flash`、`billing_provider` = `opencode-go`；§5 如实记录了 run 99 的 shell 看板写删与 delegate 上下文保护绕过，并给出本轮的做法与能力限制 |
 
 ## 第七轮新增 / 加强的用例
