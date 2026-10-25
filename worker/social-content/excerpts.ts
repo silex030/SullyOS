@@ -30,6 +30,25 @@ export function estimateTokens(text: string): number {
   return count;
 }
 
+const SENTENCE_END = new Set(['。', '！', '？', '!', '?', '；', ';', '.', '\n']);
+
+/**
+ * 按句末标点切句并保留标点（等价于 split(/(?<=[。！？!?；;.\n])/)）。
+ * 不用正则后行断言：iOS Safari <16.4 的 JSC 不支持（见 utils/noLookbehind.test.ts）。
+ */
+function splitSentences(text: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (SENTENCE_END.has(text[i])) {
+      out.push(text.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < text.length) out.push(text.slice(start));
+  return out;
+}
+
 /** 把正文切成可寻址的切片：先按段落，超长再按句子/硬切。 */
 export function chunkText(text: string, maxChars = MAX_SEGMENT_CHARS): string[] {
   const paragraphs = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
@@ -39,7 +58,7 @@ export function chunkText(text: string, maxChars = MAX_SEGMENT_CHARS): string[] 
       out.push(para);
       continue;
     }
-    const sentences = para.split(/(?<=[。！？!?；;.\n])/).filter((s) => s.trim());
+    const sentences = splitSentences(para).filter((s) => s.trim());
     let buf = '';
     for (const sentence of sentences) {
       if (sentence.length > maxChars) {

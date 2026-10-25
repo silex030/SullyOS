@@ -79,12 +79,18 @@ const LEADING_PUNCT = /^[<(\[{「『“"'《【（]+/u;
 const SCHEMELESS_HOSTS = ['xhslink.com', 'www.xhslink.com', 'b23.tv', 'v.douyin.com'];
 
 const URL_IN_TEXT = /(?:https?:\/\/|www\.)[^\s<>"'`，。！？；：、（）【】《》「」『』“”‘’…]+/giu;
+// 前导边界不用正则后行断言 (?<!…)：iOS Safari <16.4 的 JSC 不支持，旧设备 new RegExp 直接抛错
+// （仓库守卫见 utils/noLookbehind.test.ts）。改为取到 match.index 后手查前一个字符（见 collectFound）。
 const SCHEMELESS_IN_TEXT = new RegExp(
-  `(?<![\\w.@/])(?:${SCHEMELESS_HOSTS.map((h) => h.replace(/\./g, '\\.')).join('|')})/[^\\s<>"'\`，。！？；：、（）【】《》「」『』“”‘’…]*`,
+  `(?:${SCHEMELESS_HOSTS.map((h) => h.replace(/\./g, '\\.')).join('|')})/[^\\s<>"'\`，。！？；：、（）【】《》「」『』“”‘’…]*`,
   'giu',
 );
 
-const BV_RE = /(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g;
+/** 裸 BV 号：前后都不能紧邻字母数字（后边界用 lookahead，前边界同样手查）。 */
+const BV_RE = /BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g;
+/** 不能出现在链接/BV 号前一个字符上的字符（等价于旧的 (?<![\w.@/]) / (?<![0-9A-Za-z])）。 */
+const SCHEMELESS_PREV_BAD = /[\w.@/]/;
+const BV_PREV_BAD = /[0-9A-Za-z]/;
 
 /** 已知不支持：TikTok 与 bilibili.tv/biliintl 不是同一产品（契约 2.1）。 */
 const UNSUPPORTED_PRODUCT_HOSTS = [
@@ -378,11 +384,15 @@ function findRawLinks(text: string): Found[] {
   }
   for (const m of text.matchAll(SCHEMELESS_IN_TEXT)) {
     const idx = m.index ?? 0;
+    // 等价于旧正则的前置 (?<![\w.@/])：紧跟在字母数字/点/@// 后面的 host 不算链接
+    if (idx > 0 && SCHEMELESS_PREV_BAD.test(text[idx - 1])) continue;
     if (found.some((f) => idx >= f.start && idx < f.end)) continue;
     push(idx, m[0], true);
   }
   for (const m of text.matchAll(BV_RE)) {
     const idx = m.index ?? 0;
+    // 等价于旧正则的前置 (?<![0-9A-Za-z])：嵌在更长的字母数字串里不算裸 BV 号
+    if (idx > 0 && BV_PREV_BAD.test(text[idx - 1])) continue;
     if (found.some((f) => idx >= f.start && idx < f.end)) continue;
     found.push({ display: m[0], url: m[0], start: idx, end: idx + m[0].length });
   }

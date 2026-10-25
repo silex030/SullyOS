@@ -293,10 +293,12 @@ var LEADING_PUNCT = /^[<(\[{「『“"'《【（]+/u;
 var SCHEMELESS_HOSTS = ["xhslink.com", "www.xhslink.com", "b23.tv", "v.douyin.com"];
 var URL_IN_TEXT = /(?:https?:\/\/|www\.)[^\s<>"'`，。！？；：、（）【】《》「」『』“”‘’…]+/giu;
 var SCHEMELESS_IN_TEXT = new RegExp(
-  `(?<![\\w.@/])(?:${SCHEMELESS_HOSTS.map((h) => h.replace(/\./g, "\\.")).join("|")})/[^\\s<>"'\`\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001\uFF08\uFF09\u3010\u3011\u300A\u300B\u300C\u300D\u300E\u300F\u201C\u201D\u2018\u2019\u2026]*`,
+  `(?:${SCHEMELESS_HOSTS.map((h) => h.replace(/\./g, "\\.")).join("|")})/[^\\s<>"'\`\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001\uFF08\uFF09\u3010\u3011\u300A\u300B\u300C\u300D\u300E\u300F\u201C\u201D\u2018\u2019\u2026]*`,
   "giu"
 );
-var BV_RE = /(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g;
+var BV_RE = /BV[0-9A-Za-z]{10}(?![0-9A-Za-z])/g;
+var SCHEMELESS_PREV_BAD = /[\w.@/]/;
+var BV_PREV_BAD = /[0-9A-Za-z]/;
 var UNSUPPORTED_PRODUCT_HOSTS = [
   "tiktok.com",
   "www.tiktok.com",
@@ -545,11 +547,13 @@ function findRawLinks(text) {
   }
   for (const m of text.matchAll(SCHEMELESS_IN_TEXT)) {
     const idx = m.index ?? 0;
+    if (idx > 0 && SCHEMELESS_PREV_BAD.test(text[idx - 1])) continue;
     if (found.some((f) => idx >= f.start && idx < f.end)) continue;
     push(idx, m[0], true);
   }
   for (const m of text.matchAll(BV_RE)) {
     const idx = m.index ?? 0;
+    if (idx > 0 && BV_PREV_BAD.test(text[idx - 1])) continue;
     if (found.some((f) => idx >= f.start && idx < f.end)) continue;
     found.push({ display: m[0], url: m[0], start: idx, end: idx + m[0].length });
   }
@@ -1919,6 +1923,19 @@ function estimateTokens(text) {
   for (const _ of text) count += 1;
   return count;
 }
+var SENTENCE_END = /* @__PURE__ */ new Set(["\u3002", "\uFF01", "\uFF1F", "!", "?", "\uFF1B", ";", ".", "\n"]);
+function splitSentences(text) {
+  const out = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (SENTENCE_END.has(text[i])) {
+      out.push(text.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < text.length) out.push(text.slice(start));
+  return out;
+}
 function chunkText(text, maxChars = MAX_SEGMENT_CHARS) {
   const paragraphs = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
   const out = [];
@@ -1927,7 +1944,7 @@ function chunkText(text, maxChars = MAX_SEGMENT_CHARS) {
       out.push(para);
       continue;
     }
-    const sentences = para.split(/(?<=[。！？!?；;.\n])/).filter((s) => s.trim());
+    const sentences = splitSentences(para).filter((s) => s.trim());
     let buf = "";
     for (const sentence of sentences) {
       if (sentence.length > maxChars) {
