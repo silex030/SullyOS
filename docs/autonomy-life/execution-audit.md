@@ -8,7 +8,26 @@
 > 更新（本卡）：`docs/autonomy-life/entry-migration.md` 里「后端 D1 端口与 worker 路由
 > 尚未接线」的限制已解除，见第 4 节。
 
-## 0. 本轮（第七轮）返工摘要（对应第七轮复审 comment 的两项）
+## 0. 本轮（第八轮）返工摘要（对应第八轮复审 comment 的 A–D）
+
+第八轮复审的唯一阻断项是：**真实暂停入口与各执行闸不是同一份暂停状态**。
+`POST /pause` 账号层只写 `autonomy_life_accounts.paused`，角色层只写
+`autonomy_life_characters.payload.pauseRequestedAt`，两者都**不动**
+`autonomy_life_boundaries` 的 payload / revision；而旧实现里 `legacyGate.readEffectiveBoundary`、
+`runtime.boundaryFor`、`BOUNDARY_ATOMIC_GUARD`、`claimRoundEffect` 只看 boundaries，
+所以「按下暂停之后新起的旧 AIRP 回合 / 出行 tick」仍能调模型，正式 `/external/*`
+在许可 CAS 之后按下真实暂停时最终额度门仍会放行。本轮把暂停权威统一到真实落点。
+
+| 复审要求 | 本轮改动 | 证据（真 SQLite / 真路由） |
+| --- | --- | --- |
+| A. 统一暂停权威；所有执行闸现读并在原子授权/核销条件里检查 `accounts.paused` 与角色 `pauseRequestedAt`（旧 AIRP 每次模型调用 / 结果效果 / 通知、独立 travel 模型与返回效果、正式 external 最终额度） | ① `legacyGate.readEffectiveBoundary` 同时读两张真实暂停表，折叠为 `globalPaused` —— 复用它的 `gateLegacyAutonomyPacks` / `reserveLegacyRoundCall`（含预留下的复核）/ `legacyRoundStillAllowed` / `chargeLegacyQuota`（通知与 kind 效果）/ `travelModelGateAllows` / `intentKindQuota` / `gateTravelDecisionPort` 返回后的效果门全部按同一份暂停判定；② `runtime.boundaryFor` 同样折叠（引擎 tick 候选生成、路由 `/external/*` 的当前边界预检、`tick.ts` 的 cron 边界门都改走它，不再自己 merge boundaries）；③ `BOUNDARY_ATOMIC_GUARD`（`consumeLegacyQuotaAtomic` / `consumeExternalQuotaAtomic` / `claimTravelDecisionAtomic` 共用）在**同一条条件语句**里加 `NOT EXISTS(accounts.paused<>0)` 与 `NOT EXISTS(characters.pauseRequestedAt IS NOT NULL)`；④ `claimRoundEffect`（旧回合输出效果的一次性认领）同样加这两条；⑤ 0 行后的原因诊断新增 `readRealPause()`，把「暂停」如实报成 `boundary_changed`（409）而不是「额度用完」（429） | `legacyGate.ts`、`runtime.ts`、`tick.ts`、`store.ts`；`wiring.test.ts` +2 例、`autonomyFire.integration.test.ts` +3 例、`travel/legacyGate.integration.test.ts` +3 例 |
+| B. 真 SQLite + **真实 `POST /pause`** 回归（账号与角色各一组）：先开边界+授权，`/pause` 成功、boundaries 原值不变，再走真实旧 AIRP `beforeFire`/handler 与 travel tick，断言新模型调用=0、零愿望/经历/通知；解除暂停仍走正常控制路径 | `autonomyFire.integration.test.ts`：用 `handleAutonomyLifeRequest`（真路由）+ 真 SQLite，`POST /pause` 账号/角色后断言 `accounts.paused=1` / `pauseRequestedAt` 已写、`SELECT scope,char_id,revision,payload` 的 boundaries 快照**逐字节不变**，`beforeFire` 返回 `skip/governanceDenied`（=不调模型）、预算行 0、经历 0；再 `pause:false` 走同一入口恢复（`messages` 正常返回）。另有「模型已返回、落效果前按真实 `/pause`」→ 零经历/零愿望/零下发/零认领。`travel/legacyGate.integration.test.ts`：wiring 建好之后按真实 `/pause`（账号/角色）→ 真 tick 模型调用 0、愿望 0、预算行 0；解除后同一 wiring 恢复（模型 1 次、愿望 1 条）；`proposeIntent` 内 await 真实 `/pause` → 零愿望（模型调用照记 `used_calls=1`） | 三个新 describe/用例（见 §7），全部真 SQLite + 真路由，无假库/无假 fetch |
+| C. 正式 `/external/read`、`/external/wish` 在「许可 CAS 之后、`external_usage` 语句之前」注入**真实暂停表状态**（不是改 `globalPaused`）→ 最终核销拒绝、`fetch=0`、愿望 0、`external_usage` 零新增 | `wiring.test.ts` 的 `beforeStatement` 注入语句与 `/pause` 落点逐字一致：`UPDATE autonomy_life_accounts SET paused=1, pause_requested_at=?`（owner 绑定）与 `UPDATE autonomy_life_characters SET payload=json_set(...,'$.pauseRequestedAt',?)`（owner+char 绑定）；read 与 wish 各一组，断言 409 `boundary_changed`、`fetch` 0、愿望 0、`used=0` | `wiring.test.ts`（+2 例）；原有「改 `globalPaused` + bump revision」用例保留，作为**边界层**竞态的另一条路径 |
+| D. 更新最终 HEAD / bundle 与完整原始日志；只用 native 看板工具送审（不得删改历史保护绕过记录） | 全量 / 定向 / tsc / build / e2e / grep 审计全部在最终代码上重跑（§7，日志入库 `evidence/`）；`runtime-audit.md` §6 记录本轮会话的 model/provider、工具直方图与六类禁用模式扫描（命中项只有审计脚本自身的正则字面量），并保留 §5 的历史违规原文 | `evidence/MANIFEST-r8.txt`；本文件 §7 |
+
+非阻断项（复审同时指出、本轮顺手清掉）：`git diff --check` 之前报的尾空格/EOF 空行在第八轮改动里为 **0**（见 §7 的 `git diff --check` 行）。
+
+## 0.1 第七轮返工摘要（对应第七轮复审 comment 的两项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真路由） |
 | --- | --- | --- |
@@ -17,7 +36,7 @@
 
 上一轮（第六轮）的摘要保留在下面，便于对照。
 
-## 0.1 第六轮返工摘要（对应第六轮复审 comment 的三个阻断项）
+## 0.2 第六轮返工摘要（对应第六轮复审 comment 的三个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler / 真 tick） |
 | --- | --- | --- |
@@ -27,7 +46,7 @@
 
 上一轮（第五轮）的返工摘要保留在下面，便于对照。
 
-## 0.2 第五轮返工摘要（对应第五轮复审 comment 的四个阻断项）
+## 0.3 第五轮返工摘要（对应第五轮复审 comment 的四个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler / 真 tick） |
 | --- | --- | --- |
@@ -38,7 +57,7 @@
 
 上一轮（第四轮）的返工摘要保留在下面，便于对照。
 
-## 0.3 第四轮返工摘要（对应第四轮复审 comment 的四个阻断项）
+## 0.4 第四轮返工摘要（对应第四轮复审 comment 的四个阻断项）
 
 | 复审意见 | 本轮改动 | 证据（真 SQLite / 真 handler） |
 | --- | --- | --- |
@@ -49,7 +68,7 @@
 
 上一轮（第三轮）的返工摘要保留在下面，便于对照。
 
-## 0.4 第三轮返工摘要（第三轮复审 comment 的四条）
+## 0.5 第三轮返工摘要（第三轮复审 comment 的四条）
 
 | 复审意见 | 本轮改动 | 证据 |
 | --- | --- | --- |
@@ -184,7 +203,7 @@ cron（每分钟）
 
 ```bash
 $ AUTONOMY_E2E_EVIDENCE=... node scripts/autonomy-e2e/run.mjs
-[e2e] 40/40 checks passed        # EXIT 0
+[e2e] 41/41 checks passed        # EXIT 0（第八轮新增「账号总暂停不改边界 revision」）
 ```
 
 覆盖的 5 个场景（每条都断言服务端落库与本地效果一致）：
@@ -375,6 +394,56 @@ worker/amsg/src/autonomyScheduler.test.ts
 两笔并发抢最后一格 → 恰好一个 200、一个 429，`used=1`（不超卖）。
 
 
+### 5.5 第八轮补的「真实暂停」权威（所有执行闸同一份暂停状态）
+
+复审证据链：UI → `store.setPause` → `POST /autonomy-life/v1/pause`（`routes.ts:194-208`）
+→ `service.pause`（`utils/autonomyLife/service.ts:191-221`）。账号层最终是
+`requestPause` → `store.setAccountPause` → `autonomy_life_accounts.paused = 1`；
+角色层是 `putCharacterLife({ pauseRequestedAt, availability:'paused' })`。
+两条路径都**不改** `autonomy_life_boundaries`。
+
+所以「暂停后新起的回合仍跑」不是时序问题，而是**读错了数据源**。本轮：
+
+1. **读侧统一**（`legacyGate.ts` 的 `readEffectiveBoundary`）：除两张边界行外，再读
+   `(SELECT paused FROM autonomy_life_accounts WHERE owner_id = ?)` 与
+   `(SELECT json_extract(payload,'$.pauseRequestedAt') FROM autonomy_life_characters
+   WHERE owner_id = ? AND char_id = ?)`，任一为真就把生效边界折叠成
+   `globalPaused = true`。所有复用它的闸（建任务筛包、每次模型调用前的原子预留与复核、
+   输出效果前的执行期复核、通知额度、出行模型授权与返回后效果门）自动一致。
+2. **运行期统一**（`runtime.ts` 的 `boundaryFor`）：同样折叠真实暂停。引擎 tick 的候选生成、
+   `/external/*` 的「当前生效边界」预检、`tick.ts` 的 cron 边界门都改为走它（不再各自
+   `mergeEffectiveBoundary`），避免「同一个暂停，三个读法」。
+3. **原子条件统一**（`store.ts`）：`BOUNDARY_ATOMIC_GUARD` 新增
+   `NOT EXISTS (accounts.paused <> 0)` 与
+   `NOT EXISTS (characters.payload.pauseRequestedAt IS NOT NULL)`，绑定个数与占位符同步；
+   `consumeLegacyQuotaAtomic`（通知 / per-kind 效果）、`consumeExternalQuotaAtomic`
+   （授权窗口额度，正式端点与旧链路共用）、`claimTravelDecisionAtomic`（出行决策效果）
+   因此都在**同一条**语句里判真实暂停 —— 不再依赖「边界 revision 变了没有」。
+   `claimRoundEffect`（旧回合输出效果的一次性认领）同样加这两条，所以即使读侧窗口被绕过，
+   认领这一步仍然是 0 行。
+4. **原因如实**：0 行后的诊断新增 `readRealPause()`，真实暂停报 `boundary_changed`（409），
+   不会误报成 `external_quota_exhausted`（429）；`claimRoundEffect` 新增 `paused` 原因。
+5. **保留的语义**：`POST /pause` 的 `acknowledged / quiesced` 与「在途许可不回收」不变；
+   暂停期间**不**写任何业务效果，也**不**把「已发出的模型请求」当成没花额度
+   （旧回合认领失败时不结算，凭据停在 held 等 TTL/对账 —— 见 residual 7/9）。
+
+复现用例（真 SQLite；两条真实黑盒入口）：
+
+| 入口 | 用例 | 断言 |
+| --- | --- | --- |
+| 真路由 `POST /pause`（账号） | `autonomyFire.integration.test.ts`「账号暂停：/pause 只写 accounts.paused…」 | 200 + `accounts.paused=1`；boundaries 快照**不变**；`beforeFire` = `skip/governanceDenied`；预算行 0、经历 0；`pause:false` 后恢复 |
+| 真路由 `POST /pause`（角色） | 同上「角色暂停：…」 | 200 + `pauseRequestedAt` 已写；boundaries 不变；`beforeFire` skip；解除后恢复 |
+| 真 handler + 真暂停 | 同上「模型已返回、落效果之前按下真实 /pause」 | 零经历 / 零愿望 / 零下发 / 零认领 |
+| 真路由 + 真 tick（账号 / 角色） | `travel/legacyGate.integration.test.ts` | 已建好的 wiring 在暂停后模型调用 0、愿望 0、预算行 0；解除后恢复（1 次 / 1 条） |
+| 真 tick + 模型内暂停 | 同上「模型已经发出、返回之前按下真实 /pause」 | 零愿望；`used_calls=1`（真实花了照记） |
+| 许可 CAS 后真实暂停（read / wish） | `wiring.test.ts` 两组 | 409 `boundary_changed`、`fetch=0`、愿望 0、`external_usage` 0 |
+
+变异测试（`evidence/mutation-real-pause.log.gz`）：删掉 `readEffectiveBoundary` 的暂停折叠 →
+AIRP 用例返回 `messages`、travel 用例模型调用 1 次（**4 failed / EXIT 1**）；
+把 `BOUNDARY_ATOMIC_GUARD` 的暂停条件换成恒真 → 两个正式端点不再在额度门被拒（走到出网，
+被 mock fetch 拦下，**2 failed / EXIT 1**）。两处还原后同一命令恢复 GREEN。
+
+
 ## 6. 仍未覆盖（residual risk，交付时如实列出）
 
 1. **AIRP 旧自主回合是「改道」不是「删除」**：`worker/amsg/src/autonomyScheduler.ts` 的实现
@@ -428,18 +497,29 @@ worker/amsg/src/autonomyScheduler.test.ts
 17. **授权额度按 `dayKey`（角色时区）+ provider 统计**：`consumeExternalQuotaAtomic` 用调用方
     传进来的 `dayKey`（与读边界时的时区一致），跨日/跨时区边界那一刻的记账与旧实现同口径，
     本卡没有改这个口径。
+18. **暂停与「已经发出的模型请求」之间的微窗口**：`beforeFire` / travel 预留在模型请求前
+    现读真实暂停，模型返回后还有执行期效果门 + 一次性认领两层原子条件；但「预留成功 →
+    请求真正发到上游」之间若恰好按下暂停，这一次模型调用仍可能发出去（随后效果全部被拒，
+    旧回合不结算、凭据停在 held）。这是跨外部请求无法原子化的一部分，方向是**只多花一次、
+    不多写一个业务效果**；没有把它说成「零模型调用」。
+19. **`POST /pause` 与执行闸之间没有共享事务**：真实暂停写两张表、执行闸在各自的语句里读；
+    单 isolate / D1 串行下等价于提交后可见，但跨语句没有事务保护。本轮把「暂停」放进每条
+    核销语句的 WHERE（而不是先读后判）已经把窗口压到单条语句内；跨两条语句的中间态
+    仍按 fail closed 处理（见 residual 2）。
 
 ## 7. 验证日志（本机真实输出，日志作为本任务 durable attachments）
 
 | 检查 | 命令 | 结果 |
 | --- | --- | --- |
-| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 926 用例全通过，EXIT 0**（`focused.log.gz`） |
-| 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7641 用例全通过，EXIT 0**（115.2s，`vitest-full.log.gz`，未裁剪） |
+| 定向用例（含旧回合 fire 真 SQLite 集成、出行 tick 集成） | `npx vitest run worker/amsg/src/autonomyFire.test.ts worker/amsg/src/autonomyFire.integration.test.ts worker/amsg/src/autonomyLife worker/amsg/src/travel worker/amsg/src/autonomyScheduler.test.ts worker/amsg/src/autonomyStore.test.ts worker/amsg/src/planLifecycle.wiring.test.ts worker/amsg/src/index.test.ts worker/amsg/src/autonomyRetry.sqlite.test.ts utils/autonomyLife` | **42 文件 / 934 用例全通过，EXIT 0**（`focused.log.gz`，第八轮 +8） |
+| 全量用例（**完整原始输出**） | `npx vitest run` | **624 文件 / 7649 用例全通过，EXIT 0**（154.5s，`vitest-full.log.gz`，未裁剪） |
 | 类型检查（全仓） | `npx tsc --noEmit -p tsconfig.json` | **两边各 56 条；归一化 worktree / 基线临时路径后逐行 diff 为空；本卡新增 0 条**（`tsc-current.log.gz`、`tsc-baseline.log.gz`、`tsc-compare.txt`；`EXIT:2` 与基线同值） |
-| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 12s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5，`consumeExternalQuotaAtomic` = 3；`build.log.gz`） |
-| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=<scratch>/r7/e2e node scripts/autonomy-e2e/run.mjs` | **40/40 checks 通过，EXIT 0**（`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
+| 构建 | `pnpm run build`（= `build:workers` + `vite build`） | **EXIT 0**（worker bundle 重新生成，vite built in 1m 35s；`grep -c autonomy_life_effect_claims worker/amsg/worker.bundle.js` = 5、`consumeExternalQuotaAtomic` = 3、`pauseRequestedAt` = 16；`build.log.gz`） |
+| 真实浏览器联调（本轮重跑，最终代码上） | `AUTONOMY_E2E_EVIDENCE=<scratch>/r8/e2e node scripts/autonomy-e2e/run.mjs` | **41/41 checks 通过，EXIT 0**（真 Chromium + 真 HTTP + 真 SQLite/IDB；新增「账号总暂停不改边界 revision（暂停落在 accounts.paused）」；`e2e-run.log.gz`、`e2e-report.json.gz`、`e2e-http-requests.json.gz`） |
 | 旧入口完整审计（按实际入口） | `bash scripts/autonomy-legacy-grep-audit.sh` | 见 `legacy-grep.log.gz`：旧频率编辑 / `external_window_not_implemented` / `autonomyLife/client.ts` 均 **0 命中**；第 12 项「旧 `consumeExternalQuota(limit)` 定义与调用」**0 命中**、第 13 项列出唯一入口 `consumeExternalQuotaAtomic`；AIRP 回合、出行 tick 的模型调用与效果落库都有**执行期**统一闸 |
-| 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90/95/97/99/101 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署；run 99 的 shell 看板写删与保护绕过见该文件 §5 |
+| 实现期模型/provider 与操作审计 | 见 [`runtime-audit.md`](./runtime-audit.md) | run 66/68/78/83/90/95/97/99/101/**103** 的会话均为 `deepseek-v4.1-flash` / `opencode-go`；无 `hermes config set` / 网关启动 / 部署；run 99 的 shell 看板写删与保护绕过见该文件 §5，run 103 的做法见 §6 |
+| 变异测试（证明第八轮用例非恒真） | ① 删掉 `readEffectiveBoundary` 的暂停折叠 → 跑 `autonomyFire.integration` + `travel/legacyGate.integration` 的 `-t "真实 POST /pause"`；② 把 `BOUNDARY_ATOMIC_GUARD` 的暂停条件换成恒真 → 跑 `wiring.test.ts -t "真实暂停"` | ① **4 failed / 2 passed / 47 skipped，EXIT 1**（AIRP 直接返回 `messages`、travel 模型调用 1 次）；还原后 **6 passed，EXIT 0**。② **2 failed / 32 skipped，EXIT 1**（请求不再被额度门拒，走到出网）；还原后 **2 passed，EXIT 0**。原始日志 `mutation-real-pause.log.gz` |
+| 空白检查 | `git diff --check` | **无输出（0 处尾空格 / 冲突标记）** |
 
 本轮（第七轮）新增的可复现用例（都在上面两份日志里，真 SQLite + 真路由）：
 
@@ -449,6 +529,21 @@ worker/amsg/src/autonomyScheduler.test.ts
   `external_usage` 零占用。另加「额度 1：第一笔 200、第二笔 429、只出网一次」与
   「两笔并发抢最后一格 → 200 + 429、`used=1`」。
 - `autonomyLife/external.test.ts`：删除旧 `consumeExternalQuota(旧 limit)` 的单测（函数已删）。
+
+本轮（第八轮）新增的可复现用例（都在上面两份日志里，真 SQLite + **真 `POST /pause` 路由**）：
+
+- `autonomyLife/wiring.test.ts`（+2）：`beforeStatement` 在「许可 CAS 之后、`external_usage`
+  语句之前」注入**与 `/pause` 落点逐字一致**的写入 ——
+  `accounts.paused=1` / `characters.payload.pauseRequestedAt`，不碰 boundaries；
+  read 与 wish 各一组，断言 409 `boundary_changed`、`fetch` 0、愿望 0、`used=0`。
+- `autonomyFire.integration.test.ts`（+3）：真路由 `POST /pause` 账号/角色——boundaries 快照
+  不变、`beforeFire` 直接 skip（不调模型）、预算行 0、经历 0；`pause:false` 恢复；以及
+  「模型已返回、落效果前按真实 `/pause`」→ 零经历/零愿望/零下发/零认领。
+- `travel/legacyGate.integration.test.ts`（+3）：wiring 建好后按真实 `/pause`（账号/角色）→
+  真 tick 模型 0 次、愿望 0、预算 0；解除后恢复（1 次 / 1 条）；`proposeIntent` 内 await
+  真实 `/pause` → 零愿望、`used_calls=1`。
+- `scripts/autonomy-e2e/run.mjs`（真 Chromium）：新增 check「账号总暂停不改边界 revision
+  （暂停落在 accounts.paused）」→ 41/41。
 
 上一轮（第六轮）新增的可复现用例（同一批日志里，真 SQLite / 真 handler / 真 tick）：
 
@@ -473,8 +568,8 @@ worker/amsg/src/autonomyScheduler.test.ts
 
 说明：`vitest-full.log` 是完整的原始 stdout（600+ KB），不是手工汇总。本轮全部日志都在
 **最终代码**上跑（构建里重新生成了 `worker/amsg/worker.bundle.js`，同一提交内）；
-同一批原始日志入库到 [`evidence/`](./evidence/README.md)（`gunzip -c` 读，`MANIFEST-r7.txt`
-给 sha256，`git show <HEAD>:docs/autonomy-life/evidence/<file>` 可随时复核）。
+同一批原始日志入库到 [`evidence/`](./evidence/README.md)（`gunzip -c` 读，`MANIFEST-r8.txt`
+给 sha256、前几轮的 `MANIFEST-r5/r6/r7.txt` 保留对照，`git show <HEAD>:docs/autonomy-life/evidence/<file>` 可随时复核）。
 附件只用 native `kanban_attach` 上传清单/比较结果等小文件：该工具只接受内联 base64
 （解码后 ≤25MB），600 KB 的原始日志转 base64 会显著撑大单条工具调用；这个能力限制如实
 报给协调方（见 `runtime-audit.md` §5.3），本轮不再用 shell / 清除保护标记去绕。

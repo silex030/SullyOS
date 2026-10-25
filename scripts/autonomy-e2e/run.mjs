@@ -358,6 +358,15 @@ async function scenarioRevokeAndPause() {
     body: { scope: 'account', paused: true, expectedRevision: pauseRevision },
   });
   check('账号总暂停成功', pause.status === 200, pause.status);
+  // 真实暂停落点是 `autonomy_life_accounts.paused`，不是 boundaries：
+  // `/pause` 之后边界 revision（以及 enabled/globalPaused）都不该变。
+  // 这条检查钉住「暂停权威来源」——只读 boundaries 的实现会在这里露出马脚。
+  const revisionAfterPause = await boundaryRevision('account');
+  check(
+    '账号总暂停不改边界 revision（暂停落在 accounts.paused）',
+    revisionAfterPause === pauseRevision,
+    { pauseRevision, revisionAfterPause },
+  );
   const pausedCall = await call(`${API}/external/read`, {
     method: 'POST',
     body: {

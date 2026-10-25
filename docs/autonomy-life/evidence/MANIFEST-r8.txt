@@ -1,0 +1,23 @@
+# t_984b3cfc 第八轮（架构审查 request_changes 第 8 轮）证据清单
+# HEAD: 见本清单所在提交（git log -1 -- docs/autonomy-life/evidence）
+# 生成时间(UTC): 2026-10-25 01:10 UTC
+# 说明: evidence/ 下全部原始日志与代码同源，均为原始 stdout/stderr（未裁剪）。sha256 供逐字节复核。
+# 读取: gunzip -c <file>.gz | less
+
+485f936f8f89f5a075efacffed40a373a99f44a68bf7be04c04d5d8a5f833432  MANIFEST-r5.txt
+660d993f3e7f74fa8d1a21bb8cceefaedab8825f1f835e61ffe2e29230d14715  MANIFEST-r6.txt
+7e3d3ec6bd9bba0ccc0727eaef504a2b6d84c23faec0b40958d9f926039d7866  MANIFEST-r7.txt
+be89cc5b65edc850104a4be4be50e1fe45a0e81990c0b65a4e7cf765d0a9c9d7  README.md
+c11696b833be348cd5972cd8fc6612522ed00983ac95b87085457512b806804b  build.log.gz
+3e25fb6a69b68eba45b9baf50c2d13cf18cfb8614611b021c37f6d81f8dec6e6  e2e-http-requests.json.gz
+706ac35d31f5f5fa46298dac9422befaeadacf002a7114aabf3300868aafb32d  e2e-report.json.gz
+2779aaaa308a0fd70b5987dcc60426f9e6ff58285f9597a4c321f2325909bfdd  e2e-run.log.gz
+0181ebcac28773744a6700037a5ddf61eecf9c46984ae89dc9d1b5fffe41c76f  focused.log.gz
+af78f98591f6642f26a4bca3ddc51a5e7579c0b3878215323f8209427f8a8f77  legacy-grep.log.gz
+457716f937e78e9fa9b3a1caf1f0fa78a61bf7eea0d9181cef5e0b1fb603859b  mutation-old-quota.log.gz
+bb1e3e0504de81f68175982b7c3fb33caef466d1ac8b3659a2147ff1832fa771  mutation-real-pause.log.gz
+273c74a97de6bdff074fe657dff8d6d5a729ecb99cc7e2ebe547a40f70a49a93  runtime-audit.md.gz
+a56382634e20445d9ab89db58fdcbcc5af08a5c47b9ab2a78f1c8dba696f2f4f  tsc-baseline.log.gz
+b397b3e4179f3679c556741a1e980e39a5c17a9026fb6870faf19e4ee0ca45c7  tsc-compare.txt
+7f4053f912ee442c541bc9a9cafbfb6f614a7437b7afc03f2b4969d6cf72d4eb  tsc-current.log.gz
+0c3562b221ca500da525cb846f448104954f4237dbdee187f80fd6b6d55dff2e  vitest-full.log.gz

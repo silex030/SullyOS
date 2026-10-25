@@ -1082,8 +1082,14 @@ describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一�
    * 场景固定为「许可 CAS 已经成功 → external_usage 语句执行之前」，用真 SQLite 的
    * `beforeStatement` 钩子插入另一台设备的写入（收紧额度 / 撤权 / 暂停）。
    * 期望：本轮零出网、零愿望；额度行不被占用；不是按「读边界时的旧 grant.dailyQuota」放行。
+   *
+   * 每条注入可以是裸 SQL（默认按 ownerId 绑定），也可以是 `{ sql, params }`：
+   * 真实暂停的落点（`accounts.paused` / `characters.payload.pauseRequestedAt`）需要
+   * 别的参数，必须按 `/pause` 真正写的那张表注入，而不是改 boundaries 冒充暂停。
    */
-  const injectBeforeQuotaStatement = async (statements: string[]) => {
+  const injectBeforeQuotaStatement = async (
+    statements: Array<string | { sql: string; params?: unknown[] }>,
+  ) => {
     let permitConsumed = false;
     const injected = { value: false };
     fresh({
@@ -1094,13 +1100,32 @@ describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一�
         }
         if (!injected.value && permitConsumed && /autonomy_life_external_usage/.test(text)) {
           injected.value = true;
-          for (const statement of statements) sql.prepare(statement).run(USER);
+          for (const statement of statements) {
+            if (typeof statement === 'string') sql.prepare(statement).run(USER);
+            else sql.prepare(statement.sql).run(...((statement.params ?? [USER]) as never[]));
+          }
         }
       },
     });
     resetAutonomyLifeSchemaCacheForTesting();
     await ensureAutonomyLifeSchema(db);
     return injected;
+  };
+
+  /** 真实角色暂停的落点：`autonomy_life_characters.payload.pauseRequestedAt`（`service.pause` 写的）。 */
+  const seedCharacterLife = async (charId = CHAR) => {
+    const life = emptyCharacterLife(charId, NOW, 'Asia/Shanghai');
+    await db
+      .prepare('INSERT OR REPLACE INTO autonomy_life_characters (owner_id, char_id, revision, payload, updated_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(USER, charId, life.revision, JSON.stringify(life), NOW)
+      .run();
+  };
+
+  const characterPauseStatement = {
+    sql: `UPDATE autonomy_life_characters
+      SET revision = revision + 1, payload = json_set(payload, '$.pauseRequestedAt', ?)
+      WHERE owner_id = ? AND char_id = ?`,
+    params: [NOW, USER, CHAR],
   };
 
   const usageRows = async (provider: 'xhs' | 'amap') => Number(
@@ -1212,6 +1237,87 @@ describe('HTTP 路由：受控外部只读窗口（绑定已 claim 动作 + 一�
     expect(injected.value).toBe(true);
     expect(res?.status).toBe(409);
     expect((await res!.json() as any).error.message).toBe('boundary_changed');
+    expect(await wishRows()).toBe(0);
+    expect(await usageRows('amap')).toBe(0);
+  });
+
+  /**
+   * 第八轮复审退回项：**真实暂停**的落点不是 boundaries。
+   *
+   * `POST /pause` 账号层写 `autonomy_life_accounts.paused = 1`，角色层写
+   * `autonomy_life_characters.payload.pauseRequestedAt`，两者都**不动**边界 revision。
+   * 所以「许可 CAS 之后、external_usage 语句之前」按下真实暂停按钮时：
+   *   - 最终额度语句必须 0 行（不是按旧 grant.dailyQuota / 旧 revision 放行）；
+   *   - read 不得出网、wish 不得落行、额度行不得新增。
+   * 这两条用例的注入语句与 `/pause` 的实际落点逐字一致（不是改 globalPaused 冒充）。
+   */
+  it('许可 CAS 之后账号真实暂停（accounts.paused=1，边界不动）→ 读取 409 零出网、愿望零新增', async () => {
+    const readBinding = await prepareExternalAction({
+      kind: 'external.read',
+      args: readArgs,
+      actionId: 'act-read-real-account-pause',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const readInjected = await injectBeforeQuotaStatement([
+      'UPDATE autonomy_life_accounts SET paused = 1, pause_requested_at = 1792851200000 WHERE owner_id = ?',
+    ]);
+    const readRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...readBinding }, readEnv);
+    expect(readInjected.value).toBe(true);
+    expect(readRes?.status).toBe(409);
+    expect((await readRes!.json() as any).error.message).toBe('boundary_changed');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await usageRows('xhs')).toBe(0);
+
+    // 撤销暂停（同一落点）后准备第二个动作：证明拒绝来自暂停而不是动作本身坏了。
+    await db.prepare('UPDATE autonomy_life_accounts SET paused = 0, pause_requested_at = NULL WHERE owner_id = ?').bind(USER).run();
+    const wishBinding = await prepareExternalAction({
+      kind: 'travel.wish',
+      args: wishArgs,
+      actionId: 'act-wish-real-account-pause',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const wishInjected = await injectBeforeQuotaStatement([
+      'UPDATE autonomy_life_accounts SET paused = 1, pause_requested_at = 1792851200000 WHERE owner_id = ?',
+    ]);
+    const wishRes = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...wishBinding });
+    expect(wishInjected.value).toBe(true);
+    expect(wishRes?.status).toBe(409);
+    expect((await wishRes!.json() as any).error.message).toBe('boundary_changed');
+    expect(await wishRows()).toBe(0);
+    expect(await usageRows('amap')).toBe(0);
+  });
+
+  it('许可 CAS 之后角色真实暂停（characters.pauseRequestedAt，边界不动）→ 读取 409 零出网、愿望零新增', async () => {
+    await seedCharacterLife();
+    const readBinding = await prepareExternalAction({
+      kind: 'external.read',
+      args: readArgs,
+      actionId: 'act-read-real-char-pause',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const readInjected = await injectBeforeQuotaStatement([characterPauseStatement]);
+    const readRes = await call('/autonomy-life/v1/external/read', { charId: CHAR, query: '咖啡', fields: ['title'], ...readBinding }, readEnv);
+    expect(readInjected.value).toBe(true);
+    expect(readRes?.status).toBe(409);
+    expect((await readRes!.json() as any).error.message).toBe('boundary_changed');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await usageRows('xhs')).toBe(0);
+
+    // 解除角色暂停（与 service.pause 的落点一致：把 pauseRequestedAt 置空）。
+    await db.prepare(`UPDATE autonomy_life_characters SET revision = revision + 1,
+        payload = json_set(payload, '$.pauseRequestedAt', json('null')) WHERE owner_id = ? AND char_id = ?`)
+      .bind(USER, CHAR).run();
+    const wishBinding = await prepareExternalAction({
+      kind: 'travel.wish',
+      args: wishArgs,
+      actionId: 'act-wish-real-char-pause',
+      grantOverrides: { dailyQuota: 5 },
+    });
+    const wishInjected = await injectBeforeQuotaStatement([characterPauseStatement]);
+    const wishRes = await call('/autonomy-life/v1/external/wish', { charId: CHAR, text: '想去海边看一次日出', ...wishBinding });
+    expect(wishInjected.value).toBe(true);
+    expect(wishRes?.status).toBe(409);
+    expect((await wishRes!.json() as any).error.message).toBe('boundary_changed');
     expect(await wishRows()).toBe(0);
     expect(await usageRows('amap')).toBe(0);
   });

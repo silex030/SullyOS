@@ -100,7 +100,19 @@ export function createAutonomyLifeRuntime(options: RuntimeOptions): AutonomyLife
   const boundaryFor = async (targetCharId: string): Promise<EffectiveBoundaryV1> => {
     const account = await boundaries.getAccount();
     const character = await boundaries.getCharacter(targetCharId);
-    return mergeEffectiveBoundary({ account, character, charId: targetCharId, nowMs: now() });
+    const merged = mergeEffectiveBoundary({ account, character, charId: targetCharId, nowMs: now() });
+    /*
+     * 真实暂停的权威来源是 `/pause` 写入的两处：`autonomy_life_accounts.paused` 与
+     * `autonomy_life_characters.payload.pauseRequestedAt`。它们**不写** boundaries，
+     * 所以只 merge 边界会得到「没暂停」。整条链路（引擎 tick 的候选生成、路由侧的
+     * 当前边界预检、旧 AIRP / 出行闸）都走这里，暂停才能只有一个口径。
+     */
+    const [pause, life] = await Promise.all([
+      store.getAccountPause(userId),
+      store.getCharacterLife(targetCharId),
+    ]);
+    const realPause = pause.paused || life?.pauseRequestedAt != null;
+    return realPause ? { ...merged, globalPaused: true } : merged;
   };
 
   const probes: CapabilityProbeState = options.probes ?? {

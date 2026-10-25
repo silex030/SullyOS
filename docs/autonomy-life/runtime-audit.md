@@ -6,7 +6,8 @@
 `~/.hermes/state.db`（只用于定位另一个 desktop 会话）与看板 run 表
 （`~/.hermes/kanban.db` 的 `task_runs`）。不是事后自述，也不含任何密钥。
 
-采集时间：2026-10-25 07:45；第七轮更新 2026-10-25 08:25（Asia/Shanghai，新增 run 101 与本文件 §5）。
+采集时间：2026-10-25 07:45；第七轮更新 2026-10-25 08:25（Asia/Shanghai，新增 run 101 与本文件 §5）；
+第八轮更新 2026-10-25 09:10（Asia/Shanghai，新增 run 103 / §6；§5 的历史记录原样保留）。
 
 ## 1. run ↔ 会话 ↔ 模型/provider
 
@@ -26,7 +27,11 @@
 | 96 | arch-reviewer | ready / changes_requested | 2026-10-25 05:46:15 | 2026-10-25 05:48:57 | （arch-reviewer 审查 run，无实现会话） |
 | 97 | ds-executor | review / review_requested | 2026-10-25 05:50:13 | 2026-10-25 07:04:19 | `20261025_055024_c9739b` |
 | 98 | arch-reviewer | ready / changes_requested | 2026-10-25 07:04:53 | 2026-10-25 07:07:35 | （arch-reviewer 审查 run，无实现会话） |
-| 99 | ds-executor | running / running | 2026-10-25 07:08:51 | — | `20261025_070859_9c5a60` |
+| 99 | ds-executor | review / review_requested | 2026-10-25 07:08:51 | 2026-10-25 07:52:36 | `20261025_070859_9c5a60` |
+| 100 | arch-reviewer | ready / changes_requested | 2026-10-25 07:54:20 | 2026-10-25 07:56:07 | （arch-reviewer 审查 run，无实现会话） |
+| 101 | ds-executor | review / review_requested | 2026-10-25 07:56:18 | 2026-10-25 08:27:50 | `20261025_075624_4eb008` |
+| 102 | arch-reviewer | ready / changes_requested | 2026-10-25 08:29:41 | 2026-10-25 08:32:43 | （arch-reviewer 审查 run，无实现会话） |
+| 103 | ds-executor | running / —（本轮，采集于送审前） | 2026-10-25 08:33:32 | — | `20261025_083338_7461a4` |
 
 会话库逐条（标题均命中本卡；`model` / `billing_provider` 是会话实际走的通道）：
 
@@ -39,10 +44,11 @@
 | `20261025_032319_1d928e` | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 03:23:24 → 2026-10-25 04:59:35 | 187 | 188 | terminal×103, patch×60, read_file×16, execute_code×4, write_file×3, kanban_show×1 |
 | `20261025_050331_0ef5f1`（第四轮返工 run 95） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:03:40 → 2026-10-25 05:46:08 | 340 | 169 | terminal×103, patch×29, execute_code×14, read_file×13, write_file×4, kanban_show×2, kanban_request_review×1, kanban_attachments×1 |
 | `20261025_055024_c9739b`（第五轮返工 run 97） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 05:50:35 → 2026-10-25 07:04:27 | 390 | 194 | terminal×84, execute_code×26, read_file×24, tool_call×24, patch×22, kanban_attach×6, write_file×3, kanban_show×1, kanban_request_review×1, kanban_comment×1 |
-| `20261025_070859_9c5a60`（第六轮返工 run 99，本轮，采集于送审前） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 07:09:06 → — | — | 115 | terminal×51, read_file×22, patch×20, tool_call×12, execute_code×8, kanban_show×2 |
-| `20261025_075624_4eb008`（第七轮返工 run 101，本轮，采集于送审前） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 07:56:29 → — | — | 81 | terminal×56, execute_code×20, kanban_show×1, kanban_attach×1, kanban_request_review×1, kanban_comment×1, read_file×1, patch×1, tool_describe×1, process_manage×1 |
+| `20261025_070859_9c5a60`（第六轮返工 run 99） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 07:09:06 → 2026-10-25 07:52:36 | — | 115 | terminal×51, read_file×22, patch×20, tool_call×12, execute_code×8, kanban_show×2 |
+| `20261025_075624_4eb008`（第七轮返工 run 101） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 07:56:29 → 2026-10-25 08:12:52 | — | 81 | terminal×56, execute_code×20, kanban_show×1, kanban_attach×1, kanban_request_review×1, kanban_comment×1, read_file×1, patch×1, tool_describe×1, process_manage×1 |
+| `20261025_083338_7461a4`（第八轮返工 run 103，本轮，采集于送审前） | `deepseek-v4.1-flash` | `opencode-go` | 2026-10-25 08:33:41 → — | — | 173 | terminal×105, execute_code×29, patch×19, read_file×15, write_file×2, kanban_show×1, kanban_heartbeat×1, tool_call×1 |
 
-- 九个实现会话（含两个 **crashed** run 66 / 78 与返工 run 83 / 90 / 95 / 97 / 99 / 101）的 `model`
+- 十个实现会话（含两个 **crashed** run 66 / 78 与返工 run 83 / 90 / 95 / 97 / 99 / 101 / 103）的 `model`
   全部是 `deepseek-v4.1-flash`，`billing_provider` 全部是 `opencode-go`；
 - 两张崩溃 run 的会话行还在（`end_reason=cli_close`）：崩溃后进程退出，改动留在工作树里，
   下一轮 run 接着做——不存在「换模型 / 换 provider 重跑」的痕迹；
@@ -51,7 +57,7 @@
 
 ## 2. 工具操作范围（有没有越界）
 
-对上述八个实现会话的 `messages.tool_calls` 做精确正则扫描（不是模糊包含）：
+对上述十个实现会话（含本轮 run 103）的 `messages.tool_calls` 做精确正则扫描（不是模糊包含）：
 
 - `hermes\s+config\s+set`：**0 命中**
 - `hermes\s+gateway` / `gateway\s+(start|run)`：**0 次执行**（run 83 里的命中是
@@ -61,7 +67,7 @@
   `npm publish` 的 GLOB 命中各 1–2 条，**全部是本轮审计命令自身的字样**（就是上面那行扫描
   语句本身，出现在 `tool_calls` 里），没有一条是真正的执行；工具直方图见上表（无任何
   `config set` / 网关启动 / 部署类工具调用）。
-- run 97（第五轮返工）/ run 99（本轮，第六轮返工）按同一套正则逐条扫描：六类模式**全部 0 命中**
+- run 97（第五轮返工）/ run 99（第六轮返工）/ run 103（本轮，第八轮返工）按同一套正则逐条扫描：六类模式**全部 0 命中**（run 103 只命中审计脚本自身的正则字面量，见 §6）
   （含 `terminal` 参数原文与工具名两层）；本轮新增的唯一「系统级」动作是只读查询
   `sqlite3 -readonly`（sessions / kanban.db）与仓库内 `pnpm run build` / `npx vitest` /
   `node scripts/autonomy-e2e/run.mjs`。
@@ -155,3 +161,26 @@ execute_code / browser_exec 与 kanban_* 协调工具）。
   处理是：原始日志入库 `docs/autonomy-life/evidence/`（git 可寻址 + `MANIFEST-r7.txt`
   给 sha256），附件只放清单与比较结果等小文件；若协调方要求大日志必须作为附件，
   需要工具侧支持路径上传（当前没有），不自行绕过。
+
+## 6. 第八轮返工（run 103，会话 `20261025_083338_7461a4`）
+
+本轮只做「真实暂停权威统一」的代码/测试/日志改动，过程审计如下（采集时点：送审前）：
+
+- **模型 / provider**：会话行 `model=deepseek-v4.1-flash`、`billing_provider=opencode-go`；
+  `model_config` 仍是 profile 既有配置（`reasoning_config.effort=high`，mtime 早于本卡首次 run），
+  本轮没有改任何模型/provider 配置。
+- **工具范围**（`messages.tool_calls` 精确统计，采集时 173 次）：`terminal`×105、`execute_code`×29、
+  `patch`×19、`read_file`×15、`write_file`×2、`kanban_show`×1、`kanban_heartbeat`×1、`tool_call`×1
+  （`tool_call` 用于 `process_manage` 轮询全量测试的后台进程）。没有任何 shell 看板命令、
+  没有 `browser_exec`；附件/送审只走 native `kanban_*`。
+- **六类禁用模式逐条扫描**（`hermes config set` / `hermes gateway|gateway start|run` /
+  `wrangler deploy|npm publish|systemctl start|restart` / `hermes serve` / `hermes kanban` /
+  `env -u HERMES_DELEGATED_CHILD_CONTEXT`）：每类命中 1 条，**全部是本轮审计脚本自身的
+  正则字面量**（`execute_code` 消息 id 9328 / 9330 的源码字符串），不是执行；
+  真正的执行类调用为 0（与工具直方图一致：没有 config / 网关 / 部署 / 看板 shell）。
+- **仓库内动作**：读文件、`patch` 改代码与测试、`npx vitest run`（全量 / 定向 / 变异）、
+  `npx tsc --noEmit`（当前与基线）、`pnpm run build`、`node scripts/autonomy-e2e/run.mjs`
+  （本机 Chromium + 真 worker 路由 + node:sqlite，未部署、未连生产）、
+  `bash scripts/autonomy-legacy-grep-audit.sh`。没有启动网关、没有部署、没有读密钥。
+- **对历史的处理**：§5 关于 run 99 的 shell 看板写删与 delegate 上下文保护绕过的记录
+  **原样保留**，本轮没有删除、改写或淡化；本轮本身不再出现同类操作。

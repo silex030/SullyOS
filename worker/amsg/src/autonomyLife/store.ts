@@ -1044,11 +1044,44 @@ export type QuotaConsumeFailure =
   | 'store_unavailable';
 
 /**
+ * 读**真实暂停落点**（不是边界 payload 里的 volatile 标记）：
+ *   - 账号层：`POST /pause` → `requestPause` → `autonomy_life_accounts.paused = 1`；
+ *   - 角色层：`POST /pause` → `service.pause` → `autonomy_life_characters.payload.pauseRequestedAt`。
+ *
+ * 只用于「0 行之后把原因说准」与 read-side 判定；原子判定在 SQL 条件里各写一遍。
+ * 读失败按「暂停」处理（fail closed），避免把存储故障说成额度问题。
+ */
+export async function readRealPause(options: {
+  db: LifeDb;
+  ownerId: string;
+  charId: string;
+}): Promise<boolean> {
+  try {
+    const row = await options.db
+      .prepare(`SELECT
+          (SELECT COALESCE(paused, 0) FROM autonomy_life_accounts WHERE owner_id = ?) AS account_paused,
+          (SELECT json_extract(payload, '$.pauseRequestedAt') FROM autonomy_life_characters
+            WHERE owner_id = ? AND char_id = ?) AS char_pause_requested_at`)
+      .bind(options.ownerId, options.ownerId, options.charId)
+      .first();
+    return Number(row?.account_paused ?? 0) !== 0 || row?.char_pause_requested_at != null;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * 边界必须「还是读它时那一版」才允许核销。
  *
  * 为什么不用「再读一次再判」：D1 没有跨语句事务，读完边界到写预算之间永远有一个窗口。
  * 把两层 revision 与暂停/开关标志放进**同一条** UPDATE/INSERT 的 WHERE，窗口就没了：
  * 期间任何一次 PATCH（撤权、暂停、收紧额度）都会让 revision 变，语句 0 行 → 核销失败。
+ *
+ * 真正的暂停按钮**不写边界**：`POST /pause` → `requestPause` → `autonomy_life_accounts.paused`；
+ * 角色暂停 → `autonomy_life_characters.payload.pauseRequestedAt`（见 `service.ts`）。
+ * 所以「边界 revision 没变」不等于「用户没暂停」——只看 boundaries 的旧写法会让
+ * 「按了暂停之后新起的回合/最终额度门」照样放行（第八轮复审退回的正是这一点）。
+ * 这里把**真实暂停落点**也放进同一条条件语句：暂停后 0 行，不依赖 revision。
  */
 const BOUNDARY_ATOMIC_GUARD = `EXISTS (
     SELECT 1 FROM autonomy_life_boundaries b
@@ -1058,11 +1091,20 @@ const BOUNDARY_ATOMIC_GUARD = `EXISTS (
       AND COALESCE(json_extract(b.payload, '$.enabled'), 1) <> 0
   )
   AND EXISTS (
-    SELECT 1 FROM autonomy_life_boundaries c
-    WHERE c.owner_id = ? AND c.scope = 'character' AND c.char_id = ?
-      AND c.revision = ?
-      AND COALESCE(json_extract(c.payload, '$.charEnabled'), 1) <> 0
-      AND COALESCE(json_extract(c.payload, '$.enabled'), 1) <> 0
+    SELECT 1 FROM autonomy_life_boundaries cb
+    WHERE cb.owner_id = ? AND cb.scope = 'character' AND cb.char_id = ?
+      AND cb.revision = ?
+      AND COALESCE(json_extract(cb.payload, '$.charEnabled'), 1) <> 0
+      AND COALESCE(json_extract(cb.payload, '$.enabled'), 1) <> 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM autonomy_life_accounts pa
+    WHERE pa.owner_id = ? AND COALESCE(pa.paused, 0) <> 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM autonomy_life_characters pc
+    WHERE pc.owner_id = ? AND pc.char_id = ?
+      AND json_extract(pc.payload, '$.pauseRequestedAt') IS NOT NULL
   )`;
 
 /** 外部授权也进原子条件：核销那一刻重新读 payload 里的授权（撤权/到期 → 0 行）。 */
@@ -1109,8 +1151,13 @@ export async function consumeLegacyQuotaAtomic(
 
   const accountRevision = input.expectedAccountRevision ?? -1;
   const characterRevision = input.expectedCharacterRevision ?? -1;
-  // 绑定顺序与 BOUNDARY_ATOMIC_GUARD 的占位符顺序一致。
-  const guardBindings = (): unknown[] => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  // 绑定顺序与 BOUNDARY_ATOMIC_GUARD 的占位符顺序一致（末尾三个是真实暂停落点）。
+  const guardBindings = (): unknown[] => [
+    ownerId, accountRevision,
+    ownerId, charId, characterRevision,
+    ownerId,
+    ownerId, charId,
+  ];
   const grantBindings = (): unknown[] =>
     input.requireGrant ? [ownerId, input.requireGrant, nowMs] : [];
   const grantClause = input.requireGrant ? `AND ${GRANT_ATOMIC_GUARD}` : '';
@@ -1188,6 +1235,9 @@ export async function consumeLegacyQuotaAtomic(
       || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: 'boundary_changed' };
     }
+    // revision 没变也可能是因为**真实暂停按钮**（accounts.paused / 角色 pauseRequestedAt）：
+    // 这两个落点不动边界 revision，必须单独判，否则会把「暂停」误报成「额度用完」。
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: 'boundary_changed' };
     if (input.requireGrant && !input.kind) return { ok: false, reason: 'external_quota_exhausted' };
     if (input.kind) return { ok: false, reason: 'kind_exhausted' };
     return { ok: false, reason: input.notificationLimit != null ? 'notifications_exhausted' : 'kind_exhausted' };
@@ -1230,7 +1280,12 @@ export async function consumeExternalQuotaAtomic(input: {
 
   const accountRevision = input.expectedAccountRevision ?? -1;
   const characterRevision = input.expectedCharacterRevision ?? -1;
-  const guardBindings = (): unknown[] => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const guardBindings = (): unknown[] => [
+    ownerId, accountRevision,
+    ownerId, charId, characterRevision,
+    ownerId,
+    ownerId, charId,
+  ];
   // 当前授权额度（执行时读 payload，不看读边界时的旧值）；没有有效授权 → NULL → 条件不成立。
   const QUOTA_GUARD = `used < (
       SELECT COALESCE(json_extract(ge.value, '$.dailyQuota'), 0)
@@ -1290,6 +1345,8 @@ export async function consumeExternalQuotaAtomic(input: {
       || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: 'boundary_changed' };
     }
+    // 真实暂停落点（不改边界 revision）：按「边界变了」回 409，而不是误报「额度用完」。
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: 'boundary_changed' };
     return { ok: false, reason: 'external_quota_exhausted' };
   } catch {
     return { ok: false, reason: 'store_unavailable' };
@@ -1331,6 +1388,7 @@ export async function claimTravelDecisionAtomic(input: {
       .bind(
         ownerId, claimRef, charId, windowId, nowMs, expiresAt,
         ownerId, accountRevision, ownerId, charId, characterRevision,
+        ownerId, ownerId, charId,
         ownerId, 'amap', nowMs,
       )
       .run();
@@ -1353,6 +1411,8 @@ export async function claimTravelDecisionAtomic(input: {
       || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: 'boundary_changed' };
     }
+    // 真实暂停落点不动边界 revision，必须单独判（否则误报成授权额度问题）。
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: 'boundary_changed' };
     return { ok: false, reason: 'external_quota_exhausted' };
   } catch {
     return { ok: false, reason: 'store_unavailable' };
@@ -1367,6 +1427,7 @@ export type RoundClaimFailure =
   | 'invalid_input'
   | 'claim_exists'
   | 'reservation_invalid'
+  | 'paused'
   | 'store_unavailable';
 
 export type RoundClaimResult =
@@ -1379,10 +1440,13 @@ export type RoundClaimResult =
  * 一条语句完成「校验 + 认领」，没有任何「先读后写」的窗口：
  *   1. 预留记录必须真实存在、属于本 owner、本角色，且生命周期可用
  *      （`held` 在途 / `settled` 已结算的计划期凭据）且未过期；
- *   2. `(owner_id, round_ref)` 是主键 → 同一回合只有第一次 INSERT 能成功。
+ *   2. **真实暂停落点**（accounts.paused / 角色 pauseRequestedAt）必须为空：
+ *      这是 `POST /pause` 写的两张表，不写 boundaries，所以不能只看边界 revision；
+ *   3. `(owner_id, round_ref)` 是主键 → 同一回合只有第一次 INSERT 能成功。
  *
  * 返回 `claim_exists` = 这一回合已经被认领过（重放/并发），调用方必须零业务效果。
  * 返回 `reservation_invalid` = 凭据不可信（缺失/伪造/释放/过期），同样零业务效果。
+ * 返回 `paused` = 用户在这期间真的按了暂停（同样零业务效果）。
  * 抛错/存储不可用一律按拒绝处理（fail closed）。
  */
 export async function claimRoundEffect(input: {
@@ -1413,22 +1477,35 @@ export async function claimRoundEffect(input: {
           SELECT 1 FROM autonomy_life_budget_reservations r
           WHERE r.owner_id = ? AND r.reservation_id = ? AND r.char_id = ?
             AND r.state IN ('held', 'settled') AND r.expires_at > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_accounts pa
+          WHERE pa.owner_id = ? AND COALESCE(pa.paused, 0) <> 0
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_characters pc
+          WHERE pc.owner_id = ? AND pc.char_id = ?
+            AND json_extract(pc.payload, '$.pauseRequestedAt') IS NOT NULL
         )`)
       .bind(
         ownerId, roundRef, claimId, charId, reservationId, asString(input.outputHash), input.nowMs, expiresAt,
         ownerId, reservationId, charId, input.nowMs,
+        ownerId,
+        ownerId, charId,
       )
       .run();
     if (changesOf(inserted) > 0) {
       return { ok: true, claimId, outputHash: asString(input.outputHash) };
     }
-    // 没插进去：要么这一回合已经认领过，要么凭据不可信。两者对调用方都是「拒绝」，
-    // 但要能区分（审计/测试要看得见原因）。
+    // 没插进去：要么这一回合已经认领过，要么凭据不可信，要么刚被暂停。
+    // 三者对调用方都是「拒绝」，但要能区分（审计/测试要看得见原因）。
     const existing = await input.db
       .prepare('SELECT claim_id FROM autonomy_life_round_claims WHERE owner_id = ? AND round_ref = ?')
       .bind(ownerId, roundRef)
       .first();
-    return { ok: false, reason: existing ? 'claim_exists' : 'reservation_invalid' };
+    if (existing) return { ok: false, reason: 'claim_exists' };
+    if (await readRealPause({ db: input.db, ownerId, charId })) return { ok: false, reason: 'paused' };
+    return { ok: false, reason: 'reservation_invalid' };
   } catch {
     return { ok: false, reason: 'store_unavailable' };
   }

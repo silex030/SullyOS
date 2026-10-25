@@ -14,10 +14,13 @@ import { TRAVEL_SCHEMA_SQL } from '../../../../contracts/travel';
 import { normalizeBoundary } from '../../../../utils/autonomyLife/boundary';
 import { createSqliteD1, openTestSqlite, type TestSqlite } from '../test/d1-sqlite';
 import {
+  createD1LifeStore,
   ensureAutonomyLifeSchema,
   resetAutonomyLifeSchemaCacheForTesting,
   type LifeDb,
 } from '../autonomyLife/store';
+import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from '../autonomyLife/routes';
+import { emptyCharacterLife } from '../../../../utils/autonomyLife/engine';
 import { gateTravelDecisionPort, travelModelAccess } from '../autonomyLife/travelGate';
 import { ensureTravelBudgetRow, setTravelBudgetPaused } from './budget';
 import {
@@ -799,5 +802,136 @@ describe('出行 cron 探针：统一边界 + 统一预算（真 SQLite）', () 
       expect(await countWishes(), scenario).toBe(0);
       expect(await externalUsed(), scenario).toBe(0);
     }
+  });
+});
+
+
+/* ==================================================================== *
+ * 真实 POST /pause（真 SQLite + 真路由）：出行链路同样按真实暂停落点拒
+ * ==================================================================== *
+ *
+ * `POST /pause` 只写 `autonomy_life_accounts.paused` /
+ * `autonomy_life_characters.payload.pauseRequestedAt`，不动 boundaries。
+ * 旧实现只读 boundaries，于是「暂停后 tick 仍调模型」；这里用真路由暂停，
+ * 断言模型调用 0、愿望 0、预算行不新增。
+ */
+
+const ROUTE_TOKEN = 'shared-token';
+
+const pauseRoute = async (body: Record<string, unknown>): Promise<Response | null> => {
+  const env = { DB: lifeDb, AMSG_SERVER_TOKEN: ROUTE_TOKEN } as never;
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'X-User-Id': USER,
+    'X-Client-Token': ROUTE_TOKEN,
+  });
+  const request = new Request('https://worker.example/autonomy-life/v1/pause', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  return handleAutonomyLifeRequest(request, env, {
+    now: () => NOW,
+    resolveOwner: (req) => resolveOwnerFromSharedToken(req, env),
+    respond: (status, payload) => new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    }),
+    hasModelCredentials: async () => true,
+    requestId: () => 'req-pause-travel',
+  });
+};
+
+const boundarySnapshot = async () => (await lifeDb
+  .prepare('SELECT scope, char_id, revision, payload FROM autonomy_life_boundaries WHERE owner_id = ? ORDER BY scope, char_id')
+  .bind(USER)
+  .all()).results ?? [];
+
+describe('出行 cron：真实 POST /pause 之后零模型 / 零愿望（真路由 + 真 SQLite）', () => {
+  it('账号暂停（/pause 不改 boundaries）→ 已建好的 wiring 也不再调模型、不落愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(access.ok).toBe(true);
+    const wiring = buildWiring(counter, access);
+    const before = await boundarySnapshot();
+
+    const res = await pauseRoute({ scope: 'account', paused: true });
+    expect(res?.status).toBe(200);
+    expect(await boundarySnapshot()).toEqual(before);
+
+    const outcome = await runTravelTickForSubject(db, subject, wiring);
+    expect(counter.calls).toBe(0);
+    expect(await countWishes()).toBe(0);
+    expect(await budgetRows()).toEqual([]);
+    expect(outcome.skipped.length).toBeGreaterThan(0);
+
+    // 解除暂停后同一个 wiring 恢复工作（正常控制路径仍然在）。
+    const resumed = await pauseRoute({ scope: 'account', paused: false });
+    expect(resumed?.status).toBe(200);
+    await runTravelTickForSubject(db, subject, wiring);
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(1);
+  });
+
+  it('角色暂停（/pause 只写 pauseRequestedAt）→ 已建好的 wiring 零模型、零愿望', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    const store = createD1LifeStore({ db: lifeDb, ownerId: USER, now: () => NOW });
+    const life = emptyCharacterLife(CHAR, NOW, 'Asia/Shanghai');
+    await store.putCharacterLife(life, life.revision);
+
+    const counter = { calls: 0 };
+    const access = await travelModelAccess({ db: lifeDb, travelDb: db, ownerId: USER, charId: CHAR, nowMs: NOW });
+    expect(access.ok).toBe(true);
+    const wiring = buildWiring(counter, access);
+    const before = await boundarySnapshot();
+
+    const res = await pauseRoute({ scope: 'character', charId: CHAR, paused: true });
+    expect(res?.status).toBe(200);
+    expect(await boundarySnapshot()).toEqual(before);
+
+    const outcome = await runTravelTickForSubject(db, subject, wiring);
+    expect(counter.calls).toBe(0);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped.length).toBeGreaterThan(0);
+  });
+
+  it('模型已经发出、返回之前按下真实 /pause → 零愿望（模型调用照常记账）', async () => {
+    await seedNewBoundary();
+    await seedTravelAuthorization();
+    const counter = { calls: 0 };
+    const rawPort = {
+      async choose() { counter.calls += 1; return { kind: 'wait' }; },
+      async proposeIntent() {
+        counter.calls += 1;
+        // 用户在另一台设备上按下真实暂停按钮（与 UI 同一个端点）。
+        const res = await pauseRoute({ scope: 'account', paused: true });
+        expect(res?.status).toBe(200);
+        return { want: 'wander', wish: '想去公园走走' };
+      },
+      lastUsageTokens: () => 111,
+    };
+    const decisionPort = gateTravelDecisionPort(rawPort, {
+      db: lifeDb, ownerId: USER, charId: CHAR, now: () => NOW,
+    });
+    const wiring = {
+      now: () => NOW,
+      providers: [],
+      region: 'CN' as const,
+      readAnchor: async () => anchor,
+      decisionPort,
+      intentWindowMs: 3 * 60 * 60 * 1000,
+    };
+
+    const outcome = await runTravelTickForSubject(db, subject, wiring);
+    expect(counter.calls).toBe(1);
+    expect(await countWishes()).toBe(0);
+    expect(outcome.skipped).toContain('llm_unavailable');
+    const rows = await budgetRows();
+    const account = rows.find((row) => row.scope === 'account');
+    expect(Number(account?.used_calls)).toBe(1);
+    expect(Number(account?.reserved_calls)).toBe(0);
   });
 });

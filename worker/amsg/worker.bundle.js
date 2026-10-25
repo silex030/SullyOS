@@ -14393,6 +14393,17 @@ async function readBudgetRows(options) {
   };
   return { account: await read("account"), char: await read(charId) };
 }
+async function readRealPause(options) {
+  try {
+    const row = await options.db.prepare(`SELECT
+          (SELECT COALESCE(paused, 0) FROM autonomy_life_accounts WHERE owner_id = ?) AS account_paused,
+          (SELECT json_extract(payload, '$.pauseRequestedAt') FROM autonomy_life_characters
+            WHERE owner_id = ? AND char_id = ?) AS char_pause_requested_at`).bind(options.ownerId, options.ownerId, options.charId).first();
+    return Number(row?.account_paused ?? 0) !== 0 || row?.char_pause_requested_at != null;
+  } catch {
+    return true;
+  }
+}
 var BOUNDARY_ATOMIC_GUARD = `EXISTS (
     SELECT 1 FROM autonomy_life_boundaries b
     WHERE b.owner_id = ? AND b.scope = 'account' AND b.char_id = ''
@@ -14401,11 +14412,20 @@ var BOUNDARY_ATOMIC_GUARD = `EXISTS (
       AND COALESCE(json_extract(b.payload, '$.enabled'), 1) <> 0
   )
   AND EXISTS (
-    SELECT 1 FROM autonomy_life_boundaries c
-    WHERE c.owner_id = ? AND c.scope = 'character' AND c.char_id = ?
-      AND c.revision = ?
-      AND COALESCE(json_extract(c.payload, '$.charEnabled'), 1) <> 0
-      AND COALESCE(json_extract(c.payload, '$.enabled'), 1) <> 0
+    SELECT 1 FROM autonomy_life_boundaries cb
+    WHERE cb.owner_id = ? AND cb.scope = 'character' AND cb.char_id = ?
+      AND cb.revision = ?
+      AND COALESCE(json_extract(cb.payload, '$.charEnabled'), 1) <> 0
+      AND COALESCE(json_extract(cb.payload, '$.enabled'), 1) <> 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM autonomy_life_accounts pa
+    WHERE pa.owner_id = ? AND COALESCE(pa.paused, 0) <> 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM autonomy_life_characters pc
+    WHERE pc.owner_id = ? AND pc.char_id = ?
+      AND json_extract(pc.payload, '$.pauseRequestedAt') IS NOT NULL
   )`;
 var GRANT_ATOMIC_GUARD = `EXISTS (
     SELECT 1 FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
@@ -14420,7 +14440,16 @@ async function consumeLegacyQuotaAtomic(input) {
   if (input.notificationLimit == null && !input.kind) return { ok: false, reason: "invalid_input" };
   const accountRevision = input.expectedAccountRevision ?? -1;
   const characterRevision = input.expectedCharacterRevision ?? -1;
-  const guardBindings = () => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const guardBindings = () => [
+    ownerId,
+    accountRevision,
+    ownerId,
+    charId,
+    characterRevision,
+    ownerId,
+    ownerId,
+    charId
+  ];
   const grantBindings = () => input.requireGrant ? [ownerId, input.requireGrant, nowMs] : [];
   const grantClause = input.requireGrant ? `AND ${GRANT_ATOMIC_GUARD}` : "";
   try {
@@ -14475,6 +14504,7 @@ async function consumeLegacyQuotaAtomic(input) {
     if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: "boundary_changed" };
     }
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: "boundary_changed" };
     if (input.requireGrant && !input.kind) return { ok: false, reason: "external_quota_exhausted" };
     if (input.kind) return { ok: false, reason: "kind_exhausted" };
     return { ok: false, reason: input.notificationLimit != null ? "notifications_exhausted" : "kind_exhausted" };
@@ -14487,7 +14517,16 @@ async function consumeExternalQuotaAtomic(input) {
   if (!ownerId || !charId || !dayKey2 || !provider) return { ok: false, reason: "store_unavailable" };
   const accountRevision = input.expectedAccountRevision ?? -1;
   const characterRevision = input.expectedCharacterRevision ?? -1;
-  const guardBindings = () => [ownerId, accountRevision, ownerId, charId, characterRevision];
+  const guardBindings = () => [
+    ownerId,
+    accountRevision,
+    ownerId,
+    charId,
+    characterRevision,
+    ownerId,
+    ownerId,
+    charId
+  ];
   const QUOTA_GUARD = `used < (
       SELECT COALESCE(json_extract(ge.value, '$.dailyQuota'), 0)
       FROM autonomy_life_boundaries g, json_each(json_extract(g.payload, '$.externalGrants')) ge
@@ -14526,6 +14565,7 @@ async function consumeExternalQuotaAtomic(input) {
     if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: "boundary_changed" };
     }
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: "boundary_changed" };
     return { ok: false, reason: "external_quota_exhausted" };
   } catch {
     return { ok: false, reason: "store_unavailable" };
@@ -14557,6 +14597,9 @@ async function claimTravelDecisionAtomic(input) {
       charId,
       characterRevision,
       ownerId,
+      ownerId,
+      charId,
+      ownerId,
       "amap",
       nowMs
     ).run();
@@ -14569,6 +14612,7 @@ async function claimTravelDecisionAtomic(input) {
     if (!stillCurrent || Number(stillCurrent.ar ?? -1) !== accountRevision || Number(stillCurrent.cr ?? -1) !== characterRevision) {
       return { ok: false, reason: "boundary_changed" };
     }
+    if (await readRealPause({ db, ownerId, charId })) return { ok: false, reason: "boundary_changed" };
     return { ok: false, reason: "external_quota_exhausted" };
   } catch {
     return { ok: false, reason: "store_unavailable" };
@@ -14590,6 +14634,15 @@ async function claimRoundEffect(input) {
           SELECT 1 FROM autonomy_life_budget_reservations r
           WHERE r.owner_id = ? AND r.reservation_id = ? AND r.char_id = ?
             AND r.state IN ('held', 'settled') AND r.expires_at > ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_accounts pa
+          WHERE pa.owner_id = ? AND COALESCE(pa.paused, 0) <> 0
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM autonomy_life_characters pc
+          WHERE pc.owner_id = ? AND pc.char_id = ?
+            AND json_extract(pc.payload, '$.pauseRequestedAt') IS NOT NULL
         )`).bind(
       ownerId,
       roundRef,
@@ -14602,13 +14655,18 @@ async function claimRoundEffect(input) {
       ownerId,
       reservationId,
       charId,
-      input.nowMs
+      input.nowMs,
+      ownerId,
+      ownerId,
+      charId
     ).run();
     if (changesOf4(inserted) > 0) {
       return { ok: true, claimId, outputHash: asString3(input.outputHash) };
     }
     const existing = await input.db.prepare("SELECT claim_id FROM autonomy_life_round_claims WHERE owner_id = ? AND round_ref = ?").bind(ownerId, roundRef).first();
-    return { ok: false, reason: existing ? "claim_exists" : "reservation_invalid" };
+    if (existing) return { ok: false, reason: "claim_exists" };
+    if (await readRealPause({ db: input.db, ownerId, charId })) return { ok: false, reason: "paused" };
+    return { ok: false, reason: "reservation_invalid" };
   } catch {
     return { ok: false, reason: "store_unavailable" };
   }
@@ -14628,12 +14686,15 @@ async function readEffectiveBoundary(db, args) {
     if (!accountRow || !characterRow) {
       return { ok: false, reason: accountRow ? "character_not_registered" : "account_disabled" };
     }
+    const pauseRow = await db.prepare(`SELECT
+          (SELECT COALESCE(paused, 0) FROM autonomy_life_accounts WHERE owner_id = ?) AS account_paused,
+          (SELECT json_extract(payload, '$.pauseRequestedAt') FROM autonomy_life_characters
+            WHERE owner_id = ? AND char_id = ?) AS char_pause_requested_at`).bind(args.ownerId, args.ownerId, args.charId).first();
     const account = JSON.parse(String(accountRow.payload));
     const character = JSON.parse(String(characterRow.payload));
-    return {
-      ok: true,
-      boundary: mergeEffectiveBoundary({ account, character, charId: args.charId, nowMs: args.nowMs })
-    };
+    const merged = mergeEffectiveBoundary({ account, character, charId: args.charId, nowMs: args.nowMs });
+    const realPause = Number(pauseRow?.account_paused ?? 0) !== 0 || pauseRow?.char_pause_requested_at != null;
+    return { ok: true, boundary: realPause ? { ...merged, globalPaused: true } : merged };
   } catch {
     return { ok: false, reason: "account_disabled" };
   }
@@ -26152,7 +26213,13 @@ function createAutonomyLifeRuntime(options) {
   const boundaryFor = async (targetCharId) => {
     const account = await boundaries.getAccount();
     const character = await boundaries.getCharacter(targetCharId);
-    return mergeEffectiveBoundary({ account, character, charId: targetCharId, nowMs: now() });
+    const merged = mergeEffectiveBoundary({ account, character, charId: targetCharId, nowMs: now() });
+    const [pause, life] = await Promise.all([
+      store.getAccountPause(userId),
+      store.getCharacterLife(targetCharId)
+    ]);
+    const realPause = pause.paused || life?.pauseRequestedAt != null;
+    return realPause ? { ...merged, globalPaused: true } : merged;
   };
   const probes = options.probes ?? {
     localStoresReady: false,
@@ -27031,13 +27098,7 @@ async function handleAutonomyLifeScheduled(input) {
         map: { configured: false, reachable: false }
       }
     });
-    const account = await runtime.boundaries.getAccount();
-    const effective = mergeEffectiveBoundary({
-      account,
-      character: await runtime.boundaries.getCharacter(charId),
-      charId,
-      nowMs
-    });
+    const effective = await runtime.boundaryFor(charId);
     if (!effective.enabled || effective.globalPaused) {
       outcomes.push({ charId, status: "skipped", reason: "account_disabled" });
       continue;

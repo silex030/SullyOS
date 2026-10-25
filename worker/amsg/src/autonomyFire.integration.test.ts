@@ -20,7 +20,9 @@ import {
   configureAutonomyFireDb,
   configureAutonomyFireMasterKey,
 } from './autonomyFire';
-import { ensureAutonomyLifeSchema, resetAutonomyLifeSchemaCacheForTesting, type LifeDb } from './autonomyLife/store';
+import { ensureAutonomyLifeSchema, createD1LifeStore, resetAutonomyLifeSchemaCacheForTesting, type LifeDb } from './autonomyLife/store';
+import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './autonomyLife/routes';
+import { emptyCharacterLife } from '../../../utils/autonomyLife/engine';
 import { hashAutonomyOutput } from './autonomyFire';
 import { ensureTravelSchema, setTravelCharEnabled, upsertTravelSettings } from './travel/store';
 import { ensureTravelBudgetRow } from './travel/budget';
@@ -837,5 +839,139 @@ describe('旧自动回合的出行愿望：受统一边界与 kind 配额约束�
       .prepare('SELECT used FROM autonomy_life_external_usage WHERE owner_id = ?')
       .bind(USER)
       .first())?.used ?? 0)).toBe(0);
+  });
+});
+
+
+/* ==================================================================== *
+ * 真实 POST /pause（真 SQLite + 真路由）：暂停权威只有一份
+ * ==================================================================== *
+ *
+ * 第八轮复审退回项：`POST /pause` 写的是 `autonomy_life_accounts.paused` /
+ * `autonomy_life_characters.payload.pauseRequestedAt`，**不写** boundaries。
+ * 所以「暂停后新起的旧 AIRP 回合」必须被挡住——这里走真路由 + 真 handler，
+ * 断言零模型调用（beforeFire 直接 skip）、零预留、零经历/愿望/下发。
+ */
+
+const ROUTE_TOKEN = 'shared-token';
+
+/** 走真正的 HTTP 路由（与 UI 按钮同一条链路：/pause → service.pause → store）。 */
+const pauseRoute = async (body: Record<string, unknown>): Promise<Response | null> => {
+  const env = { DB: db, AMSG_SERVER_TOKEN: ROUTE_TOKEN } as never;
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'X-User-Id': USER,
+    'X-Client-Token': ROUTE_TOKEN,
+  });
+  const request = new Request('https://worker.example/autonomy-life/v1/pause', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  return handleAutonomyLifeRequest(request, env, {
+    now: () => NOW,
+    resolveOwner: (req) => resolveOwnerFromSharedToken(req, env),
+    respond: (status, payload) => new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    }),
+    hasModelCredentials: async () => true,
+    requestId: () => 'req-pause',
+  });
+};
+
+const boundaryRows = async () => (await db
+  .prepare('SELECT scope, char_id, revision, payload FROM autonomy_life_boundaries WHERE owner_id = ? ORDER BY scope, char_id')
+  .bind(USER)
+  .all()).results ?? [];
+
+const accountPauseRow = async () => db
+  .prepare('SELECT paused, pause_requested_at FROM autonomy_life_accounts WHERE owner_id = ?')
+  .bind(USER)
+  .first();
+
+const seedCharacterLifeRow = async () => {
+  const store = createD1LifeStore({ db, ownerId: USER, now: () => NOW });
+  const life = emptyCharacterLife(CHAR, NOW, 'Asia/Shanghai');
+  await store.putCharacterLife(life, life.revision);
+};
+
+const realPauseTravelOutput = (): string => JSON.stringify({
+  v: 1,
+  rest: false,
+  experiences: [{ q: '午后', note: '想出去走走。', kind: 'walk', importance: 2 }],
+  travel: { want: 'wander', wish: '想去公园走走' },
+});
+
+describe('真实 POST /pause（真 SQLite + 真路由）：暂停后新回合零模型 / 零业务', () => {
+  it('账号暂停：/pause 只写 accounts.paused、不改 boundaries；新回合 fire 前跳过，解除后恢复', async () => {
+    await seedBoundary();
+    const before = await boundaryRows();
+    const res = await pauseRoute({ scope: 'account', paused: true });
+    expect(res?.status).toBe(200);
+    const body = await res!.json() as any;
+    expect(body.paused).toBe(true);
+
+    // 真实落点：accounts.paused=1（不是 boundaries.globalPaused）。
+    expect(Number((await accountPauseRow())?.paused)).toBe(1);
+    // 关键：暂停一个字节都没改 boundaries —— 只读 boundaries 的旧实现根本看不到这次暂停。
+    expect(await boundaryRows()).toEqual(before);
+
+    const skipped = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    expect(skipped).toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.governanceDenied });
+    expect(await budgetRows()).toEqual([]);
+    expect(await countExperiences()).toBe(0);
+
+    // 解除暂停仍走同一个真实入口：正常控制路径不能被「关掉功能让负例恒真」。
+    const resumed = await pauseRoute({ scope: 'account', paused: false });
+    expect(resumed?.status).toBe(200);
+    const allowed = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    expect('messages' in allowed).toBe(true);
+  });
+
+  it('角色暂停：/pause 只写 characters.pauseRequestedAt、不改 boundaries；新回合 fire 前跳过', async () => {
+    await seedBoundary();
+    await seedCharacterLifeRow();
+    const before = await boundaryRows();
+    const res = await pauseRoute({ scope: 'character', charId: CHAR, paused: true });
+    expect(res?.status).toBe(200);
+
+    const row = await db
+      .prepare("SELECT json_extract(payload, '$.pauseRequestedAt') AS paused_at FROM autonomy_life_characters WHERE owner_id = ? AND char_id = ?")
+      .bind(USER, CHAR)
+      .first();
+    expect(Number(row?.paused_at)).toBeGreaterThan(0);
+    expect(await boundaryRows()).toEqual(before);
+
+    const skipped = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    expect(skipped).toEqual({ skip: true, reason: AUTONOMY_FIRE_SKIP.governanceDenied });
+    expect(await budgetRows()).toEqual([]);
+    expect(await countExperiences()).toBe(0);
+
+    // 解除后同一入口恢复（不留下「暂停过就永远跑不了」的死状态）。
+    const resumed = await pauseRoute({ scope: 'character', charId: CHAR, paused: false });
+    expect(resumed?.status).toBe(200);
+    const allowed = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    expect('messages' in allowed).toBe(true);
+  });
+
+  it('模型已经返回、落效果之前按下真实 /pause → 零经历 / 零愿望 / 零下发', async () => {
+    await seedBoundary({ allowedKinds: ['interaction.message', 'travel.wish'], externalGrants: [amapGrant()] });
+    await seedTravelWishPrereqs();
+    const plan = await autonomyRoundHandler.beforeFire({ ctx: makeCtx(), charId: CHAR, taskMeta: {} });
+    if (!('messages' in plan)) throw new Error('这一跳不该被跳过');
+
+    // 模型跑的这几秒里，用户在另一台设备上按下真实暂停按钮。
+    const res = await pauseRoute({ scope: 'account', paused: true });
+    expect(res?.status).toBe(200);
+
+    const sink = makeSinkCtx(realPauseTravelOutput(), { total_tokens: 30 });
+    const decision = await autonomyRoundHandler.llmOutput({ ctx: sink.ctx, state: plan.state });
+    expect(decision).toEqual({ decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied });
+    expect(sink.emitted).toHaveLength(0);
+    expect(await countExperiences()).toBe(0);
+    expect(await countPushedExperiences()).toBe(0);
+    expect(await countWishes()).toBe(0);
+    expect(await countClaims()).toBe(0);
   });
 });

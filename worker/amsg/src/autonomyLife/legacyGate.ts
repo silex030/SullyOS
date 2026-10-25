@@ -85,6 +85,14 @@ const userForbidden = (boundary: EffectiveBoundaryV1): string[] =>
  * 从 D1 读「这个角色当前生效的边界」。
  * 缺账号行 = 从没在新入口打开过（account_disabled）；缺角色行 = 没登记（character_not_registered）。
  * 读失败一律按不可用处理（fail closed），旧链路不能因为「读不到边界」而放飞。
+ *
+ * **真实暂停也在这里读**：`POST /pause` 不写 `autonomy_life_boundaries`——
+ * 账号暂停写 `autonomy_life_accounts.paused`，角色暂停写
+ * `autonomy_life_characters.payload.pauseRequestedAt`（`service.ts` 的落点）。
+ * 只读 boundaries 会出现「用户按了暂停，边界 payload/ revision 一点没变，
+ * 新起的旧 AIRP 回合与出行 tick 照样调模型」（第八轮复审退回的正是这一点）。
+ * 这里把真实暂停折叠成 `globalPaused`，于是所有复用本函数的执行闸
+ * （beforeFire / 结果效果 / 通知 / 出行模型与效果 / 授权额度）都按同一份暂停权威判定。
  */
 export async function readEffectiveBoundary(
   db: LifeDb,
@@ -102,12 +110,20 @@ export async function readEffectiveBoundary(
     if (!accountRow || !characterRow) {
       return { ok: false, reason: accountRow ? 'character_not_registered' : 'account_disabled' };
     }
+    // 真实暂停落点（与 POST /pause 写入的表/字段一致）。读失败 → 走 catch fail closed。
+    const pauseRow = await db
+      .prepare(`SELECT
+          (SELECT COALESCE(paused, 0) FROM autonomy_life_accounts WHERE owner_id = ?) AS account_paused,
+          (SELECT json_extract(payload, '$.pauseRequestedAt') FROM autonomy_life_characters
+            WHERE owner_id = ? AND char_id = ?) AS char_pause_requested_at`)
+      .bind(args.ownerId, args.ownerId, args.charId)
+      .first();
     const account = JSON.parse(String(accountRow.payload)) as Parameters<typeof mergeEffectiveBoundary>[0]['account'];
     const character = JSON.parse(String(characterRow.payload)) as NonNullable<Parameters<typeof mergeEffectiveBoundary>[0]['character']>;
-    return {
-      ok: true,
-      boundary: mergeEffectiveBoundary({ account, character, charId: args.charId, nowMs: args.nowMs }),
-    };
+    const merged = mergeEffectiveBoundary({ account, character, charId: args.charId, nowMs: args.nowMs });
+    const realPause = Number(pauseRow?.account_paused ?? 0) !== 0
+      || pauseRow?.char_pause_requested_at != null;
+    return { ok: true, boundary: realPause ? { ...merged, globalPaused: true } : merged };
   } catch {
     return { ok: false, reason: 'account_disabled' };
   }

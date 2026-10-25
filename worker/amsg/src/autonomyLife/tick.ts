@@ -14,7 +14,6 @@
  */
 
 import type { ActivityKind } from '../../../../contracts/autonomyLife';
-import { mergeEffectiveBoundary } from '../../../../utils/autonomyLife/boundary';
 import { tickCharacter } from '../../../../utils/autonomyLife/engine';
 import { createAutonomyLifeModelPort, isUsableLifeCredentials } from './model';
 import { ensureCharacterLife, createAutonomyLifeRuntime } from './runtime';
@@ -84,13 +83,10 @@ export async function handleAutonomyLifeScheduled(
     });
 
     // 边界门：账号总开关 / 暂停 / 角色开关任一关着就不发模型请求。
-    const account = await runtime.boundaries.getAccount();
-    const effective = mergeEffectiveBoundary({
-      account,
-      character: await runtime.boundaries.getCharacter(charId),
-      charId,
-      nowMs,
-    });
+    // 用 runtime.boundaryFor 而不是在这里自己 merge：真实暂停（`POST /pause` 写的
+    // accounts.paused / characters.pauseRequestedAt）不在 boundaries 里，必须走统一读法，
+    // 否则「用户按了暂停，cron 仍拿 allowedKinds 去建模型端口」。
+    const effective = await runtime.boundaryFor(charId);
     if (!effective.enabled || effective.globalPaused) {
       outcomes.push({ charId, status: 'skipped', reason: 'account_disabled' });
       continue;
