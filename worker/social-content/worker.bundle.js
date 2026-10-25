@@ -35,6 +35,14 @@ var nodePinningTransport = (req) => new Promise((resolve, reject2) => {
       resolve({
         status: res.statusCode || 0,
         headers,
+        // 不读正文的分支（重定向/非 2xx）必须主动释放：否则 keep-alive 连接被未读响应占住，
+        // 重定向链上的 socket 会一路泄漏到进程退出。
+        discard: () => {
+          try {
+            res.destroy();
+          } catch {
+          }
+        },
         readBody: (limitBytes) => new Promise((done, fail2) => {
           const chunks = [];
           let bytes = 0;
@@ -783,15 +791,82 @@ function headerValue(headers, name) {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
   return key ? headers[key] : null;
 }
+function mapBodyError(err, timedOut) {
+  if (timedOut) return new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true });
+  if (err instanceof SocialError) return err;
+  return new SocialError("NETWORK_ERROR", "body_read_failed", { autoRetryable: true });
+}
+async function readBodyWithinBudget(res, maxBytes, budgetMs, controller) {
+  let timer;
+  let timedOut = false;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      controller.abort();
+    } catch {
+    }
+    try {
+      res.discard?.();
+    } catch {
+    }
+  };
+  try {
+    return await new Promise((resolve, reject2) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        release();
+        reject2(new SocialError("TIMEOUT", "body_timeout", { autoRetryable: true }));
+      }, budgetMs);
+      let pending;
+      try {
+        pending = res.readBody(maxBytes);
+      } catch (err) {
+        release();
+        reject2(mapBodyError(err, timedOut));
+        return;
+      }
+      pending.then(
+        (value) => resolve(value),
+        (err) => {
+          release();
+          reject2(mapBodyError(err, timedOut));
+        }
+      );
+    });
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
+async function withBudget(promise, ms, reason) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject2) => {
+        timer = setTimeout(() => reject2(new SocialError("TIMEOUT", reason, { autoRetryable: true })), Math.max(0, ms));
+      })
+    ]);
+  } finally {
+    if (timer !== void 0) clearTimeout(timer);
+  }
+}
 async function safeGet(rawUrl, deps, policy) {
   const maxRedirects = policy.maxRedirects ?? SHARE_REQUEST_LIMITS.maxRedirects;
   const timeoutMs = policy.perRequestTimeoutMs ?? SHARE_REQUEST_LIMITS.perRequestTimeoutMs;
   const maxBytes = policy.maxBytes ?? SHARE_CONTENT_LIMITS.maxHtmlBytes;
+  const now = deps.now ?? (() => Date.now());
+  const deadline = typeof policy.deadline === "number" && Number.isFinite(policy.deadline) ? policy.deadline : null;
   const audit = [];
   let current = rawUrl;
   let hops = 0;
   let headers = { ...policy.headers ?? {}, accept: "text/html,application/json;q=0.9,*/*;q=0.5" };
   for (; ; ) {
+    const remainingTotal = deadline == null ? Number.POSITIVE_INFINITY : deadline - now();
+    if (remainingTotal <= 0) throw new SocialError("TIMEOUT", "fetch_deadline_exceeded", { autoRetryable: true });
+    const hopBudget = Math.min(timeoutMs, remainingTotal);
+    const hopStart = now();
     let hopUrl;
     try {
       hopUrl = assertUrlAllowed(current, { allowedHosts: policy.allowedHosts });
@@ -802,60 +877,85 @@ async function safeGet(rawUrl, deps, policy) {
     const { url, host } = hopUrl;
     let addresses;
     try {
-      addresses = await deps.resolve(host);
-    } catch {
+      addresses = await withBudget(deps.resolve(host), hopBudget, "dns_timeout");
+    } catch (err) {
+      if (err instanceof SocialError) throw err;
       throw new SocialError("NETWORK_ERROR", "dns_failed", { autoRetryable: true });
     }
     const ipCheck = checkResolvedAddresses(addresses);
     if (!ipCheck.ok) throw new SocialError("UNSAFE_URL", `dns_${ipCheck.reason}`);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let res;
+    const afterDns = now();
+    const connectBudget = Math.max(
+      1,
+      Math.min(hopBudget - (afterDns - hopStart), deadline == null ? Number.POSITIVE_INFINITY : deadline - afterDns)
+    );
+    let connectTimer = setTimeout(() => controller.abort(), connectBudget);
     try {
-      res = await deps.transport({
-        url: url.toString(),
-        method: "GET",
-        headers,
-        pinnedAddresses: addresses,
-        signal: controller.signal,
-        maxBytes
-      });
-    } catch (err) {
-      if (controller.signal.aborted) throw new SocialError("TIMEOUT", "upstream_timeout", { autoRetryable: true });
-      throw new SocialError("NETWORK_ERROR", "transport_failed", { autoRetryable: true });
-    } finally {
-      clearTimeout(timer);
-    }
-    audit.push({ host, addresses, status: res.status });
-    if (REDIRECT_STATUS.has(res.status)) {
-      const location = headerValue(res.headers, "location");
-      if (!location) throw new SocialError("UPSTREAM_CHANGED", "redirect_without_location");
-      hops += 1;
-      if (hops > maxRedirects) throw new SocialError("UNSAFE_URL", "too_many_redirects");
-      let next;
+      let res;
       try {
-        next = new URL(location, url);
+        res = await deps.transport({
+          url: url.toString(),
+          method: "GET",
+          headers,
+          pinnedAddresses: addresses,
+          signal: controller.signal,
+          maxBytes
+        });
       } catch {
-        throw new SocialError("UNSAFE_URL", "bad_redirect_location");
+        if (controller.signal.aborted) throw new SocialError("TIMEOUT", "upstream_timeout", { autoRetryable: true });
+        throw new SocialError("NETWORK_ERROR", "transport_failed", { autoRetryable: true });
       }
-      if (url.protocol === "https:" && next.protocol !== "https:") throw new SocialError("UNSAFE_URL", "redirect_protocol_downgrade");
-      if (!isSameOrigin(url, next)) headers = withoutSensitive(headers);
-      current = next.toString();
-      continue;
+      if (controller.signal.aborted) {
+        res.discard?.();
+        throw new SocialError("TIMEOUT", "upstream_timeout", { autoRetryable: true });
+      }
+      audit.push({ host, addresses, status: res.status });
+      if (REDIRECT_STATUS.has(res.status)) {
+        res.discard?.();
+        const location = headerValue(res.headers, "location");
+        if (!location) throw new SocialError("UPSTREAM_CHANGED", "redirect_without_location");
+        hops += 1;
+        if (hops > maxRedirects) throw new SocialError("UNSAFE_URL", "too_many_redirects");
+        let next;
+        try {
+          next = new URL(location, url);
+        } catch {
+          throw new SocialError("UNSAFE_URL", "bad_redirect_location");
+        }
+        if (url.protocol === "https:" && next.protocol !== "https:") {
+          throw new SocialError("UNSAFE_URL", "redirect_protocol_downgrade");
+        }
+        if (!isSameOrigin(url, next)) headers = withoutSensitive(headers);
+        current = next.toString();
+        continue;
+      }
+      const mapped = mapHttpStatus(res.status, { retryAfter: headerValue(res.headers, "retry-after") });
+      if (mapped) {
+        res.discard?.();
+        throw mapped;
+      }
+      const consumed = now() - hopStart;
+      const bodyBudget = Math.max(
+        1,
+        Math.min(hopBudget - consumed, deadline == null ? Number.POSITIVE_INFINITY : deadline - now())
+      );
+      clearTimeout(connectTimer);
+      connectTimer = void 0;
+      const body = await readBodyWithinBudget(res, maxBytes, bodyBudget, controller);
+      return {
+        status: res.status,
+        headers: res.headers,
+        text: body.text,
+        bytes: body.bytes,
+        truncated: body.truncated,
+        finalUrl: url.toString(),
+        hops,
+        audit
+      };
+    } finally {
+      if (connectTimer !== void 0) clearTimeout(connectTimer);
     }
-    const mapped = mapHttpStatus(res.status, { retryAfter: headerValue(res.headers, "retry-after") });
-    if (mapped) throw mapped;
-    const body = await res.readBody(maxBytes);
-    return {
-      status: res.status,
-      headers: res.headers,
-      text: body.text,
-      bytes: body.bytes,
-      truncated: body.truncated,
-      finalUrl: url.toString(),
-      hops,
-      audit
-    };
   }
 }
 
@@ -990,7 +1090,7 @@ var SUBTITLE_HOSTS = PLATFORM_HOSTS.bilibiliCdn;
 var JSON_BYTES = 256 * 1024;
 var COMMENTS_LIMIT = 5;
 var OPEN_API_HEADERS = {
-  "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+  "user-agent": "SullyOS/1.0 (social-content; read-only link resolver)",
   referer: "https://www.bilibili.com/"
 };
 function parseJson(res, what) {
@@ -1036,7 +1136,9 @@ async function fetchOfficialSubtitle(deps, url, ctx, partKey, language, sourceRe
     ...fetchPolicy(deps),
     allowedHosts: [...HOSTS, ...SUBTITLE_HOSTS],
     headers: OPEN_API_HEADERS,
-    maxBytes: JSON_BYTES
+    maxBytes: JSON_BYTES,
+    // 全链路期限：DNS/连接/正文都必须落在这次解析的总预算里（缺陷 2）
+    deadline: ctx.deadline
   });
   const parsed = parseJson(res, "subtitle");
   const body = Array.isArray(parsed.body) ? parsed.body : [];
@@ -1065,7 +1167,7 @@ async function fetchOfficialSubtitle(deps, url, ctx, partKey, language, sourceRe
 async function fetchComments(deps, aid, ctx, sourceRef) {
   const now = ctx.now?.() ?? Date.now();
   const url = `https://api.bilibili.com/x/v2/reply?type=1&oid=${aid}&sort=2&ps=${COMMENTS_LIMIT}&pn=1`;
-  const res = await safeGet(url, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES });
+  const res = await safeGet(url, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline });
   const parsed = parseJson(res, "comments");
   const mapped = mapBiliCode(parsed.code);
   if (mapped) throw mapped;
@@ -1108,7 +1210,8 @@ function createBilibiliAdapter(deps) {
       const res = await safeGet(url, deps.safeFetch, {
         ...fetchPolicy(deps, HOSTS),
         headers: OPEN_API_HEADERS,
-        maxBytes: 64 * 1024
+        maxBytes: 64 * 1024,
+        deadline: ctx.deadline
       });
       const finalUrl = new URL(res.finalUrl);
       const m = finalUrl.pathname.match(/^\/video\/((?:BV[0-9A-Za-z]{10})|(?:av\d+))\/?$/);
@@ -1120,7 +1223,7 @@ function createBilibiliAdapter(deps) {
     async fetchContent(target, ctx) {
       const now = ctx.now?.() ?? Date.now();
       const viewUrl = `https://api.bilibili.com/x/web-interface/view?${externalIdToQuery(target.externalId)}`;
-      const viewRes = await safeGet(viewUrl, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES });
+      const viewRes = await safeGet(viewUrl, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline });
       const viewEnvelope = parseJson(viewRes, "view");
       const viewErr = mapBiliCode(viewEnvelope.code);
       if (viewErr) throw viewErr;
@@ -1137,7 +1240,7 @@ function createBilibiliAdapter(deps) {
           const playerRes = await safeGet(
             `https://api.bilibili.com/x/player/v2?bvid=${encodeURIComponent(bvid)}&cid=${cid}`,
             deps.safeFetch,
-            { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES }
+            { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline }
           );
           const player = parseJson(playerRes, "player");
           if (player.code === 0) {
@@ -1366,7 +1469,8 @@ function createDouyinAdapter(deps) {
         ...fetchPolicy(deps, HOSTS2),
         allowedHosts: HOSTS2,
         perRequestTimeoutMs: policy.requestTimeoutMs,
-        maxBytes: 64 * 1024
+        maxBytes: 64 * 1024,
+        deadline: ctx.deadline
       });
       const finalUrl = new URL(res.finalUrl);
       const parsed = parseDouyinIdFromUrl(finalUrl);
@@ -1386,7 +1490,8 @@ function createDouyinAdapter(deps) {
         ...fetchPolicy(deps, HOSTS2),
         allowedHosts: HOSTS2,
         perRequestTimeoutMs: policy.requestTimeoutMs,
-        maxBytes: HTML_MAX_BYTES
+        maxBytes: HTML_MAX_BYTES,
+        deadline: ctx.deadline
       });
       const html = res.text;
       const lowered = html.slice(0, 2e5).toLowerCase();
@@ -1497,7 +1602,8 @@ function createXiaohongshuAdapter(deps, opts = {}) {
         ...fetchPolicy(deps, hosts),
         allowedHosts: hosts,
         perRequestTimeoutMs: policy.requestTimeoutMs,
-        maxBytes: 64 * 1024
+        maxBytes: 64 * 1024,
+        deadline: ctx.deadline
       });
       const finalUrl = new URL(res.finalUrl);
       const parsed = parseXhsPost(finalUrl);
@@ -1620,6 +1726,7 @@ function rowToAttachment(row) {
     attempt: Number(row.attempt) || 1,
     createdAt: Number(row.created_at) || 0,
     updatedAt: Number(row.updated_at) || 0,
+    leaseUntil: row.lease_until == null ? null : Number(row.lease_until),
     error: parseJson2(row.error_json),
     preview: parseJson2(row.preview_json),
     contextProjection: parseJson2(row.projection_json)
@@ -1672,7 +1779,7 @@ function insertValues(attachment, scope) {
     attachment.state,
     attachment.revision,
     attachment.attempt,
-    null,
+    attachment.leaseUntil ?? null,
     attachment.error?.code ?? null,
     attachment.error ? JSON.stringify(attachment.error) : null,
     attachment.preview ? JSON.stringify(attachment.preview) : null,
@@ -1783,7 +1890,7 @@ var D1SocialStore = class {
     if (!this.available) throw new PersistenceUnavailable();
     return new ScopedStore(this.db, scope);
   }
-  async recoverInterrupted(now) {
+  async recoverInterrupted(now, opts = {}) {
     if (!this.available) return 0;
     const error = JSON.stringify({
       code: "TIMEOUT",
@@ -1792,13 +1899,14 @@ var D1SocialStore = class {
       userMessage: "\u89E3\u6790\u4E2D\u65AD\uFF08\u670D\u52A1\u91CD\u542F\u6216\u79DF\u7EA6\u8FC7\u671F\uFF09\uFF0C\u53EF\u624B\u52A8\u91CD\u8BD5",
       safeDiagnosticId: null
     });
+    const leaseClause = opts.includeLive ? "" : "AND (lease_until IS NULL OR lease_until < ?)";
     const res = await this.db.prepare(
       `UPDATE social_share_attachments
             SET state = 'failed', error_code = 'TIMEOUT', error_json = ?,
                 revision = revision + 1, lease_until = NULL, updated_at = ?
           WHERE state IN ('queued','resolving')
-            AND (lease_until IS NULL OR lease_until < ?)`
-    ).bind(error, now, now).run();
+            ${leaseClause}`
+    ).bind(...opts.includeLive ? [error, now] : [error, now, now]).run();
     return changesOf(res);
   }
 };
@@ -1958,6 +2066,14 @@ function buildExcerpts(record, req) {
 
 // worker/social-content/resolver.ts
 var POLL_AFTER_MS = 1e3;
+var LEASE_GRACE_MS = 5e3;
+function isTerminalState(state) {
+  return state === "ready" || state === "partial" || state === "failed" || state === "cancelled";
+}
+function inFlightUntil(attachment, leaseMs) {
+  if (attachment.leaseUntil != null) return Number(attachment.leaseUntil);
+  return (Number(attachment.updatedAt) || 0) + leaseMs;
+}
 function defaultShareRef() {
   const bytes = new Uint8Array(16);
   const cryptoObj = globalThis.crypto;
@@ -2031,13 +2147,16 @@ function stateFromRecord(record) {
   const transcripts = record.transcripts ?? [];
   const captionOk = transcripts.some((t) => t.kind === "native_caption" && t.availability === "available");
   const captionFailed = transcripts.some((t) => t.kind === "native_caption" && t.availability === "failed");
+  const captionTrack = transcripts.find((t) => t.kind === "native_caption");
+  const transcription = transcripts.find((t) => t.kind === "speech_transcription");
   if (captionOk) coverage.push("transcript");
   else if (captionFailed) missing.push("transcript");
+  const transcriptState = captionOk ? "available" : captionFailed ? "failed" : captionTrack ? "not_available" : transcription ? transcription.availability : "absent";
   const commentsAvailability = record.commentsSample?.availability ?? "not_requested";
   if (commentsAvailability === "available") coverage.push("comments");
   else if (commentsAvailability === "failed") missing.push("comments");
   const state = missing.length > 0 ? "partial" : "ready";
-  return { state, coverage, missing };
+  return { state, coverage, missing, transcriptState };
 }
 function previewOf(record) {
   return {
@@ -2070,11 +2189,29 @@ async function resolveShares(req, deps, hooks = {}) {
   if (!extracted.ok) {
     throw new SocialError(extracted.code, "extract_failed");
   }
-  const persistence = deps.store ? "available" : "unavailable";
+  const store = deps.store ?? null;
   const now = nowFn();
+  const leaseMs = deps.leaseMs ?? (deps.resolveDeadlineMs ?? SHARE_REQUEST_LIMITS.resolveDeadlineMs) + LEASE_GRACE_MS;
+  const existingByKey = /* @__PURE__ */ new Map();
+  for (const att of deps.existing ?? []) existingByKey.set(occurrenceKeyOf(att), att);
   const drafts = [];
   const parseJobs = [];
-  extracted.candidates.forEach((candidate, index) => {
+  const ownedJobs = /* @__PURE__ */ new Set();
+  const settled = /* @__PURE__ */ new Set();
+  let writeFailed = false;
+  const persist = async (attachment, expectedRevision) => {
+    if (!store) return attachment;
+    try {
+      const ok = await store.put(attachment, expectedRevision);
+      if (ok) return attachment;
+      const fresh = await store.get(attachment.shareRef, req.scope);
+      return fresh ?? attachment;
+    } catch {
+      writeFailed = true;
+      return attachment;
+    }
+  };
+  for (const [index, candidate] of extracted.candidates.entries()) {
     const shareRef = newRef();
     const common = {
       messageId: req.messageId,
@@ -2091,13 +2228,13 @@ async function resolveShares(req, deps, hooks = {}) {
         new SocialError("SIZE_LIMIT", "over_link_limit").toShareError(null)
       );
       drafts[index] = att;
-      return;
+      continue;
     }
     if (candidate.linkKind === "unsupported") {
       const code = candidate.rejectCode === "SIZE_LIMIT" || candidate.rejectCode === null ? "UNSUPPORTED_LINK_TYPE" : candidate.rejectCode;
       const att = unsupportedAttachment(candidate, common, now, new SocialError(code, candidate.rejectReason ?? code).toShareError(null));
       drafts[index] = att;
-      return;
+      continue;
     }
     if (!sourceId || !candidate.platform) {
       const att = unsupportedAttachment(
@@ -2107,7 +2244,7 @@ async function resolveShares(req, deps, hooks = {}) {
         new SocialError("SOURCE_NOT_CONFIGURED", "no_source_for_platform").toShareError(null)
       );
       drafts[index] = att;
-      return;
+      continue;
     }
     const adapter = deps.adapters[candidate.platform];
     if (!adapter) {
@@ -2118,38 +2255,117 @@ async function resolveShares(req, deps, hooks = {}) {
         new SocialError("SOURCE_NOT_CONFIGURED", "adapter_missing").toShareError(null)
       );
       drafts[index] = att;
-      return;
+      continue;
     }
-    const queued = {
-      schemaVersion: SHARE_SCHEMA_VERSION,
-      shareRef,
-      messageId: req.messageId,
-      conversationId: req.conversationId,
-      characterId: req.characterId,
-      occurrenceSpans: candidate.spans,
-      originalUrl: candidate.originalUrl,
-      platform: candidate.platform,
-      sourceId,
-      resolvedUrl: null,
-      canonicalUrl: candidate.canonicalUrl,
-      openUrl: candidate.openUrl,
-      contentId: null,
-      partKey: candidate.partKey,
-      state: "queued",
-      revision: 1,
-      attempt: 1,
-      createdAt: now,
-      updatedAt: now,
-      error: null,
-      preview: null,
-      contextProjection: null
-    };
-    drafts[index] = queued;
+    const occurrenceKey = occurrenceKeyOf({ originalUrl: candidate.originalUrl, occurrenceSpans: candidate.spans });
+    const prior = existingByKey.get(occurrenceKey);
+    if (prior && isTerminalState(prior.state)) {
+      drafts[index] = prior;
+      settled.add(index);
+      continue;
+    }
+    let baseRevision;
+    let current;
+    if (prior) {
+      if (inFlightUntil(prior, leaseMs) > nowFn()) {
+        drafts[index] = prior;
+        settled.add(index);
+        continue;
+      }
+      let claimed = false;
+      if (store?.claim) {
+        try {
+          claimed = await store.claim(prior.shareRef, nowFn() + leaseMs, nowFn());
+        } catch {
+          writeFailed = true;
+          drafts[index] = prior;
+          settled.add(index);
+          continue;
+        }
+        if (!claimed) {
+          const fresh = await store.get(prior.shareRef, req.scope).catch(() => null);
+          drafts[index] = fresh ?? prior;
+          settled.add(index);
+          continue;
+        }
+      }
+      baseRevision = prior.revision + (claimed ? 1 : 0);
+      current = {
+        ...prior,
+        state: "resolving",
+        revision: baseRevision,
+        updatedAt: nowFn(),
+        leaseUntil: claimed ? nowFn() + leaseMs : prior.leaseUntil ?? null
+      };
+    } else {
+      current = {
+        schemaVersion: SHARE_SCHEMA_VERSION,
+        shareRef,
+        messageId: req.messageId,
+        conversationId: req.conversationId,
+        characterId: req.characterId,
+        occurrenceSpans: candidate.spans,
+        originalUrl: candidate.originalUrl,
+        platform: candidate.platform,
+        sourceId,
+        resolvedUrl: null,
+        canonicalUrl: candidate.canonicalUrl,
+        openUrl: candidate.openUrl,
+        contentId: null,
+        partKey: candidate.partKey,
+        state: "queued",
+        revision: 1,
+        attempt: 1,
+        createdAt: now,
+        updatedAt: now,
+        leaseUntil: null,
+        error: null,
+        preview: null,
+        contextProjection: null
+      };
+      if (store) {
+        let inserted = false;
+        try {
+          inserted = await store.put(current, 0);
+        } catch {
+          writeFailed = true;
+        }
+        if (!inserted) {
+          let twin;
+          try {
+            twin = (await store.listByMessage(req.scope, req.messageId)).find((a) => occurrenceKeyOf(a) === occurrenceKey);
+          } catch {
+            twin = void 0;
+          }
+          if (twin) {
+            drafts[index] = twin;
+            settled.add(index);
+            continue;
+          }
+        }
+      }
+      let claimed = false;
+      if (store?.claim) {
+        try {
+          claimed = await store.claim(current.shareRef, nowFn() + leaseMs, nowFn());
+        } catch {
+          writeFailed = true;
+        }
+      }
+      baseRevision = current.revision + (claimed ? 1 : 0);
+      current = {
+        ...current,
+        state: "resolving",
+        revision: baseRevision,
+        updatedAt: nowFn(),
+        leaseUntil: claimed ? nowFn() + leaseMs : null
+      };
+    }
+    drafts[index] = current;
+    ownedJobs.add(index);
+    hooks.onUpdate?.(current);
     parseJobs.push(async () => {
-      let revision = 2;
-      let current = { ...queued, state: "resolving", revision, updatedAt: nowFn() };
-      drafts[index] = current;
-      hooks.onUpdate?.(current);
+      let revision = baseRevision;
       try {
         if (nowFn() >= deadline) throw new SocialError("TIMEOUT", "deadline_before_start");
         let target;
@@ -2170,14 +2386,15 @@ async function resolveShares(req, deps, hooks = {}) {
         }
         if (nowFn() >= deadline) throw new SocialError("TIMEOUT", "deadline_before_fetch");
         const record = await withDeadline(adapter.fetchContent(target, { scope: req.scope, deadline }), deadline, nowFn);
-        const { state, coverage, missing } = stateFromRecord(record);
+        const { state, coverage, missing, transcriptState } = stateFromRecord(record);
         const contentId = buildContentId(record.platform, record.sourceId, record.externalId);
         revision += 1;
-        current = {
+        const ready = {
           ...current,
           state,
           revision,
           updatedAt: nowFn(),
+          leaseUntil: null,
           contentId,
           resolvedUrl: target.resolvedUrl,
           canonicalUrl: target.canonicalUrl,
@@ -2194,38 +2411,63 @@ async function resolveShares(req, deps, hooks = {}) {
             summaryText: buildLocalSummary(record, coverage),
             evidenceCoverage: coverage,
             reason: missing.length ? `missing:${missing.join(",")}` : null,
-            frozenAt: nowFn()
+            frozenAt: nowFn(),
+            transcriptState
           }
         };
-        drafts[index] = current;
-        hooks.onUpdate?.(current);
+        const stored = await persist(ready, baseRevision);
+        drafts[index] = stored;
+        settled.add(index);
+        hooks.onUpdate?.(stored);
       } catch (err) {
         const social = asSocialError(err);
         revision += 1;
-        current = failedAttachment(current, social.toShareError(null), nowFn(), revision);
-        drafts[index] = current;
-        hooks.onUpdate?.(current);
+        const failed = {
+          ...failedAttachment(current, social.toShareError(null), nowFn(), revision),
+          leaseUntil: null
+        };
+        const stored = await persist(failed, baseRevision);
+        drafts[index] = stored;
+        settled.add(index);
+        hooks.onUpdate?.(stored);
       }
     });
-  });
+  }
   await runWithConcurrency(parseJobs, concurrency);
   const attachments = drafts.filter((a) => Boolean(a));
+  if (store) {
+    for (let i = 0; i < attachments.length; i += 1) {
+      if (settled.has(i)) continue;
+      const att = attachments[i];
+      try {
+        const ok = await store.put(att, 0);
+        if (!ok) {
+          const list = await store.listByMessage(req.scope, req.messageId);
+          const twin = list.find((a) => occurrenceKeyOf(a) === occurrenceKeyOf(att));
+          if (twin) {
+            attachments[i] = twin;
+            settled.add(i);
+          }
+        } else {
+          settled.add(i);
+        }
+      } catch {
+        writeFailed = true;
+      }
+    }
+  }
   for (let i = 0; i < attachments.length; i += 1) {
     const att = attachments[i];
+    if (!ownedJobs.has(i)) continue;
     if (att.state === "queued" || att.state === "resolving") {
-      attachments[i] = failedAttachment(att, new SocialError("TIMEOUT", "resolve_deadline").toShareError(null), nowFn(), att.revision + 1);
+      const failed = {
+        ...failedAttachment(att, new SocialError("TIMEOUT", "resolve_deadline").toShareError(null), nowFn(), att.revision + 1),
+        leaseUntil: null
+      };
+      attachments[i] = await persist(failed, att.revision);
     }
   }
-  let persistenceFinal = persistence;
-  if (deps.store) {
-    try {
-      for (const attachment of attachments) {
-        await deps.store.put(attachment, 0);
-      }
-    } catch {
-      persistenceFinal = "unavailable";
-    }
-  }
+  const persistenceFinal = !deps.store ? "unavailable" : writeFailed ? "unavailable" : "available";
   return {
     attachments,
     pollAfterMs: POLL_AFTER_MS,
@@ -2256,6 +2498,52 @@ function planRetry(existing, expectedRevision, now) {
     preview: null,
     contextProjection: null
   };
+}
+
+// worker/social-content/src/delivery.ts
+var PROJECTION_DELIVERY_LIMITS = {
+  summaryChars: 400,
+  coverageEntries: 8,
+  coverageEntryChars: 24,
+  reasonChars: 200
+};
+var TRANSCRIPT_STATES = /* @__PURE__ */ new Set([
+  "available",
+  "failed",
+  "not_available",
+  "not_requested",
+  "absent"
+]);
+function clip(value, maxChars) {
+  if (typeof value !== "string") return "";
+  return Array.from(value).slice(0, maxChars).join("");
+}
+function finiteNumberOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function boundedProjection(attachment) {
+  const projection = attachment?.contextProjection;
+  if (!projection) return null;
+  const contentRevision = typeof projection.contentRevision === "number" && Number.isFinite(projection.contentRevision) ? projection.contentRevision : null;
+  const coverage = Array.isArray(projection.evidenceCoverage) ? projection.evidenceCoverage : [];
+  const delivered = {
+    projectionVersion: finiteNumberOr(projection.projectionVersion, 1),
+    shareRef: attachment.shareRef,
+    contentId: typeof projection.contentId === "string" ? projection.contentId : attachment.contentId,
+    contentRevision,
+    stateAtFreeze: projection.stateAtFreeze ?? attachment.state,
+    summaryText: clip(projection.summaryText, PROJECTION_DELIVERY_LIMITS.summaryChars),
+    evidenceCoverage: coverage.slice(0, PROJECTION_DELIVERY_LIMITS.coverageEntries).map((entry) => clip(entry, PROJECTION_DELIVERY_LIMITS.coverageEntryChars)).filter(Boolean),
+    reason: projection.reason ? clip(projection.reason, PROJECTION_DELIVERY_LIMITS.reasonChars) : null,
+    frozenAt: finiteNumberOr(projection.frozenAt, 0)
+  };
+  if (typeof projection.transcriptState === "string" && TRANSCRIPT_STATES.has(projection.transcriptState)) {
+    delivered.transcriptState = projection.transcriptState;
+  }
+  return delivered;
+}
+function lightAttachment(attachment) {
+  return { ...attachment, contextProjection: boundedProjection(attachment) };
 }
 
 // worker/social-content/handlers.ts
@@ -2301,9 +2589,6 @@ function fail(err) {
     }
   };
 }
-function light(a) {
-  return { ...a, contextProjection: null };
-}
 function createSocialService(deps) {
   const now = deps.now ?? (() => Date.now());
   function gate() {
@@ -2312,17 +2597,6 @@ function createSocialService(deps) {
   }
   function scoped(scope) {
     return deps.store.forScope(scope);
-  }
-  async function persist(st, attachment) {
-    const ok = await writeOrThrow(st, attachment, 0);
-    if (ok) return attachment;
-    const existing = await st.get(attachment.shareRef);
-    if (existing) return existing;
-    const updated = await writeOrThrow(st, attachment, attachment.revision - 1);
-    if (updated) return attachment;
-    const after = await st.get(attachment.shareRef);
-    if (after) return after;
-    throw new PersistenceUnavailable("share_insert_failed");
   }
   return {
     /**
@@ -2342,7 +2616,6 @@ function createSocialService(deps) {
         const storeAvailable = deps.store.available;
         const st = storeAvailable ? scoped(scope) : null;
         const existing = st ? await st.listByMessage(messageId) : [];
-        const existingByKey = new Map(existing.map((a) => [occurrenceKeyOf(a), a]));
         const result = await resolveShares(
           {
             messageId,
@@ -2357,35 +2630,27 @@ function createSocialService(deps) {
             sourceIdFor: deps.sourceIdFor,
             now,
             store: st,
+            existing,
             rednoteEnabled: deps.config.rednoteEnabled,
             maxConcurrentPerScope: deps.config.maxConcurrentPerScope,
             resolveDeadlineMs: deps.config.resolveDeadlineMs
           },
           { onUpdate: deps.onUpdate }
         );
-        if (!st) {
+        if (!st || result.persistence === "unavailable") {
           return {
             status: 503,
             body: {
               error: "PERSISTENCE_UNAVAILABLE",
-              attachments: result.attachments.map(light),
+              attachments: result.attachments.map(lightAttachment),
               pollAfterMs: result.pollAfterMs
             }
           };
         }
-        const merged = [];
-        for (const attachment of result.attachments) {
-          const prior = existingByKey.get(occurrenceKeyOf(attachment));
-          if (prior && isTerminal(prior.state) && prior.revision >= attachment.revision) {
-            merged.push(prior);
-            continue;
-          }
-          merged.push(await persist(st, attachment));
-        }
         return {
           status: 202,
           body: {
-            attachments: merged.map(light),
+            attachments: result.attachments.map(lightAttachment),
             pollAfterMs: result.pollAfterMs,
             droppedOverLimit: result.droppedOverLimit
           }
@@ -2402,7 +2667,7 @@ function createSocialService(deps) {
         if (!conversationId || !messageId) throw new SocialError("INVALID_URL", "missing_ids");
         const attachments = await scoped(scope).listByMessage(messageId);
         const filtered = attachments.filter((a) => a.conversationId === conversationId);
-        return { status: 200, body: { attachments: filtered.map(light) } };
+        return { status: 200, body: { attachments: filtered.map(lightAttachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -2414,7 +2679,7 @@ function createSocialService(deps) {
       try {
         const attachment = await scoped(scope).get(shareRef);
         if (!attachment) return { status: 404, body: { error: "CONTENT_NOT_FOUND" } };
-        return { status: 200, body: { attachment: light(attachment) } };
+        return { status: 200, body: { attachment: lightAttachment(attachment) } };
       } catch (err) {
         return fail(err);
       }
@@ -2437,8 +2702,18 @@ function createSocialService(deps) {
         const planned = planRetry(existing, expectedRevision, now());
         const ok = await st.put(planned, existing.revision);
         if (!ok) return { status: 409, body: { error: "revision_conflict" } };
-        const resolved = await resolveOne(st, planned, scope);
-        return { status: 202, body: { attachment: light(resolved) } };
+        let baseRevision = planned.revision;
+        try {
+          const claimed = await st.claim(planned.shareRef, now() + deps.config.resolveDeadlineMs + 5e3, now());
+          if (claimed) {
+            baseRevision += 1;
+          } else {
+            return { status: 409, body: { error: "retry_in_flight" } };
+          }
+        } catch {
+        }
+        const resolved = await resolveOne(st, planned, scope, baseRevision);
+        return { status: 202, body: { attachment: lightAttachment(resolved) } };
       } catch (err) {
         return fail(err);
       }
@@ -2476,13 +2751,12 @@ function createSocialService(deps) {
         return fail(err);
       }
     },
-    /** 重启恢复：把租约过期的 resolving 行明确标 failed（幂等，可在每次启动调用）。 */
+    /** 重启恢复：把上次进程留下的 queued/resolving 明确标 failed（幂等，每次启动调用）。 */
     async recover() {
-      return deps.store.recoverInterrupted(now());
+      return deps.store.recoverInterrupted(now(), { includeLive: true });
     }
   };
-  async function resolveOne(st, planned, scope) {
-    const recordRevision = planned.revision;
+  async function resolveOne(st, planned, scope, recordRevision = planned.revision) {
     try {
       const extracted = extractShareLinks(planned.originalUrl, { rednoteEnabled: deps.config.rednoteEnabled });
       const candidate = extracted.ok ? extracted.candidates[0] : null;
@@ -2508,7 +2782,7 @@ function createSocialService(deps) {
         };
       }
       const record = await adapter.fetchContent(target, { scope, deadline, now });
-      const { state, coverage, missing } = stateFromRecord(record);
+      const { state, coverage, missing, transcriptState } = stateFromRecord(record);
       const contentId = buildContentId(record.platform, record.sourceId, record.externalId);
       const next = {
         ...planned,
@@ -2538,7 +2812,8 @@ function createSocialService(deps) {
           summaryText: buildLocalSummary(record, coverage),
           evidenceCoverage: coverage,
           reason: missing.length ? `missing:${missing.join(",")}` : null,
-          frozenAt: now()
+          frozenAt: now(),
+          transcriptState
         }
       };
       const ok = await st.put(next, recordRevision);
@@ -2562,17 +2837,6 @@ function createSocialService(deps) {
     await st.put(failed, expectedRevision);
     return failed;
   }
-}
-async function writeOrThrow(st, attachment, expectedRevision) {
-  try {
-    return await st.put(attachment, expectedRevision);
-  } catch (err) {
-    if (err instanceof PersistenceUnavailable) throw err;
-    throw new PersistenceUnavailable(`share_write_failed:${err?.message ?? "unknown"}`);
-  }
-}
-function isTerminal(state) {
-  return state === "ready" || state === "partial" || state === "failed" || state === "cancelled";
 }
 function withContentPersistence(adapter, store, opts) {
   return {

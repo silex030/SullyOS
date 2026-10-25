@@ -134,11 +134,11 @@ export function createDouyinAdapter(deps: AdapterDeps): ContentAdapter {
         allowedHosts: HOSTS,
         perRequestTimeoutMs: policy.requestTimeoutMs,
         maxBytes: 64 * 1024,
+        deadline: ctx.deadline,
       });
       const finalUrl = new URL(res.finalUrl);
       const parsed = parseDouyinIdFromUrl(finalUrl);
       if (!parsed) throw new SocialError('UNSUPPORTED_LINK_TYPE', 'vdouyin_target_not_video');
-      void ctx;
       return {
         platform: 'douyin',
         externalId: parsed.externalId,
@@ -157,6 +157,7 @@ export function createDouyinAdapter(deps: AdapterDeps): ContentAdapter {
         allowedHosts: HOSTS,
         perRequestTimeoutMs: policy.requestTimeoutMs,
         maxBytes: HTML_MAX_BYTES,
+        deadline: ctx.deadline,
       });
 
       const html = res.text;

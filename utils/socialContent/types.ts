@@ -87,7 +87,15 @@ export interface ContextProjection {
   evidenceCoverage: string[];
   reason: string | null;
   frozenAt: number;
+  /**
+   * 原生字幕/转写的真实状态（契约 3.9「字幕缺失不得静默」）。
+   * available=拿到了；failed=请求失败；not_available=平台没有；not_requested=未开启 ASR；
+   * absent=内容记录里根本没有字幕轨（适配器未声明）。缺省视为 absent。
+   */
+  transcriptState?: TranscriptState;
 }
+
+export type TranscriptState = 'available' | 'failed' | 'not_available' | 'not_requested' | 'absent';
 
 /** 一条消息里的一个链接 = 一张分享卡（契约 3.2）。 */
 export interface ShareAttachment {
@@ -117,6 +125,8 @@ export interface ShareAttachment {
   attempt: number;
   createdAt: number;
   updatedAt: number;
+  /** 解析租约到期时间（仅 queued/resolving 有值）：别的持有者据此判断“在途作业”。 */
+  leaseUntil?: number | null;
   error: ShareError | null;
   preview: SharePreview | null;
   contextProjection: ContextProjection | null;

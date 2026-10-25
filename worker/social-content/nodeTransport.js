@@ -49,6 +49,13 @@ export const nodePinningTransport = (req) =>
         resolve({
           status: res.statusCode || 0,
           headers,
+          // 不读正文的分支（重定向/非 2xx）必须主动释放：否则 keep-alive 连接被未读响应占住，
+          // 重定向链上的 socket 会一路泄漏到进程退出。
+          discard: () => {
+            try {
+              res.destroy();
+            } catch {}
+          },
           readBody: (limitBytes) =>
             new Promise((done, fail) => {
               const chunks = [];

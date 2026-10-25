@@ -36,9 +36,16 @@ const HOSTS = PLATFORM_HOSTS.bilibili;
 const SUBTITLE_HOSTS = PLATFORM_HOSTS.bilibiliCdn;
 const JSON_BYTES = 256 * 1024;
 const COMMENTS_LIMIT = 5;
-/** 公开接口要求普通浏览器 UA + 站内 Referer；不带会被风控 412（真实探测已验证）。 */
+/**
+ * 公开接口的请求头。
+ *
+ * 注意 user-agent：**不要伪装浏览器**。本机实测（2026-10-24，本卡第 5 条证据）：
+ * 带 Chrome UA 打 api.bilibili.com 会被风控直接 412（无 cookie 的浏览器 UA 反而最可疑），
+ * 用中性 UA（或 curl 默认 UA）同一 URL 返回 200。这里如实用一个说明用途的 UA，
+ * 不冒用浏览器身份；平台若改策略，错误会如实映射成 ACCESS_DENIED，不伪造内容。
+ */
 const OPEN_API_HEADERS: Record<string, string> = {
-  'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+  'user-agent': 'SullyOS/1.0 (social-content; read-only link resolver)',
   referer: 'https://www.bilibili.com/',
 };
 
@@ -118,6 +125,8 @@ async function fetchOfficialSubtitle(
     allowedHosts: [...HOSTS, ...SUBTITLE_HOSTS],
     headers: OPEN_API_HEADERS,
     maxBytes: JSON_BYTES,
+    // 全链路期限：DNS/连接/正文都必须落在这次解析的总预算里（缺陷 2）
+    deadline: ctx.deadline,
   });
   const parsed = parseJson(res, 'subtitle') as { body?: Array<{ from?: number; to?: number; content?: string }> };
   const body = Array.isArray(parsed.body) ? parsed.body : [];
@@ -152,7 +161,7 @@ async function fetchComments(
 ): Promise<CommentsSample> {
   const now = ctx.now?.() ?? Date.now();
   const url = `https://api.bilibili.com/x/v2/reply?type=1&oid=${aid}&sort=2&ps=${COMMENTS_LIMIT}&pn=1`;
-  const res = await safeGet(url, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES });
+  const res = await safeGet(url, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline });
   const parsed = parseJson(res, 'comments') as {
     code?: number;
     data?: {
@@ -212,20 +221,20 @@ export function createBilibiliAdapter(deps: AdapterDeps): ContentAdapter {
         ...fetchPolicy(deps, HOSTS),
         headers: OPEN_API_HEADERS,
         maxBytes: 64 * 1024,
+        deadline: ctx.deadline,
       });
       const finalUrl = new URL(res.finalUrl);
       const m = finalUrl.pathname.match(/^\/video\/((?:BV[0-9A-Za-z]{10})|(?:av\d+))\/?$/);
       if (!m) throw new SocialError('UNSUPPORTED_LINK_TYPE', 'b23_target_not_video');
       const partKey = bilibiliPartKey(finalUrl);
       const canonicalUrl = `https://www.bilibili.com/video/${m[1]}${partKey ? `?p=${partKey.slice(1)}` : ''}`;
-      void ctx;
       return { platform: 'bilibili', externalId: m[1], partKey, canonicalUrl, resolvedUrl: res.finalUrl };
     },
 
     async fetchContent(target: SourceTarget, ctx: AdapterContext) {
       const now = ctx.now?.() ?? Date.now();
       const viewUrl = `https://api.bilibili.com/x/web-interface/view?${externalIdToQuery(target.externalId)}`;
-      const viewRes = await safeGet(viewUrl, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES });
+      const viewRes = await safeGet(viewUrl, deps.safeFetch, { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline });
       const viewEnvelope = parseJson(viewRes, 'view') as { code?: number; message?: string; data?: BiliViewData };
       const viewErr = mapBiliCode(viewEnvelope.code);
       if (viewErr) throw viewErr;
@@ -245,7 +254,7 @@ export function createBilibiliAdapter(deps: AdapterDeps): ContentAdapter {
           const playerRes = await safeGet(
             `https://api.bilibili.com/x/player/v2?bvid=${encodeURIComponent(bvid)}&cid=${cid}`,
             deps.safeFetch,
-            { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES },
+            { ...fetchPolicy(deps), headers: OPEN_API_HEADERS, maxBytes: JSON_BYTES, deadline: ctx.deadline },
           );
           const player = parseJson(playerRes, 'player') as { code?: number; data?: BiliPlayerData };
           if (player.code === 0) {

@@ -48,7 +48,12 @@ export interface ScopedSocialStore {
 
 export interface SocialStoreRoot {
   forScope(scope: string): ScopedSocialStore;
-  recoverInterrupted(now: number): Promise<number>;
+  /**
+   * 启动恢复：把上次进程留下的 queued/resolving 明确标 failed(TIMEOUT)。
+   * includeLive=true 时连“租约还没到期”的行也一起收（进程已经重启，旧持有者不可能还活着；
+   * 单实例部署下这是正确语义）；默认 false 只收过期租约，留给多副本/在线重试路径。
+   */
+  recoverInterrupted(now: number, opts?: { includeLive?: boolean }): Promise<number>;
   /** 持久化能力自检：准备好表但没绑 DB 时为 false。 */
   readonly available: boolean;
 }
@@ -117,6 +122,7 @@ function rowToAttachment(row: AttachmentRow): ShareAttachment {
     attempt: Number(row.attempt) || 1,
     createdAt: Number(row.created_at) || 0,
     updatedAt: Number(row.updated_at) || 0,
+    leaseUntil: row.lease_until == null ? null : Number(row.lease_until),
     error: parseJson(row.error_json),
     preview: parseJson(row.preview_json),
     contextProjection: parseJson(row.projection_json),
@@ -150,7 +156,7 @@ function insertValues(attachment: ShareAttachment, scope: string): unknown[] {
     attachment.state,
     attachment.revision,
     attachment.attempt,
-    null,
+    attachment.leaseUntil ?? null,
     attachment.error?.code ?? null,
     attachment.error ? JSON.stringify(attachment.error) : null,
     attachment.preview ? JSON.stringify(attachment.preview) : null,
@@ -293,7 +299,7 @@ export class D1SocialStore implements SocialStoreRoot {
     return new ScopedStore(this.db as D1Like, scope);
   }
 
-  async recoverInterrupted(now: number): Promise<number> {
+  async recoverInterrupted(now: number, opts: { includeLive?: boolean } = {}): Promise<number> {
     if (!this.available) return 0;
     const error = JSON.stringify({
       code: 'TIMEOUT',
@@ -302,15 +308,16 @@ export class D1SocialStore implements SocialStoreRoot {
       userMessage: '解析中断（服务重启或租约过期），可手动重试',
       safeDiagnosticId: null,
     });
+    const leaseClause = opts.includeLive ? '' : 'AND (lease_until IS NULL OR lease_until < ?)';
     const res = await (this.db as D1Like)
       .prepare(
         `UPDATE social_share_attachments
             SET state = 'failed', error_code = 'TIMEOUT', error_json = ?,
                 revision = revision + 1, lease_until = NULL, updated_at = ?
           WHERE state IN ('queued','resolving')
-            AND (lease_until IS NULL OR lease_until < ?)`,
+            ${leaseClause}`,
       )
-      .bind(error, now, now)
+      .bind(...(opts.includeLive ? [error, now] : [error, now, now]))
       .run();
     return changesOf(res);
   }

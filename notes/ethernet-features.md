@@ -338,3 +338,10 @@
   - 文案边界：申请连接是本站按钮（不在高德找配对码）、短码 `XXXX-XXXX` 交管理员一次批准后本浏览器自动连接、`clientSecret`/`ownerKey`/API Key 禁止发聊天；Web 服务 Key 可复用并按官方平台名「Web服务」、JS Key 平台「Web端(JS API)」（官方原文 web 平台（JS API））+ 白名单 `link.ethernet.bot.cd`；jscode 存服务端不回显；Mapbox 可选留空、`pk.` 与 `sk.` 区分、不承诺永久免费；保存≠已出图/已开通权限，测试连接可能耗额度。
   - 固定地点卡（`TravelAnchorCard`）补「先填城市再搜」；角色卡（`TravelCharCard`）补「去向由角色决定，用户只给总授权」。
   - 测试 `components/settings/TravelMapServiceCard.help.test.tsx`（12 例）：帮助文案、四个外链 host 白名单、`target`/`rel`、未配对只有申请连接、Mapbox 可选。
+- 2026-10-24：**角色按需读分享片段（`read_share_excerpts`，未提交/未部署）**——链接分享卡进上下文后，角色在真实工具循环里可以按需读正文/字幕/评论，不再是「只有简介」。
+  - 新模块 `utils/socialShareTool.ts`（schema、可读集合、预算、执行、成对记录/投影）；`hooks/useChatAI.ts` 只做四处最小接线；`utils/messageFormat.ts` 把上一轮 call/result 成对投影（≤600 token）。复用 `fetchShareExcerpts` 与 `/agent/v1/social/items/:contentId/excerpts`，没有新造抓取/URL 接口。
+  - 预算：单次 ≤1200 / 用户轮次 ≤2400（复用 `SHARE_BUDGETS`），一轮一个预算对象、并发先预留不超卖；不信模型传的 maxTokens 与服务端自报 tokenEstimate，按每码点 ≈1 token 重算并夹紧。剩余不足一条切片直接拒绝。
+  - 边界：只能给 shareRef/contentId（来自本轮上下文里的卡），URL/baseUrl/token/scope 一律拒绝且不发请求；只读、不改配置、scope 仍由服务端决定。失败/超限返回结构化 code 并要求「基于已有简介回答、不要声称读过」。中转拒绝 tools 的轮次退回无工具并显式告知。
+  - 测试：`utils/socialShareTool.test.ts`（22）+ `utils/socialShareTool.wiring.test.ts`（8）；链路用 fixture 模型 + 真 `buildExcerpts` 生成的 HTTP 响应，回归 mcpToolBridge/agenticTools/messageFormat/socialShare/chatRequestPayload/social-content 共 29 文件 327 例通过；`utils/*chat*` 38 文件 354 例通过。
+  - 门禁：全量 `tsc` 56 个既有错误（改动文件 0 新增）、`vite build` EXIT=0；未跑 check:workers、未部署。
+  - 未验证：真实模型是否主动调用、平台真实内容（B站 412/抖音登录墙/XHS 会话停用不变）、未部署。
