@@ -30,7 +30,6 @@ const JournalApp = lazyApp(() => import('../apps/JournalApp'));
 const ScheduleApp = lazyApp(() => import('../apps/ScheduleApp'));
 const RoomApp = lazyApp(() => import('../apps/RoomApp'));
 const CheckPhone = lazyApp(() => import('../apps/CheckPhone'));
-const SocialApp = lazyApp(() => import('../apps/SocialApp'));
 const MomentsApp = lazyApp(() => import('../apps/MomentsApp'));
 const StudyApp = lazyApp(() => import('../apps/StudyApp'));
 const PomodoroApp = lazyApp(() => import('../apps/PomodoroApp'));
@@ -64,7 +63,7 @@ const SpecialMomentsApp = lazyApp(() => import('./ValentineEvent').then(m => ({ 
 // 高频 App 在前；低端设备/省流量/2G 由 shouldUseIdleAppPreload 整体跳过。
 const APP_IDLE_PRELOAD_ORDER: PreloadableLazy[] = [
   Chat, Character, Settings, Appearance, GroupChat, RoomApp, CheckPhone,
-  JournalApp, ScheduleApp, SocialApp, MusicApp, CallApp, Gallery, DateApp, UserApp,
+  JournalApp, ScheduleApp, MusicApp, CallApp, Gallery, DateApp, UserApp,
   StudyApp, PomodoroApp, GameApp, NovelApp, BankApp, MemoryPalaceApp, HandbookApp,
   VRWorldApp, WorldHomeApp, LifeSimApp, SongwritingApp, GuidebookApp, FAQApp, HotNewsApp,
   XhsStockApp, XhsFreeRoamApp, BrowserApp, VoiceDesignerApp, ThemeMaker, QQBridge,
@@ -82,7 +81,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.GroupChat]: GroupChat, [AppID.ThemeMaker]: ThemeMaker, [AppID.Appearance]: Appearance,
   [AppID.Gallery]: Gallery, [AppID.Date]: DateApp, [AppID.User]: UserApp,
   [AppID.Journal]: JournalApp, [AppID.Schedule]: ScheduleApp, [AppID.Room]: RoomApp,
-  [AppID.CheckPhone]: CheckPhone, [AppID.Social]: SocialApp, [AppID.Moments]: MomentsApp, [AppID.Study]: StudyApp,
+  [AppID.CheckPhone]: CheckPhone, [AppID.Moments]: MomentsApp, [AppID.Study]: StudyApp,
   [AppID.Pomodoro]: PomodoroApp, [AppID.Tarot]: TarotApp,
   [AppID.Preset]: PresetApp,
   [AppID.FAQ]: FAQApp, [AppID.Game]: GameApp,
@@ -879,7 +878,6 @@ const PhoneShell: React.FC = () => {
       case AppID.Schedule: return <ScheduleApp />;
       case AppID.Room: return <RoomApp />; 
       case AppID.CheckPhone: return <CheckPhone />;
-      case AppID.Social: return <SocialApp />;
       case AppID.Moments: return <MomentsApp />;
       case AppID.Study: return <StudyApp />;  
       case AppID.Pomodoro: return <PomodoroApp />;

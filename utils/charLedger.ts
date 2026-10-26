@@ -9,8 +9,12 @@
 //   - purchase <-> bank_txn linkage is stored both ways
 //     (PhoneEvidence.linkedBankTxnId / BankTransaction.linkedPurchaseId).
 // ============================================================
-import { DB } from './db';
-import type { BankCard, BankTransaction } from '../types';
+import { DB, openDB } from './db';
+import type { BankCard } from '../types';
+import { getLocalDateKey } from './localDate';
+import { createLocalDbPort, debitCharCardAtomic } from './autonomyLife/localLedger';
+
+const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
 
 export interface CharPurchaseLink {
   bankTxnId: string;
@@ -18,8 +22,6 @@ export interface CharPurchaseLink {
   cardLabel: string;
   deducted: boolean;
 }
-
-const pad2 = (n: number) => String(n).padStart(2, '0');
 
 export function charCardsOf(cards: BankCard[] | undefined, charId: string): BankCard[] {
   return (cards || []).filter(c => c.owner === 'char' && c.ownerId === charId);
@@ -36,35 +38,56 @@ export async function appendCharPurchaseTxn(
 ): Promise<CharPurchaseLink> {
   const total = Math.max(0, Math.round((Number(p.amount) || 0) * 100) / 100);
   const at = p.timestamp || Date.now();
-  const d = new Date(at);
-  const dateStr = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-  const bankTxnId = `tx-char-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+  const dateStr = getLocalDateKey(new Date(at));
   const bank = await DB.getBankState().catch(() => null);
   const cards = bank?.cards || [];
   const payCard = charDefaultCard(cards, charId);
-  let deducted = false;
-  let cardId = '';
-  let cardLabel = '';
-  if (bank && payCard && total > 0 && payCard.balance >= total) {
-    cardId = payCard.id;
-    cardLabel = `${payCard.name}·${payCard.tailNo}`;
-    const nextCards = cards.map(c => c.id === payCard.id
-      ? { ...c, balance: Math.round((c.balance - total) * 100) / 100 }
-      : c);
-    await DB.saveBankState({ ...bank, cards: nextCards });
-    deducted = true;
+  const label = `${p.merchant}·${p.item}`;
+
+  // 有钱可扣：走与自主消费同一套「余额+流水+凭证+回执」单事务提交（失败则整体不落）。
+  if (bank && payCard && total > 0 && round2(payCard.balance) >= total) {
+    const port = createLocalDbPort(await openDB());
+    const outcome = await debitCharCardAtomic(port, {
+      actionId: `legacy:checkPhone:${p.purchaseId}`,
+      kind: 'shopping.order',
+      nowMs: at,
+      args: {
+        charId,
+        orderId: p.purchaseId,
+        shop: p.merchant,
+        totalMinor: Math.round(total * 100),
+        note: label,
+        category: p.category,
+      },
+    });
+    if (outcome.status === 'succeeded') {
+      return {
+        bankTxnId: `tx-order-${p.purchaseId}`,
+        cardId: payCard.id,
+        cardLabel: `${payCard.name}·${payCard.tailNo}`,
+        deducted: true,
+      };
+    }
+    // 事务层拒绝（余额/归属变化）：不扣钱，但仍按旧语义记一条「未扣款」流水。
   }
-  const tx: BankTransaction = {
+
+  // 无卡或余额不足：沿用旧语义——只写一条未扣款的支出流水（单 store，不存在半扣）。
+  const bankTxnId = `tx-char-${at}-${Math.floor(Math.random() * 1e4)}`;
+  await DB.saveTransaction({
     id: bankTxnId,
     amount: -total,
     category: p.category,
-    note: `${p.merchant}·${p.item}`,
+    note: label,
     timestamp: at,
     dateStr,
     ownerId: charId,
     linkedPurchaseId: p.purchaseId,
-    cardId: cardId || undefined,
+    cardId: payCard?.id || undefined,
+  });
+  return {
+    bankTxnId,
+    cardId: payCard?.id || '',
+    cardLabel: payCard ? `${payCard.name}·${payCard.tailNo}` : '',
+    deducted: false,
   };
-  await DB.saveTransaction(tx);
-  return { bankTxnId, cardId, cardLabel, deducted };
 }

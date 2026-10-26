@@ -97,6 +97,17 @@ import { parseTravelIntent, recordTravelIntent } from './travel/intent';
 import { ensureTravelSchema } from './travel/store';
 import type { ResolvedAirpAutonomy } from '../../../utils/airp/autonomySettings';
 import { resolveScheduleSlots } from '../../../utils/scheduleInjection';
+import {
+  LEGACY_AUTONOMY_KIND,
+  LEGACY_TRAVEL_KIND,
+  legacyRoundStillAllowed,
+  reserveLegacyEffect,
+  reserveLegacyNotification,
+  reserveLegacyRoundCall,
+  settleLegacyRoundCall,
+  type LegacyRoundPermit,
+} from './autonomyLife/legacyGate';
+import { claimRoundEffect, type LifeDb } from './autonomyLife/store';
 
 /** 只为单测导出：让测试能不经 index.ts 直接喂一份 ctx。 */
 export type { KindFireCtx, KindSessionCtx };
@@ -138,6 +149,10 @@ export const AUTONOMY_FIRE_SKIP = {
   ownerUnresolved: 'autonomy-owner-unresolved',
   /** 用户在我们建任务之后、到点之前按了总暂停。 */
   pausedByUser: 'autonomy-paused-by-user',
+  /** 统一边界门拒绝（总开关/角色/kind/未验证禁区）：fail-closed。 */
+  governanceDenied: 'autonomy-governance-denied',
+  /** 统一预算门拒绝（账号/角色额度已满，或账本不可用）。 */
+  budgetExhausted: 'autonomy-budget-exhausted',
 } as const;
 
 export const AUTONOMY_BAD_OUTPUT_REASON = 'autonomy-bad-output';
@@ -942,6 +957,10 @@ interface AutonomyFireState {
   workflowKind?: AutonomyWorkflowKind;
   planMaxChars?: number;
   idempotencyKey?: string;
+  /** 统一预算预留凭据（beforeFire 预留 → llmOutput 结算/复核）。 */
+  budgetPermit?: LegacyRoundPermit | null;
+  /** 认得出的 owner（统一边界/预算都按 owner 读数；空 = 不允许继续）。 */
+  ownerUserId?: string | null;
 }
 
 const readCarriedState = (state: unknown): AutonomyFireState | null => {
@@ -970,6 +989,8 @@ const readCarriedState = (state: unknown): AutonomyFireState | null => {
       ? { workflowKind: state.workflowKind as AutonomyWorkflowKind } : {}),
     ...(typeof state.planMaxChars === 'number' ? { planMaxChars: state.planMaxChars } : {}),
     ...(typeof state.idempotencyKey === 'string' ? { idempotencyKey: state.idempotencyKey } : {}),
+    ...(isRecord(state.budgetPermit) ? { budgetPermit: state.budgetPermit as unknown as LegacyRoundPermit } : {}),
+    ...(typeof state.ownerUserId === 'string' ? { ownerUserId: state.ownerUserId } : {}),
   };
 };
 
@@ -984,6 +1005,37 @@ const readUsage = (ctx: KindSessionCtx): AutonomyUsage => {
   const total = pick('total_tokens') || prompt + completion;
   return { prompt, completion, total };
 };
+
+/**
+ * 执行期的**当前服务端时钟**（安全判定唯一时间来源）。
+ *
+ * `carried.nowMs` 是排队时的时间，不能用来判断许可/授权是否过期（那一轮被退回的 P0）。
+ * 这里优先用运行时注入的 `ctx.now`（D1 worker 的 `ctx.now` 是服务端时间；测试用它注入
+ * 可控时钟），没有就退回进程时钟。
+ */
+const currentServerTimeMs = (ctx: KindSessionCtx): number => {
+  const raw = (ctx as unknown as { now?: unknown }).now;
+  const injected = raw instanceof Date ? raw.getTime() : typeof raw === 'number' ? raw : null;
+  return injected !== null && Number.isFinite(injected) ? injected : Date.now();
+};
+
+/**
+ * 模型输出的稳定指纹（认领记录里存一份，便于事后核对「落库的那批产物对应哪份输出」）。
+ *
+ * 不需要密码学强度：一次性门的权威判据是 `(owner, round_ref)` 主键 + 可信预留绑定，
+ * 这个 hash 只做可追溯。用两路 32 位混合（FNV-1a + 乘法散列）避免短文本轻易撞。
+ */
+export function hashAutonomyOutput(text: string): string {
+  const raw = String(text ?? '');
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let index = 0; index < raw.length; index += 1) {
+    const code = raw.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 + code) >>> 0, 0x85ebca6b) >>> 0;
+  }
+  return `h_${raw.length}_${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
 
 // ─── D1 读写（只经 holder） ──────────────────────────────────────────────
 
@@ -1349,6 +1401,31 @@ export const autonomyRoundHandler: FireKindHandler = {
         },
         perceptionBlock,
       });
+      // 统一边界 + 统一预算：**真正调模型之前**按当前生效边界重判并原子预留下一次调用。
+      // 排在这里而不是建任务前：用户可能在排队之后暂停/关角色/改额度，只读筛包挡不住。
+      const reserved = await reserveLegacyRoundCall({
+        db: db as unknown as LifeDb,
+        ownerId: ownerUserId,
+        charId,
+        nowMs,
+        kind: LEGACY_AUTONOMY_KIND,
+      });
+      if (!reserved.ok) {
+        try {
+          await settleAutonomyPlan(db, {
+            planId: plan.id,
+            status: 'failed',
+            nowMs,
+            error: reserved.reason,
+          });
+        } catch { /* 下一跳再收 */ }
+        return {
+          skip: true,
+          reason: reserved.reason === 'budget_exhausted'
+            ? AUTONOMY_FIRE_SKIP.budgetExhausted
+            : AUTONOMY_FIRE_SKIP.governanceDenied,
+        };
+      }
       return {
         messages: [{ role: 'user', content: prompt }],
         state: {
@@ -1367,6 +1444,8 @@ export const autonomyRoundHandler: FireKindHandler = {
           workflowKind: plan.kind,
           planMaxChars: plan.maxChars,
           idempotencyKey: `plan:${plan.id}`,
+          budgetPermit: reserved.permit,
+          ownerUserId,
         } satisfies AutonomyFireState,
       };
     }
@@ -1379,6 +1458,24 @@ export const autonomyRoundHandler: FireKindHandler = {
     const state = await getAutonomyState(db, charId);
     // P4：只把本地过滤后的相关小快照放进动态尾段（没有就不占位）。
     const perceptionBlock = await buildAutonomyPerceptionBlock({ db, charId, pack, nowMs });
+
+    // 统一边界 + 统一预算：到点这一跳**真正调模型之前**的硬门。
+    const reserved = await reserveLegacyRoundCall({
+      db: db as unknown as LifeDb,
+      ownerId: ownerUserId,
+      charId,
+      nowMs,
+      kind: LEGACY_AUTONOMY_KIND,
+    });
+    if (!reserved.ok) {
+      console.warn('[amsg:autonomy] 统一边界/预算拒绝，这一轮不调模型', charId, reserved.reason);
+      return {
+        skip: true,
+        reason: reserved.reason === 'budget_exhausted'
+          ? AUTONOMY_FIRE_SKIP.budgetExhausted
+          : AUTONOMY_FIRE_SKIP.governanceDenied,
+      };
+    }
 
     return {
       messages: [{ role: 'user', content: buildAutonomyRoundPrompt({ pack, nowMs, pages, autonomy, perceptionBlock }) }],
@@ -1393,6 +1490,8 @@ export const autonomyRoundHandler: FireKindHandler = {
         nowMs,
         roundRef: `round:${crypto.randomUUID()}`,
         lastUserMessageAt: typeof pack.lastUserMessageAt === 'number' ? pack.lastUserMessageAt : null,
+        budgetPermit: reserved.permit,
+        ownerUserId,
       } satisfies AutonomyFireState,
     };
   },
@@ -1402,6 +1501,87 @@ export const autonomyRoundHandler: FireKindHandler = {
     if (!db) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.dbUnavailable };
     const carried = readCarriedState(state);
     if (!carried) return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.stateMissing };
+
+    /*
+     * 输出效果的一次性执行门（服务端强制，不靠 TS 类型）。
+     *
+     * 走到这里说明上游模型已经把这一轮的输出交回来了，接下来每一步都会产生**业务副作用**
+     * （写经历、落愿望、发结果）。所以顺序被钉死：
+     *   1. carried 里必须有可信 owner + 预留凭据 + 稳定回合引用；缺一个就 fail closed
+     *      （旧版本/旧形状的 state 直接拒绝，不「尽量跑」）；
+     *   2. 认领这一回合的输出效果（一条条件 INSERT，绑定真实预留记录，主键去重）；
+     *      抢不到 = 重放/并发 → 零业务效果、零再次下发；
+     *   3. 结算这次模型调用（真实 usage）；结算被拒 → 不落业务（不再只 warn 后放行）；
+     *   4. 再读一次当前边界（暂停/关角色/新增禁区），变了就只结算不落产物。
+     * 以前的实现把 2/3 写成可选 if，缺凭据也能继续写经历，重放会写第二批。
+     */
+    if (!carried.ownerUserId || !carried.budgetPermit || !carried.roundRef) {
+      console.warn('[amsg:autonomy] 输出缺少可信 owner/凭据/回合引用，这一轮不落任何业务产物（fail-closed）', {
+        charId: carried.charId,
+        hasOwner: !!carried.ownerUserId,
+        hasPermit: !!carried.budgetPermit,
+        hasRoundRef: !!carried.roundRef,
+      });
+      return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+    }
+
+    /*
+     * 安全判定一律用**当前服务端时钟**，不用 `carried.nowMs`。
+     *
+     * `carried.nowMs` 是 beforeFire 排队那一刻的时间：上游模型可能跑很久、任务也可能在队列里
+     * 等到授权窗口过期之后才执行。拿它去比 `expires_at` / 授权到期 / 当前预算窗口，等于
+     * 「凭一张早就过期的一次性许可继续落业务效果」。展示时间（经历 createdAt、推送冷却）
+     * 仍可用 `carried.nowMs`，但**许可到期、外部授权到期、预算窗口**必须走这里。
+     */
+    const nowMs = currentServerTimeMs(ctx);
+
+    const outputHash = hashAutonomyOutput(ctx.llmOutputText || '');
+    const claim = await claimRoundEffect({
+      db: db as unknown as LifeDb,
+      ownerId: carried.ownerUserId,
+      charId: carried.charId,
+      roundRef: carried.roundRef,
+      reservationId: carried.budgetPermit.reservationId,
+      outputHash,
+      nowMs,
+    });
+    if (!claim.ok) {
+      // claim_exists = 同一回合的第二次（重放/并发）；reservation_invalid = 凭据不可信。
+      // 两种情况都必须零新增业务效果、零再次下发。
+      console.warn('[amsg:autonomy] 输出效果认领被拒，这一轮不落任何业务产物', carried.charId, claim.reason);
+      return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+    }
+
+    // 统一预算结算：这一次模型请求**真的发出去了**（llmOutput 只在上游回来后才调），
+    // 按真实 usage 结算；usage 不明就按预留上界（不猜零）。旧链路的消耗从这一刻起
+    // 记进新预算——以前只写旧 autonomy_state，新预算永远看不到。
+    const usageForBudget = readUsage(ctx);
+    const settled = await settleLegacyRoundCall({
+      db: db as unknown as LifeDb,
+      permit: carried.budgetPermit,
+      actualTokens: usageForBudget.total > 0 ? usageForBudget.total : null,
+      requestStarted: true,
+      nowMs,
+    });
+    if (!settled) {
+      // 结算失败（凭据已结算过 / 存储不可用）→ 不落业务。以前这里只 warn 就继续，
+      // 等于「账没记上照样花」，现在按 fail closed 处理。
+      console.warn('[amsg:autonomy] 预算结算被拒，这一轮不落业务产物', carried.charId, carried.budgetPermit.reservationId);
+      return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.budgetExhausted };
+    }
+
+    // 执行期复核：模型跑的这一小段时间里用户可能按了暂停 / 关了角色 / 加了禁区。
+    // 拒了就只结算、不写任何业务产物（经历/愿望/计划都不落）。
+    const denial = await legacyRoundStillAllowed({
+      db: db as unknown as LifeDb,
+      ownerId: carried.ownerUserId,
+      charId: carried.charId,
+      nowMs,
+    });
+    if (denial) {
+      console.warn('[amsg:autonomy] 执行期边界已变，这一轮不落业务产物', carried.charId, denial);
+      return { decision: 'skip-push', reason: AUTONOMY_FIRE_SKIP.governanceDenied };
+    }
 
     // P5：计划到点执行走独立分支——不产出经历列表/反刍闸/推送，只落一条虚拟经历并结算计划。
     if (carried.mode === 'workflow') return handleWorkflowOutput(db, ctx, carried);
@@ -1420,17 +1600,27 @@ export const autonomyRoundHandler: FireKindHandler = {
     const usage = readUsage(ctx);
 
     // B7：这一轮角色有没有顺口说「想出去」。**不额外发模型请求**（就长在上面这份 JSON 里），
-    // 落库前先过授权/预算复核；任何一步失败只记日志，绝不把整轮自主回合判失败。
+    // 落库前先过统一边界 + kind 配额：`travel.wish` 必须在 allowedKinds 里、边界没暂停、
+    // 没有未验证禁区，并且本窗口的 per-kind 配额还有一格。任何一步不满足 → 一个愿望都不写。
     const travelIntent = parseTravelIntent(reply.travelIntent);
     if (travelIntent === null) {
       console.warn('[amsg:autonomy] 出行意图形状不合法（这一轮不建愿望）', carried.charId);
     } else if (travelIntent.kind !== 'none') {
-      try {
-        const ownerUserId = await readAutonomyOwnerUserId(db, carried.charId);
-        if (ownerUserId) {
+      const effect = await reserveLegacyEffect({
+        db: db as unknown as LifeDb,
+        ownerId: carried.ownerUserId,
+        charId: carried.charId,
+        // 效果配额按**当前窗口**核算（排队时可能还在前一天）。
+        nowMs,
+        kind: LEGACY_TRAVEL_KIND,
+      });
+      if (!effect.ok) {
+        console.warn('[amsg:autonomy] 出行愿望被统一边界/配额拒绝（这一轮不建愿望）', carried.charId, effect.reason);
+      } else {
+        try {
           await ensureTravelSchema(db as never);
           const intentResult = await recordTravelIntent(db as never, {
-            userId: ownerUserId,
+            userId: carried.ownerUserId,
             charId: carried.charId,
             intent: travelIntent,
             nowMs: carried.nowMs,
@@ -1441,9 +1631,9 @@ export const autonomyRoundHandler: FireKindHandler = {
             written: intentResult.written,
             reason: intentResult.reason,
           });
+        } catch (error) {
+          console.warn('[amsg:autonomy] 出行意愿没落进愿望表（这一轮其余照常）', error);
         }
-      } catch (error) {
-        console.warn('[amsg:autonomy] 出行意愿没落进愿望表（这一轮其余照常）', error);
       }
     }
 
@@ -1473,7 +1663,7 @@ export const autonomyRoundHandler: FireKindHandler = {
     const pushedIndex = hasBig ? processed.findIndex((item) => item.importance >= 2) : -1;
     const parts = wallClockPartsInZone(carried.nowMs, { tzId: carried.tzId });
     const pushedToday = await countPushedOnDate(db, carried.charId, carried.tzId, carried.dateKey, carried.nowMs);
-    const push = shouldPushAutonomy({
+    let push = shouldPushAutonomy({
       push: carried.autonomy.push,
       pushedToday,
       lastPushAt: carried.lastPushAt,
@@ -1481,6 +1671,24 @@ export const autonomyRoundHandler: FireKindHandler = {
       ...(carried.autonomy.quietHours ? { quietHours: carried.autonomy.quietHours } : {}),
       minutesOfDay: parts.hour * 60 + parts.minute,
     }) && pushedIndex >= 0;
+
+    // 用户新边界里的**通知上限**（账号层，多角色共享）也必须管住这条旧链路。
+    // 以前只看旧 carried.autonomy.push / 旧 pushedToday，于是新设置把通知关成 0 也照样弹。
+    // 口径：额度 0 或已耗尽 → 只是**不发提醒**（notification.show=false），
+    // 私人活动照常落库（与新 UI 的承诺一致）。
+    if (push) {
+      const quota = await reserveLegacyNotification({
+        db: db as unknown as LifeDb,
+        ownerId: carried.ownerUserId,
+        charId: carried.charId,
+        // 通知额度是**按当前窗口**算的：排队时是昨天，执行时已经是今天 → 必须用当前时钟。
+        nowMs,
+      });
+      if (!quota.ok) {
+        console.log('[amsg:autonomy] 统一通知额度已满/关闭，这一轮只落经历不发提醒', carried.charId, quota.reason);
+        push = false;
+      }
+    }
 
     const written: AutonomyResultExperience[] = [];
     for (const [index, item] of processed.entries()) {

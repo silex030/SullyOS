@@ -12,9 +12,9 @@ import ImpressionPanel from '../components/character/ImpressionPanel';
 import RoomPlatePanel from '../components/character/RoomPlatePanel';
 import MemoryArchivist from '../components/character/MemoryArchivist';
 import ChibiStudio, { ChibiShelfPanel } from '../components/character/ChibiStudio';
-import AutonomyPanel from '../components/character/AutonomyPanel';
+import AutonomyLifeEntryCard from '../components/autonomy-life/AutonomyLifeEntryCard';
+import AutonomyLifePanel from '../components/autonomy-life/AutonomyLifePanel';
 import TravelCharCard from '../components/character/TravelCharCard';
-import AirpPanel from '../components/character/AirpPanel';
 import TokenImg from '../components/os/TokenImg';
 import { resolveBlobRefsDeep, migrateDataUrlToRef } from '../utils/blobRef';
 import { characterLaunch } from '../utils/characterLaunch';
@@ -139,6 +139,8 @@ const Character: React.FC = () => {
       });
   };
   const [detailTab, setDetailTab] = useState<'identity' | 'memory' | 'impression' | 'plates' | 'chibi'>(() => launchIntent?.openChibiStudio ? 'chibi' : 'identity');
+  // 统一「自主生活」工作区：角色详情只留一张状态入口卡，点开才是全屏面板（概况/活动/边界）。
+  const [autonomyLifeOpen, setAutonomyLifeOpen] = useState(false);
 
   // ── 地理位置（省市）：Open-Meteo geocoding 联想 + 该城市当前天气小预览 ──
   const [locDraft, setLocDraft] = useState('');
@@ -2318,28 +2320,25 @@ ${isInitialGeneration ? `
                        </div>
                    )}
                    
-                   {/* 自主背景生活（AIRP）：模板 + 覆盖 + 工具白名单。改一项随角色自动保存，
-                       落库走 updateCharacter → saveCharacter + markAmsgStateDirty 重传 fire_pack。 */}
+                   {/* 自主生活：统一入口卡（替代原 AutonomyPanel 的模板/节奏/护栏控件）。
+                       这里只读「TA 现在什么状态 / 上次做了什么 / 下次大概什么时候」，所有设置都在
+                       点开后的工作区（概况 / 活动 / 边界）里，用户只设边界，不设频率。 */}
                    {detailTab === 'identity' && (
                        <div className="mt-6 pt-4 border-t border-slate-100">
-                           <AutonomyPanel
-                               char={formData}
-                               onChange={(next) => handleChange('airp', next)}
+                           <AutonomyLifeEntryCard
+                               charId={formData.id}
+                               charName={formData.name || ''}
+                               onOpen={() => setAutonomyLifeOpen(true)}
+                               onOpenAccountSettings={() => openApp(AppID.Settings)}
                            />
                            <TravelCharCard charId={formData.id} className="mt-4" />
                        </div>
                    )}
 
-                   {/* AIRP 权限与能力：档位 + 能力白名单 + 活动记录（只读）。字段归属与 AutonomyPanel
-                       划清：这里只写 autonomyLevel / capabilities，不碰 enabled / mcpAllow / writable。 */}
-                   {detailTab === 'identity' && (
-                       <div className="mt-6 pt-4 border-t border-slate-100">
-                           <AirpPanel
-                               char={formData}
-                               onChange={(next) => handleChange('airp', next)}
-                           />
-                       </div>
-                   )}
+                   {/* AIRP 旧面板（档位 + 能力白名单 + 事件记录）不再挂在角色设定页：
+                       能力与允许窗口统一在「自主生活 → 边界」里设，活动记录统一在「活动」里看。
+                       旧 AIRP 字段仍由运行时读取（有效权限 = 旧有效 ∩ 新边界），这里只是不再提供
+                       第二套用户可调入口，避免两处含义打架。 */}
 
                    {detailTab === 'memory' && (
                        <div className="space-y-4 animate-fade-in">
@@ -2706,6 +2705,17 @@ ${isInitialGeneration ? `
                 <span className="text-xs text-slate-400">——届时可去设置里「清除云端状态」兜底。</span>
             </p>
         </Modal>
+
+        {/* 统一自主生活工作区（全屏）。挂在角色详情之上，深链到原 App 的真实记录；关闭后回到详情。 */}
+        {autonomyLifeOpen && formData && (
+            <AutonomyLifePanel
+                charId={formData.id}
+                charName={formData.name || ''}
+                onClose={() => setAutonomyLifeOpen(false)}
+                onOpenApp={(appId, context) => { setAutonomyLifeOpen(false); openApp(appId as AppID, context); }}
+                onOpenSettings={() => { setAutonomyLifeOpen(false); openApp(AppID.Settings); }}
+            />
+        )}
     </div>
   );
 };

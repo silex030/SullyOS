@@ -1,0 +1,5 @@
+# 第八轮：当前 HEAD vs 基线 f7f040c7 的 tsc 归一化比较
+# 命令: npx tsc --noEmit -p tsconfig.json（两边各 56 条 error TS，EXIT:2 与基线同值）
+# 归一化: 去掉 worktree / 基线绝对路径前缀后比较 error 行
+
+(diff 为空：两边错误集合逐行相同)

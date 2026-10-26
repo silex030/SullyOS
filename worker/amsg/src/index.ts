@@ -227,6 +227,11 @@ import { reserveMapCall as reserveTravelMapCall, getTravelBudget as getTravelBud
 import { getTravelAnchor, type TravelDb as TravelStoreDb } from './travel/store';
 import type { TravelPlaceAnchor, TravelCoordSys } from '../../../contracts/travel';
 import type { TravelTickSubject } from './travel/tick';
+import { handleAutonomyLifeRequest, resolveOwnerFromSharedToken } from './autonomyLife/routes';
+import { handleAutonomyLifeScheduled, summariseAutonomyLifeOutcomes } from './autonomyLife/tick';
+import { gateLegacyAutonomyPacks } from './autonomyLife/legacyGate';
+import { gateTravelDecisionPort, travelModelAccess } from './autonomyLife/travelGate';
+import type { LifeDb } from './autonomyLife/store';
 import { AUTONOMY_DAILY_TOKEN_BUDGET } from '../../../utils/airp/autonomySettings';
 import { handleChatLifeWorkflow } from '../../../utils/airp/chatLifeWorkflowHandler';
 import { AMSG_STATE_NAMESPACE_PREFIX } from '../../../utils/amsgFirePack';
@@ -262,6 +267,13 @@ interface Env extends NativeFcmEnv {
   SULLYOS_RUNTIME?: string;
   /** D1 binding（factory 默认 createD1Adapter(env.DB)，这里只是标注存在）。 */
   DB: unknown;
+  /* ── 自主生活受控外部窗口（全部可选；缺一项 = 能力不可用，不做默认放行）── */
+  /** 小红书式只读端点（运营配置的完整 URL；必须同时出现在下面的主机白名单里）。 */
+  AUTONOMY_EXTERNAL_XHS_URL?: string;
+  /** 地图只读端点（出行窗口用；同样受白名单约束）。 */
+  AUTONOMY_EXTERNAL_AMAP_URL?: string;
+  /** 服务端出口主机白名单（逗号分隔，必须与用户 grant.allowedHosts 同时满足）。 */
+  AUTONOMY_EXTERNAL_READ_HOSTS?: string;
   /** 以下三项给 /self-update 用，都可选；没配 CF_API_TOKEN 就是不开自更新。见 ./selfUpdate。 */
   CF_API_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
@@ -3418,8 +3430,21 @@ async function createTravelAnchorSearch(env: Env, userId: string) {
 /** 每个主体的完整 tick 接线。 */
 async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
   const anchor = await readTravelAnchorForTick(env, subject);
-  const [decisionPort, budget, guardrails] = await Promise.all([
-    createTravelDecisionForSubject(env, subject),
+  const lifeDb = env.DB as unknown as LifeDb;
+  const nowMs = Date.now();
+  // 统一边界 + 旧出行授权：任何一边不允许（新总暂停 / 关角色 / 未授权 travel.wish /
+  // 新增禁区 / 无边界行；或出行面板关掉、角色关掉、地图预算暂停/为零）就**不装
+  // decisionPort**——tick 里所有模型分支都靠它，没有端口就是零模型请求、零新增愿望。
+  // 以前这条链路完全不看新边界，用户按下总暂停它照样问模型「想不想出去」。
+  const modelGate = await travelModelAccess({
+    db: lifeDb,
+    travelDb: env.DB as unknown as Parameters<typeof travelModelAccess>[0]['travelDb'],
+    ownerId: subject.userId,
+    charId: subject.charId,
+    nowMs,
+  });
+  const [rawDecisionPort, budget, guardrails] = await Promise.all([
+    modelGate.ok ? createTravelDecisionForSubject(env, subject) : Promise.resolve(null),
     getTravelBudgetRow(env.DB as unknown as TravelStoreDb, {
       userId: subject.userId,
       nowMs: Date.now(),
@@ -3430,6 +3455,20 @@ async function buildTravelSubjectWiring(env: Env, subject: TravelTickSubject) {
       subject.userId,
     ).catch(() => null),
   ]);
+  // 每一次模型调用前还要再过一次统一闸（tick 中途边界可能变严）+ 原子预留统一预算。
+  const decisionPort = modelGate.ok
+    ? gateTravelDecisionPort(rawDecisionPort, {
+      db: lifeDb,
+      ownerId: subject.userId,
+      charId: subject.charId,
+    })
+    : null;
+  if (!modelGate.ok) {
+    console.log('[amsg:travel] 统一边界不允许出行链路调模型，本轮只推进已有行程', {
+      charId: subject.charId,
+      reason: modelGate.reason,
+    });
+  }
   // 意图探针窗口：运维可配的分钟数 → 用户自己配的同类动作最小间隔 → 3h 兜底。
   // 复用同一份 autonomy 护栏（同一份授权），不新造一套设置，也不硬编码 3h。
   const intentWindowMs = resolveIntentProbeWindowMs({
@@ -3700,6 +3739,28 @@ export default {
         mapProxySecret: resolveTravelSecretString(env as never) ?? undefined,
       });
       if (travel) return travel;
+    }
+
+    // 自主生活 v1（/autonomy-life/v1/*）：许可签发 / 领取 / 回执都走这里。
+    // 认证：AMSG_SERVER_TOKEN + X-Client-Token（共享口令）+ X-User-Id 主体断言；
+    // 所有读写按 ownerId 隔离（见 autonomyLife/routes.ts 的说明）。
+    {
+      const autonomy = await handleAutonomyLifeRequest(request, env as never, {
+        now: Date.now,
+        resolveOwner: (req) => resolveOwnerFromSharedToken(req, env as never),
+        respond: jsonWithCors,
+        hasModelCredentials: async (userId, charId) => {
+          const creds = await resolveTravelModelCredentialsForUser({
+            db: env.DB as never,
+            userId,
+            charId,
+            masterKey: env.AMSG_MASTER_KEY,
+          });
+          return !!creds;
+        },
+        requestId: () => (globalThis.crypto?.randomUUID?.() ?? `al_${Date.now().toString(36)}`),
+      });
+      if (autonomy) return autonomy;
     }
 
     // 即时对话：一个请求把「传云端状态 + 建任务」串完，回 202 之后立刻起一跳。
@@ -4081,10 +4142,18 @@ export default {
         return;
       }
       const scanned = await scanAutonomyPacks({ db, masterKey: env.AMSG_MASTER_KEY });
+      // **统一边界闸**：旧 AIRP 回合自己的护栏不看新边界，必须在建任务之前按新边界再筛一遍
+      // （暂停 / 关角色 / allowedKinds / 未验证禁区 / 预算耗尽 → 整包跳过）。这样「旧配置」
+      // 不能再绕过设置页里的暂停与额度；没有新边界的存量用户默认不跑。
+      const legacyGate = await gateLegacyAutonomyPacks({
+        db: env.DB as unknown as Parameters<typeof gateLegacyAutonomyPacks>[0]['db'],
+        packs: scanned.packs,
+        nowMs,
+      });
       const result = await runAutonomyTick({
         nowMs,
         db,
-        packs: scanned.packs,
+        packs: legacyGate.allowed,
         // 扫描与 tick 内的兜底读取必须同一把钥：缺了它护栏只能按「读不出来」暂停，
         // 而以前是把用户的总暂停静默降级成「未暂停 + 默认 6 次/天」。
         masterKey: env.AMSG_MASTER_KEY,
@@ -4099,15 +4168,48 @@ export default {
       const notableSkips = result.skipped.filter(
         (entry) => entry.reason !== AUTONOMY_SKIP_REASONS.disabled,
       );
-      if (result.built.length > 0 || notableSkips.length > 0 || scanned.skipped.length > 0) {
+      if (
+        result.built.length > 0
+        || notableSkips.length > 0
+        || scanned.skipped.length > 0
+        || legacyGate.skipped.length > 0
+      ) {
         console.log('[amsg:autonomy]', {
           built: result.built,
           skipped: result.skipped,
+          // 新边界闸拦下来的（旧链路旁路证据）。
+          gated: legacyGate.skipped,
           unreadable: scanned.skipped,
         });
       }
     } catch (error) {
       console.error('[amsg:autonomy] 本轮调度失败（下一分钟重来）', error);
+    }
+
+    // 自主生活 v1（utils/autonomyLife + worker/amsg/src/autonomyLife）：只推进状态机，
+    // 不建上游任务、不发推送。单独扫一次包，与 AIRP 回合解耦（两者互不因对方失败而停）。
+    // 整段 fail-soft：cron 没人看返回值，失败只代表「这一分钟白跑」。
+    try {
+      const lifeNowMs = Date.now();
+      const lifePacks = await scanAutonomyPacks({ db: env.DB as unknown as AutonomyDb, masterKey: env.AMSG_MASTER_KEY });
+      const lifeResult = await handleAutonomyLifeScheduled({
+        db: env.DB as unknown as Parameters<typeof handleAutonomyLifeScheduled>[0]['db'],
+        packs: lifePacks.packs,
+        nowMs: lifeNowMs,
+        masterKey: env.AMSG_MASTER_KEY,
+        // 外部窗口的真实配置：端点 + 服务端出口主机白名单。未配置 = 能力不可用（不猜）。
+        external: {
+          xhsUrl: env.AUTONOMY_EXTERNAL_XHS_URL,
+          amapUrl: env.AUTONOMY_EXTERNAL_AMAP_URL,
+          readHosts: env.AUTONOMY_EXTERNAL_READ_HOSTS,
+        },
+      });
+      const lifeSummary = summariseAutonomyLifeOutcomes(lifeResult.outcomes);
+      if (lifeSummary.scheduled > 0 || lifeSummary.skipped.length > 0) {
+        console.log('[amsg:autonomy-life]', lifeSummary);
+      }
+    } catch (error) {
+      console.error('[amsg:autonomy-life] 本轮调度失败（下一分钟重来）', error);
     }
 
     // 角色自主出行：与推送订阅、页面开关**没有**依赖关系，靠时钟 + DB 推进。

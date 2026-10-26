@@ -1,0 +1,708 @@
+/**
+ * 统一自主预算账本（调用 / token / 通知 / 同类动作 / 模拟消费）。
+ *
+ * 契约 §5.2 的硬要求，逐条落在这里：
+ *   - 每一次模型请求（profile 提取、规划、生成、工具后总结、自动重试）**逐次**计数，
+ *     不能「一轮计一次」；
+ *   - 账号 + 角色两个维度一起校验，任一维度失败 → **全不预留**；
+ *   - token 先按最大可能用量预留，结算按真实 usage，usage 不明就保留全额上界（不猜零），
+ *     后续对账只收缩不超额；
+ *   - 0 明确禁止（不是缺省）；存储不可用一律 fail closed；
+ *   - 预算窗口按**服务端**记录的角色时区日切确定并持久化，时区改了也不刷新已有窗口额度。
+ *
+ * 原子性怎么保证：所有「读 + 判 + 写」都在 port.mutate() 的同一临界区里完成。
+ * D1 侧用 BEGIN IMMEDIATE / 单条条件 UPDATE，内存侧用串行队列（见 createMemoryBudgetPort）。
+ * 绝不在 JS 里先 read 再 write ——那正是并发超额的来源。
+ */
+
+import type { AutonomyLifeErrorCode, BudgetUsage } from '../../contracts/autonomyLife';
+import { DEFAULT_ACCOUNT_LIMITS, MAXIMUM_ACCOUNT_LIMITS, type AutonomyLimits } from '../../contracts/autonomyLife';
+import { budgetWindowId, type Clock } from './time';
+
+export type BudgetScopeKey = 'account' | string; // 'account' | charId
+
+export interface BudgetRow {
+  windowId: string;
+  scope: BudgetScopeKey;
+  usedCalls: number;
+  reservedCalls: number;
+  usedTokens: number;
+  reservedTokens: number;
+  notifications: number;
+  kindCounts: Record<string, number>;
+  spendMinor: number;
+  /** 单调递增；SQLite 侧用来做条件更新（CAS），检测并发丢失更新。 */
+  revision: number;
+  updatedAt: number;
+}
+
+export function emptyBudgetRow(windowId: string, scope: BudgetScopeKey, updatedAt: number): BudgetRow {
+  return {
+    windowId,
+    scope,
+    usedCalls: 0,
+    reservedCalls: 0,
+    usedTokens: 0,
+    reservedTokens: 0,
+    notifications: 0,
+    kindCounts: {},
+    spendMinor: 0,
+    revision: 0,
+    updatedAt,
+  };
+}
+
+/**
+ * 预留凭据（可追溯记录）。
+ *
+ * 为什么不能只靠 `usedCalls + reservedCalls >= 1`：那等于「本窗口有过任意一次调用」
+ * 就给任何格式合法的 id 背书——伪造一个 id 也能撞上别人的历史用量。许可签发/外部副作用
+ * 之前必须能按 id 查到**这一条**记录，并核对 owner / 角色 / 窗口 / 动作绑定 / 生命周期。
+ *
+ * 状态机：
+ *   held      —— 已预留、还没结算（在途预留）
+ *   settled   —— 已按真实 usage 结算（计划期的模型调用凭据，仍可作为对应动作的依据）
+ *   released  —— 请求根本没发出，额度已还回去（不能再当依据）
+ */
+export interface ReservationRecord {
+  reservationId: string;
+  /** 自证 id 里的 counter（参与可信核验，不能只看前缀）。 */
+  counter: number;
+  ownerId: string;
+  windowId: string;
+  charId: string;
+  kind: string | null;
+  /** 计划/动作的稳定引用（可追溯：这次预留给谁用）。 */
+  planRef: string | null;
+  calls: number;
+  tokens: number;
+  state: 'held' | 'settled' | 'released';
+  /** 绑定到具体动作；没绑定的记录不能给许可背书。 */
+  actionId: string | null;
+  createdAt: number;
+  expiresAt: number;
+  settledAt: number | null;
+  revision: number;
+}
+
+/** 预留记录的写入：expectedRevision = -1 表示新建。 */
+export interface ReservationUpdate {
+  reservation: ReservationRecord;
+  expectedRevision: number;
+}
+
+export interface BudgetMutationResult<T> {
+  updates: BudgetRow[];
+  /** 与预算行同一临界区里提交的预留记录变更。 */
+  reservations?: ReservationUpdate[];
+  result: T;
+}
+
+/**
+ * 预算存储端口。实现方必须保证 mutator 在同一临界区内执行且全有或全无：
+ *   - 返回 null → 什么都不写（放弃这次预检）；
+ *   - 抛异常 → 整次事务回滚，调用方按 fail closed 处理。
+ *
+ * `reservationIds` 声明这次要读进临界区的预留记录（mutator 的第二个参数）。
+ */
+export interface BudgetPort {
+  available(): boolean;
+  mutate<T>(
+    windowId: string,
+    scopes: BudgetScopeKey[],
+    mutator: (
+      rows: Record<string, BudgetRow>,
+      reservations: Record<string, ReservationRecord>,
+    ) => BudgetMutationResult<T> | null,
+    reservationIds?: string[],
+  ): Promise<T | null>;
+  /** 按 id 读真实预留记录（没有 = 从没签发过）。 */
+  readReservation(reservationId: string): Promise<ReservationRecord | null>;
+  /** 把预留绑定到具体动作（只允许绑一次，且必须同窗口/同角色）。 */
+  bindReservation(input: {
+    reservationId: string;
+    actionId: string;
+    charId: string;
+    windowId: string;
+    nowMs: number;
+  }): Promise<boolean>;
+}
+
+/** 内存实现（测试 + 单进程降级）。串行队列保证 mutator 不交错。 */
+export function createMemoryBudgetPort(opts?: { failClosed?: boolean }): BudgetPort & {
+  snapshot(): Record<string, BudgetRow>;
+  reservationSnapshot(): Record<string, ReservationRecord>;
+  setAvailable(value: boolean): void;
+} {
+  const rows = new Map<string, BudgetRow>();
+  const reservations = new Map<string, ReservationRecord>();
+  let queue: Promise<unknown> = Promise.resolve();
+  let available = opts?.failClosed !== true;
+  const keyOf = (windowId: string, scope: BudgetScopeKey): string => `${windowId}::${scope}`;
+
+  return {
+    available: () => available,
+    setAvailable: (value: boolean) => {
+      available = value;
+    },
+    snapshot: () => Object.fromEntries(rows),
+    reservationSnapshot: () => Object.fromEntries(reservations),
+    async readReservation(reservationId: string) {
+      const record = reservations.get(String(reservationId ?? '').trim());
+      return record ? { ...record } : null;
+    },
+    async bindReservation(input) {
+      const record = reservations.get(input.reservationId);
+      if (!record) return false;
+      if (record.actionId !== null) return record.actionId === input.actionId;
+      if (record.windowId !== input.windowId || record.charId !== input.charId) return false;
+      if (record.state === 'released') return false;
+      reservations.set(input.reservationId, {
+        ...record,
+        actionId: input.actionId,
+        revision: record.revision + 1,
+      });
+      return true;
+    },
+    mutate<T>(
+      windowId: string,
+      scopes: BudgetScopeKey[],
+      mutator: (
+        input: Record<string, BudgetRow>,
+        held: Record<string, ReservationRecord>,
+      ) => BudgetMutationResult<T> | null,
+      reservationIds: string[] = [],
+    ): Promise<T | null> {
+      const run = async (): Promise<T | null> => {
+        if (!available) throw new Error('BUDGET_STORE_UNAVAILABLE');
+        const input: Record<string, BudgetRow> = {};
+        const held: Record<string, ReservationRecord> = {};
+        const created: string[] = [];
+        for (const scope of scopes) {
+          const key = keyOf(windowId, scope);
+          if (!rows.has(key)) {
+            rows.set(key, emptyBudgetRow(windowId, scope, Date.now()));
+            created.push(key);
+          }
+          input[scope] = { ...rows.get(key)!, kindCounts: { ...rows.get(key)!.kindCounts } };
+        }
+        for (const id of reservationIds) {
+          const record = reservations.get(id);
+          if (record) held[id] = { ...record };
+        }
+        let outcome: BudgetMutationResult<T> | null;
+        try {
+          outcome = mutator(input, held);
+        } catch (error) {
+          for (const key of created) rows.delete(key);
+          throw error;
+        }
+        if (!outcome) {
+          // 判定失败：连「刚建出来的空行」都不留（与 D1 侧不插行一致）。
+          for (const key of created) rows.delete(key);
+          return null;
+        }
+        for (const update of outcome.reservations ?? []) {
+          const next = update.reservation;
+          if (update.expectedRevision === -1) {
+            if (reservations.has(next.reservationId)) {
+              for (const key of created) rows.delete(key);
+              return null;
+            }
+            reservations.set(next.reservationId, { ...next, revision: 0 });
+            continue;
+          }
+          const current = reservations.get(next.reservationId);
+          if (!current || current.revision !== update.expectedRevision) {
+            for (const key of created) rows.delete(key);
+            return null;
+          }
+          reservations.set(next.reservationId, { ...next });
+        }
+        for (const row of outcome.updates) {
+          const key = keyOf(row.windowId, row.scope);
+          rows.set(key, { ...row, kindCounts: { ...row.kindCounts } });
+        }
+        // 只读用途（例如 reserve 失败后回读维度原因）不会返回 updates：
+        // 这种情况下新建的空行不该被持久化，否则「失败也留了一行」会误导快照。
+        const updatedKeys = new Set(outcome.updates.map((row) => keyOf(row.windowId, row.scope)));
+        for (const key of created) {
+          if (!updatedKeys.has(key)) rows.delete(key);
+        }
+        return outcome.result;
+      };
+      const next = queue.then(run, run);
+      queue = next.catch(() => undefined);
+      return next;
+    },
+  };
+}
+
+export interface ReservationRequest {
+  nowMs: number;
+  /** 服务端在窗口开启时持久化的时区；不要用「当前设置的时区」重算已有窗口。 */
+  windowTimezone: string;
+  accountId: string;
+  charId: string;
+  limits: AutonomyLimits;
+  /** 本次请求开始就消耗的调用数（一次请求 = 1，重试算新请求）。 */
+  calls?: number;
+  /** 本次请求 token 上界（max_tokens + 输入上界）。 */
+  tokens: number;
+  kind?: string;
+  /** 是否需要占一条通知配额。 */
+  notification?: boolean;
+  /** 模拟消费金额（最小货币单位）。 */
+  spendMinor?: number;
+  /** 单笔/单次订单上限校验用。 */
+  orderMaxMinor?: number;
+  /** 计划/动作的稳定引用（写进预留记录，便于追溯这次预留给谁用）。 */
+  planRef?: string | null;
+  /** 预留凭据的有效期（默认 RESERVATION_TTL_MS）。 */
+  ttlMs?: number;
+}
+
+export interface BudgetGrant {
+  reservationId: string;
+  windowId: string;
+  charId: string;
+  calls: number;
+  tokens: number;
+  notification: boolean;
+  spendMinor: number;
+  kind: string | null;
+  createdAt: number;
+}
+
+export type ReserveOutcome =
+  | { ok: true; grant: BudgetGrant }
+  | { ok: false; code: Extract<AutonomyLifeErrorCode, 'BUDGET_EXHAUSTED' | 'SERVICE_UNAVAILABLE'>; dimension: string };
+
+const limitOf = (limits: AutonomyLimits, key: keyof AutonomyLimits, scope: 'account' | 'char'): number => {
+  const value = limits[key];
+  if (value === null || value === undefined) {
+    return Math.min(
+      DEFAULT_ACCOUNT_LIMITS[key as keyof typeof DEFAULT_ACCOUNT_LIMITS] ?? 0,
+      MAXIMUM_ACCOUNT_LIMITS[key as keyof typeof MAXIMUM_ACCOUNT_LIMITS] ?? 0,
+    );
+  }
+  return value;
+};
+
+export interface BudgetPrecheckInputs {
+  accountRow: BudgetRow;
+  charRow: BudgetRow;
+  limits: AutonomyLimits;
+  request: ReservationRequest;
+}
+
+export interface BudgetPrecheck {
+  ok: boolean;
+  dimension?: string;
+}
+
+/**
+ * 纯判定：所有维度都必须通过。不修改入参。
+ * 注意 calls 与 tokens 都是「已用 + 在途 + 本次」一起比额度——在途预留也算占用，
+ * 否则并发两次都能过。
+ */
+export function precheckBudget(inputs: BudgetPrecheckInputs): BudgetPrecheck {
+  const { accountRow, charRow, limits, request } = inputs;
+  const calls = request.calls ?? 1;
+  const tokens = request.tokens;
+  const spend = request.spendMinor ?? 0;
+
+  const acctCalls = limitOf(limits, 'accountModelCallsPerDay', 'account');
+  const charCalls = limitOf(limits, 'charModelCallsPerDay', 'char');
+  const acctTokens = limitOf(limits, 'accountTokensPerDay', 'account');
+  const charTokens = limitOf(limits, 'charTokensPerDay', 'char');
+  const notifLimit = limitOf(limits, 'notificationsPerDay', 'account');
+  const perKind = limitOf(limits, 'perKindActionsPerDay', 'char');
+  const spendLimit = limitOf(limits, 'virtualSpendPerDayMinor', 'char');
+  const orderMax = limitOf(limits, 'virtualOrderMaxMinor', 'char');
+
+  if (calls > 0) {
+    if (acctCalls <= 0) return { ok: false, dimension: 'account_calls' };
+    if (charCalls <= 0) return { ok: false, dimension: 'char_calls' };
+    if (accountRow.usedCalls + accountRow.reservedCalls + calls > acctCalls) {
+      return { ok: false, dimension: 'account_calls' };
+    }
+    if (charRow.usedCalls + charRow.reservedCalls + calls > charCalls) {
+      return { ok: false, dimension: 'char_calls' };
+    }
+  }
+  if (tokens > 0) {
+    if (acctTokens <= 0) return { ok: false, dimension: 'account_tokens' };
+    if (charTokens <= 0) return { ok: false, dimension: 'char_tokens' };
+    if (accountRow.usedTokens + accountRow.reservedTokens + tokens > acctTokens) {
+      return { ok: false, dimension: 'account_tokens' };
+    }
+    if (charRow.usedTokens + charRow.reservedTokens + tokens > charTokens) {
+      return { ok: false, dimension: 'char_tokens' };
+    }
+  }
+  if (request.notification) {
+    if (notifLimit <= 0) return { ok: false, dimension: 'notifications' };
+    if (accountRow.notifications + 1 > notifLimit) return { ok: false, dimension: 'notifications' };
+  }
+  if (request.kind) {
+    if (perKind <= 0) return { ok: false, dimension: 'kind_actions' };
+    const used = charRow.kindCounts[request.kind] ?? 0;
+    if (used + 1 > perKind) return { ok: false, dimension: 'kind_actions' };
+  }
+  if (spend > 0) {
+    if (spendLimit <= 0) return { ok: false, dimension: 'virtual_spend' };
+    if (orderMax <= 0 || spend > orderMax) return { ok: false, dimension: 'virtual_order_max' };
+    if (charRow.spendMinor + spend > spendLimit) return { ok: false, dimension: 'virtual_spend' };
+  }
+  return { ok: true };
+}
+
+let reservationCounter = 0;
+
+/**
+ * 解析预留 id（`rsv_<windowId>_<charId>_<createdAt>_<counter>`）。
+ *
+ * 为什么需要：动作行里只存 reservationId 一个字符串，签发许可时必须能自证
+ * 「这个预留属于本窗口、本角色」，否则伪造一个 id 就能过。windowId 不含 `_`，
+ * 所以按 `_` 从右往左解析（charId 允许带下划线），解析不出来 = 拒绝。
+ */
+export function parseReservationId(
+  reservationId: string | null | undefined,
+): { windowId: string; charId: string; createdAt: number; counter: number } | null {
+  const raw = String(reservationId ?? '').trim();
+  if (!raw) return null;
+  const match = /^rsv_(w:[^_]+)_(.+)_(\d{1,16})_(\d{1,9})$/.exec(raw);
+  if (!match) return null;
+  const createdAt = Number(match[3]);
+  const counter = Number(match[4]);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(counter)) return null;
+  return { windowId: match[1], charId: match[2], createdAt, counter };
+}
+
+export interface ReservationVerification {
+  ok: boolean;
+  /** 校验通过时返回记录的 revision：调用方把它放进许可/核销的条件 UPDATE 里做线性化。 */
+  revision?: number;
+  reason?:
+    | 'reservation_missing'
+    | 'reservation_malformed'
+    | 'reservation_window_mismatch'
+    | 'reservation_character_mismatch'
+    | 'reservation_not_held'
+    | 'reservation_not_bound'
+    | 'reservation_released'
+    | 'reservation_expired'
+    | 'store_unavailable';
+}
+
+/** 预留凭据的默认有效期：与动作的 6h 执行窗对齐。 */
+export const RESERVATION_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * 服务端在签发许可 / 外部副作用之前复核预留依据。
+ *
+ * 判据只有一条来源：**按 id 查到的那条预留记录**（不是「本窗口有过用量」）。
+ *   1. id 必须能解析出自证字段，且 counter 与记录一致（格式合法但从未签发 → missing）；
+ *   2. owner / 窗口 / 角色必须与本次动作一致；
+ *   3. 必须已绑定到这条动作（没有绑定 = 不是给它的凭据）；
+ *   4. 生命周期必须可用：released 不行、过期的不行；held（在途）与 settled（已结算的计划
+ *      预算凭据）都行——settled 正是「计划期模型调用已花掉、执行期拿它作依据」的正常状态；
+ *   5. 本窗口的预算行必须还在（记录与账本对不上 = 依据不成立）。
+ */
+export async function verifyReservationHold(
+  port: BudgetPort,
+  input: {
+    reservationId: string | null | undefined;
+    ownerId?: string;
+    windowId: string;
+    charId: string;
+    actionId?: string | null;
+    nowMs: number;
+    timezone?: string;
+    /** 默认 true：要求本窗口两层预算行都存在（与记录相互印证）。 */
+    requireBudgetRows?: boolean;
+  },
+): Promise<ReservationVerification> {
+  if (!port.available()) return { ok: false, reason: 'store_unavailable' };
+  const raw = String(input.reservationId ?? '').trim();
+  if (!raw) return { ok: false, reason: 'reservation_missing' };
+  const parsed = parseReservationId(raw);
+  if (!parsed) return { ok: false, reason: 'reservation_malformed' };
+  if (parsed.windowId !== input.windowId) return { ok: false, reason: 'reservation_window_mismatch' };
+  if (parsed.charId !== input.charId) return { ok: false, reason: 'reservation_character_mismatch' };
+  if (parsed.createdAt > input.nowMs) return { ok: false, reason: 'reservation_malformed' };
+  if (input.timezone && budgetWindowId(parsed.createdAt, input.timezone) !== input.windowId) {
+    return { ok: false, reason: 'reservation_window_mismatch' };
+  }
+
+  const record = await port.readReservation(raw).catch(() => null);
+  if (!record) return { ok: false, reason: 'reservation_missing' };
+  if (record.reservationId !== raw || record.counter !== parsed.counter) {
+    return { ok: false, reason: 'reservation_malformed' };
+  }
+  if (input.ownerId && record.ownerId && record.ownerId !== input.ownerId) {
+    return { ok: false, reason: 'reservation_malformed' };
+  }
+  if (record.windowId !== input.windowId) return { ok: false, reason: 'reservation_window_mismatch' };
+  if (record.charId !== input.charId) return { ok: false, reason: 'reservation_character_mismatch' };
+  if (input.actionId !== undefined && input.actionId !== null) {
+    if (!record.actionId || record.actionId !== input.actionId) {
+      return { ok: false, reason: 'reservation_not_bound' };
+    }
+  }
+  if (record.state === 'released') return { ok: false, reason: 'reservation_released' };
+  if (record.expiresAt <= input.nowMs) return { ok: false, reason: 'reservation_expired' };
+
+  if (input.requireBudgetRows !== false) {
+    const rows = await port
+      .mutate(input.windowId, ['account', input.charId], (snapshot) => ({ updates: [], result: snapshot }))
+      .catch(() => null);
+    const account = rows?.account ?? null;
+    const char = rows?.[input.charId] ?? null;
+    if (!account || !char) return { ok: false, reason: 'reservation_not_held' };
+    if (account.windowId !== input.windowId || char.windowId !== input.windowId) {
+      return { ok: false, reason: 'reservation_window_mismatch' };
+    }
+  }
+  return { ok: true, revision: record.revision };
+}
+
+/**
+ * 预留：原子、全维度、失败即全不预留。
+ * 存储不可用/抛错 → SERVICE_UNAVAILABLE（fail closed），绝不「先放过去再补账」。
+ */
+export async function reserveBudget(port: BudgetPort, request: ReservationRequest): Promise<ReserveOutcome> {
+  if (!port.available()) {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', dimension: 'store_unavailable' };
+  }
+  const calls = request.calls ?? 1;
+  const windowId = budgetWindowId(request.nowMs, request.windowTimezone);
+  try {
+    const outcome = await port.mutate(windowId, ['account', request.charId], (rows) => {
+      const accountRow = rows.account ?? emptyBudgetRow(windowId, 'account', request.nowMs);
+      const charRow = rows[request.charId] ?? emptyBudgetRow(windowId, request.charId, request.nowMs);
+      const precheck = precheckBudget({ accountRow, charRow, limits: request.limits, request });
+      if (!precheck.ok) return null;
+      reservationCounter += 1;
+      const grant: BudgetGrant = {
+        reservationId: `rsv_${windowId}_${request.charId}_${request.nowMs}_${reservationCounter}`,
+        windowId,
+        charId: request.charId,
+        calls,
+        tokens: request.tokens,
+        notification: request.notification === true,
+        spendMinor: request.spendMinor ?? 0,
+        kind: request.kind ?? null,
+        createdAt: request.nowMs,
+      };
+      // 预留凭据与预算行在**同一次临界区**里落库：不存在「扣了额度但没有凭据」或
+      // 「有凭据但没扣额度」的中间态。counter 写进记录，供签发时与 id 自证比对。
+      const record: ReservationRecord = {
+        reservationId: grant.reservationId,
+        counter: reservationCounter,
+        ownerId: request.accountId,
+        windowId,
+        charId: request.charId,
+        kind: grant.kind,
+        planRef: request.planRef ?? null,
+        calls,
+        tokens: request.tokens,
+        state: 'held',
+        actionId: null,
+        createdAt: request.nowMs,
+        expiresAt: request.nowMs + (request.ttlMs ?? RESERVATION_TTL_MS),
+        settledAt: null,
+        revision: 0,
+      };
+      const nextAccount: BudgetRow = {
+        ...accountRow,
+        reservedCalls: accountRow.reservedCalls + calls,
+        reservedTokens: accountRow.reservedTokens + request.tokens,
+        notifications: accountRow.notifications + (request.notification ? 1 : 0),
+        revision: accountRow.revision + 1,
+        updatedAt: request.nowMs,
+      };
+      const kindCounts = { ...charRow.kindCounts };
+      if (request.kind) kindCounts[request.kind] = (kindCounts[request.kind] ?? 0) + 1;
+      const nextChar: BudgetRow = {
+        ...charRow,
+        reservedCalls: charRow.reservedCalls + calls,
+        reservedTokens: charRow.reservedTokens + request.tokens,
+        kindCounts,
+        spendMinor: charRow.spendMinor + (request.spendMinor ?? 0),
+        revision: charRow.revision + 1,
+        updatedAt: request.nowMs,
+      };
+      return { updates: [nextAccount, nextChar], reservations: [{ reservation: record, expectedRevision: -1 }], result: grant };
+    });
+    if (!outcome) {
+      // 走到这里说明临界区里判定失败：按维度重新判一次，给 UI 准确原因。
+      const detail = await port.mutate(windowId, ['account', request.charId], (rows) => {
+        const precheck = precheckBudget({
+          accountRow: rows.account,
+          charRow: rows[request.charId],
+          limits: request.limits,
+          request,
+        });
+        return { result: precheck, updates: [] };
+      });
+      const dimension = detail && !detail.ok ? detail.dimension ?? 'unknown' : 'unknown';
+      return { ok: false, code: 'BUDGET_EXHAUSTED', dimension };
+    }
+    return { ok: true, grant: outcome };
+  } catch {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE', dimension: 'store_unavailable' };
+  }
+}
+
+export interface SettleInput {
+  /** 真实 usage；undefined/null = 不明，保留全额上界（不猜零）。 */
+  actualTokens?: number | null;
+  /** 是否真的把请求交给了 provider（false 且能证明没发出 → 释放）。 */
+  requestStarted: boolean;
+  /**
+   * 当前可信服务端时钟（安全判定用）。
+   *
+   * 给了就按它校验**凭据是否已经过期**：调用方漏掉一次到期复核，也不能拿一张过了期的
+   * 凭据把账结掉（旧实现只要求 `held`，不看期限）。不给 = 保持既有语义（引擎内部调用）。
+   */
+  nowMs?: number;
+}
+
+export type SettleOutcome =
+  | { ok: true; usedTokens: number; keptReservation: boolean }
+  | { ok: false; code: 'SERVICE_UNAVAILABLE' | 'STATE_CONFLICT' };
+
+/**
+ * 结算：reserved → used，并把**同一条预留记录**推进到 settled / released。
+ *   - requestStarted=false（preflight 取消且证明未发出）：calls/tokens 全额释放；
+ *   - usage 不明：token 按预留上界记 used（不猜零）；
+ *   - usage 超过预留：只按预留结算，超出部分单独记账为 overage，不让它突破预留上界；
+ *   - 同一张凭据只能结算一次：已 settled / released 的记录再结算 → STATE_CONFLICT，
+ *     预算行一个字节都不动（否则重复回执就能重复扣账）。
+ */
+export async function settleBudget(
+  port: BudgetPort,
+  grant: BudgetGrant,
+  input: SettleInput,
+): Promise<SettleOutcome> {
+  if (!port.available()) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+  const released = !input.requestStarted;
+  const settledTokens = released
+    ? 0
+    : typeof input.actualTokens === 'number' && Number.isFinite(input.actualTokens) && input.actualTokens >= 0
+      ? Math.min(Math.round(input.actualTokens), grant.tokens)
+      : grant.tokens;
+  try {
+    const outcome = await port.mutate(grant.windowId, ['account', grant.charId], (rows, held) => {
+      const accountRow = rows.account;
+      const charRow = rows[grant.charId];
+      const record = held[grant.reservationId];
+      // 记录不在 / 已经结算过 / 已释放 / 已过期 → 这次结算没有依据，整笔拒绝（不写预算行）。
+      if (!accountRow || !charRow || !record || record.state !== 'held') return null;
+      if (input.nowMs != null && record.expiresAt <= input.nowMs) return null;
+      const nextAccount: BudgetRow = {
+        ...accountRow,
+        reservedCalls: Math.max(0, accountRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, accountRow.reservedTokens - grant.tokens),
+        usedCalls: accountRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: accountRow.usedTokens + settledTokens,
+        revision: accountRow.revision + 1,
+        updatedAt: Date.now(),
+      };
+      const nextChar: BudgetRow = {
+        ...charRow,
+        reservedCalls: Math.max(0, charRow.reservedCalls - grant.calls),
+        reservedTokens: Math.max(0, charRow.reservedTokens - grant.tokens),
+        usedCalls: charRow.usedCalls + (released ? 0 : grant.calls),
+        usedTokens: charRow.usedTokens + settledTokens,
+        revision: charRow.revision + 1,
+        updatedAt: Date.now(),
+      };
+      const nextRecord: ReservationRecord = {
+        ...record,
+        state: released ? 'released' : 'settled',
+        settledAt: Date.now(),
+        revision: record.revision + 1,
+      };
+      return {
+        updates: [nextAccount, nextChar],
+        reservations: [{ reservation: nextRecord, expectedRevision: record.revision }],
+        result: { usedTokens: settledTokens },
+      };
+    }, [grant.reservationId]);
+    if (!outcome) {
+      const record = await port.readReservation(grant.reservationId).catch(() => null);
+      // 记录已存在且不是 held（重复结算 / 已释放），或按当前时钟已过期 → 明确拒绝。
+      if (record && (record.state !== 'held' || (input.nowMs != null && record.expiresAt <= input.nowMs))) {
+        return { ok: false, code: 'STATE_CONFLICT' };
+      }
+      return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+    }
+    return { ok: true, usedTokens: outcome.usedTokens, keptReservation: !released && input.actualTokens == null };
+  } catch {
+    return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+  }
+}
+
+/** 只读：当前窗口用量快照（UI 的 budget 投影）。 */
+export function projectBudgetUsage(
+  rowAccount: BudgetRow | null,
+  rowChar: BudgetRow | null,
+  limits: AutonomyLimits,
+): BudgetUsage[] {
+  const account = rowAccount ?? emptyBudgetRow('', 'account', 0);
+  const character = rowChar ?? emptyBudgetRow('', 'char', 0);
+  return [
+    {
+      dimension: 'model_calls',
+      used: character.usedCalls,
+      reserved: character.reservedCalls,
+      limit: limitOf(limits, 'charModelCallsPerDay', 'char'),
+    },
+    {
+      dimension: 'model_calls_account',
+      used: account.usedCalls,
+      reserved: account.reservedCalls,
+      limit: limitOf(limits, 'accountModelCallsPerDay', 'account'),
+    },
+    {
+      dimension: 'tokens',
+      used: character.usedTokens,
+      reserved: character.reservedTokens,
+      limit: limitOf(limits, 'charTokensPerDay', 'char'),
+    },
+    {
+      dimension: 'notifications',
+      used: account.notifications,
+      reserved: 0,
+      limit: limitOf(limits, 'notificationsPerDay', 'account'),
+    },
+    {
+      dimension: 'virtual_spend',
+      used: character.spendMinor,
+      reserved: 0,
+      limit: limitOf(limits, 'virtualSpendPerDayMinor', 'char'),
+    },
+  ];
+}
+
+/**
+ * 多角色公平轮转：先比当日已用调用数，再比上次获准时间。
+ * 免得「第一个角色把账号总额度吃干」。
+ */
+export function rotationOrder<T extends { charId: string; usedCalls: number; lastGrantedAt: number }>(
+  states: T[],
+): T[] {
+  return [...states].sort((a, b) => {
+    if (a.usedCalls !== b.usedCalls) return a.usedCalls - b.usedCalls;
+    if (a.lastGrantedAt !== b.lastGrantedAt) return a.lastGrantedAt - b.lastGrantedAt;
+    return a.charId < b.charId ? -1 : a.charId > b.charId ? 1 : 0;
+  });
+}
+
+/** 供引擎/worker 复用的窗口 id 助手（明确要求传「窗口开启时记录的时区」）。 */
+export function windowIdAt(clock: Clock, timezone: string): string {
+  return budgetWindowId(clock.now(), timezone);
+}

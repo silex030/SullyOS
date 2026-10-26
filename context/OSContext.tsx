@@ -1,4 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
+import { startAutonomyLifeExecutor } from '../utils/autonomyLife/startExecutor';
+import { retireLegacyAutonomyConfig } from '../utils/autonomyLife/startup';
+import { createDefaultAutonomyLifeApi } from '../utils/autonomyLife/endpoint';
 import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile, MemoryPalaceFeatureFlags } from '../types';
 import { DB } from '../utils/db';
 import { safeParseJson } from '../utils/safeJson';
@@ -42,7 +45,6 @@ import { buildFetchFailureDetail, classifyFetchFailure, describeReachabilityProb
 import { INSTALLED_APPS } from '../constants';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
 import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
-import { isPhoneAutoRefreshDue, maybeAutoRefreshPhone, type PhoneAutoApiConfig } from '../utils/phoneAutoRefresh';
 import { PERSPECTIVE_DEFAULTS } from '../types';
 import { setPerspectiveTelemetryRuntime, installPerspectiveLifecycle, emitPerspectiveEvent } from '../utils/perspectiveTelemetry';
 import { markBackupDone } from '../utils/backupReminder';
@@ -943,6 +945,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               retireExternalAgentStorage();
           } catch (e) {
               console.warn('[RetiredExternalAgent] legacy terminal key cleanup failed', e);
+          }
+          // 已退役的 Spark 社交 App（2026-10-24 整块删除）本机残留清理：只删它独占的
+          // 三个精确键；朋友圈共用的 spark_char_handles 与 IndexedDB 里的帖子/资料一律不动。
+          try {
+              const { retireSparkStorage } = await import('../utils/retiredSpark');
+              retireSparkStorage();
+          } catch (e) {
+              console.warn('[RetiredSpark] legacy Spark key cleanup failed', e);
           }
           try {
               const { seedBuiltinPromptPresets, migrateLegacyVoiceOverrides } = await import('../utils/promptPresetSeeding');
@@ -3224,49 +3234,34 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
     });
   };
 
-  // ── 查手机定时自动刷新（全局调度器，每分钟 tick）──
-  // 开启 phoneState.autoRefresh 的角色，到间隔就自动重生成一批聊天记录，
-  // 用户不必每次点进 App 手动刷新。单写入者防抖（inFlight + staleness）都在
-  // maybeAutoRefreshPhone 内部；这里只负责「每分钟摇一次铃 + 到点触发」。
-  // 失败静默——下一轮 staleness 检查自然会再触发，不弹 toast 打扰用户。
-  const phoneAutoRef = useRef(false);
+  // ── 自主生活执行器（唯一的前台执行入口）──
+  // 旧的「每分钟 maybeAutoRefreshPhone」已退役：手机记录改由自主生活的 phone.record
+  // 动作产生，并且必须走「服务端签发一次性许可 → 本地事务 → 回执」同一条链。
+  // 这里只负责启动/停止，节奏由 startAutonomyLifeExecutor 内部决定（前台 60s 看一眼，
+  // 后台不 claim）。
   useEffect(() => {
-      if (!isDataLoaded) return;
-      const tick = async () => {
-          if (phoneAutoRef.current) return; // 上一轮还没跑完，跳过本 tick
-          const due = characters.filter(c => isPhoneAutoRefreshDue(c));
-          if (due.length === 0) return;
-          phoneAutoRef.current = true;
-          try {
-              const cfg: PhoneAutoApiConfig = (() => {
-                  const independent = getCheckPhoneApi();
-                  const base = independent?.baseUrl ? independent : apiConfigRef.current;
-                  return { baseUrl: base.baseUrl, apiKey: base.apiKey, model: base.model };
-              })();
-              for (const char of due) {
-                  try {
-                      await maybeAutoRefreshPhone(char.id, {
-                          char,
-                          user: userProfileRef.current,
-                          roster: charactersRef.current.filter(c => c.id !== char.id),
-                          api: cfg,
-                      }, updateCharacter);
-                  } catch (e) {
-                      console.warn(`[PhoneAuto] ${char.name} 自动刷新失败（下轮重试）:`, e);
-                  }
-              }
-          } finally {
-              phoneAutoRef.current = false;
-          }
-      };
-      const timer = setInterval(tick, 60_000);
-      void tick();
-      return () => clearInterval(timer);
-      // 刻意只依赖 isDataLoaded / characters：userProfile / apiConfig 经 ref 读最新值，
-      // 避免每轮重建 interval。updateCharacter 是组件内函数，经闭包捕获即可（其内部
-      // 用 setCharacters 函数式更新，无 stale closure 问题）。
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDataLoaded, characters]);
+    if (!isDataLoaded) return;
+    // 旧配置的一次性退役：删旧定时器键、清角色上的 autoRefresh 字段、把旧上限/暂停/
+    // 禁区搬成账号边界（allowedKinds 只做交集）。失败不阻塞启动，下次再试。
+    void retireLegacyAutonomyConfig({
+      api: createDefaultAutonomyLifeApi(),
+      characters: charactersRef.current,
+      saveCharacter: async (character) => { await DB.saveCharacter(character as never); },
+      timezone: (() => {
+        try {
+          return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        } catch {
+          return 'UTC';
+        }
+      })(),
+    }).catch((error) => console.warn('[autonomy-life] 旧配置退役失败（不阻塞启动）', error));
+    const stop = startAutonomyLifeExecutor({
+      getCharIds: () => charactersRef.current.map((item) => item.id),
+      isLocallyPaused: () => false,
+      onError: (error) => console.warn('[autonomy-life] 执行器这一轮失败（下轮重试）', error),
+    });
+    return stop;
+  }, [isDataLoaded]);
 
   const deleteCharacter = async (id: string, options?: { force?: boolean }): Promise<DeleteCharacterResult> => {
     const target = characters.find(c => c.id === id);
@@ -4097,6 +4092,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   : undefined,
               
               socialAppData: (mode === 'text_only' || mode === 'media_only' || mode === 'full') ? {
+                  // 历史遗留块（Spark 社交 App 已于 2026-10-24 移除，代码侧不再有入口）。
+                  // 保留原样只为一件事：**老用户的马甲表/资料/背景图不能因为这次减法从备份里消失**。
+                  //   charHandles → `spark_char_handles` 仍被朋友圈 MomentsApp 与聊天提示词读取，必须继续备份；
+                  //   userProfile / userId / userBg → Spark 独占，但现在还留着数据的用户靠它把资产带过机器，
+                  //   等下次清理普查确认全量用户都换过一版备份后再删这一段。
                   // 容错解析：这两个键是 localStorage 里的裸字符串，写坏一个就会让整次导出失败
                   // （用户看到「导出失败」却不知道该删哪个键）。导出路径上宁可丢这一小块。
                   // 泛型不显式写：让 TS 从 fallback 推断，好跟 FullBackupData.socialAppData 的类型对齐。

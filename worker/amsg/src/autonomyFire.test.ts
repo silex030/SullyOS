@@ -38,6 +38,7 @@ import {
   washMarkdownLinks,
 } from './autonomyFire';
 import { buildWantToSharePush } from './instantChat';
+import { normalizeBoundary } from '../../../utils/autonomyLife/boundary';
 import type { AutonomyDb, AutonomyStatement } from './autonomyStore';
 import type { RuminationPage } from './autonomyRumination';
 
@@ -126,6 +127,121 @@ const experienceRow = (overrides: Partial<FakeExperienceRow> = {}): FakeExperien
  * 记录型假 D1：只认 handler / store 真用到的那几条 SQL（前缀 + 关键词匹配）。
  * `stateRows` 直接喂 autonomy_state 的行，缺行时 store 自己回落零值。
  */
+/**
+ * 统一边界 / 统一预算（自主生活 v1）的最小内存投影。
+ *
+ * 旧回合现在必须先过统一闸，所以假库也得能回答那几条真 SQL（边界行、预算行、预留凭据）。
+ * 默认 = 开着、允许 interaction.message、额度充足；`paused` 用来模拟「用户按了暂停」。
+ * 两个假库（聊天回合 / 计划到点）共用这一份，避免两边口径漂移。
+ */
+const createGovernanceStore = (opts: { paused?: boolean; allowedKinds?: string[] } = {}) => {
+  const boundaries = new Map<string, Record<string, unknown>>();
+  const accountBoundary = normalizeBoundary(
+    {
+      enabled: true,
+      globalPaused: opts.paused === true,
+      timezone: 'Asia/Shanghai',
+      allowedKinds: opts.allowedKinds ?? ['interaction.message'],
+      limits: { accountModelCallsPerDay: 6, charModelCallsPerDay: 4, accountTokensPerDay: 20_000, charTokensPerDay: 10_000 },
+    },
+    { scope: 'account', nowMs: NOW, revision: 1 },
+  );
+  boundaries.set('account::', { payload: JSON.stringify(accountBoundary) });
+  boundaries.set(`character::${CHAR_ID}`, {
+    payload: JSON.stringify(normalizeBoundary({}, { scope: 'character', nowMs: NOW, revision: 0 })),
+  });
+  const budget = new Map<string, Record<string, unknown>>();
+  const reservations = new Map<string, Record<string, unknown>>();
+
+  return {
+    /** 返回 null = 这条 SQL 不归我管。 */
+    first(text: string, args: unknown[]): { row: Record<string, unknown> | null } | null {
+      if (text.includes('SELECT payload FROM autonomy_life_boundaries')) {
+        // 账号层 SQL 把 scope/char_id 写成字面量（只绑 owner），角色层绑 (owner, charId)。
+        const key = text.includes("scope = 'account'") ? 'account::' : `character::${args[1]}`;
+        return { row: boundaries.get(key) ?? null };
+      }
+      if (text.includes('SELECT * FROM autonomy_life_budget_reservations')) {
+        return { row: reservations.get(args[1] as string) ?? null };
+      }
+      if (text.includes('SELECT * FROM autonomy_life_budget ')) {
+        const [, windowId, scope] = args;
+        return { row: budget.get(`${windowId}::${scope}`) ?? null };
+      }
+      return null;
+    },
+    run(text: string, args: unknown[]): { changes: number } | null {
+      if (text.startsWith('INSERT OR IGNORE INTO autonomy_life_budget_reservations')) {
+        const [owner, resId, windowId, charId, counter, kind, planRef, calls, tokens, state, actionId, createdAt, expiresAt, settledAt, revision] = args;
+        if (reservations.has(resId as string)) return { changes: 0 };
+        reservations.set(resId as string, {
+          owner_id: owner,
+          reservation_id: resId,
+          window_id: windowId,
+          char_id: charId,
+          counter,
+          kind,
+          plan_ref: planRef,
+          calls,
+          tokens,
+          state,
+          action_id: actionId,
+          created_at: createdAt,
+          expires_at: expiresAt,
+          settled_at: settledAt,
+          revision,
+        });
+        return { changes: 1 };
+      }
+      if (text.includes('UPDATE autonomy_life_budget_reservations')) {
+        const [state, settledAt, revision, , resId, expected] = args;
+        const record = reservations.get(resId as string);
+        if (!record || Number(record.revision) !== Number(expected)) return { changes: 0 };
+        Object.assign(record, { state, settled_at: settledAt, revision });
+        return { changes: 1 };
+      }
+      if (text.startsWith('INSERT OR IGNORE INTO autonomy_life_budget')) {
+        const [owner, windowId, scope, usedCalls, reservedCalls, usedTokens, reservedTokens, notifications, kindCounts, spendMinor, revision, updatedAt] = args;
+        const key = `${windowId}::${scope}`;
+        if (budget.has(key)) return { changes: 0 };
+        budget.set(key, {
+          owner_id: owner,
+          window_id: windowId,
+          scope,
+          used_calls: usedCalls,
+          reserved_calls: reservedCalls,
+          used_tokens: usedTokens,
+          reserved_tokens: reservedTokens,
+          notifications,
+          kind_counts: kindCounts,
+          spend_minor: spendMinor,
+          revision,
+          updated_at: updatedAt,
+        });
+        return { changes: 1 };
+      }
+      if (text.includes('UPDATE autonomy_life_budget SET')) {
+        const [usedCalls, reservedCalls, usedTokens, reservedTokens, notifications, kindCounts, spendMinor, revision, updatedAt, , windowId, scope, expected] = args;
+        const row = budget.get(`${windowId}::${scope}`);
+        if (!row || Number(row.revision) !== Number(expected)) return { changes: 0 };
+        Object.assign(row, {
+          used_calls: usedCalls,
+          reserved_calls: reservedCalls,
+          used_tokens: usedTokens,
+          reserved_tokens: reservedTokens,
+          notifications,
+          kind_counts: kindCounts,
+          spend_minor: spendMinor,
+          revision,
+          updated_at: updatedAt,
+        });
+        return { changes: 1 };
+      }
+      return null;
+    },
+  };
+};
+
 const createFakeDb = (seed: {
   experiences?: FakeExperienceRow[];
   state?: Record<string, Record<string, unknown>>;
@@ -134,10 +250,17 @@ const createFakeDb = (seed: {
    * `userId: null` = 行在但 user_id 空 → 必须 fail-closed。
    */
   owner?: { userId?: string | null; rowMissing?: boolean };
+  /**
+   * 统一边界 / 统一预算（自主生活 v1）。旧回合现在必须先过这道闸，所以假库也要能回答
+   * 那几条真 SQL（边界行、预算行、预留凭据）。默认 = 开着、允许 interaction.message、
+   * 额度充足；`deny` 用来模拟「用户按了暂停」。
+   */
+  governance?: { paused?: boolean; allowedKinds?: string[] };
 } = {}) => {
   const experiences = [...(seed.experiences ?? [])];
   const stateRows = new Map<string, Record<string, unknown>>(Object.entries(seed.state ?? {}));
   const sql: string[] = [];
+  const governance = createGovernanceStore(seed.governance);
 
   const db: AutonomyDb = {
     prepare(text: string) {
@@ -149,6 +272,8 @@ const createFakeDb = (seed: {
         },
         async run() {
           sql.push(text);
+          const governed = governance.run(text, args);
+          if (governed) return { meta: { changes: governed.changes } };
           if (text.startsWith('INSERT INTO autonomy_experiences')) {
             const [id, charId, createdAt, q, note, kind, importance, pushed] = args;
             experiences.push({
@@ -183,6 +308,8 @@ const createFakeDb = (seed: {
         },
         async first() {
           sql.push(text);
+          const governedRow = governance.first(text, args);
+          if (governedRow) return governedRow.row;
           if (text.includes('SELECT user_id FROM client_state')) {
             if (seed.owner?.rowMissing) return null;
             return { user_id: seed.owner?.userId === undefined ? 'u1' : seed.owner.userId };
@@ -260,6 +387,9 @@ const makeSessionCtx = (
       taskId: 11,
       taskUuid: 'task-uuid-autonomy',
       occurrenceMs: NOW,
+      // 执行期的**当前**服务端时钟（生产走 Date.now()；测试注入可控时钟）。
+      // 注意不能用 occurrenceMs 代替：那是排队/计划时刻，许可到期必须按执行时刻判。
+      now: new Date(NOW),
       ...(usage ? { usage } : {}),
     } as never,
     emitResult,
@@ -968,6 +1098,7 @@ describe('P5 到点执行（独立后台请求）', () => {
   const createWorkflowDb = (plan: Record<string, unknown>) => {
     const statements: Array<{ sql: string; args: unknown[] }> = [];
     const experiences: Array<Record<string, unknown>> = [];
+    const governance = createGovernanceStore();
     const db: AutonomyDb = {
       prepare(text: string) {
         let args: unknown[] = [];
@@ -975,6 +1106,8 @@ describe('P5 到点执行（独立后台请求）', () => {
           bind(...next: unknown[]) { args = next; return stmt; },
           async run() {
             statements.push({ sql: text, args });
+            const governed = governance.run(text, args);
+            if (governed) return { meta: { changes: governed.changes } };
             if (text.startsWith('INSERT INTO autonomy_experiences')) {
               experiences.push({
                 id: args[0], basis: args[8], source: args[9], plan_id: args[10],
@@ -984,6 +1117,8 @@ describe('P5 到点执行（独立后台请求）', () => {
           },
           async first() {
             statements.push({ sql: text, args });
+            const governed = governance.first(text, args);
+            if (governed) return governed.row;
             // owner 反查：计划到点前必须先认得出 userId（真库是角色命名空间那一行）。
             if (text.includes('SELECT user_id FROM client_state')) return { user_id: 'u1' };
             if (text.includes('FROM autonomy_plans WHERE id')) return plan;

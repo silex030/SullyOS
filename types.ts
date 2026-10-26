@@ -20,7 +20,6 @@ export enum AppID {
   Schedule = 'schedule',
   Room = 'room',
   CheckPhone = 'check_phone',
-  Social = 'social',
   Moments = 'moments',
   Study = 'study',
   FAQ = 'faq',
@@ -3178,9 +3177,6 @@ export interface CharacterProfile {
       simLogs?: PhoneSimLog[]; // 「生活记录」：人格模拟演出留存
       chatReadAt?: number;     // 上次打开 Messages 的时间戳，用于计算未读
       sendToChat?: boolean;    // 查手机生成的内容是否同步到私聊（默认 true）
-      autoRefresh?: boolean;            // 定时自动刷新：到间隔自动重生成聊天记录，无需手动点（默认关）
-      autoRefreshIntervalMin?: number;  // 自动刷新间隔（分钟，默认 30）
-      lastAutoRefreshAt?: number;       // 上次自动刷新时间戳（打开 App 时据此判断是否立即补刷）
       contacts?: PhoneContact[]; // 人际关系系统：机主的通讯录
       allowFictionalContacts?: boolean; // 是否允许生成虚构 NPC 联系人；false=只与神经链接里的真实角色来往（默认 true）
       aiAgent?: {                 // 智能体 App：偷看到的「AI 也在玩 AI」记录
@@ -3377,7 +3373,7 @@ export interface CharacterProfile {
   imageGenProfile?: string;
   /**
    * AI 生图固定注入的画风 / 画师 tag（per-character，**通用**注入）。
-   * 该角色所有生图都带上：聊天自动配图、主动消息、Spark 首图、聊天相册手动生成；
+   * 该角色所有生图都带上：聊天自动配图、主动消息、朋友圈封面、聊天相册手动生成；
    * 纯景色生成也注入。逗号分隔，英文 danbooru 风格（如 "by wlop, watercolor"）。
    * 在哪里改：神经链接（角色 App）→ 角色 → 设定 → AI 生图 · 外貌提示词。
    */
@@ -4025,7 +4021,7 @@ export interface SocialPost {
     bgStyle?: string;
     authorType?: 'user' | 'character' | 'stranger';
     authorCharId?: string;
-    /** 帖子来源：'gen'（默认，AI 生成/用户发布）| 'douban'（豆瓣小组真实帖子）| 'mastodon'（读回来的 toot / 同步出去且有远端 id 的帖子）| 'moments'（朋友圈手发本地帖，不进 Spark 广场） */
+    /** 帖子来源：'gen'（默认，AI 生成/用户发布）| 'douban'（豆瓣小组真实帖子，2026-10-24 起不再新增，仅历史数据）| 'mastodon'（读回来的 toot / 同步出去且有远端 id 的帖子）| 'moments'（朋友圈手发本地帖） */
     origin?: 'gen' | 'douban' | 'mastodon' | 'moments';
     /** Mastodon 远端 status id（双向去重键，读回/发出都要写） */
     mastodonStatusId?: string;

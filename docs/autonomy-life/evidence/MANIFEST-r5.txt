@@ -1,0 +1,26 @@
+# t_984b3cfc 第五轮（架构审查 request_changes 第 5 轮）证据清单 —— 最新版
+# 上一版: 本清单此前两个同名附件（id61/id62/id63）已被本版取代，以最新附件为准。
+# 代码提交: 0b323c114341660991ccd8f34ba97ff303479299（本清单所在提交只改 docs/evidence，代码即该 commit 内容）
+# 生成时间(UTC): Sat Oct 24 11:03:17 PM UTC 2026
+# 说明: evidence/ 下全部原始日志与代码同源，均为原始 stdout/stderr（未裁剪）。sha256 供逐字节复核。
+# 读取: gunzip -c <file>.gz | less
+
+a8673a720869c4d6e468ef10987ff885bc488e26e62a1eb151346a347b6788e5      3958  docs/autonomy-life/evidence/README.md
+8b7d73838ed6341467e7c9c9f54147a5dfdd39d0ee15c73da3365e41ffc0e9b9      3413  docs/autonomy-life/evidence/build.log.gz
+0cf618af9f110d56dd0e7e24b5a317081eec19ae6db872c52416a89258d5c6a2       570  docs/autonomy-life/evidence/e2e-http-requests.json.gz
+195249cc83919bc05f1af1b15eef22ebb3eeb0a1d9ce24767e33aa4d61d1ef70      2234  docs/autonomy-life/evidence/e2e-report.json.gz
+315548551243c6452e75a10d097af6868c664721906a106ae613879a8327c0c6      2475  docs/autonomy-life/evidence/e2e-run.log.gz
+a64dc06e77ef286bcedb24a763efb10f9abeb622622b5644c07becce4ee8d1e8     15305  docs/autonomy-life/evidence/focused.log.gz
+589f38a9f8be617dea106723b33ce6437acdd0f6a670d7c5016cee903fb94903      6907  docs/autonomy-life/evidence/legacy-grep.log.gz
+6b0f371897d0687d4b615a25239b7f1892bc7b8e41eb2337e8f911ee5cfd71d1      2392  docs/autonomy-life/evidence/tsc-baseline.log.gz
+dcba29c0b469d83faa49ec39313cbe5f27b1938a41f1840303c5576c40c8b658       227  docs/autonomy-life/evidence/tsc-compare.txt
+e97a22abeae9f938b0b4221605d4dbc34c23d25bc2dad632b67cc69b9700c2c3      2368  docs/autonomy-life/evidence/tsc-current.log.gz
+e1779119755247de4bc62ba6e76eb1e14348936202e67c70e6e838015b9f991c     93588  docs/autonomy-life/evidence/vitest-full.log.gz
+
+# 运行命令（原始 stdout/stderr，未裁剪）:
+#   npx vitest run                                  -> 624 files / 7624 tests, EXIT 0
+#   npx vitest run <focused list>                   -> 42 files / 909 tests, EXIT 0
+#   npx tsc --noEmit -p tsconfig.json               -> 56 errors (baseline 56, diff empty), EXIT 2
+#   pnpm run build                                  -> EXIT 0 (vite built in 1m 50s)
+#   node scripts/autonomy-e2e/run.mjs               -> 40/40 checks, EXIT 0
+#   bash scripts/autonomy-legacy-grep-audit.sh      -> EXIT 0

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Check, ClockCounterClockwise, SlidersHorizontal } from '@phosphor-icons/react';
 import type { CharacterProfile } from '../../types';
-import { buildAirpSettings } from './AutonomyPanel';
+import { buildAirpSettings } from '../../utils/airp/airpWrite';
 import {
   capabilityPolicyPatch,
   mergeAirpSettings,
@@ -24,7 +24,7 @@ import { listAirpEventsByChar } from '../../utils/airp/eventStore';
  *
  * 落库走 apps/Character.tsx 的既有自动保存链路（formData 一变 → updateCharacter →
  * DB.saveCharacter + markAmsgStateDirty 重传 fire_pack），这里不新增任何同步代码。
- * 写回复用 AutonomyPanel 的 buildAirpSettings()：默认值打底 → 现有字段 → patch，
+ * 写回复用 utils/airp/airpWrite 的 buildAirpSettings()：默认值打底 → 现有字段 → patch，
  * 面板不管的字段（enabled / directorModel / mcpAllow / writable / autonomy）原样保留。
  *
  * 权限契约（B4）：能力授权有显式三态 all / allowlist / none，判定统一走

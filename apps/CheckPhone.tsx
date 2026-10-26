@@ -27,7 +27,6 @@ import { getCheckPhoneApi, resolveCheckPhoneApi, setCheckPhoneApi } from '../uti
 import { buildPurchaseGenPrompt, parsePurchaseGenJson, extractInterestKeywords } from '../utils/phonePurchaseGen';
 import { appendCharPurchaseTxn } from '../utils/charLedger';
 import { resolveCategory } from '../utils/bankCategories';
-import { isPhoneAutoRefreshDue, maybeAutoRefreshPhone } from '../utils/phoneAutoRefresh';
 import { generateRelationshipContacts, type ContactGenApiConfig } from '../utils/relationshipContactGen';
 import {
     User, Phone, ChatCircleDots, ChatCircle, ShoppingBag, Hamburger, Compass, GearSix, Wallet,
@@ -443,34 +442,6 @@ const CheckPhone: React.FC = () => {
         return () => window.removeEventListener('check-phone-api-changed', sync);
     }, []);
 
-    // 定时自动刷新 · 打开 App 时的补刷：如果开启 autoRefresh 且已过间隔（比如后台
-    // 定时器被浏览器杀掉 / 设备休眠跳过了几轮），进来时立刻补一次，保证用户看到的
-    // 就是「最新生活」。maybeAutoRefreshPhone 内部有单写入者防抖，与全局调度器
-    // 并发到达时只有一个真正执行；失败静默，不打扰用户。
-    useEffect(() => {
-        if (!targetChar || !userProfile || activeAppId) return; // 只在手机桌面页触发
-        if (!isPhoneAutoRefreshDue(targetChar)) return;
-        if (!effectiveApiConfig.apiKey) return;
-        void (async () => {
-            try {
-                const added = await maybeAutoRefreshPhone(targetChar.id, {
-                    char: targetChar,
-                    user: userProfile,
-                    roster: characters.filter(c => c.id !== targetChar.id),
-                    api: { baseUrl: effectiveApiConfig.baseUrl, apiKey: effectiveApiConfig.apiKey, model: effectiveApiConfig.model },
-                }, updateCharacter);
-                if (added !== null && added > 0) {
-                    console.log(`[PhoneAuto] 打开补刷完成，新增 ${added} 条记录`);
-                }
-            } catch (e) {
-                console.warn('[PhoneAuto] 打开补刷失败（静默）:', e);
-            }
-        })();
-        // 刻意不依赖 targetChar 等深对象：只在挂载 / 切换角色时评估一次，
-        // 防止生成落库引发的 characters 变化反复触发本 effect。
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [targetChar?.id]);
-
     // Reset page scroll on navigation to prevent mobile layout shift
     useEffect(() => {
         window.scrollTo(0, 0);
@@ -628,23 +599,6 @@ const CheckPhone: React.FC = () => {
             phoneState: { ...targetChar.phoneState, records: targetChar.phoneState?.records || [], sendToChat: next },
         });
         addToast(next ? '已开启 · 查手机内容会同步到私聊' : '已关闭 · 查手机内容仅本地可见', 'info');
-    };
-
-    // 定时自动刷新设置：开启后由全局调度器按间隔自动重生成聊天记录（无需手动点）。
-    // 只写 phoneState 的配置字段；lastAutoRefreshAt 由刷新引擎自己维护。
-    const setAutoRefresh = (enabled: boolean, intervalMin?: number) => {
-        if (!targetChar) return;
-        updateCharacter(targetChar.id, {
-            phoneState: {
-                ...targetChar.phoneState,
-                records: targetChar.phoneState?.records || [],
-                autoRefresh: enabled,
-                ...(intervalMin !== undefined ? { autoRefreshIntervalMin: intervalMin } : {}),
-            },
-        });
-        if (intervalMin === undefined) {
-            addToast(enabled ? '已开启 · 将按设定间隔自动更新手机' : '已关闭自动更新', 'info');
-        }
     };
 
     // 打开 Messages：把已读时间戳推到现在 → 清掉未读红点
@@ -2879,38 +2833,14 @@ ${olderText}
                         : <button onClick={() => setShowContactModal(true)} className="text-white/80 active:scale-90 transition"><UserPlus size={20} weight="bold" /></button>} />
                 {/* 约束开关：是否允许虚构 NPC */}
                 <div className="px-4 pt-1 pb-2 shrink-0">
-                    {/* 定时自动更新（原 API 设置弹窗迁移至此：选人界面下 targetChar 为空导致开关静默失效） */}
+                    {/* 自动更新已退役：旧「15/30/60/120 分钟」人工频率不是边界，
+                        手机里的新记录由自主生活的 phone.record 动作在同一套预算/暂停/禁区下产生。 */}
                     <div className="w-full rounded-xl px-3 py-2.5 bg-white/[0.04] border border-white/[0.07] mb-1.5">
-                        <div className="flex items-center gap-2">
-                            <button onClick={() => setAutoRefresh(!(targetChar?.phoneState?.autoRefresh))} className="flex-1 min-w-0 text-left active:scale-[0.99] transition">
-                                <span className="text-[11px] font-semibold text-white/80">自动更新 TA 的手机</span>
-                                <span className="block text-[10px] text-white/40 mt-0.5">按间隔自动生成新的聊天记录，无需手动刷新。后台写入手机，不往私聊塞卡片。</span>
-                            </button>
-                            <button onClick={() => setAutoRefresh(!(targetChar?.phoneState?.autoRefresh))} aria-label="切换自动更新" className="relative w-9 h-5 rounded-full transition shrink-0" style={{ background: targetChar?.phoneState?.autoRefresh ? '#a78bfa' : 'rgba(255,255,255,0.15)' }}>
-                                <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all" style={{ left: targetChar?.phoneState?.autoRefresh ? '18px' : '2px' }} />
-                            </button>
-                        </div>
-                        {targetChar?.phoneState?.autoRefresh && (
-                            <div className="mt-2 pt-2 border-t border-white/[0.06]">
-                                <div className="text-[10px] text-white/40 mb-1.5">更新间隔</div>
-                                <div className="flex gap-1.5">
-                                    {[15, 30, 60, 120].map(mins => {
-                                        const active = (targetChar?.phoneState?.autoRefreshIntervalMin || 30) === mins;
-                                        return (
-                                            <button key={mins} onClick={() => setAutoRefresh(true, mins)}
-                                                className={`flex-1 py-1.5 rounded-xl text-[10.5px] font-bold transition ${active ? 'bg-violet-500 text-white shadow-sm' : 'bg-white/[0.07] text-white/50 active:scale-95'}`}>
-                                                {mins < 60 ? `${mins} 分钟` : `${mins / 60} 小时`}
-                                            </button>
-                                        );
-                                    })}
-                                </div>
-                                {targetChar?.phoneState?.lastAutoRefreshAt ? (
-                                    <div className="text-[10px] text-white/35 mt-1.5">
-                                        上次自动更新：{new Date(targetChar.phoneState.lastAutoRefreshAt).toLocaleString()}
-                                    </div>
-                                ) : null}
-                            </div>
-                        )}
+                        <span className="text-[11px] font-semibold text-white/70">TA 的手机由自主生活更新</span>
+                        <span className="block text-[10px] text-white/40 mt-0.5 leading-relaxed">
+                            什么时候记下一段聊天、打一个电话，由角色自己的作息与情境决定；不再有「每 N 分钟自动生成」的开关。
+                            想收紧或停掉，去「角色 → 自主生活 → 边界」：允许哪些活动、每日上限、总暂停都在那里。
+                        </span>
                     </div>
                     <div className="w-full flex items-center gap-2 rounded-xl px-3 py-2 bg-white/[0.04] border border-white/[0.07]">
                         <button onClick={toggleAllowFictional} className="flex-1 min-w-0 text-left active:scale-[0.99] transition">

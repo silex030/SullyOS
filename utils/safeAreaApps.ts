@@ -9,7 +9,6 @@ export const SELF_SAFE_AREA_APPS: ReadonlySet<AppID> = new Set<AppID>([
     AppID.VRWorld,
     AppID.Chat,
     AppID.GroupChat,
-    AppID.Social,
     // 批量迁移（顶栏自理 safe-top，外层/内层拆见各 App）：
     AppID.Settings,
     AppID.Character,

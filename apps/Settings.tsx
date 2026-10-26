@@ -29,7 +29,7 @@ import { Sun, Newspaper, NotePencil, Notebook, Book, Calendar, ForkKnife, Coffee
 import { loadMcpServers, saveMcpServers, createMcpServer, effectiveMcpRouting, migrateMcpRoutingDefault, testMcpConnection, resetMcpSession, getMcpUseNativeTools, setMcpUseNativeTools, loadMcpSettings, saveMcpSettings, type McpServerConfig, type McpSettings } from '../utils/mcpClient';
 import { getMcpResultList, clearMcpResults } from '../utils/mcpResultMemory';
 import PushSubscriptionPanel from '../components/settings/PushSubscriptionPanel';
-import AutonomyGuardrailsSettings from '../components/settings/AutonomyGuardrailsSettings';
+import AutonomyAccountSection from '../components/autonomy-life/AutonomyAccountSection';
 import TravelMapServiceCard from '../components/settings/TravelMapServiceCard';
 import MemoryNegotiationSettings from '../components/settings/MemoryNegotiationSettings';
 import BluetoothPanel from '../components/settings/BluetoothPanel';
@@ -70,7 +70,7 @@ const MAP_READINESS_LABEL: Record<MapReadinessPhase, string> = {
     ready: '已就绪',
 };
 import { readAgentRoutingConfig } from '../utils/agentRouting';
-import type { APIConfig, BridgeConfig, TtsProvider } from '../types';
+import { AppID, type APIConfig, type BridgeConfig, type TtsProvider } from '../types';
 import { getEffectiveBridges, normalizeBridges, makeBridgeId } from '../utils/bridgeRegistry';
 import { describeImageWithVisionApi, VISION_API_TEST_IMAGE_DATA_URL, visionApiConfigFromPreset } from '../utils/visionApi';
 import { runImageGenTest } from '../utils/imageGenFlow';
@@ -651,6 +651,7 @@ const Settings: React.FC = () => {
       realtimeConfig, updateRealtimeConfig, // 实时感知配置
       // 改工具凭据时要连云端提示词一起刷（见 syncAmsgToolConfigAndPrompts）
       characters, groups, userProfile,
+      openApp,
       cloudBackupConfig, updateCloudBackupConfig,
       cloudBackupToWebDAV, cloudRestoreFromWebDAV, listCloudBackups,
   } = useOS();
@@ -3999,9 +4000,9 @@ const Settings: React.FC = () => {
             </p>
         </SettingsSection>
 
-        {/* ───────── 自主生活护栏（全局预算；权威副本在鉴权后台，本机只是草稿） ───────── */}
+        {/* ───────── 自主生活（账号总览：总暂停 / 总额度 / 外部授权；角色层在角色详情里改） ───────── */}
         <SettingsSection
-            title="自主生活护栏"
+            title="自主生活"
             icon={
                 <div className="p-2 bg-violet-100/60 rounded-xl text-violet-600">
                     <ShieldCheck size={16} weight="bold" />
@@ -4009,9 +4010,9 @@ const Settings: React.FC = () => {
             }
         >
             <p className="text-xs text-slate-500 mb-3 leading-relaxed">
-                角色自己安排生活时的总闸与预算：全局每天最多几次、每角色默认几次、同类动作最少隔多久、每天 token 预算。各角色面板里还能单独收紧；0 = 暂停。
+                角色自己怎么安排生活，由 TA 的人设、作息和当下情境决定，不是这里设的周期。这里只管账号层的边界：总暂停、调用与 token 上限、模拟消费上限、通知条数、禁止方向与外部只读授权；单个角色参与哪些活动，在「神经链接 → 角色 → 自主生活 → 边界」里单独收紧。上限只是天花板，TA 不需要用满。
             </p>
-            <AutonomyGuardrailsSettings />
+            <AutonomyAccountSection characters={characters} onOpenApp={(appId, context) => openApp(appId as AppID, context)} />
         </SettingsSection>
 
         {/* 角色自主出行的具体设置已按所有权拆走：

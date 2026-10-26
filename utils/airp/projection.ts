@@ -108,31 +108,6 @@ export function selectUnprojectedEvents<T extends { id: string }>(
   return events.filter((event) => !projected.has(event.id));
 }
 
-/** 朋友圈素材只当发帖灵感用，一次刷新喂不超过 3 条（帖子是短内容，多了反而稀释）。 */
-const MOMENTS_MATERIAL_LIMIT = 3;
-
-/**
- * 朋友圈（Spark）投影：挑出可当发帖素材的事件。只保留「公开且已对用户交代过」
- * （classifyEventVisibility === 'public' 且 disclosedToUser === true）的事件；
- * private / trace 一律排除，即使已交代也不放行。已投影过的 id 先剔除，
- * 再按 at 倒序（最新在前）取最多 limit 条（默认 3）。
- * 纯函数、不碰数据库，浏览器与 worker 都能用；不 clone 事件对象本身。
- */
-export function selectMomentsMaterial(
-  events: readonly AirpCommittedEvent[],
-  projectedIds: ReadonlySet<string> | readonly string[],
-  limit: number = MOMENTS_MATERIAL_LIMIT,
-): AirpCommittedEvent[] {
-  if (!Array.isArray(events)) return [];
-  const eligible = selectUnprojectedEvents(
-    events.filter(
-      (event) => classifyEventVisibility(event) === 'public' && event.disclosedToUser === true,
-    ),
-    projectedIds,
-  );
-  return takeLimit(sortByAtDesc(eligible), limit);
-}
-
 /** 查手机素材上限：一次刷新最多喂 5 条事件（记录是短线索，多了反而把明细摊薄）。 */
 export const CHECK_PHONE_MATERIAL_LIMIT = 5;
 
