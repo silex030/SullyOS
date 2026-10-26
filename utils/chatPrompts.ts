@@ -1820,7 +1820,17 @@ ${(await resolveVoiceActingGuide()) ?? ''}`;
                     // 复用 normalizeMessageContent 翻成完整文本，让角色"记得"一起玩过/写过什么。
                     content = `${timeStr} ${normalizeMessageContent(m, char?.name || '你', userProfile?.name || '用户')}`;
                 }
-                else content = `${timeStr} ${sourceTag} ${content}`;
+                else {
+                    // 链接分享（集成卡 t_babca897 / 验收卡 t_8487919b）：带 metadata.shares 的消息
+                    // 按契约投影成「shareRef + 有界简介」；带 metadata.shareExcerpts 的消息再附上
+                    // 此前 read_share_excerpts 的成对记录。之前这里直接塞 m.content，私聊主历史里
+                    // 模型看到的是原始长链接、也看不到自己上一轮读到的片段（部署环境实测发现）。
+                    const hasShareMeta = !!m.metadata?.shares || !!m.metadata?.shareExcerpts;
+                    const projected = hasShareMeta
+                        ? normalizeMessageContent(m, char?.name || '你', userProfile?.name || '用户')
+                        : content;
+                    content = `${timeStr} ${sourceTag} ${projected}`;
+                }
 
                 return { role: m.role, content };
             }),
