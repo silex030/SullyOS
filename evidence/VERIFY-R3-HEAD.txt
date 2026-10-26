@@ -1,0 +1,8 @@
+HEAD=f01fd6a2 2026-10-25T02:47:03+08:00
+VITEST_TOOL_EXIT=0
+VITEST_CHAT_EXIT=0
+VITEST_FOCUSED_EXIT=0
+TSC_EXIT=2 (56 pre-existing, error-set diff vs evidence/tsc-full.log empty)
+VITE_BUILD_EXIT=0 (2m50s)
+POSTDOCS_VITEST_EXIT=0 (56 passed, evidence/vitest-tool-r3-postdocs.log)
+DONE=2026-10-25T02:47:03+08:00

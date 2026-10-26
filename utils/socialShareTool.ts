@@ -18,9 +18,21 @@
  *  - **失败如实**：超限/失败都返回结构化结果，并明确要求「基于已有简介回答、说明片段不可用」，
  *    不让模型把没读到说成读过。
  *
- * 落历史：每次调用的 call（工具名/参数）与 result（状态/收费/文本）成对记进本轮记录，
- * 由 useChatAI 在回复落库后挂到该条助手消息的 metadata.shareExcerpts 上；下一轮投影由
- * messageFormat 读出这对记录（成对渲染，不单独回放孤立片段）。
+ * 落历史：每次调用执行完**立刻**把 call（工具名/参数）与 result（状态/收费/文本）成对写进
+ * 「本轮触发消息」（`contextMsgs` 的最后一条，发送前已落库、id 确定）的 metadata.shareExcerpts；
+ * 这一步不依赖最终自然语言回复成功，模型失败/用户取消也不会丢。**本轮收到的每一次调用都保留**
+ * （含拒绝/超限，不按条数截断——拒绝记录不能挤掉已成功的片段，返工第 4 轮 P1-1）。
+ * 写库失败的批**留在待补偿队列**
+ * （`ShareExcerptPairOutbox`），由下一次 dispatch / 收尾 flush 有界重试；重试仍失败就明确标为
+ * 「未保存」并上报，不冒充已保存。下一轮投影由 messageFormat 读出这对记录
+ * （成对渲染，不单独回放孤立片段，≤600 token）。落库器见 ShareExcerptPairRecorder。
+ *
+ * 无锚不读：拿不到本轮确定的持久化锚点时，生产路径在**读取前**就返回 `HISTORY_UNAVAILABLE`
+ * （`dispatchShareExcerptToolCall`），避免「读过却没有记录」。
+ *
+ * 引用契约：模型可见标识 = **完整 shareRef**（投影里 `[分享 shr_...]`）；执行器精确匹配，
+ * 并容忍 ≥8 字符的唯一前缀。前缀命中多张卡时返回 SHARE_REF_AMBIGUOUS 并列出候选，
+ * 绝不按相似度猜一张（返工卡 t_38463abd P1）。
  */
 
 import { SHARE_BUDGETS, type ShareAttachment, type ShareState } from './socialContent/types';
@@ -32,7 +44,6 @@ import {
   fetchShareExcerpts,
   sanitizeExternalText,
   shareAttachmentsOf,
-  shortShareRef,
   type ExcerptsInput,
   type ExcerptsResult,
   type ShareCallResult,
@@ -57,6 +68,11 @@ export const SHARE_EXCERPT_LIMITS = {
   envelopeTokens: 220,
   minGrantTokens: 320,
   /**
+   * 模型把可见 shareRef 抄一半时能接受的最短前缀。低于它就当作「没这一张」，
+   * 免得 4~7 个字符的公共前缀把多张卡糊到一张上（返工卡 t_38463abd P1）。
+   */
+  minRefPrefixChars: 8,
+  /**
    * 服务端 excerpts 的契约是「至少返回一条切片，哪怕已经超出预算」，单条切片上限 400 字符
    * （worker/social-content/excerpts.ts 的 MAX_SEGMENT_CHARS）。请求时先把这段可能的溢出
    * 预留掉，客户端才不会为了砍掉一条溢出片段而丢掉 nextCursor（丢掉就等于只能读一屏）。
@@ -70,8 +86,23 @@ export const SHARE_EXCERPT_LIMITS = {
   partKeyChars: 64,
 } as const;
 
-/** 落历史时给每条助手消息保留的调用记录上限（同一轮最多 4 次调用，留点余量）。 */
-export const SHARE_EXCERPT_RECORD_KEEP = 8;
+/**
+ * 落历史**不做条数截断**（返工第 4 轮 P1-1）。
+ *
+ * 曾经这里有个 `SHARE_EXCERPT_RECORD_KEEP = 8`，`attachShareExcerptPairs` 每次写库
+ * `pairs.slice(-8)`。后果是：一批 9 个不同 id 的调用（第 1 条真读到字幕，第 2–8 条同参被
+ * `DUPLICATE_TOOL_CALL` 拒，第 9 条 `TOOL_CALL_LIMIT`）会把**唯一成功的证据**挤出历史；
+ * 而 outbox 那边已 markWritten、`pending=0`，收尾 flush 也不会补回来 —— 健康 DB 下的静默丢证据。
+ * 次数上限（`maxToolCallsPerTurn`）只挡「第 N+1 次网络读取」，不挡产生 call/result，所以不能靠它兜底。
+ *
+ * 现在的口径：**本轮收到的每一次调用都成对保留**，拒绝记录不能抹掉既有成功证据。
+ * 体量本身有界，不需要条数上限来兜：
+ *  - 每条消息的 metadata 只装**这一轮**的记录（锚点 = 本轮触发消息，不跨轮累积）；
+ *  - 成功片段的正文合计受轮次预算 ≤2400 token 夹紧（`SHARE_BUDGETS.excerptsPerUserTurnTokens`）；
+ *  - 失败/拒绝记录只有一行结构化说明（各自 ≤ 一次信封量级），条数由本轮 tool_calls 决定；
+ *  - 「投影」（下一轮进模型的文本）另有 600 token 上限（`SHARE_EXCERPT_PROJECTION_TOKENS`），
+ *    与「历史保留多少」是两件事：保留完整、投影有界。
+ */
 /** 下一轮投影里这些片段最多占多少 token（与「片段会占未来上下文」的说明一致，但仍要有界）。 */
 export const SHARE_EXCERPT_PROJECTION_TOKENS = 600;
 
@@ -97,6 +128,9 @@ export type ShareExcerptToolCode =
   | 'INVALID_ARGUMENTS'
   | 'ARGUMENT_NOT_ALLOWED'
   | 'MISSING_TARGET'
+  | 'HISTORY_UNAVAILABLE'
+  | 'SHARE_REF_INVALID'
+  | 'SHARE_REF_AMBIGUOUS'
   | 'SHARE_TARGET_MISMATCH'
   | 'SHARE_NOT_IN_CONTEXT'
   | 'SHARE_CONTENT_NOT_READY'
@@ -146,7 +180,8 @@ export function buildShareExcerptsTool() {
       name: SHARE_EXCERPTS_TOOL_NAME,
       description: [
         '读取本轮对话里已出现的分享卡（小红书 / 抖音 / B站等）的原始片段：正文、字幕、评论样本。',
-        '只能用 shareRef 或 contentId 指定卡片；不能传 URL、域名、baseUrl、token、scope —— 地址与授权由系统与服务端决定。',
+        '只能用 shareRef 或 contentId 指定卡片；shareRef 就照抄上下文里 [分享 shr_xxx] 括号里的完整值（抄短了会被拒绝或提示歧义）。',
+        '不能传 URL、域名、baseUrl、token、scope —— 地址与授权由系统与服务端决定。',
         '单次最多 1200 token，一个用户轮次里所有调用合计最多 2400 token；超限或失败的返回是结构化的，',
         '这时请基于卡片里已有的简介回答，并说明片段没读到，不要声称读过。',
         '卡片简介已经够回答时不要调用；只有确实需要引用原文/字幕/评论细节时才读。',
@@ -157,7 +192,7 @@ export function buildShareExcerptsTool() {
         properties: {
           shareRef: {
             type: 'string',
-            description: '卡片引用，形如 shr_...（上下文里 [分享 shr_xxx] 中的那个）。',
+            description: '卡片引用：照抄上下文里 [分享 shr_...] 括号内的完整值（允许唯一前缀，但不要自己改写）。',
           },
           contentId: {
             type: 'string',
@@ -357,6 +392,77 @@ export function hasReadableShareExcerptTarget(turn: ShareExcerptTurn | null | un
   return false;
 }
 
+// ─── 引用解析（可见标识 = 完整 shareRef；容忍唯一前缀，歧义必须拒绝） ──────
+
+/** 分享引用的形状：`shr_` + 1~64 位字母数字（服务端随机 32 位 hex）。 */
+export const SHARE_REF_PATTERN = /^shr_[0-9A-Za-z]{1,64}$/;
+
+export type ShareRefResolution =
+  | { ok: true; target: ShareExcerptTarget; matched: 'exact' | 'prefix' }
+  | {
+      ok: false;
+      code: 'SHARE_REF_INVALID' | 'SHARE_REF_AMBIGUOUS' | 'SHARE_NOT_IN_CONTEXT';
+      detail: string;
+      /** 歧义时的候选完整引用（供模型改抄完整值；不含其它卡的内容）。 */
+      candidates: string[];
+    };
+
+/**
+ * 把模型给的 shareRef 解析成「本轮可读集合」里的一张卡。规则只有三条，宁拒绝不猜：
+ *  1. 完整引用精确命中 → 就用它（正常路径，投影里给的就是完整值）；
+ *  2. 否则按**前缀**找（只允许 >= minRefPrefixChars），唯一命中才接受 —— 这是对模型抄短的容错；
+ *  3. 命中多张 = 歧义，直接拒绝并列出候选完整引用；**绝不**按相似度/长度挑一个，
+ *     否则会把 A 卡的内容当成 B 卡的回答（返工卡 t_38463abd P1 的核心要求）。
+ * 不在此集合里 → SHARE_NOT_IN_CONTEXT（模型不能指向本轮没出现过的内容）。
+ */
+export function resolveShareExcerptTarget(
+  turn: ShareExcerptTurn,
+  rawRef: unknown,
+): ShareRefResolution {
+  const ref = typeof rawRef === 'string' ? rawRef.trim() : '';
+  if (!ref) {
+    return { ok: false, code: 'SHARE_REF_INVALID', detail: 'shareRef 为空', candidates: [] };
+  }
+  const exact = turn.targets.get(ref);
+  if (exact) return { ok: true, target: exact, matched: 'exact' };
+
+  if (!SHARE_REF_PATTERN.test(ref)) {
+    return {
+      ok: false,
+      code: 'SHARE_REF_INVALID',
+      detail: `shareRef=${clipCodepoints(ref, 48)} 形状不对，应形如 shr_...（照抄上下文里的完整值）`,
+      candidates: [],
+    };
+  }
+
+  if (Array.from(ref).length < SHARE_EXCERPT_LIMITS.minRefPrefixChars) {
+    return {
+      ok: false,
+      code: 'SHARE_NOT_IN_CONTEXT',
+      detail: `shareRef=${ref} 不在本轮上下文里（前缀至少 ${SHARE_EXCERPT_LIMITS.minRefPrefixChars} 个字符才能认出是哪张卡）`,
+      candidates: [],
+    };
+  }
+
+  const needle = ref.toLowerCase();
+  const hits = [...turn.targets.values()].filter((t) => t.shareRef.toLowerCase().startsWith(needle));
+  if (hits.length === 1) return { ok: true, target: hits[0], matched: 'prefix' };
+  if (hits.length > 1) {
+    return {
+      ok: false,
+      code: 'SHARE_REF_AMBIGUOUS',
+      detail: `前缀 ${ref} 命中 ${hits.length} 张卡，无法确定要读哪一张`,
+      candidates: hits.map((t) => t.shareRef),
+    };
+  }
+  return {
+    ok: false,
+    code: 'SHARE_NOT_IN_CONTEXT',
+    detail: '这张卡不在本轮上下文里（只能读本轮对话里出现过的分享卡）',
+    candidates: [],
+  };
+}
+
 // ─── 入参清洗 ────────────────────────────────────────────────────────
 
 interface ParsedArgs {
@@ -463,6 +569,7 @@ const clockLabel = (ms: number): string => `${(ms / 1000).toFixed(1)}s`;
 
 function segmentLine(index: number, seg: ExcerptsResult['segments'][number]): string {
   const time = seg.startMs != null && seg.endMs != null ? ` ${clockLabel(seg.startMs)}-${clockLabel(seg.endMs)}` : '';
+  // 片段是外部内容：先做净化（控制字符/零宽与边界伪造中和），再由调用方整体包低信任块。
   return `${index}. ${seg.field}${time}：${sanitizeExternalText(seg.text)}`;
 }
 
@@ -490,6 +597,12 @@ export interface ExecuteShareExcerptInput {
   args?: unknown;
   turn: ShareExcerptTurn;
   endpoint?: ShareEndpoint | null;
+  /**
+   * 本轮拿不到确定的持久化锚点时为 true：**不读**，直接返回 `HISTORY_UNAVAILABLE`。
+   * 生产路径由 `dispatchShareExcerptToolCall` 依据 recorder.anchorId 设置，
+   * 保证「返回给模型的片段」一定有成对落库的去处（卡片第 3 条）。
+   */
+  historyUnavailable?: boolean;
 }
 
 export interface ExecuteShareExcerptResult {
@@ -552,6 +665,20 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
     return finish(false, 'UNKNOWN_TOOL', text, 0, {});
   }
 
+  // 历史必须成对留存（卡片第 3 条）：拿不到本轮确定的持久化锚点时**不读**。
+  // 读到了却写不进任何消息的 metadata，就成了「读过却没有记录」——下一轮既回放不出来，
+  // 模型只能凭记忆复述片段（等于给了它一个无法追溯的来源）。宁可不给片段，也不给不留痕的片段。
+  // 这个判定在预算/网络之前，所以拒绝时一次请求都不发。
+  if (input.historyUnavailable) {
+    return finish(
+      false,
+      'HISTORY_UNAVAILABLE',
+      failureText('HISTORY_UNAVAILABLE', '这一轮没有可确定的持久化位置（拿不到本轮消息 id），读到的片段无法成对记进历史，所以这次不读取'),
+      0,
+      {},
+    );
+  }
+
   // 每轮调用次数硬顶：预算用完前先把「模型开始复读」这种情况挡住。
   if (turn.calls.length >= SHARE_EXCERPT_LIMITS.maxToolCallsPerTurn) {
     return finish(false, 'TOOL_CALL_LIMIT', failureText('TOOL_CALL_LIMIT', `本轮调用次数已达上限 ${SHARE_EXCERPT_LIMITS.maxToolCallsPerTurn} 次`), 0, {});
@@ -575,17 +702,18 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
 
   // 目标解析：只在本轮可见卡片里找，绝不按模型给的名字去猜内容。
   let target: ShareExcerptTarget | undefined;
-  if (args.shareRef && args.contentId) {
-    const byRef = turn.targets.get(args.shareRef);
-    if (!byRef) {
-      return finish(false, 'SHARE_NOT_IN_CONTEXT', failureText('SHARE_NOT_IN_CONTEXT', `shareRef=${shortShareRef(args.shareRef)} 不在本轮上下文里`), 0, recordArgs);
+  if (args.shareRef) {
+    const resolved = resolveShareExcerptTarget(turn, args.shareRef);
+    if (!resolved.ok) {
+      const extra = resolved.candidates.length
+        ? `候选（请照抄其中一个完整值）：${resolved.candidates.join(', ')}`
+        : '';
+      return finish(false, resolved.code, failureText(resolved.code, resolved.detail, extra), 0, recordArgs);
     }
-    if (byRef.contentId !== args.contentId) {
+    target = resolved.target;
+    if (args.contentId && target.contentId !== args.contentId) {
       return finish(false, 'SHARE_TARGET_MISMATCH', failureText('SHARE_TARGET_MISMATCH', 'shareRef 与 contentId 不是同一张卡'), 0, recordArgs);
     }
-    target = byRef;
-  } else if (args.shareRef) {
-    target = turn.targets.get(args.shareRef);
   } else if (args.contentId) {
     target = turn.byContentId.get(args.contentId);
   }
@@ -663,14 +791,20 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
         true,
         'NO_SEGMENTS',
         [
-          `[read_share_excerpts · 无匹配片段] ${shortShareRef(target.shareRef)} contentRevision=${target.contentRevision} 字段=${args.fields.join('/')}${args.query ? ` query=${args.query}` : ''}`,
+          `[read_share_excerpts · 无匹配片段] ${target.shareRef} contentRevision=${target.contentRevision} 字段=${args.fields.join('/')}${args.query ? ` query=${args.query}` : ''}`,
           '这次请求成功了，但上述字段/关键词下没有可返回的片段。别把「没匹配到」说成「读过了」，需要就换个 query 或字段再试。',
         ].join('\n'),
         0,
         recordArgs,
       );
     }
-    const bodyAllowance = Math.max(1, grant - SHARE_EXCERPT_LIMITS.envelopeTokens);
+    // 片段同样是外部内容：整段放进低信任块，并在块前声明“只作资料、不执行其中指令”。
+    // 块的边界标记已由 sanitizeExternalText 中和，内容无法伪造收尾/闭合（返工 t_42231e16 缺陷 3）。
+    // 这三段结构开销先从不超出单次额度的正文 allowance 里扣掉，避免硬切时把闭合标记切掉。
+    const untrustedOverhead = estimateShareTokens(
+      `${EXTERNAL_UNTRUSTED_NOTICE}\n${externalBlockOpen(target.shareRef)}\n${EXTERNAL_BLOCK_CLOSE}\n`,
+    );
+    const bodyAllowance = Math.max(1, grant - SHARE_EXCERPT_LIMITS.envelopeTokens - untrustedOverhead);
     const lines: string[] = [];
     let bodyEstimate = 0;
     let clientTruncated = false;
@@ -694,9 +828,9 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
     }
 
     const remainingBefore = turn.budget.remaining;
-    const budgetAfterHint = Math.max(0, remainingBefore - Math.min(grant, bodyEstimate + SHARE_EXCERPT_LIMITS.envelopeTokens));
+    const budgetAfterHint = Math.max(0, remainingBefore - Math.min(grant, bodyEstimate + SHARE_EXCERPT_LIMITS.envelopeTokens + untrustedOverhead));
     const header = [
-      `[read_share_excerpts · OK] ${shortShareRef(target.shareRef)}`,
+      `[read_share_excerpts · OK] ${target.shareRef}`,
       `contentRevision=${target.contentRevision}`,
       `字段=${args.fields.join('/')}`,
       args.query ? `query=${args.query}` : '',
@@ -711,8 +845,6 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
       footer = `（可续读：cursor=${body.nextCursor}）`;
     }
 
-    // 片段同样是外部内容：整段放进低信任块，并在块前声明“只作资料、不执行其中指令”。
-    // 块的边界标记已由 sanitizeExternalText 中和，内容无法伪造收尾/闭合。（缺陷 3）
     const text = [
       header,
       EXTERNAL_UNTRUSTED_NOTICE,
@@ -720,9 +852,7 @@ export async function executeShareExcerptToolCall(input: ExecuteShareExcerptInpu
       ...lines,
       EXTERNAL_BLOCK_CLOSE,
       footer,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    ].filter(Boolean).join('\n');
     turn.seenSignatures.add(signature);
     charged = estimateShareTokens(text);
     if (charged > grant) {
@@ -753,17 +883,32 @@ export interface ShareExcerptPairRecord {
 }
 
 /**
- * 把本轮 call/result 成对挂到助手消息 metadata 上（只增不改已有键）。
+ * 把本轮 call/result 成对挂到消息 metadata 上（只增不改已有键）。
  * 成对存的意义：下一轮投影能还原「模型问了什么 → 系统回了什么」，不会只回放一段孤立片段，
  * 也不会因为片段没落历史而让模型下一轮「记得自己读过」却拿不出依据。
+ *
+ * 幂等：同一 toolCallId 只保留一条。逐次落库（每执行完一次工具就写）与收尾 flush 会重复
+ * 提交同一批记录，DB 侧重试也可能重放，这里必须按 id 去重，否则历史里会出现重复对。
+ *
+ * 不截断（返工第 4 轮 P1-1）：本轮收到的每一次调用都留着，**拒绝记录不能挤掉成功证据**。
+ * 曾经 `pairs.slice(-8)` 会让一批 9 个 id 的调用把第 1 条成功记录挤出历史（见文件头注释）。
+ * 体量有界来自「一条消息 = 一轮」+ 轮次预算 2400 token + 失败记录只有一行；投影另有 600 token 上限。
  */
 export function attachShareExcerptPairs(prev: any, records: readonly ShareExcerptCallRecord[]): any {
   const base = prev && typeof prev === 'object' ? prev : {};
   const existing: ShareExcerptPairRecord | null = base[SHARE_EXCERPT_META_KEY] ?? null;
   const pairs = Array.isArray(existing?.pairs) ? [...existing!.pairs] : [];
+  const seen = new Set<string>();
+  for (const pair of pairs) {
+    const id = pair?.call?.toolCallId;
+    if (typeof id === 'string' && id) seen.add(id);
+  }
   for (const record of records ?? []) {
+    const id = typeof record?.toolCallId === 'string' ? record.toolCallId.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
     pairs.push({
-      call: { toolCallId: record.toolCallId, name: record.name, args: record.args, at: record.at },
+      call: { toolCallId: id, name: record.name, args: record.args, at: record.at },
       result: { ok: record.ok, code: record.code, chargedTokens: record.chargedTokens, text: record.resultText },
     });
   }
@@ -772,7 +917,8 @@ export function attachShareExcerptPairs(prev: any, records: readonly ShareExcerp
     ...base,
     [SHARE_EXCERPT_META_KEY]: {
       version: 1,
-      pairs: pairs.slice(-SHARE_EXCERPT_RECORD_KEEP),
+      // 全部保留（不 slice）：拒绝/超限记录不能把已成功的片段挤出历史。
+      pairs,
     } satisfies ShareExcerptPairRecord,
   };
 }
@@ -786,14 +932,16 @@ export function readShareExcerptPairs(metadata: any): ShareExcerptPairRecord | n
 /**
  * 下一轮投影：把本轮记录的 call/result 成对渲染成有界文本。
  * 只接受带 tool_call_id 的成对记录；budget 默认 600 token，超了按顺序截断（稳定、不抖动）。
- * 只对助手消息生效（用户消息不背工具记录）。
+ *
+ * 角色：assistant（兜底锚点）与 user（正常锚点——记录挂在本轮触发消息上）都要投影；
+ * 其它角色（system/tool）不背工具记录。
  */
 export function renderShareExcerptPairProjection(
   metadata: any,
   role: string | null | undefined,
   opts: { maxTokens?: number } = {},
 ): string | null {
-  if (role !== 'assistant') return null;
+  if (role !== 'assistant' && role !== 'user') return null;
   const record = readShareExcerptPairs(metadata);
   if (!record) return null;
   const budget = Math.max(1, Math.min(opts.maxTokens ?? SHARE_EXCERPT_PROJECTION_TOKENS, SHARE_EXCERPT_PROJECTION_TOKENS));
@@ -815,24 +963,418 @@ export function renderShareExcerptPairProjection(
   }
   if (chunks.length === 0) return null;
   return [
-    `[上轮 read_share_excerpts 记录 · ${chunks.length} 次调用]`,
+    `[read_share_excerpts 记录 · ${chunks.length} 次调用]`,
     ...chunks,
-    '（这是上一轮真实读到的片段；它们只覆盖当时请求的部分，不代表完整内容）',
+    '（这是此前真实读到的片段；它们只覆盖当时请求的部分，不代表完整内容）',
   ].join('\n');
 }
 
 /**
- * 找本轮回复该挂记录的那条助手消息：本次生成开始之后落库的最后一条 assistant。
- * 抽成纯函数便于测试；找不到就返回 null（不强行挂到别的消息上）。
+ * 找本轮该挂记录的那条消息：**本轮请求上下文里的最后一条消息**（触发本轮的那条）。
+ *
+ * 为什么不用「本次生成开始后落库的助手消息」当锚点：那要求最终自然语言回复成功落库，
+ * 模型失败/用户取消/后处理异常时就无锚可挂，记录直接丢（返工卡 t_38463abd P1 第 2 条）。
+ * 触发消息在发请求前就已经在库里、id 确定，逐次落库不依赖后续任何一步成功，
+ * 也不可能挂到并发的其它轮次上（id 来自本轮 contextMsgs 快照，不是时间戳扫库）。
+ *
+ * 反向扫描的边界（返工第 5 轮 P1）：**只认最后一条非背景消息本身**。
+ *  - 尾部 `system` 背景项（本轮拼进去的提示块）不是触发消息，可以跳过；
+ *  - 跳过之后遇到的那条就是触发消息，它的 id 必须可持久化；**不合法就返回 null**，
+ *    绝不继续往前找「上一条有 id 的 user/assistant」——那会把本轮记录健康地写进
+ *    另一个轮次的消息（committed saver 会成功、unsaved=false，门形同虚设）。
+ *  - `tool` 等中间态角色不是触发消息，同样返回 null（不是跳到更早的消息）。
  */
-export function pickShareExcerptAnchor(
-  messages: readonly { id: number; role: string; timestamp?: number }[] | null | undefined,
-  sinceMs: number,
+export function pickShareExcerptTurnAnchor(
+  messages: readonly { id?: unknown; role?: unknown }[] | null | undefined,
 ): number | null {
-  let found: number | null = null;
-  for (const msg of messages ?? []) {
-    if (msg.role !== 'assistant') continue;
-    if (typeof msg.timestamp === 'number' && msg.timestamp >= sinceMs) found = msg.id;
+  const list = messages ?? [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const msg = list[i] as { id?: unknown; role?: unknown } | null | undefined;
+    const role = msg?.role;
+    // 尾部系统提示（本轮拼的背景块）不是触发消息，可跳过。
+    if (role === 'system') continue;
+    // 触发消息只可能是 user/assistant；无 role 的裸对象（旧导入/测试）按触发消息处理。
+    if (role !== undefined && role !== 'user' && role !== 'assistant') return null;
+    const id = msg?.id;
+    return typeof id === 'number' && Number.isFinite(id) && Number.isInteger(id) && id > 0 ? id : null;
   }
-  return found;
+  return null;
+}
+
+/**
+ * 一轮「分享片段工具」的准备结果：可注入的 turn + 确定的本轮锚点。
+ *
+ * 单独抽出来是为了让 hook 与测试走**同一口径**：卡片集合、可读性、触发消息 id 三道门
+ * 都在这里判定，任何一道不过就 `turn: null`（不注入工具）+ `anchorId: null`
+ * （dispatch 侧还会再拒一次 `HISTORY_UNAVAILABLE`）。
+ */
+export interface ShareExcerptTurnPrep {
+  turn: ShareExcerptTurn | null;
+  anchorId: number | null;
+  reason: 'ok' | 'no_target' | 'no_readable_target' | 'no_anchor';
+}
+
+export function prepareShareExcerptTurn(
+  messages: readonly { id?: unknown; role?: unknown; metadata?: any }[] | null | undefined,
+  opts: ShareExcerptTurnOptions = {},
+): ShareExcerptTurnPrep {
+  const turn = createShareExcerptTurn(messages, opts);
+  if (!turn) return { turn: null, anchorId: null, reason: 'no_target' };
+  // 一张能读的卡都没有（全是解析中/失败）时不注入：只给一个注定报错的工具没有意义。
+  if (!hasReadableShareExcerptTarget(turn)) return { turn: null, anchorId: null, reason: 'no_readable_target' };
+  // 历史必须成对留存：拿不到本轮触发消息的持久化 id 就**不读**（连工具都不注入）。
+  const anchorId = pickShareExcerptTurnAnchor(messages);
+  if (anchorId == null) return { turn: null, anchorId: null, reason: 'no_anchor' };
+  return { turn, anchorId, reason: 'ok' };
+}
+
+/** 成对记录写库的回调（测试注入；生产是 DB.updateMessageMetadata + attachShareExcerptPairs）。 */
+export type ShareExcerptPairSaver = (messageId: number, records: readonly ShareExcerptCallRecord[]) => Promise<void>;
+
+/**
+ * 待补偿队列与重试的上界（不是无限重试，也不会无限堆内存）。
+ *  - perAnchorRecords / anchors：失败批次最多留多少（本轮 + 最近几轮），超了丢最旧的并明确报错。
+ *    `perAnchorRecords` 必须**明显高于一轮可能产生的记录数**（返工第 4 轮 P1-1）：次数上限只挡
+ *    「第 N+1 次网络读取」，一批 tool_calls 里被拒的每一条仍会产生记录；16 太近，一批 17+ 条的
+ *    失败批次会从队列里挤掉最旧的未落库记录。256 是内存安全阀，真实一轮远到不了。
+ *  - flushAttempts：每次 flush 最多再尝试几轮写库；hook 有两个收尾点（成功尾部 + finally），
+ *    所以一整轮的尝试次数上界是 `2 × flushAttempts`，再加每次 dispatch 自带的那一次。
+ */
+export const SHARE_EXCERPT_OUTBOX_LIMITS = {
+  perAnchorRecords: 256,
+  anchors: 8,
+  flushAttempts: 3,
+  /** 「已写成功」这一事实最多记多少条（跨轮共享；只增不去重写，容量只防无界增长）。 */
+  writtenKeys: 512,
+} as const;
+
+export interface ShareExcerptOutboxEntry {
+  anchorId: number;
+  records: readonly ShareExcerptCallRecord[];
+}
+
+/**
+ * 未落库记录的**待补偿队列**。
+ *
+ * 语义（返工卡 t_38463abd P1 第 2 条）：写库失败的批次**留在这里**——不标成已保存，
+ * 也不靠 `console.warn` 就算完；之后的 `record`（下一次工具调用）与 `flush`（收尾路径）
+ * 会在 `SHARE_EXCERPT_OUTBOX_LIMITS` 的上界内重试同一批，成功后才移除。
+ * 于是「第一次失败、第二次会成功」的瞬时故障由**真实生产收尾路径**补上，而不是只有测试里
+ * 手动再调一次 `record` 才补。
+ *
+ * 每条记录带自己的 `anchorId`（原始触发消息 id），所以跨轮重试仍然写回同一条消息，
+ * 不会挂到后来的轮次上。容量有界：超限时丢最旧的锚点并 `console.error` 明确说丢了多少。
+ *
+ * 去重状态（哪些「锚点 + toolCallId」已经真正写成功）也放在这里，而不是每个记录器各存一份：
+ * 队列是跨轮共享的，写成功也可能由**另一个**记录器（下一次 dispatch / 收尾 flush）完成；
+ * 若各存一份，A 轮的记录器永远不知道自己那批已被 B 轮写下，统计会失真（返工第 3 轮 P1-1）。
+ */
+export class ShareExcerptPairOutbox {
+  private readonly bins = new Map<number, Map<string, ShareExcerptCallRecord>>();
+  private readonly written = new Set<string>();
+
+  /** 去重键 = 锚点 + toolCallId；中间夹 NUL 防止拼接歧义。 */
+  private static key(anchorId: number, toolCallId: string): string {
+    return `${anchorId}\u0000${toolCallId}`;
+  }
+
+  add(anchorId: number, records: readonly ShareExcerptCallRecord[]): void {
+    if (!Number.isFinite(anchorId)) return;
+    let bin = this.bins.get(anchorId);
+    if (!bin) {
+      bin = new Map();
+      this.bins.set(anchorId, bin);
+    }
+    for (const record of records ?? []) {
+      const id = typeof record?.toolCallId === 'string' ? record.toolCallId.trim() : '';
+      if (!id) continue;
+      if (!bin.has(id)) bin.set(id, record);
+    }
+    while (bin.size > SHARE_EXCERPT_OUTBOX_LIMITS.perAnchorRecords) {
+      const oldest = bin.keys().next().value as string | undefined;
+      if (oldest == null) break;
+      bin.delete(oldest);
+      console.error('[share-excerpt] 待补偿队列超过单消息上限，丢弃最旧的一条未落库记录:', oldest);
+    }
+    while (this.bins.size > SHARE_EXCERPT_OUTBOX_LIMITS.anchors) {
+      const oldestAnchor = this.bins.keys().next().value as number | undefined;
+      if (oldestAnchor == null) break;
+      this.bins.delete(oldestAnchor);
+      console.error('[share-excerpt] 待补偿队列超过消息数上限，丢弃最旧消息的未落库记录:', oldestAnchor);
+    }
+  }
+
+  /** 按锚点分组的待写批次（锚点顺序 = 加入顺序，便于日志与测试断言稳定）。 */
+  entries(): ShareExcerptOutboxEntry[] {
+    const out: ShareExcerptOutboxEntry[] = [];
+    for (const [anchorId, bin] of this.bins) {
+      if (bin.size === 0) continue;
+      out.push({ anchorId, records: [...bin.values()] });
+    }
+    return out;
+  }
+
+  clear(anchorId: number, toolCallIds: readonly string[]): void {
+    const bin = this.bins.get(anchorId);
+    if (!bin) return;
+    for (const id of toolCallIds) bin.delete(id);
+    if (bin.size === 0) this.bins.delete(anchorId);
+  }
+
+  /** 未落库条数：给绝对值就是某个锚点，不给就是全部（含往轮遗留）。 */
+  pendingCount(anchorId?: number): number {
+    if (typeof anchorId === 'number') return this.bins.get(anchorId)?.size ?? 0;
+    let total = 0;
+    for (const bin of this.bins.values()) total += bin.size;
+    return total;
+  }
+
+  /** 这条（锚点, toolCallId）是否已经**真正写成功**（事务提交过；跨轮共享这一事实）。 */
+  hasWritten(anchorId: number, toolCallId: string): boolean {
+    if (!Number.isFinite(anchorId) || !toolCallId) return false;
+    return this.written.has(ShareExcerptPairOutbox.key(anchorId, toolCallId));
+  }
+
+  /** 标记（锚点, toolCallId）已写成功；容量有界，超限丢最旧的（只影响统计精度，不影响正确性）。 */
+  markWritten(anchorId: number, toolCallId: string): void {
+    if (!Number.isFinite(anchorId) || !toolCallId) return;
+    const key = ShareExcerptPairOutbox.key(anchorId, toolCallId);
+    if (this.written.has(key)) return;
+    this.written.add(key);
+    while (this.written.size > SHARE_EXCERPT_OUTBOX_LIMITS.writtenKeys) {
+      const oldest = this.written.values().next().value as string | undefined;
+      if (oldest == null) break;
+      this.written.delete(oldest);
+    }
+  }
+
+  /** 已写成功的条数：给锚点算这个锚点，不给算全部。 */
+  writtenCount(anchorId?: number): number {
+    if (typeof anchorId !== 'number') return this.written.size;
+    const prefix = `${anchorId}\u0000`;
+    let count = 0;
+    for (const key of this.written) if (key.startsWith(prefix)) count += 1;
+    return count;
+  }
+}
+
+/** 生产用的进程内待补偿队列（hook 显式传入；测试默认每个 recorder 私有，互不污染）。 */
+export const SHARE_EXCERPT_OUTBOX = new ShareExcerptPairOutbox();
+
+export interface ShareExcerptRecorderSnapshot {
+  anchorId: number | null;
+  /** 本锚点已成功写库的条数（共享队列里的事实；可能是别的轮次补偿写下的）。 */
+  recorded: number;
+  /** 共享待补偿队列里已知写成功的（锚点, toolCallId）总数（含往轮）。 */
+  recordedAll: number;
+  /** 写库失败次数（每轮失败计一次；失败批次留在待补偿队列，不会被标成已写）。 */
+  failures: number;
+  /** 当前排队的写操作数（>0 表示还有没落地的写入）。 */
+  pendingWrites: number;
+  /** **本锚点**还没落库的记录条数（失败后在这里等 dispatch/flush 有界重试）。 */
+  pendingRecords: number;
+  /** 待补偿队列里所有锚点的未落库记录总数（含往轮遗留）。 */
+  outboxPending: number;
+  /** 待补偿队列里还有任何未落库记录（含往轮遗留）→ true。这时**不能对外声称已保存**。 */
+  unsaved: boolean;
+  lastError: string | null;
+}
+
+export interface ShareExcerptPairRecorderOptions {
+  anchorId: number | null;
+  savePairs: ShareExcerptPairSaver;
+  /** 跨轮共享的待补偿队列（生产传 SHARE_EXCERPT_OUTBOX；不传则本记录器私有）。 */
+  outbox?: ShareExcerptPairOutbox;
+  /** 每次 flush 最多再尝试几轮（默认且上限 SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts）。 */
+  maxAttemptsPerFlush?: number;
+  /** 两轮重试之间的等待（默认 0；本地 IDB 失败通常是即时的，不需要退避）。 */
+  retryDelayMs?: number;
+  /** 持续失败的可见上报（默认 console.error；测试可注入断言）。 */
+  reportUnsaved?: (info: { anchorId: number | null; pending: number; lastError: string }) => void;
+}
+
+/**
+ * 本轮工具记录的持久化器：**每执行完一次工具就成对写库**，而不是等整轮回复写完。
+ *
+ * 保证（对应契约「工具 call/result 必须成对保留在历史里」）：
+ *  - 成对：call 与 result 在同一批、同一次 metadata 写入里落盘，不存在只有一半。
+ *  - 及时：读成功/失败/超限/取消都会立刻落，后续模型请求失败或用户中断都不影响已读过的调用。
+ *  - 幂等：同一 **（锚点, toolCallId）** 只写一次（内存去重键带锚点 + attachShareExcerptPairs
+ *    落库侧按 id 去重）。光用裸 toolCallId 去重会出事：共享待补偿队列里，上一轮（消息 101）
+ *    与这一轮（消息 404）完全可能都叫 `call_1`；先写成功 101 就按 id 把 404 当成「已写」清掉，
+ *    404 的片段根本没落库却被报成 pending=0 —— 见返工第 3 轮 P1。
+ *  - 串行：同一记录器内的写入排在同一条 promise 链上，避免并发 read-modify-write 互相覆盖。
+ *  - **不丢**：写库失败只记账并把批次留在待补偿队列（`ShareExcerptPairOutbox`），
+ *    下一次 `record`/`flush` 有界重试；重试后仍失败 → `snapshot().unsaved === true` +
+ *    `console.error`，明确「没保存、在待补偿」，不再承诺已保存。
+ *  - 无锚不猜：anchorId 为空时既不写也不猜别的消息；生产路径在读取前就拒绝（见 dispatch）。
+ */
+export class ShareExcerptPairRecorder {
+  readonly anchorId: number | null;
+  private readonly savePairs: ShareExcerptPairSaver;
+  private readonly outbox: ShareExcerptPairOutbox;
+  private readonly maxAttemptsPerFlush: number;
+  private readonly retryDelayMs: number;
+  private readonly reportUnsaved: (info: { anchorId: number | null; pending: number; lastError: string }) => void;
+  private queue: Promise<void> = Promise.resolve();
+  private failures = 0;
+  private writes = 0;
+  private queued = 0;
+  private lastError: string | null = null;
+  private unsavedReported = false;
+
+  constructor(opts: ShareExcerptPairRecorderOptions) {
+    this.anchorId = typeof opts.anchorId === 'number' && Number.isFinite(opts.anchorId) ? opts.anchorId : null;
+    this.savePairs = opts.savePairs;
+    this.outbox = opts.outbox ?? new ShareExcerptPairOutbox();
+    const wanted = Math.floor(opts.maxAttemptsPerFlush ?? SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts);
+    this.maxAttemptsPerFlush = Math.max(1, Math.min(Number.isFinite(wanted) ? wanted : 1, SHARE_EXCERPT_OUTBOX_LIMITS.flushAttempts));
+    this.retryDelayMs = Math.max(0, Math.floor(opts.retryDelayMs ?? 0));
+    this.reportUnsaved = opts.reportUnsaved ?? ((info) => {
+      console.error(
+        `[share-excerpt] 工具记录未能写入历史（待补偿）：still-unpersisted=${info.pending} anchor=${info.anchorId ?? 'none'} lastError=${info.lastError}`,
+      );
+    });
+  }
+
+  /**
+   * 落一批记录。可重复调用；返回的 promise 在**这一轮**写库尝试结束后 resolve（永不 reject）。
+   * 同一批里已经写成功过的 id 会被跳过；失败的留在待补偿队列里等 flush / 下一次 dispatch 重试。
+   */
+  record(records: readonly ShareExcerptCallRecord[] | null | undefined): Promise<void> {
+    const anchor = this.anchorId;
+    if (anchor == null) return this.queue;
+    // 只按**本锚点**的（锚点, id）判断是否已写：别的轮次同 id 的批次不能被当成本轮已写。
+    const fresh = (records ?? []).filter((r) => {
+      if (typeof r?.toolCallId !== 'string' || !r.toolCallId) return false;
+      return !this.outbox.hasWritten(anchor, r.toolCallId);
+    });
+    if (fresh.length === 0) return this.queue;
+    this.outbox.add(anchor, fresh);
+    return this.enqueueAttempt();
+  }
+
+  private enqueueAttempt(): Promise<void> {
+    this.queued += 1;
+    this.queue = this.queue.then(async () => {
+      try {
+        await this.writePending();
+      } finally {
+        this.queued = Math.max(0, this.queued - 1);
+      }
+    });
+    return this.queue;
+  }
+
+  /**
+   * 写一轮：待补偿队列里的**所有**批次（本轮 pending + 之前失败留下的），按锚点合并成一次写。
+   * 所以后续的新调用不会遗漏旧的失败批次——它们还在同一个队列里按原始锚点重试。
+   */
+  private async writePending(): Promise<void> {
+    for (const entry of this.outbox.entries()) {
+      // 按（锚点, toolCallId）判断：别的锚点写成功过同 id 的记录，不代表这一条也写过了。
+      const still = entry.records.filter((r) => !this.outbox.hasWritten(entry.anchorId, r.toolCallId));
+      if (still.length === 0) {
+        // 该锚点的这批都已是「本队列确认写成功」的（只可能来自同一队列重复入队 / 别的记录器已写）：
+        // 只清这个锚点自己的这些 id，绝不碰别的锚点。
+        this.outbox.clear(entry.anchorId, entry.records.map((r) => r.toolCallId));
+        continue;
+      }
+      try {
+        await this.savePairs(entry.anchorId, still);
+        for (const r of still) this.outbox.markWritten(entry.anchorId, r.toolCallId);
+        this.outbox.clear(entry.anchorId, still.map((r) => r.toolCallId));
+        this.writes += 1;
+        this.unsavedReported = false;
+      } catch (e: any) {
+        this.failures += 1;
+        this.lastError = String(e?.message || e);
+        // 失败批次留在待补偿队列里（不丢、也不标成已写）。一个锚点失败不挡其它锚点继续写。
+        console.warn('[share-excerpt] 工具记录落历史失败（保留在待补偿队列，收尾 flush 有界重试）:', e);
+      }
+    }
+  }
+
+  /**
+   * 收尾：等已排队的写入落地，再对仍留在待补偿队列里的批次做**有界重试**。
+   * 重试次数用尽还失败 → `snapshot().unsaved === true`，并按 `reportUnsaved` 明确上报
+   * 「没保存、在待补偿」（默认 console.error）。flush 永不 reject。
+   */
+  async flush(): Promise<void> {
+    await this.queue;
+    for (let round = 0; round < this.maxAttemptsPerFlush; round++) {
+      if (this.outbox.pendingCount() === 0) return;
+      if (round > 0 && this.retryDelayMs > 0) await new Promise((r) => setTimeout(r, this.retryDelayMs));
+      await this.enqueueAttempt();
+    }
+    if (this.outbox.pendingCount() > 0) this.reportIfUnsaved();
+  }
+
+  private reportIfUnsaved(): void {
+    if (this.unsavedReported) return;
+    this.unsavedReported = true;
+    try {
+      this.reportUnsaved({
+        anchorId: this.anchorId,
+        pending: this.outbox.pendingCount(),
+        lastError: this.lastError ?? 'unknown',
+      });
+    } catch (e) {
+      // 上报本身不能把 flush 变成 reject（收尾路径不允许抛）。
+      console.error('[share-excerpt] 上报「未保存」失败:', e);
+    }
+  }
+
+  /**
+   * 某个 toolCallId 是否已写成功。
+   * 默认问**本记录器的锚点**；要问别的轮次必须显式给 `anchorId`（共享队列里同 id 不同锚点
+   * 是两回事，裸 id 无法区分）。
+   */
+  has(toolCallId: string, anchorId?: number | null): boolean {
+    const anchor = typeof anchorId === 'number' ? anchorId : this.anchorId;
+    if (anchor == null || !toolCallId) return false;
+    return this.outbox.hasWritten(anchor, toolCallId);
+  }
+
+  snapshot(): ShareExcerptRecorderSnapshot {
+    const anchor = this.anchorId;
+    const ownPending = anchor == null ? 0 : this.outbox.pendingCount(anchor);
+    const outboxPending = this.outbox.pendingCount();
+    return {
+      anchorId: anchor,
+      recorded: anchor == null ? 0 : this.outbox.writtenCount(anchor),
+      recordedAll: this.outbox.writtenCount(),
+      failures: this.failures,
+      pendingWrites: this.queued,
+      pendingRecords: ownPending,
+      outboxPending,
+      unsaved: outboxPending > 0,
+      lastError: this.lastError,
+    };
+  }
+}
+
+/**
+ * 工具循环里的一处接线：执行一次 read_share_excerpts，**立刻**把这条 call/result 成对写库，
+ * 再把结果文本交给调用方回填给模型。useChatAI 与测试都走这个函数，避免「hook 里另写一遍」分叉。
+ *
+ * 两件事都在这里收口（返工卡 t_38463abd P1 第 2 条）：
+ *  1. **没有确定的本轮持久化锚点 → 不读**。历史必须成对留存；若读到了却没地方落库，
+ *     就等于给模型一个无法追溯的来源。所以 `recorder` 缺失或 `anchorId == null` 时
+ *     直接返回 `HISTORY_UNAVAILABLE`，预算与网络都不碰。
+ *  2. 落库失败不影响工具结果（recorder 内部吞掉异常、留在待补偿队列里重试）。
+ */
+export async function dispatchShareExcerptToolCall(input: {
+  toolCall: ShareExcerptToolCallLike | null | undefined;
+  turn: ShareExcerptTurn;
+  recorder?: ShareExcerptPairRecorder | null;
+}): Promise<ExecuteShareExcerptResult> {
+  const anchorId = input.recorder?.anchorId ?? null;
+  const outcome = await executeShareExcerptToolCall({
+    toolCall: input.toolCall,
+    turn: input.turn,
+    historyUnavailable: anchorId == null,
+  });
+  if (input.recorder && anchorId != null) await input.recorder.record([outcome.record]);
+  return outcome;
 }

@@ -261,7 +261,14 @@ function truncateToTokens(text: string, maxTokens: number): { text: string; trun
   return { text: cps.slice(0, Math.max(0, maxTokens - 1)).join('') + '…', truncated: true };
 }
 
-/** 对外展示/工具调用用的短引用（完整 shareRef 仍在 metadata 里）。 */
+/**
+ * 界面展示用的短引用（仅限 UI：卡片角标、日志）。
+ *
+ * ⚠️ 不要用它构造**进模型**的文本：模型可见标识必须是完整 shareRef，
+ * 否则模型拿着投影里的短引用去调 read_share_excerpts 时会对不上真实 ref
+ * （返工卡 t_38463abd 的 P1：可见标识与执行器索引不一致）。
+ * 工具端额外接受「唯一前缀」，但那只是对模型截断的容错，不是可见标识的契约。
+ */
 export function shortShareRef(shareRef: string): string {
   return shareRef.length > 12 ? shareRef.slice(0, 12) : shareRef;
 }
@@ -313,10 +320,13 @@ const STATE_LABEL: Record<string, string> = {
 /**
  * 单卡投影文本（进模型的那段）。只含标题/作者/简介与覆盖说明，不含完整正文与原始链接。
  * 每卡 ≤ summaryPerCardTokens；调用方再按整条消息上限二次夹紧。
+ *
+ * 开头的 `[分享 <完整 shareRef>]` 就是模型调 read_share_excerpts 时该原样传回的标识
+ * （工具端也容忍唯一前缀），所以这里不能截断——截断后模型手里的 ref 在可读集合里查不到。
  */
 export function renderShareCardProjection(share: ShareAttachment): string {
   const label = STATE_LABEL[share.state] ?? share.state;
-  const ref = shortShareRef(share.shareRef);
+  const ref = share.shareRef;
   const platform = share.preview?.platformName || share.platform || '链接';
   const head = `[分享 ${ref}] ${platform} · ${label}`;
   if (share.state === 'failed' || share.state === 'cancelled') {
@@ -401,7 +411,7 @@ export function buildShareMessageProjection(
   // 从后往前改，后面的替换不影响前面 span 的原始偏移。
   const rawSpans: Array<{ start: number; end: number; token: string }> = [];
   for (const att of attachments) {
-    const token = `[分享 ${shortShareRef(att.shareRef)}]`;
+    const token = `[分享 ${att.shareRef}]`;
     for (const span of att.occurrenceSpans ?? []) {
       if (typeof span.start !== 'number' || typeof span.end !== 'number') continue;
       rawSpans.push({ start: span.start, end: span.end, token });
