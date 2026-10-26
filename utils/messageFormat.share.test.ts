@@ -65,7 +65,7 @@ describe('normalizeMessageContent × 链接分享', () => {
             '角色',
             '我',
         );
-        expect(out).toContain('[分享 shr_01234567]');
+        expect(out).toContain('[分享 shr_0123456789abcdef0123456789abcdef]');
         expect(out).not.toContain('https://www.bilibili.com');
         expect(out).toContain('讲了啥');
         expect(out).toContain('B站 · UP主：视频标题');
