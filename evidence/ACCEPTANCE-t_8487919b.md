@@ -82,3 +82,23 @@
 
 - `/d/hermes/tmp/sshcfg/vitest-full.log`、`vitest-retry3.log`、`tsc.log`
 - 本文件：`evidence/ACCEPTANCE-t_8487919b.md`
+
+## 9. 第 2/3 轮补充（部署态实跑 → 修复 → 复验）
+
+- 第 2 轮（`evidence/ACCEPTANCE-t_8487919b-R2.md`）：在部署态实跑「分享 → 卡片 → 本轮摘录」，发现
+  私聊主历史 `utils/chatPrompts.ts` 的文本分支直接塞 `m.content`，导致下一轮上下文既没有分享投影、
+  也没有上一轮 `read_share_excerpts` 的成对片段。修复 `5719b238`（带 `metadata.shares` /
+  `metadata.shareExcerpts` 时改走 `normalizeMessageContent`）+ 3 例测试，已合入主干并部署
+  `index-ACSmMZhw.js`（sha256 `8c537e77…`，三方一致）。
+- 第 3 轮（`evidence/ACCEPTANCE-t_8487919b-R3.md`）：在同一部署构建上复验三跳全通——
+  ①卡片进 `metadata.shares`（真实 `characterId=preset-sully-v2`）；②成对记录落 `id=1` 且刷新后仍在；
+  ③下一轮 `/chat/completions` 请求体含 `[read_share_excerpts 记录 · 1 次调用]` + 片段正文。
+  模型自发调用仍属未测（本轮按网络层强制触发，方式已在该文件写明）。
+
+### X-Client-Token 明文回显（owner 决策项 · 明确落点）
+
+- 落点（只写位置，不写值）：`D:\hermes\profiles\ds-executor\state.db`，表 `messages` 的 `content` 列 1 行命中
+  token 明文（`messages_fts` 全文索引同样命中）；来源是第 1 轮浏览器 `Runtime.evaluate` 超时的工具报错。
+- 轮换涉及面：VPS `/opt/sullyos/.env` 的 `AMSG_CLIENT_TOKEN` 被 main-agent / instant-push / amsg 等本机服务共用；
+  所有已配置客户端的浏览器 `localStorage`（`os_api_config.agentToken` / `os_social_share_config.token`）
+  都要同步更新，否则会 403。本卡未轮换、未改密钥、未删除该会话记录。
