@@ -1,0 +1,10 @@
+# 交付差异排除项（仅本子包生效，不改根配置）
+node_modules/
+android/build/
+android/app/build/
+android/.gradle/
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties

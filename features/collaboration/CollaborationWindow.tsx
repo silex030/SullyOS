@@ -42,6 +42,13 @@ import type { CollaborationInlineSpan } from './markdown';
 import { parseCollaborationRichOutput, resolveCollaborationEmoji, sanitizeCollaborationRichOutputSource } from './richOutput';
 import { canSynthesizeSpeech, providerUsesRawVoiceMarkup, synthesizeSpeechDetailed } from '../../utils/ttsRouter';
 import { CollaborationStore } from './store';
+import { SharePanel } from '../appearance-sharing/SharePanel';
+import { applyShareVarsToElement } from '../appearance-sharing/scopedStyle';
+import {
+  coerceStoredReadingStyle,
+  resolveCollaborationCurrent,
+} from '../appearance-sharing/integration';
+import type { ReadingStyle } from '../appearance-sharing/types';
 import { COLLABORATION_LIBRARY_GROUP_LABELS, collaborationLibraryGroupOf, type CollaborationLibraryGroup } from './chatLibrary';
 import {
   buildInstallablePreviewDocument,
@@ -138,7 +145,7 @@ const THEME_AVATAR_MODE: Record<CollaborationUiTheme, Exclude<CollaborationAvata
   deepseek: 'none',
 };
 
-const COLLABORATION_UI_THEME_CSS = `
+export const COLLABORATION_UI_THEME_CSS = `
 .collab-ui-root{--collab-bg:#f4f6fa;--collab-panel:rgba(255,255,255,.84);--collab-panel-solid:#fff;--collab-ink:#1e293b;--collab-muted:#94a3b8;--collab-line:rgba(148,163,184,.28);--collab-accent:#6366f1;--collab-user:#6366f1;--collab-user-ink:#fff;background-color:var(--collab-bg)!important;color:var(--collab-ink)}
 .collab-safe-header{height:calc(4rem + var(--safe-top,0px))!important;padding-top:var(--safe-top,0px)}
 .collab-brand-mark,.collab-brand-label,.collab-assistant-mark,.collab-empty-brand,.collab-empty-companion{display:none}
@@ -185,9 +192,9 @@ const COLLABORATION_UI_THEME_CSS = `
 .collab-ui-root:not(.collab-ui-sully) .collab-assistant-mark{display:grid;width:25px;height:25px;flex:none;place-items:center;margin-top:2px;border-radius:8px;background:var(--collab-accent);color:#fff;font-size:13px;font-weight:700}
 .collab-ui-root:not(.collab-ui-sully) .collab-message-row-user{justify-content:flex-start;flex-direction:row-reverse}
 .collab-ui-root:not(.collab-ui-sully) .collab-message-stack{min-width:0;max-width:85%}
-.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble{box-shadow:none!important;border:0!important;font-size:15px;line-height:1.75}
-.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble-assistant{background:transparent!important;color:var(--collab-ink)!important;padding:1px 0!important;border-radius:0!important}
-.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble-user{background:var(--collab-user)!important;color:var(--collab-user-ink)!important;padding:10px 16px!important;border-radius:20px!important}
+.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble:not([data-ap-share-applied]){box-shadow:none!important;border:0!important;font-size:15px;line-height:1.75}
+.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble-assistant:not([data-ap-share-applied]){background:transparent!important;color:var(--collab-ink)!important;padding:1px 0!important;border-radius:0!important}
+.collab-ui-root:not(.collab-ui-sully) .collab-message-bubble-user:not([data-ap-share-applied]){background:var(--collab-user)!important;color:var(--collab-user-ink)!important;padding:10px 16px!important;border-radius:20px!important}
 .collab-ui-root:not(.collab-ui-sully) .collab-message-time{display:none}
 .collab-ui-root:not(.collab-ui-sully) .collab-message-system{background:color-mix(in srgb,var(--collab-ink) 6%,transparent)!important;color:var(--collab-muted)!important}
 .collab-ui-root:not(.collab-ui-sully) .collab-empty-avatar{display:none}
@@ -229,14 +236,14 @@ const COLLABORATION_UI_THEME_CSS = `
 .collab-ui-kimi .collab-mode-options{border:0!important}
 .collab-ui-kimi .collab-mode-option-icon{background:#eef2ff!important;color:#2864ff!important}
 .collab-ui-kimi .collab-message-row-assistant{margin-top:2px;margin-bottom:2px}
-.collab-ui-kimi .collab-message-bubble-assistant{background:#fff!important;border:1px solid var(--collab-line)!important;border-radius:16px!important;padding:13px 15px!important}
+.collab-ui-kimi .collab-message-bubble-assistant:not([data-ap-share-applied]){background:#fff!important;border:1px solid var(--collab-line)!important;border-radius:16px!important;padding:13px 15px!important}
 .collab-ui-kimi .collab-composer-field{border-radius:18px!important;border-color:#dfe4ee!important}
 .collab-ui-deepseek .collab-brand-mark,.collab-ui-deepseek .collab-empty-brand,.collab-ui-deepseek .collab-assistant-mark{background:#4d6bfe;border-radius:10px}
 .collab-ui-deepseek .collab-mode-brand{background:#4d6bfe;border-radius:12px}
 .collab-ui-deepseek .collab-mode-option{margin:7px 0;padding:18px 14px!important;border:1px solid var(--collab-line)!important;border-radius:14px;background:#fff}
 .collab-ui-deepseek .collab-mode-options{border:0!important}
 .collab-ui-deepseek .collab-mode-option-icon{background:#edf1ff!important;color:#4d6bfe!important}
-.collab-ui-deepseek .collab-message-bubble-assistant{background:#fff!important;border:1px solid var(--collab-line)!important;border-radius:14px!important;padding:13px 15px!important}
+.collab-ui-deepseek .collab-message-bubble-assistant:not([data-ap-share-applied]){background:#fff!important;border:1px solid var(--collab-line)!important;border-radius:14px!important;padding:13px 15px!important}
 .collab-ui-deepseek .collab-composer-field{border-radius:14px!important}
 .collab-brand-mark,.collab-brand-label,.collab-assistant-mark,.collab-empty-brand,.collab-mode-brand,.collab-mode-brand-title,.collab-empty-companion{display:none!important}
 .collab-ui-root.collab-avatar-none .collab-message-avatar,.collab-ui-root.collab-avatar-none .collab-header-avatar,.collab-ui-root.collab-avatar-none .collab-mode-avatar,.collab-ui-root.collab-avatar-none .collab-empty-avatar{display:none!important}
@@ -483,6 +490,7 @@ const ApiSettingsPanel: React.FC<{
   settings: CollaborationSettings;
   character: CharacterProfile;
   user: UserProfile;
+  theme: ChatTheme;
   chatCollaborationEnabled: boolean;
   chatApi: APIConfig;
   apiPresets: ApiPreset[];
@@ -490,7 +498,7 @@ const ApiSettingsPanel: React.FC<{
   onToggleChatCollaboration: (enabled: boolean) => void;
   onSave: (settings: CollaborationSettings) => Promise<void>;
   onClose: () => void;
-}> = ({ settings, character, user, chatCollaborationEnabled, chatApi, apiPresets, availableModels, onToggleChatCollaboration, onSave, onClose }) => {
+}> = ({ settings, character, user, theme, chatCollaborationEnabled, chatApi, apiPresets, availableModels, onToggleChatCollaboration, onSave, onClose }) => {
   const [draft, setDraft] = useState<CollaborationSettings>(() => ({
     ...settings,
     immersive: { ...settings.immersive },
@@ -504,6 +512,14 @@ const ApiSettingsPanel: React.FC<{
   }));
   const [modelStatus, setModelStatus] = useState<Record<CollaborationMode, string>>({ immersive: '', focused: '' });
   const [fetchingMode, setFetchingMode] = useState<CollaborationMode | null>(null);
+  // t_40feeeaa round3：current 引用稳定——内联 resolve 每次渲染产生新对象，
+  // 会触发 SharePanel 的 [current] 效应（进行中的文件读取作废；实测协作面板
+  // 第二次导入被静默丢弃、应用落到回落值）。只在三输入变化时重算。
+  const collabShareCurrent = useMemo(
+    () => resolveCollaborationCurrent(draft.readingStyle, draft.uiTheme, theme.ai),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [draft.readingStyle, draft.uiTheme, theme.ai],
+  );
   const profile = draft[mode];
   const selectableModels = Array.from(new Set([profile.model, ...modelOptions[mode]].filter(Boolean)));
   const previewAvatar = user.perCharAvatars?.[character.id] || user.avatar || character.avatar;
@@ -610,6 +626,23 @@ const ApiSettingsPanel: React.FC<{
                 );
               })}
             </div>
+          </section>
+
+          <section>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-xs font-semibold text-slate-600">正文样式分享</h3>
+                <p className="mt-0.5 text-[10px] text-slate-400">从分享包导入消息正文配色与字号，只影响这个协作窗口；取消不保存</p>
+              </div>
+              {!!coerceStoredReadingStyle(draft.readingStyle, 'collaboration') && (
+                <button type="button" onClick={() => setDraft(previous => ({ ...previous, readingStyle: undefined }))} className="shrink-0 rounded-full bg-slate-100 px-3 py-1.5 text-[10px] font-bold text-slate-500 active:scale-95">恢复原样式</button>
+              )}
+            </div>
+            <SharePanel
+              target="collaboration"
+              current={collabShareCurrent}
+              onApply={style => setDraft(previous => ({ ...previous, readingStyle: style }))}
+            />
           </section>
 
           <section>
@@ -1156,11 +1189,13 @@ const MessageBubble: React.FC<{
   uiTheme: CollaborationUiTheme;
   emojis: Emoji[];
   emojiCategories: EmojiCategory[];
+  /** 外观分享包覆盖（已校验）；缺省 = 原主题气泡视觉零变化。 */
+  shareStyle?: ReadingStyle;
   voiceState?: CollaborationVoiceUiState;
   onPlayVoice: (message: CollaborationMessage) => void;
   onOpenAttachment: (attachment: CollaborationAttachment) => void;
   onLongPress: (message: CollaborationMessage) => void;
-}> = ({ message, character, user, theme, uiTheme, emojis, emojiCategories, voiceState, onPlayVoice, onOpenAttachment, onLongPress }) => {
+}> = ({ message, character, user, theme, uiTheme, emojis, emojiCategories, shareStyle, voiceState, onPlayVoice, onOpenAttachment, onLongPress }) => {
   const longPressHandlers = useCollaborationLongPress(() => onLongPress(message));
   if (message.role === 'system') {
     return <div {...longPressHandlers} className="collab-message-system mx-auto my-3 max-w-[82%] rounded-full bg-slate-900/6 px-4 py-2 text-center text-[11px] leading-relaxed text-slate-500">{message.content}</div>;
@@ -1174,8 +1209,17 @@ const MessageBubble: React.FC<{
       <TokenImg value={avatar} alt={isUser ? user.name : character.name} className={`collab-message-avatar ${isUser ? 'collab-message-avatar-user' : 'collab-message-avatar-assistant'} h-8 w-8 shrink-0 rounded-full object-cover shadow-sm ring-1 ring-black/5`} />
       <div className={`collab-message-stack min-w-0 max-w-[78%] ${isUser ? 'items-end' : 'items-start'} flex flex-col`} data-ui-theme={uiTheme}>
         <div
+          data-ap-share-applied={shareStyle ? '1' : undefined}
           className={`collab-message-bubble min-w-0 max-w-full ${isUser ? 'collab-message-bubble-user' : 'collab-message-bubble-assistant'} px-4 py-3 text-[15px] leading-7 shadow-sm`}
-          style={{
+          style={shareStyle ? {
+            color: 'var(--ap-share-fg)',
+            backgroundColor: 'var(--ap-share-bg)',
+            borderRadius: 'var(--ap-share-radius)',
+            border: '1px solid var(--ap-share-accent)',
+            fontFamily: 'var(--ap-share-font)',
+            fontSize: 'var(--ap-share-font-size)',
+            lineHeight: 'var(--ap-share-line-height)',
+          } : {
             color: style.textColor || (isUser ? '#fff' : '#1e293b'),
             backgroundColor: withAlpha(style.backgroundColor, style.opacity ?? 1, isUser ? '#6366f1' : '#fff'),
             borderRadius: style.borderRadius ?? 20,
@@ -1199,7 +1243,7 @@ const MessageBubble: React.FC<{
             <AttachmentButton key={attachment.id} attachment={attachment} onOpen={() => onOpenAttachment(attachment)} />
           ))}
         </div>
-        <span className="collab-message-time mt-1 px-1 text-[9px] text-slate-400">{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+        <span className="collab-message-time mt-1 px-1 text-[9px] text-slate-400" style={shareStyle ? { color: 'var(--ap-share-accent)' } : undefined}>{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
       </div>
     </div>
   );
@@ -1486,6 +1530,15 @@ const CollaborationWindow: React.FC<CollaborationWindowProps> = ({
   const [playingVoiceId, setPlayingVoiceId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 外观分享包覆盖：只取已校验值；非法/缺省 → undefined，原主题视觉零变化。
+  const collabShareStyle: ReadingStyle | undefined = coerceStoredReadingStyle(settings.readingStyle, 'collaboration');
+  // 变量只写消息滚动容器节点（复用 scrollRef，滚动行为不动），不碰其它节点；
+  // 取消/卸载时由 cleanup 还原。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !collabShareStyle) return;
+    return applyShareVarsToElement(el, collabShareStyle);
+  }, [collabShareStyle, loaded]);
   const abortRef = useRef<AbortController | null>(null);
   const notifyRef = useRef(notify);
   const actionDialogRef = useRef<CollaborationDialogState | null>(null);
@@ -2317,6 +2370,7 @@ const CollaborationWindow: React.FC<CollaborationWindowProps> = ({
                 user={user}
                 theme={theme}
                 uiTheme={uiTheme}
+                shareStyle={collabShareStyle}
                 emojis={visibleEmojiLibrary.emojis}
                 emojiCategories={visibleEmojiLibrary.categories}
                 voiceState={{
@@ -2421,6 +2475,7 @@ const CollaborationWindow: React.FC<CollaborationWindowProps> = ({
           settings={settings}
           character={character}
           user={user}
+          theme={theme}
           chatCollaborationEnabled={chatCollaborationEnabled}
           chatApi={chatApi}
           apiPresets={apiPresets}

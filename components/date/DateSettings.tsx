@@ -8,6 +8,8 @@ import { pickDateFallbackSprite } from '../../utils/dateSprites';
 import TokenImg from '../os/TokenImg';
 import { DATE_STYLE_PRESETS } from '../../utils/datePrompts';
 import ObserveSettings from './ObserveSettings';
+import { SharePanel } from '../../features/appearance-sharing/SharePanel';
+import { coerceStoredReadingStyle, resolveDateCurrent } from '../../features/appearance-sharing/integration';
 
 // 标准情绪列表
 const REQUIRED_EMOTIONS = ['normal', 'happy', 'angry', 'sad', 'shy'];
@@ -309,6 +311,29 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                         >
                             <div className={`absolute top-0.5 w-6 h-6 bg-white rounded-full shadow-md transition-transform ${char.dateReadingShowAvatars ? 'translate-x-5' : 'translate-x-0.5'}`}></div>
                         </button>
+                    </div>
+                </section>
+
+                <section className="bg-white rounded-2xl border border-slate-100 shadow-sm">
+                    <div className="flex items-center justify-between gap-4 p-4">
+                        <div className="min-w-0">
+                            <h3 className="text-xs font-bold text-slate-400 uppercase">阅读样式分享</h3>
+                            <p className="text-[11px] text-slate-400 mt-1">从分享包导入小说视图配色与字号，只影响本角色的见面记录；取消不保存</p>
+                        </div>
+                        {!!coerceStoredReadingStyle(char.dateReadingStyle, 'date-reading') && (
+                            <button
+                                onClick={() => updateCharacter(char.id, { dateReadingStyle: undefined })}
+                                type="button"
+                                className="shrink-0 px-3 py-1.5 rounded-full bg-slate-100 text-[10px] font-bold text-slate-500 active:scale-95 transition-transform"
+                            >恢复原样式</button>
+                        )}
+                    </div>
+                    <div className="px-4 pb-4">
+                        <SharePanel
+                            target="date-reading"
+                            current={resolveDateCurrent(char.dateReadingStyle, !!char.dateLightReading)}
+                            onApply={(style) => updateCharacter(char.id, { dateReadingStyle: style })}
+                        />
                     </div>
                 </section>
 

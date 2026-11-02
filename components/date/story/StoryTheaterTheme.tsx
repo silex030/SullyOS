@@ -4,6 +4,12 @@ import { getPortalHost } from '../../../utils/portalHost';
 import { Moon, Palette, Sparkle, SquaresFour, Sun, X } from '@phosphor-icons/react';
 import { STORY_THEATER_APPEARANCE_STORAGE_KEY } from '../../../utils/storyTheaterBackup';
 import { useOS } from '../../../context/OSContext';
+import { SharePanel } from '../../../features/appearance-sharing/SharePanel';
+import {
+    coerceStoredReadingStyle,
+    resolveStoryCurrent,
+} from '../../../features/appearance-sharing/integration';
+import type { ReadingStyle } from '../../../features/appearance-sharing/types';
 
 export type StoryColorMode = 'light' | 'dark';
 export type StoryDecorMode = 'plain' | 'cinema';
@@ -11,12 +17,16 @@ export type StoryDecorMode = 'plain' | 'cinema';
 interface StoryAppearance {
     color: StoryColorMode;
     decor: StoryDecorMode;
+    /** 外观分享包落到故事正文的可选覆盖（t_40feeeaa 接线）；缺省 = 原主题视觉零变化。 */
+    readingStyle?: ReadingStyle;
 }
 
 interface StoryThemeContextValue {
     appearance: StoryAppearance;
     setColor: (value: StoryColorMode) => void;
     setDecor: (value: StoryDecorMode) => void;
+    /** onApply 写入；取消永不调用；undefined = 恢复原样式（只去可选覆盖，不动 color/decor）。 */
+    setReadingStyle: (value: ReadingStyle | undefined) => void;
 }
 
 const STORAGE_KEY = STORY_THEATER_APPEARANCE_STORAGE_KEY;
@@ -32,6 +42,8 @@ function readAppearance(): StoryAppearance {
         return {
             color: value.color === 'dark' ? 'dark' : 'light',
             decor: value.decor === 'cinema' ? 'cinema' : 'plain',
+            // 非法存档直接丢弃（历史数据无此字段保持原样），校验走分享包真实 API。
+            readingStyle: coerceStoredReadingStyle(value.readingStyle, 'story-reading'),
         };
     } catch {
         return DEFAULT_APPEARANCE;
@@ -162,6 +174,7 @@ export const StoryTheaterThemeProvider: React.FC<React.PropsWithChildren> = ({ c
         appearance,
         setColor: color => setAppearance(current => ({ ...current, color })),
         setDecor: decor => setAppearance(current => ({ ...current, decor })),
+        setReadingStyle: readingStyle => setAppearance(current => ({ ...current, readingStyle })),
     }), [appearance]);
 
     return <StoryThemeContext.Provider value={value}>
@@ -172,10 +185,24 @@ export const StoryTheaterThemeProvider: React.FC<React.PropsWithChildren> = ({ c
     </StoryThemeContext.Provider>;
 };
 
+export const useStoryTheme = (): StoryThemeContextValue | null => useContext(StoryThemeContext);
+
 export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ className = '' }) => {
     const context = useContext(StoryThemeContext);
     const { registerBackHandler } = useOS();
     const [open, setOpen] = useState(false);
+    // t_40feeeaa round3：current/onApply 必须引用稳定——内联每次渲染都产生新对象，
+    // 会触发 SharePanel 的 [current] 效应（draft 重置为 current、进行中的文件读取作废），
+    // 剧场会话重渲染频繁时导入永远赢不了竞态。只在三输入变化时重算。
+    const storyShareCurrent = useMemo(
+        () => resolveStoryCurrent(context?.appearance.readingStyle, context?.appearance.color ?? 'light', context?.appearance.decor ?? 'plain'),
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [context?.appearance.readingStyle, context?.appearance.color, context?.appearance.decor],
+    );
+    const applyStoryShareStyle = useCallback(
+        (style: ReadingStyle) => context?.setReadingStyle(style),
+        [context],
+    );
     const closePanel = useCallback(() => {
         setOpen(false);
         try {
@@ -212,7 +239,7 @@ export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ classN
         };
     }, [closePanel, open, registerBackHandler]);
     if (!context) return null;
-    const { appearance, setColor, setDecor } = context;
+    const { appearance, setColor, setDecor, setReadingStyle } = context;
 
     return <>
         <button type='button' onClick={() => setOpen(true)} className={`w-9 h-9 rounded-full grid place-items-center ${className}`} title='剧情外观' aria-label='剧情外观'>
@@ -238,6 +265,24 @@ export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ classN
                 <div className='mt-5 min-h-0 overflow-y-auto overscroll-contain border-t border-slate-200'>
                     <div className='py-4 flex items-center gap-3'><span className='text-xs font-semibold w-16'>明暗</span><div className='min-w-0 flex-1 grid grid-cols-2 p-1 rounded-xl bg-slate-200'><button onClick={() => setColor('light')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.color === 'light' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sun size={14} />浅色</button><button onClick={() => setColor('dark')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.color === 'dark' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Moon size={14} />深色</button></div></div>
                     <div className='py-4 border-t border-slate-200 flex items-center gap-3'><span className='text-xs font-semibold w-16'>装饰</span><div className='min-w-0 flex-1 grid grid-cols-2 p-1 rounded-xl bg-slate-200'><button onClick={() => setDecor('plain')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.decor === 'plain' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><SquaresFour size={14} />素雅</button><button onClick={() => setDecor('cinema')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.decor === 'cinema' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkle size={14} />花里胡哨</button></div></div>
+                    <div className='py-4 border-t border-slate-200'>
+                        <div className='flex items-center justify-between gap-3'>
+                            <span className='text-xs font-semibold'>阅读样式分享</span>
+                            {appearance.readingStyle && <button
+                                type='button'
+                                onClick={() => setReadingStyle(undefined)}
+                                className='px-3 py-1.5 rounded-full bg-slate-100 text-[10px] font-bold text-slate-500 active:scale-95 transition-transform'
+                            >恢复原样式</button>}
+                        </div>
+                        <p className='mt-1 text-[10px] leading-5 text-slate-400'>从分享包导入正文配色与字号，只影响故事正文；取消不保存，恢复原样式只去掉这层覆盖。</p>
+                        <div className='mt-3'>
+                            <SharePanel
+                                target='story-reading'
+                                current={storyShareCurrent}
+                                onApply={applyStoryShareStyle}
+                            />
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>, getPortalHost())}

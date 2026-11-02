@@ -15,6 +15,8 @@ import { Door, Sparkle, Image, GearSix, Camera, MoonStars, ArrowUUpLeft, ArrowUU
 import { FURNITURE_ICONS } from '../utils/furnitureIcons';
 import PixelHomeView from './pixelHome/PixelHomeView';
 import WorldHomeApp from './WorldHomeApp';
+import { Room3DHome } from '../features/room3d/Room3DHome';
+import { resolveChibiMarker } from '../features/room3d/chibiAdapter';
 import DreamTheater from './DreamTheater';
 import { useDreamSim, dreamSimStore } from '../utils/dreamSimStore';
 import { roomLaunch } from '../utils/roomLaunch';
@@ -317,7 +319,7 @@ const RoomApp: React.FC = () => {
     const launchedFromDesktopRef = useRef(!!launchIntent);
 
     // Core State
-    const [viewState, setViewState] = useState<'select' | 'room' | 'pixelHome'>(() => {
+    const [viewState, setViewState] = useState<'select' | 'room' | 'pixelHome' | 'room3d'>(() => {
         if (launchIntent?.tab === 'pixelHome' && launchIntent.charId) return 'pixelHome';
         if (launchIntent?.charId) return 'room'; // 房间 / 梦境
         return 'select';
@@ -1670,6 +1672,37 @@ ${!shouldGenerateTodo ? `(系统: 今日待办已存在，无需生成，请忽�
         );
     }
 
+    // 3D ROOM SCREEN：原 2D / 像素 / 家园全部保留，新增的清楚入口。
+    // 布局按角色隔离（charId），保存后重进自动恢复；WebGL 不可用时渲染
+    // fallback2D 插槽（返回 2D 小窝按钮），绝不递归嵌套整个 RoomApp。
+    if (viewState === 'room3d' && char) {
+        return (
+            <div key="room3d" className={`h-full w-full flex flex-col font-sans overflow-y-auto no-scrollbar bg-[#eef2f7] ${navAnim}`}>
+                <div className="sticky top-0 z-30 px-4 pb-2 flex items-center gap-2 bg-[#eef2f7]/90 backdrop-blur" style={{ paddingTop: 'max(3rem, var(--safe-top, 0px))' }}>
+                    <button onClick={() => { setNavDir('r'); setViewState('room'); }} className="bg-white/90 p-2 rounded-full shadow-md pointer-events-auto active:scale-90 transition-transform text-slate-600" aria-label="返回 2D 小窝"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg></button>
+                    <div className="flex-1 min-w-0">
+                        <h1 className="text-[16px] font-bold text-slate-700 truncate">🧊 3D 房间 · {char.name}</h1>
+                        <p className="text-[10px] text-slate-400">布局按角色隔离保存，重开自动恢复</p>
+                    </div>
+                </div>
+                <div className="px-4 pb-8">
+                    <Room3DHome
+                        charId={char.id}
+                        storage={window.localStorage}
+                        chibi={resolveChibiMarker(char)}
+                        fallback2D={(
+                            <button onClick={() => { setNavDir('r'); setViewState('room'); }} className="rounded-2xl bg-slate-800 px-4 py-2.5 text-sm text-white font-bold active:scale-95 transition-transform">
+                                返回 2D 小窝
+                            </button>
+                        )}
+                        onSaved={() => addToast('3D 布局已保存，重开自动恢复', 'success')}
+                        onFallback={(reason) => addToast(`3D 暂不可用（${reason}），2D 小窝不受影响`, 'info')}
+                    />
+                </div>
+            </div>
+        );
+    }
+
     // SELECT SCREEN
     if (viewState === 'select') {
         // 像素家园=深色，小小窝/家园=浅色（参考稿）
@@ -2102,6 +2135,10 @@ ${!shouldGenerateTodo ? `(系统: 今日待办已存在，无需生成，请忽�
                         <button onClick={() => setShowRefreshConfirm(true)} className="p-2 bg-white/90 rounded-full shadow-md text-slate-500 hover:text-primary active:scale-90 transition-transform" title="强制刷新今日">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" /></svg>
                         </button>
+                    )}
+                    {/* 3D 房间入口：只在浏览模式露出，原 2D 流程不动 */}
+                    {mode === 'view' && (
+                        <button onClick={() => { setNavDir('l'); setViewState('room3d'); }} className="px-4 py-2 rounded-full font-bold text-xs shadow-md transition-all bg-white text-slate-600 active:scale-95" title="进入 3D 房间">🧊 3D房间</button>
                     )}
                     <button onClick={() => { setMode(mode === 'view' ? 'edit' : 'view'); setSelectedItemId(null);  }} className={`px-4 py-2 rounded-full font-bold text-xs shadow-md transition-all ${mode === 'edit' ? 'bg-blue-500 text-white' : 'bg-white text-slate-600'}`}>{mode === 'edit' ? '完成' : '装修'}</button>
                 </div>

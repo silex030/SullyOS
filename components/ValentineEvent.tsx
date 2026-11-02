@@ -33,6 +33,11 @@ import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { markAmsgStateDirty } from '../utils/amsgStateSync';
 import { createQixiChatMessagePair } from '../utils/qixiChatCard';
 import StoryTheater from './date/story/StoryTheater';
+import { HalloweenHunt } from '../features/seasonal-events/HalloweenHunt';
+import { getHalloweenPhase, halloweenClaimId, loadHalloweenMeta } from '../features/seasonal-events/halloween';
+import { HALLOWEEN_END_KEY, HALLOWEEN_EVENT_ID, HALLOWEEN_START_KEY } from '../features/seasonal-events/types';
+import type { HalloweenRewardIntent } from '../features/seasonal-events/types';
+import { getLocalDateKey } from '../utils/localDate';
 
 // ============================================================
 // 情人节立绘 Sprite 映射 (占位 emoji，等图片整理好后替换为图床URL)
@@ -1341,6 +1346,13 @@ export const SpecialMomentsApp: React.FC = () => {
     // Qixi
     const [showQixiSession, setShowQixiSession] = useState(false);
     const [qixiCharId, setQixiCharId] = useState<string>('');
+
+    // 万圣节寻物（本地活动 2026-10-29..31）：收集 6 点 → 一次领取。
+    // 奖励是本地纪念糖果收集记录（persisted claimed + 稳定 claimId 为唯一凭证），
+    // 不计入银行 / 捕鱼余额，不调用货币存档；回执走既有 DB.assets（随备份走）。
+    const [showHalloweenSession, setShowHalloweenSession] = useState(false);
+    const [halloweenCharId, setHalloweenCharId] = useState<string>('');
+    const [halloweenReceipt, setHalloweenReceipt] = useState<Record<string, 'saved' | 'failed'>>({});
     const [qixiChoiceCharId, setQixiChoiceCharId] = useState<string>('');
     const [qixiSessionMode, setQixiSessionMode] = useState<QixiSessionMode>('fresh');
     const [qixiReplaySnapshot, setQixiReplaySnapshot] = useState<QixiReplaySnapshot | null>(null);
@@ -1479,6 +1491,59 @@ export const SpecialMomentsApp: React.FC = () => {
         openQixiSession(charId, 'fresh');
     };
 
+    // 万圣节领取回执 id：稳定、可重放幂等（claimId 终身唯一）。
+    const halloweenReceiptId = (charId: string): string =>
+        `halloween-receipt-${halloweenClaimId(charId)}`;
+
+    // 对账补记：本地已有 claimed 但回执缺失时补写一条；已存在则直接标 saved。
+    // 返回 true = 回执已在（或补记成功），false = 写失败（界面明示可重试）。
+    const reconcileHalloweenReceipt = async (charId: string, collectedCount?: number): Promise<boolean> => {
+        try {
+            const meta = loadHalloweenMeta(window.localStorage, charId);
+            if (meta.status !== 'ok' || !meta.state?.claimed) return false;
+            const id = halloweenReceiptId(charId);
+            const existing = await DB.getAsset(id);
+            if (existing) {
+                setHalloweenReceipt(prev => ({ ...prev, [charId]: 'saved' }));
+                return true;
+            }
+            await DB.saveAsset(id, JSON.stringify({
+                kind: 'halloween-candy-receipt',
+                eventId: HALLOWEEN_EVENT_ID,
+                charId,
+                claimId: meta.state.claimId ?? halloweenClaimId(charId),
+                collectedCount: collectedCount ?? meta.state.collected.length,
+                claimedAt: Date.now(),
+            }));
+            setHalloweenReceipt(prev => ({ ...prev, [charId]: 'saved' }));
+            return true;
+        } catch {
+            setHalloweenReceipt(prev => ({ ...prev, [charId]: 'failed' }));
+            return false;
+        }
+    };
+
+    const openHalloweenSession = (charId: string) => {
+        setHalloweenCharId(charId);
+        setShowHalloweenSession(true);
+        // 进页即对账：刷新 / 重放导致回执缺失时自动补记，不静默丢奖
+        void reconcileHalloweenReceipt(charId);
+    };
+
+    // onReward 对接：intent 自带 charId，必须与当前会话角色一致，
+    // 否则不记奖（错角色不得记奖）；成功只写一条本地回执（见上），
+    // 绝不写银行 / 捕鱼余额；写失败明示可重试。
+    const handleHalloweenReward = (intent: HalloweenRewardIntent) => {
+        if (!halloweenCharId || intent.charId !== halloweenCharId || intent.eventId !== HALLOWEEN_EVENT_ID) {
+            addToast('奖励归属异常，未记奖', 'error');
+            return;
+        }
+        void reconcileHalloweenReceipt(intent.charId, intent.collectedCount).then(ok => {
+            if (ok) addToast('纪念糖果已记入本地收藏 🎃', 'success');
+            else addToast('领取回执保存失败，重进本页可重试', 'error');
+        });
+    };
+
     if (showCustomTheater) {
         return (
             <StoryTheater onSwitchCompanion={() => setShowCustomTheater(false)} onClose={() => setShowCustomTheater(false)} />
@@ -1529,6 +1594,54 @@ export const SpecialMomentsApp: React.FC = () => {
             />
         );
     }
+
+    if (showHalloweenSession && halloweenCharId) {
+        const hwChar = characters.find(c => c.id === halloweenCharId);
+        const hwReceiptState = halloweenReceipt[halloweenCharId];
+        let hwClaimed = false;
+        try {
+            const hwMeta = loadHalloweenMeta(window.localStorage, halloweenCharId);
+            hwClaimed = hwMeta.status === 'ok' && !!hwMeta.state?.claimed;
+        } catch { /* 读失败不挡展示 */ }
+        return (
+            <div className="h-full w-full bg-gradient-to-b from-orange-50 via-white to-amber-50 flex flex-col font-light">
+                <div className="border-b border-orange-100 bg-white/80 backdrop-blur-sm shrink-0" style={{ paddingTop: 'var(--safe-top)' }}>
+                    <div className="h-16 flex items-center justify-between px-4">
+                        <button onClick={() => { setShowHalloweenSession(false); setHalloweenCharId(''); }} className="p-2 -ml-2 rounded-full hover:bg-orange-50" aria-label="返回特别时光">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-6 h-6 text-slate-600"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg>
+                        </button>
+                        <span className="font-bold text-slate-700">万圣节寻物 · {hwChar?.name || ''}</span>
+                        <div className="w-8" />
+                    </div>
+                </div>
+                <div className="flex-1 overflow-y-auto p-6">
+                    <HalloweenHunt
+                        charId={halloweenCharId}
+                        storage={window.localStorage}
+                        onReward={handleHalloweenReward}
+                    />
+                    <div className="mt-4 rounded-3xl border border-amber-200 bg-amber-50/80 p-4">
+                        <p className="text-xs font-bold text-amber-800">🎃 纪念奖励说明</p>
+                        <p className="mt-1 text-[11px] leading-relaxed text-amber-700">
+                            集齐领取的是「本地纪念糖果收集记录」：领取凭证 {halloweenClaimId(halloweenCharId)}，
+                            持久保存在本机，重开 / 刷新不会重复发放。这是纪念收藏，
+                            不计入银行 / 捕鱼余额，也不调用任何货币存档（onReward 只写一条本地回执，可重放幂等）。
+                        </p>
+                        <p className="mt-2 text-[11px] text-amber-700">
+                            领取回执：{!hwClaimed ? '尚未领取' : hwReceiptState === 'saved' ? '已保存 ✓' : hwReceiptState === 'failed' ? '保存失败' : '对账中…'}
+                            {hwClaimed && hwReceiptState === 'failed' && (
+                                <button onClick={() => void reconcileHalloweenReceipt(halloweenCharId)} className="ml-2 rounded-lg bg-amber-600 px-2 py-1 text-[10px] font-bold text-white active:scale-95">重试</button>
+                            )}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    const hwToday = getLocalDateKey(new Date());
+    const hwPhase = getHalloweenPhase(hwToday);
+    const hwPhaseText = hwPhase === 'active' ? `进行中 · 可收集（${hwToday}）` : hwPhase === 'before' ? '10-29 开启' : `已结束（${hwToday}）`;
 
     return (
         <div className="h-full w-full bg-gradient-to-b from-pink-50 via-white to-rose-50 flex flex-col font-light">
@@ -1620,6 +1733,46 @@ export const SpecialMomentsApp: React.FC = () => {
                         pendingDeleteId={deleteTargetId}
                     />
                 )}
+                {/* 万圣节寻物（本地活动 2026-10-29..31）：收集 6 点 → 一次领取。
+                    日期取设备本地今天，由 HalloweenHunt 按真实日期显示未开始 / 进行 / 已结束；
+                    过期仍可查看已有记录，不会假显示当前仍开放。 */}
+                <div className="mb-6 rounded-3xl p-6 text-white relative overflow-hidden bg-gradient-to-br from-orange-700 via-amber-600 to-yellow-500 shadow-xl shadow-orange-200">
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-bl-full pointer-events-none" />
+                    <div className="relative">
+                        <div className="text-3xl mb-2">🎃</div>
+                        <h2 className="text-xl font-bold mb-1">万圣节寻物</h2>
+                        <p className="text-orange-50/90 text-xs mb-1">2026.10.29–10.31 — 收集 6 处糖果点位，领取本地纪念糖果</p>
+                        <p className="text-[10px] text-orange-100/70 mb-4">按你手机上的日期：{hwPhaseText} · 活动窗口 {HALLOWEEN_START_KEY} ~ {HALLOWEEN_END_KEY}</p>
+                        {characters.length === 0 ? (
+                            <p className="text-[11px] text-orange-100/80">还没有角色，先去「神经链接」创建一个吧。</p>
+                        ) : (
+                            <div className="flex gap-2 overflow-x-auto pb-1">
+                                {characters.map(c => {
+                                    let claimed = false;
+                                    try {
+                                        const m = loadHalloweenMeta(window.localStorage, c.id);
+                                        claimed = m.status === 'ok' && !!m.state?.claimed;
+                                    } catch { /* 读失败按未领取展示 */ }
+                                    return (
+                                        <button
+                                            key={c.id}
+                                            type="button"
+                                            onClick={() => openHalloweenSession(c.id)}
+                                            className="relative flex flex-col items-center gap-1 rounded-2xl border border-white/25 bg-white/10 px-3 py-2.5 min-w-[64px] active:scale-95 transition-transform"
+                                        >
+                                            <span className="w-10 h-10 rounded-full overflow-hidden bg-white/20 flex items-center justify-center text-xl">
+                                                {c.avatar ? <TokenImg value={c.avatar} className="w-full h-full object-cover" alt={c.name} /> : '🌸'}
+                                            </span>
+                                            <span className="text-[10px] font-bold truncate w-full text-center">{c.name}</span>
+                                            {claimed && <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-white/80" />}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                        <p className="text-[10px] text-orange-100/60 mt-3">纪念奖励说明：领取的是本地纪念收藏（领取凭证），不计入银行 / 捕鱼余额。</p>
+                    </div>
+                </div>
                 {/* 自定义小剧场 */}
                 <div className="mb-6" style={{ contain: 'layout paint' }}>
                     <div className="rounded-3xl p-6 text-white relative overflow-hidden bg-gradient-to-br from-violet-600 via-purple-600 to-fuchsia-500 shadow-xl shadow-purple-200">

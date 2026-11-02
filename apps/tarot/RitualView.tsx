@@ -18,6 +18,7 @@ interface Props {
   addToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
   dateKey: string;
   onSaved: (record: TarotReadingRecord) => void;
+  onSkyNavigation?: () => void;
 }
 
 const QUICK_QUESTIONS = ['最近的感情走向', '事业上该注意什么', '这件事该如何选择', '我现在的状态怎么样'];
@@ -41,7 +42,7 @@ const TableFelt: React.FC = () => (
 );
 
 export const RitualView: React.FC<Props> = ({
-  characters, activeCharacterId, userProfile, apiConfig, addToast, dateKey, onSaved,
+  characters, activeCharacterId, userProfile, apiConfig, addToast, dateKey, onSaved, onSkyNavigation,
 }) => {
   const [phase, setPhase] = useState<Phase>('setup');
   const [targetId, setTargetId] = useState<string>('user');
@@ -67,6 +68,7 @@ export const RitualView: React.FC<Props> = ({
   const later = (ms: number, fn: () => void) => { timers.current.push(window.setTimeout(fn, ms)); };
 
   const startShuffle = () => {
+    onSkyNavigation?.();
     const picks = drawSpread(CARDS.length, spread.cardCount);
     const resolved: ResolvedDrawn[] = picks.map((p, i) => ({
       card: CARDS[p.cardIndex],
@@ -90,6 +92,7 @@ export const RitualView: React.FC<Props> = ({
   const flipAll = () => setFlipped(new Array(drawn.length).fill(true));
 
   const openReading = async () => {
+    onSkyNavigation?.();
     const rec: TarotReadingRecord = {
       id: newReadingId(),
       kind: 'spread',
@@ -113,6 +116,7 @@ export const RitualView: React.FC<Props> = ({
   };
 
   const reset = () => {
+    onSkyNavigation?.();
     timers.current.forEach(clearTimeout);
     timers.current = [];
     setPhase('setup');
@@ -195,7 +199,7 @@ export const RitualView: React.FC<Props> = ({
   // ── shuffling ──
   if (phase === 'shuffling') {
     return (
-      <div className="flex h-[380px] flex-col items-center justify-center" onClick={() => setPhase('dealing')}>
+      <div className="flex h-[380px] flex-col items-center justify-center" onClick={() => { onSkyNavigation?.(); setPhase('dealing'); }}>
         <div className="relative h-44 w-28">
           <div className="tarot-aura pointer-events-none absolute -inset-12 rounded-full" style={{ background: 'radial-gradient(circle, rgba(201,162,39,0.30) 0%, transparent 70%)' }} />
           {[0, 1, 2, 3, 4].map((i) => (
@@ -305,6 +309,7 @@ export const RitualView: React.FC<Props> = ({
           api={{ baseUrl: apiConfig.baseUrl, apiKey: apiConfig.apiKey, model: apiConfig.model }}
           user={userProfile}
           addToast={addToast}
+          onSkyNavigation={onSkyNavigation}
           onRecordChange={async (next) => {
             setRecord(next);
             try { await DB.saveTarotReading(next); } catch { /* 展示优先，落库失败不打断 */ }

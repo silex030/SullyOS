@@ -1,5 +1,6 @@
 import React from 'react';
 import { AppConfig, AppID } from './types';
+import { BibiIcon } from './features/friend-feed/BibiIcon';
 import {
   UserCircle,
   IdentificationCard,
@@ -84,6 +85,7 @@ export const Icons: Record<string, React.FC<{ className?: string }>> = {
   WorldHome: ({ className }) => <HouseLine className={className} weight="regular" />,
   Pomodoro: ({ className }) => <Timer className={className} weight="regular" />,
   Tarot: ({ className }) => <Cards className={className} weight="regular" />,
+  Bibi: ({ className }) => <BibiIcon className={className} size={22} />,
   Terminal: ({ className }) => <TerminalWindow className={className} weight="regular" />,
   Launcher: ({ className }) => <House className={className} weight="fill" />,
 };
@@ -108,6 +110,7 @@ export const INSTALLED_APPS: AppConfig[] = [
   { id: AppID.Journal, name: '交换日记', icon: 'Journal', color: 'amber' },
   // { id: AppID.Handbook, name: '手账', icon: 'Handbook', color: 'fuchsia' }, // Hidden temporarily, pending update
   { id: AppID.Moments, name: '朋友圈', icon: 'Moments', color: 'green' },
+  { id: AppID.Bibi, name: '哔哔', icon: 'Bibi', color: 'teal' },
   { id: AppID.Study, name: '自习室', icon: 'Study', color: 'emerald' },
   { id: AppID.Pomodoro, name: '番茄钟', icon: 'Pomodoro', color: 'orange' },
   { id: AppID.Tarot, name: '塔罗', icon: 'Tarot', color: 'amber' },

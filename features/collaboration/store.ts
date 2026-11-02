@@ -8,6 +8,7 @@ import type {
   CollaborationBackupSnapshot,
 } from './types';
 import { DEFAULT_COLLABORATION_SETTINGS } from './types';
+import { coerceStoredReadingStyle } from '../appearance-sharing/integration';
 
 const DB_NAME = 'SullyOS_Collaboration';
 const DB_VERSION = 1;
@@ -246,7 +247,10 @@ export const CollaborationStore = {
     const db = await openCollaborationDatabase();
     const transaction = db.transaction(STORE_SETTINGS, 'readonly');
     const saved = await requestResult(transaction.objectStore(STORE_SETTINGS).get('main')) as CollaborationSettings | undefined;
-    return saved
+    // readingStyle 是可选覆盖：非法存档直接丢弃（历史数据无此字段保持原样），
+    // 校验走外观分享包真实 API（parseSharePackage），不自造判断。
+    const readingStyle = coerceStoredReadingStyle(saved?.readingStyle, 'collaboration');
+    const base = saved
       ? {
           ...DEFAULT_COLLABORATION_SETTINGS,
           ...saved,
@@ -258,6 +262,10 @@ export const CollaborationStore = {
           immersive: { ...DEFAULT_COLLABORATION_SETTINGS.immersive },
           focused: { ...DEFAULT_COLLABORATION_SETTINGS.focused },
         };
+    if (readingStyle) return { ...base, readingStyle };
+    const { readingStyle: _dropped, ...rest } = base as CollaborationSettings & { readingStyle?: unknown };
+    void _dropped;
+    return rest;
   },
 
   saveSettings: (settings: CollaborationSettings): Promise<void> => put(STORE_SETTINGS, settings),

@@ -6,9 +6,10 @@ import { CARDS, cardById, spreadById } from '../utils/tarotData';
 import { drawDailyCard } from '../utils/tarotEngine';
 import { buildLocalSummary, newReadingId, type TarotReadingRecord } from '../utils/tarotReading';
 import { DB } from '../utils/db';
+import { resolveNavigationPose } from '../utils/tarotSky';
 import ConfirmDialog from '../components/os/ConfirmDialog';
 import { TarotThumb } from './tarot/TarotCards';
-import { TarotParticles } from './tarot/TarotParticles';
+import { TarotDomeCanvas } from './tarot/TarotDomeCanvas';
 import { TarotSkyShader } from './tarot/TarotSkyShader';
 import { TarotBokeh } from './tarot/TarotBokeh';
 import { ZodiacRing } from './tarot/ZodiacRing';
@@ -55,6 +56,7 @@ const TAROT_CSS = `
   .tarot-spark { animation: none !important; opacity: 0 !important; }
   .tarot-sweep { animation: none !important; opacity: 0 !important; }
   .tarot-sheen { animation: none !important; opacity: 0 !important; }
+  .tarot-sky-attitude { transition: none !important; }
   .tarot-lit, .tarot-ring-spin { animation: none !important; }
   .tarot-flip-inner { transition: none; }
 }
@@ -85,7 +87,8 @@ const DailyView: React.FC<{
   records: TarotReadingRecord[];
   recordsLoaded: boolean;
   refresh: () => void;
-}> = ({ records, recordsLoaded, refresh }) => {
+  onSkyNavigation: () => void;
+}> = ({ records, recordsLoaded, refresh, onSkyNavigation }) => {
   const { characters, activeCharacterId, userProfile, apiConfig, addToast } = useOS();
   const dateKey = useLocalDateKey();
   const [targetId, setTargetId] = useState('user');
@@ -221,6 +224,7 @@ const DailyView: React.FC<{
         user={userProfile}
         addToast={addToast}
         hideCardList
+        onSkyNavigation={onSkyNavigation}
         onRecordChange={async (next) => {
           setRecord(next);
           try { await DB.saveTarotReading(next); } catch { /* 展示优先 */ }
@@ -234,7 +238,8 @@ const DailyView: React.FC<{
 const HistoryView: React.FC<{
   records: TarotReadingRecord[];
   refresh: () => void;
-}> = ({ records, refresh }) => {
+  onSkyNavigation: () => void;
+}> = ({ records, refresh, onSkyNavigation }) => {
   const { characters, activeCharacterId, userProfile, apiConfig, addToast } = useOS();
   const [openId, setOpenId] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
@@ -278,7 +283,7 @@ const HistoryView: React.FC<{
             : characters.find((c) => c.id === r.targetId);
         return (
           <div key={r.id} className="overflow-hidden rounded border border-[#8b7355]/30 bg-[#f5f0e1]/[0.045]">
-            <button onClick={() => setOpenId(open ? null : r.id)} className="w-full p-3 text-left active:bg-[#f5f0e1]/[0.03]">
+            <button onClick={() => { setOpenId(open ? null : r.id); onSkyNavigation(); }} className="w-full p-3 text-left active:bg-[#f5f0e1]/[0.03]">
               <div className="flex items-center gap-2 font-serif">
                 <span className={`shrink-0 rounded border px-1.5 py-px text-[10px] ${r.kind === 'daily' ? 'border-[#c9a227]/50 text-[#e8c96a]' : 'border-[#8b7355]/50 text-[#f5f0e1]/60'}`}>
                   {r.kind === 'daily' ? '每日' : '牌阵'}
@@ -304,6 +309,7 @@ const HistoryView: React.FC<{
                   api={{ baseUrl: apiConfig.baseUrl, apiKey: apiConfig.apiKey, model: apiConfig.model }}
                   user={userProfile}
                   addToast={addToast}
+                  onSkyNavigation={onSkyNavigation}
                   onRecordChange={async (next) => {
                     try { await DB.saveTarotReading(next); } catch { /* 展示优先 */ }
                     refresh();
@@ -327,12 +333,13 @@ const HistoryView: React.FC<{
 export const TarotApp: React.FC = () => {
   const { closeApp, characters, activeCharacterId, userProfile, apiConfig, addToast } = useOS();
   const [tab, setTab] = useState<Tab>('daily');
+  const [navigationSignal, setNavigationSignal] = useState(0);
+  const signalSkyNavigation = useCallback(() => setNavigationSignal((current) => (current + 1) % 8), []);
   const [records, setRecords] = useState<TarotReadingRecord[]>([]);
   const [recordsLoaded, setRecordsLoaded] = useState(false);
   const [skyOff, setSkyOff] = useState(() => !supportsWebGL());
   const todayKey = useLocalDateKey();
-  const tabIndex = Math.max(0, TABS.findIndex((t) => t.id === tab));
-  const parallax = (perTab: number) => `translateX(${-(tabIndex - 1.5) * perTab}%)`;
+  const navigationPose = resolveNavigationPose(navigationSignal);
 
   const refresh = useCallback(async () => {
     try {
@@ -354,14 +361,17 @@ export const TarotApp: React.FC = () => {
     >
       <style>{TAROT_CSS}</style>
       <div
-        className="pointer-events-none absolute inset-0"
-        style={{ transform: parallax(7), transition: 'transform 1.6s cubic-bezier(.22,.8,.24,1)' }}
+        className="tarot-sky-attitude pointer-events-none absolute inset-0"
+        style={{ transform: `rotate(${navigationPose.roll}rad)`, transition: 'transform 1.6s cubic-bezier(.22,.8,.24,1)' }}
       >
         <div className="tarot-glow absolute -top-24 left-1/2 h-64 w-64 -translate-x-1/2 rounded-full" style={{ background: 'radial-gradient(circle, rgba(201,162,39,0.26) 0%, transparent 70%)' }} />
         <div className="tarot-drift absolute -left-20 top-1/3 h-64 w-64 rounded-full" style={{ background: 'radial-gradient(circle, rgba(92,70,160,0.26) 0%, transparent 70%)', animationDelay: '-30s' }} />
         <div className="tarot-drift absolute -right-16 bottom-10 h-72 w-72 rounded-full" style={{ background: 'radial-gradient(circle, rgba(92,70,160,0.2) 0%, transparent 70%)', animationDelay: '-14s' }} />
       </div>
-      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div
+        className="tarot-sky-attitude pointer-events-none absolute inset-0 overflow-hidden"
+        style={{ transform: `rotate(${navigationPose.roll * 0.55}rad)`, transition: 'transform 1.6s cubic-bezier(.22,.8,.24,1)' }}
+      >
         <div className="tarot-aurora absolute -left-[18%] -top-[12%] h-[52%] w-[86%] rounded-full" style={{ background: 'radial-gradient(circle, rgba(122,92,205,0.30) 0%, transparent 70%)', filter: 'blur(48px)' }} />
         <div className="tarot-aurora absolute -right-[22%] -top-[6%] h-[46%] w-[80%] rounded-full" style={{ background: 'radial-gradient(circle, rgba(74,160,140,0.22) 0%, transparent 70%)', filter: 'blur(54px)', animationDelay: '-14s', animationDirection: 'reverse', animationDuration: '42s' }} />
         <div className="tarot-aurora absolute -top-[4%] left-[8%] h-[30%] w-[70%] rounded-full" style={{ background: 'radial-gradient(circle, rgba(232,201,106,0.14) 0%, transparent 70%)', filter: 'blur(40px)', animationDelay: '-8s', animationDuration: '26s' }} />
@@ -401,11 +411,11 @@ export const TarotApp: React.FC = () => {
           />
         </div>
       </div>
-      {!skyOff && <TarotSkyShader parallaxIndex={tabIndex} onFallback={() => setSkyOff(true)} />}
+      {!skyOff && <TarotSkyShader navigationSignal={navigationSignal} onFallback={() => setSkyOff(true)} />}
       <div className="pointer-events-none absolute inset-x-0 top-0 h-72 overflow-hidden">
         <ZodiacRing size={300} durationS={140} glyphColor="rgba(201,162,39,0.55)" className="opacity-[0.13]" />
       </div>
-      <TarotParticles parallaxIndex={tabIndex} />
+      <TarotDomeCanvas navigationSignal={navigationSignal} />
       <div className="pointer-events-none absolute inset-0 z-20" style={{ background: 'radial-gradient(120% 95% at 50% 42%, transparent 58%, rgba(0,0,0,0.30) 100%)' }} />
 
       <div className="relative z-10 shrink-0 px-4" style={{ paddingTop: 'calc(var(--chrome-top) + 0.25rem)' }}>
@@ -429,7 +439,7 @@ export const TarotApp: React.FC = () => {
       </div>
 
       <div key={tab} className="no-scrollbar relative z-10 min-h-0 flex-1 overflow-y-auto px-4 py-4 animate-fade-soft">
-        {tab === 'daily' && <DailyView records={records} recordsLoaded={recordsLoaded} refresh={refresh} />}
+        {tab === 'daily' && <DailyView records={records} recordsLoaded={recordsLoaded} refresh={refresh} onSkyNavigation={signalSkyNavigation} />}
         {tab === 'ritual' && (
           <RitualView
             characters={characters}
@@ -439,10 +449,11 @@ export const TarotApp: React.FC = () => {
             addToast={addToast}
             dateKey={todayKey}
             onSaved={refresh}
+            onSkyNavigation={signalSkyNavigation}
           />
         )}
-        {tab === 'library' && <LibraryView />}
-        {tab === 'history' && <HistoryView records={records} refresh={refresh} />}
+        {tab === 'library' && <LibraryView onSkyNavigation={signalSkyNavigation} />}
+        {tab === 'history' && <HistoryView records={records} refresh={refresh} onSkyNavigation={signalSkyNavigation} />}
       </div>
 
       <nav
@@ -452,7 +463,7 @@ export const TarotApp: React.FC = () => {
         {TABS.map(({ id, name, Icon }) => (
           <button
             key={id}
-            onClick={() => setTab(id)}
+            onClick={() => { if (tab !== id) signalSkyNavigation(); setTab(id); }}
             className={`flex flex-col items-center gap-0.5 py-1 active:scale-95 ${tab === id ? 'text-[#e8c96a]' : 'text-[#f5f0e1]/45'}`}
           >
             <Icon
@@ -465,7 +476,7 @@ export const TarotApp: React.FC = () => {
           </button>
         ))}
       </nav>
-      <TarotBokeh parallaxIndex={tabIndex} />
+      <TarotBokeh />
     </div>
   );
 };

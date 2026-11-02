@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- 外观分享独立预览 harness（验证用，不改主网页路由）。
+  本页是薄壳：只提供挂载点与基础样式，全部逻辑来自真实模块
+ （features/appearance-sharing/SharePanel.tsx + package.ts + scopedStyle.ts），
+  由 preview/main.tsx 挂载真实 SharePanel，经 esbuild 打包为同目录的
+  standalone.bundle.js（构建命令见下方注释）。本页不重复实现任何解析/校验逻辑。
+  构建：./node_modules/.bin/esbuild features/appearance-sharing/preview/main.tsx \
+    --bundle --minify --format=iife --jsx=automatic \
+    --outfile=features/appearance-sharing/preview/standalone.bundle.js
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>外观分享 · 独立预览（真实 SharePanel）</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #0f172a; color: #e2e8f0; }
+  button { margin: 4px 8px 4px 0; padding: 8px 14px; border-radius: 10px; border: 1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.1); color: inherit; }
+  input[type="file"] { margin: 4px 0; color: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="./standalone.bundle.js"></script>
+</body>
+</html>

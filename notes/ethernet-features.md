@@ -107,6 +107,7 @@
   - 深空景深第三波：WebGL 着色器天空（fbm 星云云团 + 竖向幕帘极光明显横移 + 银河雾，60fps 封顶、按实测帧率自适应降档、失败自动回落 CSS 幕帘）；2D 层扩到 6 组星座满屏常驻 + 星点加亮；Tab 切换背景分层横移（近动远静）而内容纯淡入；新增 z-30 前景散景层盖在内容上；晕影减弱。
   - 第四波视觉重构：极光扩为贯穿全屏的 5 层幕帘（CSS 回落层同步全屏）；星座改仰视半球天穹（天球角度布点 + θ³ 鱼眼投影，桌面 24 / 手机 18 组保持密布、大部分在屏内仅边缘轻微溢出，Tab 切换整片天穹旋转）；流星统一为右下方斜掠；极光带加噪声摆动/厚薄变化/呼吸脉冲去规律化；牌库取消每类首张放大（全部同尺寸网格）、类别提示提高层级避免被 hover 卡遮挡；今日页去掉与顶部牌面重复的「今日运势」牌义块。，连线逐点投影呈弧形、双层描边，8 组星座数据；首页每日牌去掉外围大框、解读正文去掉卡片外壳直接排星空上；「让 TA 解读」改四角 L 形纹样仪式按钮（hover 角纹外扩 + 金色扫光）。
   - 第四波收尾（2026-09-22 入库）：首页鱼眼天穹四件套（`TarotSkyShader`/`TarotParticles`/`TarotBokeh`/`ZodiacRing`）全部接线渲染；解读框 aurora/sky/fisheye 三波样式跟齐。
+  - **天穹去重与内页偏转（2026-10-28，本地候审）**：14 组几何独立的自包含星图单次锚定在三维半球（不宣称天文精确），以天顶鱼眼投影与球面弧线渲染；天穹、星尘、银河雾和 WebGL 天空共用低速姿态，指定 Tab/牌详情/历史解读等导航以有界 yaw/pitch/roll 联动；减少动效动态切换、静态星座与后台暂停保持。
 
 ## 九、提示词与预设
 
@@ -272,6 +273,7 @@
 
 ## 更新记录
 
+- 2026-10-28：塔罗星空升级（本地候审）——14 组独特星图改为三维半球鱼眼投影，星尘/银河与背景 shader 共用慢速天穹姿态；明确的 Tab、牌详情、历史展开与解读进入/返回事件触发有界平滑偏转，并响应动态 reduced-motion。
 - 2026-09-12：初稿（覆盖至当日的新增功能，含当日完成、尚未提交的主动消息发图与角色页设定迁移）；定位调整为开发者自用功能账本。
 - 2026-09-13：补记聊天图片点击放大查看（全屏灯箱，单聊 + 群聊）。
 - 2026-09-15：**部署换轨 + 域名迁移**——前端站点由 Vercel 换到 Cloudflare Pages（`functions/` + `public/_redirects` 承接同源中转与 SPA 回退，构建命令 `pnpm exec vite build`，只从 ethernet 分支自动构建），VPS 域名拆分为后端 / MCP / opencode / worker 中转四个主机名；Vercel 保留为备用入口。工程细节与踩坑见 `notes/ethernet-branch-context.md` 同日条目。
@@ -366,3 +368,14 @@
   - 测试：`utils/socialShareTool.test.ts`（22）+ `utils/socialShareTool.wiring.test.ts`（8）；链路用 fixture 模型 + 真 `buildExcerpts` 生成的 HTTP 响应，回归 mcpToolBridge/agenticTools/messageFormat/socialShare/chatRequestPayload/social-content 共 29 文件 327 例通过；`utils/*chat*` 38 文件 354 例通过。
   - 门禁：全量 `tsc` 56 个既有错误（改动文件 0 新增）、`vite build` EXIT=0；未跑 check:workers、未部署。
   - 未验证：真实模型是否主动调用、平台真实内容（B站 412/抖音登录墙/XHS 会话停用不变）、未部署。
+- 2026-11-01：**3D 房间 + 万圣节寻物 + 错误脱敏 + 安卓框架进主目录（t_de3d52fc，未提交/未部署/未打包）**——
+  - 来源：`features/room3d`（8 源码 + INTEGRATION.md + ordered-ack 回归）/`features/seasonal-events`（3 源码）/`features/shared/uiOperationLease.ts` 逐字节取自 t_20bfd93f；
+    `utils/safeApiRedact.ts` + `safeApi.ts` 域 + conservative/errors/redesign 三测试取自 t_93787474（禁带旧 PDF/lsMirror）；
+    `native/android-shell`（69 版本管理文件）逐字节取自 t_40eddaf5（排除 node_modules/build/.gradle/local.properties/已忽略 assets 副本），仅改新复制 README 四处旧 worktree 表述 + 未来同步先装子包依赖步骤。
+  - 接线：`apps/RoomApp.tsx` 房间工具栏加「🧊 3D房间」入口 + `room3d` 视图（charId + localStorage + `resolveChibiMarker`，fallback2D 为返回 2D 按钮，不递归嵌套）；
+    `components/ValentineEvent.tsx` 加万圣节卡 + 会话（真实角色选择 + 真实 localStorage，生产不传 todayKey；奖励 = 本地纪念收藏，claimed + 稳定 claimId 为唯一凭证 + DB.assets 回执 + 错角色拒记 + 失败重试，界面明示不计入银行/捕鱼）；
+    备份：`utils/roomSeasonalBackup.ts` 新薄适配（前缀收集 + 实际 validator 逐条恢复校验）+ `types.ts` 两字段 + `OSContext` 导出/恢复各一 hunk，不动 schema/store/通用策略；`tsconfig.json` exclude 加 `native/android-shell`（隔离子包不进根 tsc）。
+  - 验证：新 `utils/roomSeasonalBackup.test.ts`（5）+ `components/HalloweenHunt.wiring.test.tsx`（3，显式时钟）+ `components/Room3DFallback.wiring.test.tsx`（2）单 worker 全绿；
+    safeApi 五文件在主目录单 worker 90/90；根 tsc 56 错误皆无关历史存量（改动文件 0 新增）；
+    桌面浏览器冒烟（dev server + 真 Sully 角色，DOM 工具输出，非物理手机实测）：特别时光万圣节卡按设备真实日期 2026-11-02 显示已结束 → 进会话 0/6 无假领取 → 小小窝三 Tab 完好 → 进 2D 房见 3D 入口 → 3D 真实渲染 → 加桌 → 保存 →8 件落盘（`sully-home3d-preset-sully-v2`）→ 返回重进仍 8 件。
+  - 限制：未跑旧大矩阵/全量 vitest/生产 build（本卡禁生产 build）；家具拖拽逐点位移验证沿用模块既有证据，本轮仅桌面浏览器加桌/保存/返回重进 8 件，不宣称物理手机实测；备份已测范围仅模块保存/读取→备份适配器恢复 + OSContext 真实接线，系统整包 ZIP 未专项复验；无真机 Android（未编译未打包未上机）；无截图留存；小红书会话桥/微博云分享/退役 App 未动，未宣称完成或部署。

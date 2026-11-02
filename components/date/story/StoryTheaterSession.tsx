@@ -55,7 +55,10 @@ import {
 import { processNewMessagesWithAutoArchive } from '../../../utils/memoryPalace/autoArchive';
 import { incrementDigestRound, runCognitiveDigestion } from '../../../utils/memoryPalace';
 import StoryQuickPresetPanel from './StoryQuickPresetPanel';
-import { StoryAppearanceButton } from './StoryTheaterTheme';
+import { StoryAppearanceButton, useStoryTheme } from './StoryTheaterTheme';
+import { applyShareVarsToElement } from '../../../features/appearance-sharing/scopedStyle';
+import { coerceStoredReadingStyle, shareSurfaceStyle, shareTextStyle } from '../../../features/appearance-sharing/integration';
+import type { ReadingStyle } from '../../../features/appearance-sharing/types';
 import { shareOrDownloadFile } from '../../../utils/shareExport';
 import {
     buildStoryContinueInstruction,
@@ -201,7 +204,7 @@ const StorySceneRelationships: React.FC<{ inputs: StoryAffinityInput[] }> = ({ i
     })}</div>
 </div>;
 
-const StoryOutput: React.FC<{ content: string; onChoose?: (text: string) => void; affinityInputs: StoryAffinityInput[] }> = ({ content, onChoose, affinityInputs }) => {
+const StoryOutput: React.FC<{ content: string; onChoose?: (text: string) => void; affinityInputs: StoryAffinityInput[]; shareStyle?: ReadingStyle }> = ({ content, onChoose, affinityInputs, shareStyle }) => {
     const blocks = parseStoryDisplayBlocks(content);
     const relationshipSceneIndex = blocks.findIndex(block => block.kind === 'scene');
     const hasScene = relationshipSceneIndex >= 0;
@@ -218,7 +221,7 @@ const StoryOutput: React.FC<{ content: string; onChoose?: (text: string) => void
         {!hasScene && relationship}
         {blocks.map((block, index) => {
             const lines = splitDisplayLines(block.text);
-            if (block.kind === 'story') return <p key={index} className='font-serif text-[15px] leading-8 text-slate-800 whitespace-pre-wrap'>{block.text}</p>;
+            if (block.kind === 'story') return <p key={index} className={shareStyle ? 'story-share-text whitespace-pre-wrap' : 'font-serif text-[15px] leading-8 text-slate-800 whitespace-pre-wrap'} style={shareStyle ? shareTextStyle(shareStyle) : undefined}>{block.text}</p>;
             if (block.kind === 'scene') return <section key={index} className='py-4 border-y border-slate-300'>
                 <div className='flex items-center gap-2 text-[9px] tracking-[.22em] uppercase font-bold text-violet-600'><FilmSlate size={14} weight='fill' />{block.title}</div>
                 <div className='mt-3 grid grid-cols-2 gap-x-5 gap-y-3'>{lines.map((line, lineIndex) => <div key={lineIndex} className={line.label === '场面' ? 'col-span-2' : ''}><div className='flex items-center gap-1 text-[9px] font-bold text-slate-400'>{line.label === '时间' ? <Clock size={11} /> : line.label === '地点' ? <MapPin size={11} /> : null}{line.label || '场景'}</div><div className='mt-1 text-[12px] leading-5 text-slate-700'>{line.value}</div></div>)}</div>
@@ -272,6 +275,16 @@ const StoryOutput: React.FC<{ content: string; onChoose?: (text: string) => void
 
 const StoryTheaterSession: React.FC<Props> = ({ entry, preset, masks, onBack, onEdit, onOpenVectorMemory, onEntryChange }) => {
     const { characters, userProfile, apiConfig, memoryPalaceConfig, remoteVectorConfig, updateCharacter, addToast } = useOS();
+    const storyTheme = useStoryTheme();
+    // 分享包覆盖：只取已校验值；非法/缺省 → undefined，原主题视觉零变化。
+    const shareStyle: ReadingStyle | undefined = coerceStoredReadingStyle(storyTheme?.appearance.readingStyle, 'story-reading');
+    const shareBodyRef = useRef<HTMLDivElement | null>(null);
+    // 变量只写故事正文容器节点，不碰 document/body/:root；取消/卸载时还原。
+    useEffect(() => {
+        const el = shareBodyRef.current;
+        if (!el || !shareStyle) return;
+        return applyShareVarsToElement(el, shareStyle);
+    }, [shareStyle]);
     const threadId = storyTheaterThreadId(entry.id);
     const actors = useMemo(() => characters.filter(char => entry.characterIds.includes(char.id)), [characters, entry.characterIds]);
     const memoryActors = useMemo(() => {
@@ -835,7 +848,7 @@ const StoryTheaterSession: React.FC<Props> = ({ entry, preset, masks, onBack, on
                 {pageCount > 1 && <StoryPagination className='mb-4' page={messagePage} pageCount={pageCount} onChange={setMessagePage} />}
                 {pageArchivedIds.length > 0 && <div className='mb-7 px-1 flex items-center justify-between gap-3 text-[9px] text-slate-400'><span>本页 {pageArchivedIds.length} 条归档原文 · 展开时才渲染正文</span><button onClick={togglePageArchives} className='shrink-0 px-3 py-1.5 rounded-full bg-white border border-slate-200 font-bold text-violet-600'>{allPageArchivesExpanded ? '全部收起' : '全部展开'}</button></div>}
 
-                <div className='space-y-8'>
+                <div ref={shareBodyRef} className='space-y-8'>
                     {pageMessages.map(message => {
                         const archived = mirrorArchived(message, entry);
                         if (archived) {
@@ -857,13 +870,13 @@ const StoryTheaterSession: React.FC<Props> = ({ entry, preset, masks, onBack, on
                                 {isExpanded && <div className='pb-5 pl-7'>
                                     {message.role === 'user'
                                         ? <p className='text-sm leading-7 text-slate-600 whitespace-pre-wrap'>{message.content}</p>
-                                        : <StoryOutput content={message.content} affinityInputs={affinityInputsFromMessage(message, actors)} />}
+                                        : <StoryOutput content={message.content} affinityInputs={affinityInputsFromMessage(message, actors)} shareStyle={shareStyle} />}
                                 </div>}
                             </details>;
                         }
                         if (message.role === 'user') return <section key={message.id} {...pressHandlersFor(message)} className='pl-4 border-l-2 border-violet-300'><div className='text-[9px] tracking-[.16em] font-bold text-violet-500'>你写下</div><p className='mt-2 text-sm leading-7 text-slate-600 whitespace-pre-wrap'>{message.content}</p></section>;
                         const isLatest = message.id === messages[messages.length - 1]?.id;
-                        return <article key={message.id} {...pressHandlersFor(message)}><StoryOutput content={message.content} onChoose={choice => setInput(choice)} affinityInputs={affinityInputsFromMessage(message, actors)} />{isLatest && <div className='mt-4 flex items-center justify-end gap-2'><span className='w-1.5 h-1.5 rounded-full bg-violet-400' /><button disabled={sending} onClick={() => void send(message)} className='inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-200 bg-white text-[10px] font-bold text-slate-500 disabled:opacity-40'>{rerollingId === message.id ? <SpinnerGap size={12} className='animate-spin' /> : <ArrowClockwise size={12} />}换一种写法</button></div>}</article>;
+                        return <article key={message.id} {...pressHandlersFor(message)} style={shareStyle ? shareSurfaceStyle(shareStyle) : undefined}><StoryOutput content={message.content} onChoose={choice => setInput(choice)} affinityInputs={affinityInputsFromMessage(message, actors)} shareStyle={shareStyle} />{isLatest && <div className='mt-4 flex items-center justify-end gap-2'><span className='w-1.5 h-1.5 rounded-full bg-violet-400' /><button disabled={sending} onClick={() => void send(message)} className='inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-slate-200 bg-white text-[10px] font-bold text-slate-500 disabled:opacity-40'>{rerollingId === message.id ? <SpinnerGap size={12} className='animate-spin' /> : <ArrowClockwise size={12} />}换一种写法</button></div>}</article>;
                     })}
                 </div>
                 {pageCount > 1 && <StoryPagination className='mt-8' page={messagePage} pageCount={pageCount} onChange={setMessagePage} />}

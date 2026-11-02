@@ -15,6 +15,22 @@ describe('story theater local settings backup', () => {
         expect(localStorage.getItem(STORY_THEATER_APPEARANCE_STORAGE_KEY)).toBe(raw);
     });
 
+    it('restores appearance carrying a valid readingStyle override', () => {
+        const raw = '{"color":"dark","decor":"cinema","readingStyle":{"background":"#1e2321","foreground":"#e2e8f0","accent":"#6ee7b7","fontFamily":"sans","fontSizePx":16,"lineHeight":1.8,"borderRadiusPx":12}}';
+        expect(restoreStoryTheaterAppearanceSetting(raw)).toBe(true);
+        expect(exportStoryTheaterAppearanceSetting()).toBe(raw);
+    });
+
+    it('rejects an illegal readingStyle override without wiping old data', () => {
+        const old = '{"color":"dark","decor":"plain"}';
+        localStorage.setItem(STORY_THEATER_APPEARANCE_STORAGE_KEY, old);
+        const bad = '{"color":"dark","decor":"plain","readingStyle":{"background":"red","foreground":"#e2e8f0","accent":"#6ee7b7","fontFamily":"sans","fontSizePx":16,"lineHeight":1.8,"borderRadiusPx":12}}';
+        expect(restoreStoryTheaterAppearanceSetting(bad)).toBe(false);
+        expect(localStorage.getItem(STORY_THEATER_APPEARANCE_STORAGE_KEY)).toBe(old);
+        const outOfRange = '{"color":"dark","decor":"plain","readingStyle":{"background":"#1e2321","foreground":"#e2e8f0","accent":"#6ee7b7","fontFamily":"sans","fontSizePx":99,"lineHeight":1.8,"borderRadiusPx":12}}';
+        expect(restoreStoryTheaterAppearanceSetting(outOfRange)).toBe(false);
+        expect(localStorage.getItem(STORY_THEATER_APPEARANCE_STORAGE_KEY)).toBe(old);
+    });
     it('does not overwrite the current value with invalid backup data', () => {
         localStorage.setItem(STORY_THEATER_APPEARANCE_STORAGE_KEY, '{"color":"dark","decor":"plain"}');
         expect(restoreStoryTheaterAppearanceSetting('{"color":"unknown","decor":"plain"}')).toBe(false);

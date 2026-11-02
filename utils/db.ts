@@ -24,6 +24,9 @@ import { exportMcpLocal, importMcpLocal } from './mcpClient';
 import { exportAmsg2GlobalConfig, importAmsg2GlobalConfig } from './activeMsgStore';
 import { exportWorldHomeLocal, importWorldHomeLocal } from './worldHome/localBackup';
 import { exportDesktopSkinLocal, importDesktopSkinLocal } from './desktopSkinBackup';
+// t_40feeeaa round3（协调授权 appearance-final-repair-scope.md）：
+// DB.importFullData 入口的角色 dateReadingStyle 纯预检；不改 schema/通用 clearAndAdd。
+import { assertNoIllegalDateReadingStyle } from '../features/appearance-sharing/importGuard';
 
 const DB_NAME = 'AetherOS_Data';
 // v67：两条并行线各自用掉了 v65/v66（A线: blob_assets + 生活记录；B线: room_plates 门牌 + digest_reports 消化日志），
@@ -3679,6 +3682,9 @@ export const DB = {
           allowBackendConnection?: boolean;
       } = {}
   ): Promise<void> => {
+      // t_40feeeaa round3：角色约会阅读样式预检——非法新样式整包拒绝，
+      // 必须在 openDB/任何 clear-put 之前；无字段旧包照常通过。
+      assertNoIllegalDateReadingStyle(data);
       const db = await openDB();
       
       const availableStores = [

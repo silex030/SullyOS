@@ -1,4 +1,5 @@
 import type { ShoppingOrder } from './utils/shoppingTypes';
+import type { ReadingStyle } from './features/appearance-sharing/types';
 import type { AirpSettings } from './utils/airp/settings';
 import type { AirpCommittedEvent } from './utils/airp/commit';
 import type { AirpWorldDoc } from './utils/airp/worldStore';
@@ -46,6 +47,7 @@ export enum AppID {
   Takeout = 'takeout',   // 外卖 — 美团式点单（OSM 真实店面 + 品牌 SKU，模拟下单不真实支付）
   Pomodoro = 'pomodoro', // 番茄钟 — 自定义主题与时长的水波纹专注陪伴（打开才计时）
   Tarot = 'tarot', // 塔罗 — 每日运势与经典牌阵占卜（RWS 真实牌义，本地速览 + 角色解读）
+  Bibi = 'bibi', // 哔哔 — 本地动态（FriendFeed）：发帖/图片/评论/点赞/未读显式已读/删除，零 LLM 调用
 }
 
 export interface SystemLog {
@@ -3132,6 +3134,11 @@ export interface CharacterProfile {
   customDateSprites?: string[]; // User-added custom emotion names for date mode (per-character)
   dateLightReading?: boolean;   // Light reading mode for novel/text view in date
   dateReadingShowAvatars?: boolean; // Show both participants' avatars beside messages in date reading mode
+  /**
+   * 外观分享包落到约会小说视图的可选覆盖（t_40feeeaa 接线）。
+   * 缺省 = 原 dateLightReading 视觉零变化；只含七个外观值。
+   */
+  dateReadingStyle?: ReadingStyle;
   dateSkinSets?: SkinSet[];     // Multiple skin sets for portrait mode
   activeSkinSetId?: string;     // Currently active skin set ID
   dateStyleConfig?: DateStyleConfig; // 见面模式文风（写作风格 / 叙事人称 / 自定义补充）
@@ -4488,6 +4495,8 @@ export interface FullBackupData {
     digestReports?: any[];   // 消化日志（每角色最近 30 条）
     memoryPalaceHighWaterMarks?: Record<string, number>; // charId → lastProcessedMsgId
     memoryPalaceFlags?: Record<string, string>; // mp_personality_tried_* / mp_first_archive_notice_* 等 UI 标记
+    room3DStates?: Record<string, string>; // sully-home3d-{charId} 原始槽位（3D 房间，不新增 DB store）
+    halloweenStates?: Record<string, string>; // sully-seasonal-halloween-2026-{charId} 原始槽位（万圣节活动）
     cloudBackupConfig?: CloudBackupConfig;
     remoteVectorConfig?: { enabled: boolean; supabaseUrl: string; supabaseAnonKey: string; initialized: boolean };
 

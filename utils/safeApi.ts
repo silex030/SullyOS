@@ -13,6 +13,10 @@
 import { appendDevDebugApiLog, makeDebugLogger } from './devDebug';
 import { getApiCallAmbientContext, recordApiCall, type ApiCallMeta } from './apiCallLog';
 import { resolveBlobRefsInRequestBody } from './apiBlobRefs';
+import { redactApiErrorText } from './safeApiRedact';
+
+/** 错误文本脱敏实现见 ./safeApiRedact（整字段保守隐藏）；此处二次导出保持调用约定。 */
+export { redactApiErrorText };
 
 const log = makeDebugLogger('api', 'SafeAPI');
 
@@ -50,7 +54,8 @@ function parseRawBodyText(text: string, status: number, contentType?: string | n
     if (trimmed.startsWith('<')) {
         // Extract useful info from HTML error pages
         const titleMatch = trimmed.match(/<title>(.*?)<\/title>/i);
-        const hint = titleMatch ? titleMatch[1] : trimmed.slice(0, 120);
+        // 先整段脱敏再截断：截断后的短前缀（如只剩 `sk-` 开头几个字符）会逃过长度门槛。
+        const hint = redactApiErrorText(titleMatch ? titleMatch[1] : trimmed).slice(0, 120);
         throw new Error(
             `API返回了HTML而非JSON (HTTP ${status}): ${hint}`
         );
@@ -66,7 +71,7 @@ function parseRawBodyText(text: string, status: number, contentType?: string | n
     if (isSseResponseText(text, contentType)) {
         const assembled = parseSseToCompletion(text);
         if (assembled) return assembled;
-        const preview = text.slice(0, 200);
+        const preview = redactApiErrorText(text).slice(0, 200);
         throw new Error(
             `API流式响应未返回有效数据 (HTTP ${status}): ${preview}`
         );
@@ -76,11 +81,89 @@ function parseRawBodyText(text: string, status: number, contentType?: string | n
         return JSON.parse(text);
     } catch (e) {
         // Show a snippet of what we got for debugging
-        const preview = text.slice(0, 200);
+        const preview = redactApiErrorText(text).slice(0, 200);
         throw new Error(
             `API返回了无效JSON (HTTP ${status}): ${preview}`
         );
     }
+}
+
+/** 错误文本上限：够看清原因，又不至于把整段 HTML 灌进界面/日志。 */
+const ERROR_TEXT_LIMIT = 300;
+
+const asErrorText = (value: unknown): string | undefined => {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return undefined;
+};
+
+export interface ApiErrorFields {
+    message?: string;
+    detail?: string;
+    type?: string;
+    code?: string;
+    param?: string;
+}
+
+/**
+ * 从各家错误信封里挑出可读字段：`{error:{message,type,code,param}}`（OpenAI/Anthropic）、
+ * `{detail}`（FastAPI 风格代理）、顶层 `{message,code}`、以及 `error` 直接是字符串的老形态。
+ * 只认字符串/数字，绝不把整个对象 String() 成 `[object Object]`。
+ */
+export function extractApiErrorFields(data: unknown): ApiErrorFields {
+    const envelope: any = data && typeof data === 'object' ? data : {};
+    const rawError = envelope.error;
+    const sources: any[] = [rawError && typeof rawError === 'object' ? rawError : null, envelope];
+    const fields: ApiErrorFields = {};
+    for (const source of sources) {
+        if (!source) continue;
+        fields.message ??= asErrorText(source.message);
+        fields.detail ??= asErrorText(source.detail);
+        fields.type ??= asErrorText(source.type);
+        fields.code ??= asErrorText(source.code);
+        fields.param ??= asErrorText(source.param);
+    }
+    if (!fields.message) fields.message = asErrorText(rawError);
+    return fields;
+}
+
+/**
+ * 非 2xx 响应的错误文本。
+ *
+ * 保持 `API Error <status>` 前缀——StoryTheater / claudeProxyCompat / mcpClient
+ * 都按这个前缀分流（`includes('API Error 400')`、`/API Error 502\b/i`）。
+ * 主文案同时保留 message 与 detail（去重后拼接）：detail 往往才是可操作原因，
+ * 只取 message 会把真正有用的诊断丢掉。type/code/param 作为括号里的附加诊断，
+ * 这样「只有 code 没有 message」的代理也不会只剩一句 HTTP 状态码。
+ */
+export function formatApiError(status: number, data: unknown): string {
+    const fields = extractApiErrorFields(data);
+    // 各字段分别提取、分别整字段脱敏后再拼接：敏感 message/detail 整段隐藏为中文文案，
+    // 不会吞掉后面的 code/type 诊断；`type=`/`code=` 前缀在脱敏后才加上，
+    // 避免 `code=invalid_api_key` 这类诊断文本被误当成标注凭据。
+    const message = fields.message === undefined ? undefined : redactApiErrorText(fields.message);
+    const detail = fields.detail === undefined ? undefined : redactApiErrorText(fields.detail);
+    const type = fields.type === undefined ? undefined : redactApiErrorText(fields.type);
+    const code = fields.code === undefined ? undefined : redactApiErrorText(fields.code);
+    const param = fields.param === undefined ? undefined : redactApiErrorText(fields.param);
+    const diagnostics = [
+        type ? `type=${type}` : '',
+        code ? `code=${code}` : '',
+        param ? `param=${param}` : '',
+    ].filter(Boolean).join(', ');
+    // message 与 detail 去重后都保留：完全相同只留一条，一条包含另一条留长的，
+    // 否则用 ` — ` 拼接，detail 的可操作原因不再被丢掉。
+    let primary: string;
+    if (message && detail && message !== detail) {
+        primary = message.includes(detail) || detail.includes(message)
+            ? (message.length >= detail.length ? message : detail)
+            : `${message} — ${detail}`;
+    } else {
+        primary = message || detail || diagnostics || `HTTP ${status}`;
+    }
+    const withDiagnostics = diagnostics && primary !== diagnostics ? `${primary} (${diagnostics})` : primary;
+    const text = withDiagnostics.length > ERROR_TEXT_LIMIT ? `${withDiagnostics.slice(0, ERROR_TEXT_LIMIT)}…` : withDiagnostics;
+    return `API Error ${status}: ${text}`;
 }
 
 /**
@@ -569,9 +652,8 @@ export async function safeFetchJson(
                 }
                 // Non-retryable or last attempt: parse body for error details
                 const data = await safeResponseJson(response);
-                // If we somehow got valid JSON with error info, wrap it
-                const errMsg = data?.error?.message || data?.error || `HTTP ${response.status}`;
-                throw new Error(`API Error ${response.status}: ${errMsg}`);
+                // 结构化错误：读 message/type/code/param/detail，绝不把对象拍成 [object Object]
+                throw new Error(formatApiError(response.status, data));
             }
 
             const timing: { firstDeltaMs?: number } = {};

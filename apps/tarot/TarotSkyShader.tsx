@@ -1,7 +1,8 @@
 import React, { useEffect, useRef } from 'react';
+import { continuousSkyPose, resolveNavigationPose } from '../../utils/tarotSky';
 
 interface Props {
-  parallaxIndex?: number;
+  navigationSignal?: number;
   onFallback?: () => void;
 }
 
@@ -86,8 +87,10 @@ float auroraBand(vec2 p, float time, float seed, float centerY, float width, flo
 void main() {
   vec2 uv = gl_FragCoord.xy / u_resolution;
   vec2 p = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+  float c = cos(u_offset);
+  float s = sin(u_offset);
+  p = mat2(c, -s, s, c) * p;
   vec2 pa = p;
-  p.x += u_offset;
   float t = u_time;
 
   vec3 col = mix(vec3(0.10, 0.075, 0.16), vec3(0.045, 0.035, 0.08), clamp(uv.y, 0.0, 1.0));
@@ -138,12 +141,12 @@ const compile = (gl: WebGLRenderingContext, type: number, src: string): WebGLSha
 };
 
 /** WebGL 深空层：星云云团 + 极光幕帘 + 银河雾，60fps 封顶，失败/降档到底时回调 onFallback。 */
-export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback }) => {
+export const TarotSkyShader: React.FC<Props> = ({ navigationSignal = 0, onFallback }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const parallaxRef = useRef(parallaxIndex);
+  const navigationRef = useRef(navigationSignal);
   const fallbackRef = useRef(onFallback);
 
-  useEffect(() => { parallaxRef.current = parallaxIndex; }, [parallaxIndex]);
+  useEffect(() => { navigationRef.current = navigationSignal; }, [navigationSignal]);
   useEffect(() => { fallbackRef.current = onFallback; }, [onFallback]);
 
   useEffect(() => {
@@ -195,14 +198,15 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.clearColor(0, 0, 0, 0);
 
-    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let reduce = motionQuery.matches;
     let cssW = 0;
     let cssH = 1;
     let running = false;
     let raf = 0;
     let lastDraw = 0;
     let elapsed = 0;
-    let offsetPx = 0;
+    let skyRotation = 0;
     let quality = 1.0;
     let ema = 16.7;
     let warmup = 60;
@@ -211,7 +215,7 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
     const draw = () => {
       gl.uniform1f(uTime, elapsed);
       gl.uniform2f(uRes, canvas.width, canvas.height);
-      gl.uniform1f(uOffset, offsetPx / Math.max(1, cssH));
+      gl.uniform1f(uOffset, skyRotation);
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     };
@@ -226,6 +230,7 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
       gl.viewport(0, 0, canvas.width, canvas.height);
       if (reduce) {
         elapsed = 8;
+        skyRotation = resolveNavigationPose(navigationRef.current).yaw;
         draw();
       }
     };
@@ -240,7 +245,8 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
       lastDraw = now;
       const dt = Math.min(dtMs / 1000, 0.05);
       elapsed += dt;
-      offsetPx += (-(parallaxRef.current - 1.5) * 40 - offsetPx) * Math.min(1, dt * 2.5);
+      const targetRotation = continuousSkyPose(elapsed, resolveNavigationPose(navigationRef.current), false).yaw;
+      skyRotation += (targetRotation - skyRotation) * Math.min(1, dt * 2.5);
       draw();
 
       if (warmup > 0) {
@@ -264,7 +270,7 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
     };
 
     const start = () => {
-      if (reduce || running) return;
+      if (reduce || running || document.hidden) return;
       running = true;
       lastDraw = performance.now();
       raf = requestAnimationFrame(frame);
@@ -280,6 +286,19 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
       else start();
     };
 
+    const onMotionChange = (event: MediaQueryListEvent) => {
+      reduce = event.matches;
+      if (reduce) {
+        stop();
+        elapsed = 8;
+        skyRotation = resolveNavigationPose(navigationRef.current).yaw;
+        draw();
+      } else {
+        lastDraw = performance.now();
+        start();
+      }
+    };
+
     const onContextLost = (event: Event) => {
       event.preventDefault();
       stop();
@@ -291,6 +310,7 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
     if (canvas.parentElement) observer.observe(canvas.parentElement);
     document.addEventListener('visibilitychange', onVisibility);
     canvas.addEventListener('webglcontextlost', onContextLost);
+    motionQuery.addEventListener('change', onMotionChange);
     start();
 
     return () => {
@@ -298,6 +318,7 @@ export const TarotSkyShader: React.FC<Props> = ({ parallaxIndex = 0, onFallback 
       observer.disconnect();
       document.removeEventListener('visibilitychange', onVisibility);
       canvas.removeEventListener('webglcontextlost', onContextLost);
+      motionQuery.removeEventListener('change', onMotionChange);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     };
   }, []);

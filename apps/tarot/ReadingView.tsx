@@ -14,6 +14,7 @@ interface Props {
   user: UserProfile;
   addToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
   onRecordChange: (next: TarotReadingRecord) => void;
+  onSkyNavigation?: () => void;
   /** 今日运势等牌面已在别处展示时，隐藏逐张牌义与速览，避免重复 */
   hideCardList?: boolean;
 }
@@ -29,7 +30,7 @@ const CornerMarks: React.FC = () => (
 );
 
 /** 一次占卜的完整解读页：本地速览永远可用，「让 TA 解读」按需调 LLM。 */
-export const ReadingView: React.FC<Props> = ({ record, reader, api, user, addToast, onRecordChange, hideCardList = false }) => {
+export const ReadingView: React.FC<Props> = ({ record, reader, api, user, addToast, onRecordChange, onSkyNavigation, hideCardList = false }) => {
   const [asking, setAsking] = useState(false);
   const spread = spreadById(record.spreadId);
   const summaryLines = record.localSummary.split('\n');
@@ -39,6 +40,7 @@ export const ReadingView: React.FC<Props> = ({ record, reader, api, user, addToa
     if (!reader) { addToast('还没有可解读的角色', 'error'); return; }
     if (!api.apiKey) { addToast('请先在设置里配置 API Key', 'error'); return; }
     if (!spread) return;
+    onSkyNavigation?.();
     setAsking(true);
     try {
       const text = await requestTarotReading(api, reader, user, {

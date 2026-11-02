@@ -1,5 +1,7 @@
 export type CollaborationMode = 'immersive' | 'focused';
 
+import type { ReadingStyle } from '../appearance-sharing/types';
+
 export type CollaborationUiTheme = 'sully' | 'gpt' | 'claude' | 'gemini' | 'kimi' | 'deepseek';
 
 /** Avatar visibility is independent from the workspace skin. */
@@ -130,6 +132,12 @@ export interface CollaborationSettings {
   /** `theme` follows each skin's layout; every other value is an explicit user override. */
   avatarMode?: CollaborationAvatarMode;
   avatarStyle?: CollaborationAvatarStyle;
+  /**
+   * 外观分享包落到协作正文的可选覆盖（t_40feeeaa 接线）。
+   * 缺省 = 原主题视觉零变化；备份随 settings 整体透传，本字段只含七个
+   * 外观值，绝不含 immersive/focused 的 API 凭据（分享包构建侧无读取入口）。
+   */
+  readingStyle?: ReadingStyle;
   immersive: CollaborationApiProfile;
   focused: CollaborationApiProfile;
   updatedAt: number;

@@ -1,0 +1,7 @@
+Manifest XML parse: OK
+capacitor.config.json parse: OK com.sullyos.app / SullyOS ethernet
+package.json: sullyos-android-shell 1.0.0 {'@capacitor/core': '8.6.0', '@capacitor/android': '8.6.0'} {'@capacitor/cli': '8.6.0'}
+final webDir ../../dist: True
+appId com.sullyos.app in config: True
+settings.gradle references subpackage node_modules: True
+EXIT:0

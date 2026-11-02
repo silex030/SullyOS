@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DB } from './db';
 import { MIRRORED_KEYS, MIRROR_ASSET_ID, healLocalStorageMirror, snapshotLocalStorageMirror } from './lsMirror';
 import { LS_MIRROR_ASSET_ID } from './backupSecrets';
@@ -68,6 +68,77 @@ describe('localStorage IndexedDB 镜像 (lsMirror)', () => {
     it('没有镜像时回填静默返回空数组', async () => {
         const restored = await healLocalStorageMirror();
         expect(restored).toEqual([]);
+    });
+
+    it('局部读取异常不等于用户删除：快照不会抹掉这次读不到的键', async () => {
+        localStorage.setItem('os_theme', '{"hue":3}');
+        localStorage.setItem('os_api_config', '{"baseUrl":"https://x","apiKey":"sk-2"}');
+        await snapshotLocalStorageMirror();
+
+        // 隐私模式 / 个别 WebView 里 getItem 会直接抛错。这不是「用户删了这个键」
+        // （删除是返回 null），快照若按缺失处理，就会把镜像里唯一一份配置抹掉。
+        const store: any = globalThis.localStorage;
+        const original = store.getItem;
+        store.getItem = (key: string) => {
+            if (key === 'os_api_config') throw new Error('SecurityError');
+            if (key === 'os_theme') return '{"hue":3}';
+            return null;
+        };
+        try {
+            await snapshotLocalStorageMirror();
+        } finally {
+            store.getItem = original;
+        }
+
+        localStorage.clear();
+        const restored = await healLocalStorageMirror();
+        expect(restored.sort()).toEqual(['os_api_config', 'os_theme']);
+    });
+
+    it('整轮读取都异常时不写快照（不让一次异常把镜像换成空壳）', async () => {
+        localStorage.setItem('os_theme', '{"hue":5}');
+        await snapshotLocalStorageMirror();
+
+        const store: any = globalThis.localStorage;
+        const original = store.getItem;
+        store.getItem = () => { throw new Error('SecurityError'); };
+        try {
+            await snapshotLocalStorageMirror();
+        } finally {
+            store.getItem = original;
+        }
+
+        localStorage.clear();
+        expect(await healLocalStorageMirror()).toEqual(['os_theme']);
+    });
+
+    it('旧镜像读失败 + 局部读取异常时保守跳过写入（未知≠删除，不丢旧配置）', async () => {
+        // 复现场景：os_api_config 的 getItem 抛错、os_theme 可读，本轮
+        // DB.getAssetRaw 短暂失败但 saveAssetRaw 会成功。旧语义会写入只含
+        // os_theme 的快照，丢掉镜像里唯一一份 os_api_config。
+        const oldPayload = { savedAt: 1, data: { os_theme: 'old-theme', os_api_config: 'synthetic-config' } };
+        await DB.saveAssetRaw('ls_mirror_v1', oldPayload as any);
+
+        const store: any = globalThis.localStorage;
+        const original = store.getItem;
+        store.getItem = (key: string) => {
+            if (key === 'os_api_config') throw new Error('SecurityError');
+            if (key === 'os_theme') return 'new-theme';
+            return null;
+        };
+        const getSpy = vi.spyOn(DB, 'getAssetRaw').mockRejectedValueOnce(new Error('transient IDB failure'));
+        const saveSpy = vi.spyOn(DB, 'saveAssetRaw');
+        const writesBefore = saveSpy.mock.calls.length;
+        try {
+            await snapshotLocalStorageMirror();
+        } finally {
+            store.getItem = original;
+            getSpy.mockRestore();
+            saveSpy.mockRestore();
+        }
+
+        expect(saveSpy.mock.calls.length).toBe(writesBefore); // 0 次覆盖
+        expect(await DB.getAssetRaw('ls_mirror_v1')).toEqual(oldPayload); // 旧载荷原样保留
     });
 
     it('镜像键名单不含大体积键（data URI 类必须走 assets）', () => {

@@ -53,18 +53,39 @@ const SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 
 type MirrorPayload = { savedAt: number; data: Record<string, string> };
 
+/** 读镜像载荷；读失败/形状不对一律当没有（绝不因为一次读异常影响主流程）。 */
+const readMirrorPayload = async (): Promise<MirrorPayload | null> => {
+    try {
+        const payload = await DB.getAssetRaw(MIRROR_ASSET_ID);
+        return payload && typeof payload === 'object' ? payload as MirrorPayload : null;
+    } catch {
+        return null;
+    }
+};
+
+type MirrorRead = { ok: true; payload: MirrorPayload | null } | { ok: false };
+
+/**
+ * 区分「镜像不存在/形状不对」与「读取失败」：后者返回 ok:false。
+ * 快照路径必须用它——读失败时旧镜像内容未知，把读不到的键当删除会用不完整
+ * 快照覆盖掉镜像里唯一一份旧配置。
+ */
+const readMirrorResult = async (): Promise<MirrorRead> => {
+    try {
+        const payload = await DB.getAssetRaw(MIRROR_ASSET_ID);
+        return { ok: true, payload: payload && typeof payload === 'object' ? payload as MirrorPayload : null };
+    } catch {
+        return { ok: false };
+    }
+};
+
 /**
  * 启动回填：镜像里有、localStorage 里没有的键写回 localStorage。
  * 返回被回填的键名（空数组 = localStorage 完好或没有镜像）。
  * 必须在任何读 localStorage 的初始化逻辑（OSContext.loadSettings 等）之前 await。
  */
 export async function healLocalStorageMirror(): Promise<string[]> {
-    let payload: MirrorPayload | null = null;
-    try {
-        payload = await DB.getAssetRaw(MIRROR_ASSET_ID);
-    } catch {
-        return [];
-    }
+    const payload = await readMirrorPayload();
     const data = payload?.data;
     if (!data || typeof data !== 'object') return [];
 
@@ -84,14 +105,36 @@ export async function healLocalStorageMirror(): Promise<string[]> {
     return restored;
 }
 
-/** 把当前 localStorage 里的镜像键快照进 IndexedDB。全部缺失时不写（避免拿空快照覆盖有效镜像）。 */
+/**
+ * 把当前 localStorage 里的镜像键快照进 IndexedDB。
+ *
+ * 两条边界（都与「用户主动删除了某个键」区分开）：
+ *  - 全部缺失 / 整轮读取异常 → 不写：空快照会拿"什么都不知道"覆盖有效镜像；
+ *  - 个别键读取抛错（隐私模式、WebView 安全异常）→ 沿用镜像里的旧值：删除是
+ *    getItem 返回 null，抛错不是删除的证据，按缺失处理等于把唯一一份配置抹掉；
+ *    若旧镜像本身也读失败（内容未知），则整轮跳过写入，绝不用不完整快照覆盖。
+ */
 export async function snapshotLocalStorageMirror(): Promise<void> {
     const data: Record<string, string> = {};
+    const unreadable: string[] = [];
     for (const key of MIRRORED_KEYS) {
         try {
             const v = localStorage.getItem(key);
             if (v !== null) data[key] = v;
-        } catch { /* ignore */ }
+        } catch {
+            unreadable.push(key);
+        }
+    }
+    if (unreadable.length === MIRRORED_KEYS.length) return;
+    if (unreadable.length > 0) {
+        const previous = await readMirrorResult();
+        // 旧镜像读失败 + 存在读不到的键：未知 ≠ 删除，保守跳过本轮写入，
+        // 避免用不完整快照覆盖掉镜像里唯一一份旧配置（读失败≠镜像不存在）。
+        if (!previous.ok) return;
+        for (const key of unreadable) {
+            const v = previous.payload?.data?.[key];
+            if (typeof v === 'string') data[key] = v;
+        }
     }
     if (Object.keys(data).length === 0) return;
     try {

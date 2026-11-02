@@ -34,6 +34,7 @@ const MomentsApp = lazyApp(() => import('../apps/MomentsApp'));
 const StudyApp = lazyApp(() => import('../apps/StudyApp'));
 const PomodoroApp = lazyApp(() => import('../apps/PomodoroApp'));
 const TarotApp = lazyApp(() => import('../apps/TarotApp'));
+const FriendFeedApp = lazyApp(() => import('../apps/FriendFeedApp'));
 const FAQApp = lazyApp(() => import('../apps/FAQApp'));
 const GameApp = lazyApp(() => import('../apps/GameApp'));
 const NovelApp = lazyApp(() => import('../apps/NovelApp'));
@@ -94,6 +95,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.WorldHome]: WorldHomeApp,
   [AppID.Shopping]: ShoppingApp,
   [AppID.Takeout]: TakeoutApp,
+  [AppID.Bibi]: FriendFeedApp,
 };
 // AppIcon 的 pointerdown 只预取用户正在点的 App；失败时由 preloadableLazy 清缓存，点击可正常重试。
 setAppPayloadWarmer((id: AppID) => APP_BY_ID[id]?.preload());
@@ -906,6 +908,7 @@ const PhoneShell: React.FC = () => {
       case AppID.VRWorld: return <VRWorldApp />;
       case AppID.WorldHome: return <WorldHomeApp />;
       case AppID.CharCreatorDev: return <CharCreatorDevApp />;
+      case AppID.Bibi: return <FriendFeedApp />;
       case AppID.Launcher:
       default: return <Launcher />;
     }

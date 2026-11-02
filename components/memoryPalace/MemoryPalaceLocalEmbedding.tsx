@@ -70,8 +70,17 @@ const BTN_BASE: React.CSSProperties = {
     cursor: 'pointer',
 };
 
-function agentEndpoint(agentUrl: string): string {
-    const base = String(agentUrl || '').trim().replace(/\/+$/, '');
+/**
+ * 主代理本地 embedding 入口。agentUrl 约定是站点根（设置页提示「不带 /agent 后缀」），
+ * 但用户常把文档里的 `/agent` 或 `/agent/v1` 一起粘进来——genieTts / socialShare
+ * 已做同款剥离，这里不剥就会拼出 …/agent/agent/v1/local-embedding。
+ */
+export function agentEndpoint(agentUrl: string): string {
+    const base = String(agentUrl || '')
+        .trim()
+        .replace(/\/+$/, '')
+        .replace(/\/agent(\/v1)?$/, '')
+        .replace(/\/+$/, '');
     return base ? `${base}/agent/v1/local-embedding` : '';
 }
 

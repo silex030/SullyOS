@@ -28,7 +28,12 @@ export type PdfDocumentLike = {
 };
 
 type PdfJsLike = {
-    getDocument: (src: { data: ArrayBuffer }) => { promise: Promise<PdfDocumentLike> };
+    /**
+     * PDF.js 的加载参数。`isEvalSupported:false` 是这里唯一多出来的字段：
+     * 关掉它，PDF.js 不再为字体/PDF 函数编译 `new Function`（严格 CSP / 部分
+     * WebView 会直接抛错），文本提取逻辑本身不变。
+     */
+    getDocument: (src: { data: ArrayBuffer; isEvalSupported?: boolean }) => { promise: Promise<PdfDocumentLike> };
     GlobalWorkerOptions?: { workerSrc?: string };
 };
 
@@ -251,7 +256,7 @@ export const extractPdfText = async (
     options: ExtractPdfTextOptions = {},
 ): Promise<PdfTextResult> => {
     const pdfjs = await loadPdfJs();
-    const pdf = await pdfjs.getDocument({ data }).promise;
+    const pdf = await pdfjs.getDocument({ data, isEvalSupported: false }).promise;
     try {
         return await extractPdfDocumentText(pdf, options);
     } finally {

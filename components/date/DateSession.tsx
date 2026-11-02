@@ -20,6 +20,9 @@ import {
     synthesizeSpeech,
 } from '../../utils/ttsRouter';
 import { planNovelLoadMore } from '../../utils/dateSessionHistory';
+import { applyShareVarsToElement } from '../../features/appearance-sharing/scopedStyle';
+import { coerceStoredReadingStyle, shareTextStyle } from '../../features/appearance-sharing/integration';
+import type { ReadingStyle } from '../../features/appearance-sharing/types';
 import { getPendingReplyText } from '../../utils/pendingReply';
 import { fetchBlobForShare } from '../../utils/shareExport';
 import VoiceFavoriteActionSheet from '../voice/VoiceFavoriteActionSheet';
@@ -198,6 +201,15 @@ const DateSession: React.FC<DateSessionProps> = ({
     onSettings
 }) => {
     const { addToast, registerBackHandler, apiConfig, updateCharacter } = useOS();
+    // 外观分享包覆盖：只取已校验值；非法/缺省 → undefined，原阅读视觉零变化。
+    const dateShareStyle: ReadingStyle | undefined = coerceStoredReadingStyle(char.dateReadingStyle, 'date-reading');
+    // 变量只写小说视图容器节点，不碰 document/body/:root；取消/卸载时还原。
+    // 复用既有 novelScrollRef（滚动行为不动），仅在其节点上叠加作用域变量。
+    useEffect(() => {
+        const el = novelScrollRef.current;
+        if (!el || !dateShareStyle) return;
+        return applyShareVarsToElement(el, dateShareStyle);
+    }, [dateShareStyle]);
     
     // Core VN State
     const [isNovelMode, setIsNovelMode] = useState(false);
@@ -1096,7 +1108,7 @@ const DateSession: React.FC<DateSessionProps> = ({
 
             {/* Novel Mode View */}
             {isNovelMode && (
-                <div ref={novelScrollRef} className={`absolute inset-0 z-20 overflow-y-auto no-scrollbar pt-24 pb-32 px-8 mask-image-gradient overscroll-contain animate-fade-soft ${char.dateLightReading ? 'bg-[#faf8f5]' : 'bg-black/90 backdrop-blur-sm'}`} onClick={(e) => { e.stopPropagation(); if (showMenu) { setShowMenu(false); setShowVoiceLangPicker(false); return; } setShowInputBox(true); }}>
+                <div ref={novelScrollRef} data-ap-share-scope="date-reading" style={dateShareStyle ? { backgroundColor: 'var(--ap-share-bg)' } : undefined} className={`absolute inset-0 z-20 overflow-y-auto no-scrollbar pt-24 pb-32 px-8 mask-image-gradient overscroll-contain animate-fade-soft ${char.dateLightReading ? 'bg-[#faf8f5]' : 'bg-black/90 backdrop-blur-sm'}`} onClick={(e) => { e.stopPropagation(); if (showMenu) { setShowMenu(false); setShowVoiceLangPicker(false); return; } setShowInputBox(true); }}>
                     <div className="min-h-full flex flex-col justify-end">
                         <div className="max-w-2xl mx-auto animate-fade-in space-y-6">
                             {isBatchSelectMode && (
@@ -1181,7 +1193,7 @@ const DateSession: React.FC<DateSessionProps> = ({
                                     )}
                                     {msg.role === 'user' ? (
                                         <div className="flex min-w-0 items-start justify-end gap-3">
-                                            <p className={`min-w-0 flex-1 whitespace-pre-wrap font-serif text-[16px] text-right leading-loose tracking-wide italic pr-4 ${char.dateLightReading ? 'text-stone-400 border-r-2 border-stone-300/50' : 'text-slate-400 border-r-2 border-slate-600/50'}`}>{cleanTextForDisplay(msg.content)} <span className="text-[10px] uppercase font-sans not-italic ml-2 opacity-50">{userProfile.name}</span></p>
+                                            <p className={dateShareStyle ? 'min-w-0 flex-1 whitespace-pre-wrap text-right tracking-wide italic pr-4 border-r-2' : `min-w-0 flex-1 whitespace-pre-wrap font-serif text-[16px] text-right leading-loose tracking-wide italic pr-4 ${char.dateLightReading ? 'text-stone-400 border-r-2 border-stone-300/50' : 'text-slate-400 border-r-2 border-slate-600/50'}`} style={dateShareStyle ? { ...shareTextStyle(dateShareStyle), borderColor: 'var(--ap-share-accent)', borderRadius: 'var(--ap-share-radius)' } : undefined}>{cleanTextForDisplay(msg.content)} <span className="text-[10px] uppercase font-sans not-italic ml-2 opacity-50">{userProfile.name}</span></p>
                                             {char.dateReadingShowAvatars && (
                                                 <ReadingAvatar
                                                     src={userProfile.perCharAvatars?.[char.id] || userProfile.avatar}
@@ -1231,7 +1243,7 @@ const DateSession: React.FC<DateSessionProps> = ({
                                                         onMouseDown={voiceEnabled && lineIsDialogue && !isOpeningMsg ? (e) => e.stopPropagation() : undefined}
                                                         onContextMenu={voiceEnabled && lineIsDialogue && !isOpeningMsg ? (e) => { e.preventDefault(); e.stopPropagation(); void openDateVoiceFavorite(voiceTarget); } : undefined}
                                                     >
-                                                        <p className={`flex-1 whitespace-pre-wrap font-serif text-[18px] text-justify leading-loose tracking-wide pl-4 ${char.dateLightReading ? 'text-stone-700 border-l-2 border-stone-200' : 'text-slate-200 drop-shadow-md border-l-2 border-white/10'}`}>{cleanLine}</p>
+                                                        <p className={dateShareStyle ? 'flex-1 whitespace-pre-wrap text-justify tracking-wide pl-4 border-l-2' : `flex-1 whitespace-pre-wrap font-serif text-[18px] text-justify leading-loose tracking-wide pl-4 ${char.dateLightReading ? 'text-stone-700 border-l-2 border-stone-200' : 'text-slate-200 drop-shadow-md border-l-2 border-white/10'}`} style={dateShareStyle ? { ...shareTextStyle(dateShareStyle), borderColor: 'var(--ap-share-accent)', borderRadius: 'var(--ap-share-radius)' } : undefined}>{cleanLine}</p>
                                                         {/* Voice button: only for dialogue lines, not opening */}
                                                         {voiceEnabled && lineIsDialogue && !isOpeningMsg && (
                                                             <button

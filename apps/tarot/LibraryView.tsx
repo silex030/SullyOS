@@ -87,7 +87,7 @@ const CardDetail: React.FC<{ card: TarotCard; onBack: () => void }> = ({ card, o
   );
 };
 
-export const LibraryView: React.FC = () => {
+export const LibraryView: React.FC<{ onSkyNavigation?: () => void }> = ({ onSkyNavigation }) => {
   const { theme } = useOS();
   const isDesktop = useLayoutMode(theme.desktopMode) === 'desktop';
   const [query, setQuery] = useState('');
@@ -108,9 +108,9 @@ export const LibraryView: React.FC = () => {
   }, [query, suit]);
 
   const openCard = openId ? CARDS.find((c) => c.id === openId) : undefined;
-  if (openCard) return <CardDetail card={openCard} onBack={() => setOpenId(null)} />;
+  if (openCard) return <CardDetail card={openCard} onBack={() => { setOpenId(null); onSkyNavigation?.(); }} />;
 
-  const open = (c: TarotCard) => setOpenId(c.id);
+  const open = (c: TarotCard) => { onSkyNavigation?.(); setOpenId(c.id); };
   const groups = suit === 'all' ? SUITS : SUITS.filter((s) => s.id === suit);
 
   return (

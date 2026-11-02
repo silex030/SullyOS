@@ -92,8 +92,12 @@ import { exportMcdLocal } from '../utils/mcdMcpClient';
 import { exportMcpLocal } from '../utils/mcpClient';
 import { exportDesktopSkinLocal } from '../utils/desktopSkinBackup';
 import { assertSupportedSullyBackup } from '../utils/backupImportPolicy';
+// t_40feeeaa round3（协调授权 appearance-final-repair-scope.md）：
+// 与 DB.importFullData 同一纯预检，位置必须在任何 restoreAssets/blob/DB 写入前。
+import { assertNoIllegalDateReadingStyle } from '../features/appearance-sharing/importGuard';
 import { createBuiltinSullyLive2DConfig, isBuiltinSullyLive2D, upgradeBuiltinSullyLive2DDefaults } from '../utils/builtinSullyLive2D';
 import { normalizeCharacterRoomAssetsInPlace } from '../utils/roomTemplateAssets';
+import { collectRoomSeasonalBackup, restoreRoomSeasonalBackup } from '../utils/roomSeasonalBackup';
 
 interface ProactiveQueueEntry {
   charId: string;
@@ -4242,6 +4246,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               // 桌面电子宠物主题的主色调偏好（账号级 localStorage）。room_card 涓流卡片本身
               // 是普通消息、随 messages store 一起导出，这里只补带走这个纯外观偏好。
               gotchiAccentHue: (mode === 'text_only' || mode === 'full') ? (() => { try { const s = localStorage.getItem('tama_accent_hue'); return s !== null ? s : undefined; } catch { return undefined; } })() : undefined,
+
+              // 3D 房间 + 万圣节活动槽位（localStorage 整 key→整值，按前缀扫描收集；
+              // 恢复侧逐条用各模块实际 validator 校验，见 utils/roomSeasonalBackup）。
+              ...((mode === 'text_only' || mode === 'full') ? collectRoomSeasonalBackup(localStorage) : {}),
           };
 
           // 主动消息 2.0 的全局配置（Worker 地址 / 密钥 / 即时对话开关）。它存在独立的
@@ -4954,6 +4962,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 必须发生在 restoreAssetsInPlace / DB.importFullData 之前：不受支持的第三方
           // 备份一旦命中特征就整包拒绝，不能出现“导入了一半才报错”的状态。
           assertSupportedSullyBackup(data);
+          // t_40feeeaa round3：约会阅读样式非法即整包拒绝——DB 一字未动、
+          // 资产/语音/blob 恢复尚未开始；无字段旧包照常通过。
+          assertNoIllegalDateReadingStyle(data);
 
           // 协同文件先完整读出并校验，再开始写任何主数据库。这样文件索引损坏或 ZIP
           // 缺项时会整包中止，不会出现主数据已恢复、协同文件只回来一半的状态。
@@ -5235,6 +5246,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   }
               }
           }
+
+          // Restore 3D 房间 + 万圣节活动槽位：逐条用各模块实际 validator 校验
+          // 角色归属 / 版本 / 结构，非法与串槽一律跳过，旧档原样保留。
+          restoreRoomSeasonalBackup(data, localStorage);
 
           // Restore Chat 翻译 / 归档 / 润色设置
           if (typeof data.chatTranslateSourceLang === 'string') localStorage.setItem('chat_translate_source_lang', data.chatTranslateSourceLang);

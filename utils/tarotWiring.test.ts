@@ -17,6 +17,13 @@ const constants = read('../constants.tsx');
 const shell = read('../components/PhoneShell.tsx');
 const safeArea = read('./safeAreaApps.ts');
 const db = read('./db.ts');
+const tarotApp = read('../apps/TarotApp.tsx');
+const tarotLibrary = read('../apps/tarot/LibraryView.tsx');
+const tarotRitual = read('../apps/tarot/RitualView.tsx');
+const tarotReading = read('../apps/tarot/ReadingView.tsx');
+const tarotDome = read('../apps/tarot/TarotDomeCanvas.tsx');
+const tarotBokeh = read('../apps/tarot/TarotBokeh.tsx');
+const tarotSkyShader = read('../apps/tarot/TarotSkyShader.tsx');
 
 describe('tarot app registration', () => {
   it('AppID has Tarot', () => {
@@ -45,5 +52,37 @@ describe('tarot reading store', () => {
     expect(db).toContain('getTarotReadings');
     expect(db).toContain('saveTarotReading');
     expect(db).toContain('deleteTarotReading');
+  });
+});
+
+describe('tarot sky navigation wiring', () => {
+  it('keeps one continuous dome instance outside the remounted tab content', () => {
+    expect(tarotApp).toContain('<TarotDomeCanvas navigationSignal={navigationSignal} />');
+    expect(tarotApp.indexOf('<TarotDomeCanvas')).toBeLessThan(tarotApp.indexOf('key={tab}'));
+    expect(tarotApp).toContain('if (tab !== id) signalSkyNavigation();');
+    expect(tarotApp).toContain('onSkyNavigation={signalSkyNavigation}');
+  });
+
+  it('keeps foreground bokeh spatially stable outside per-tab sky parallax', () => {
+    expect(tarotApp).toContain('<TarotBokeh />');
+    expect(tarotApp).not.toContain('<TarotBokeh parallaxIndex=');
+    expect(tarotBokeh).not.toContain('parallaxIndex');
+    expect(tarotBokeh).not.toContain('offsetPx');
+    expect(tarotBokeh).not.toContain('driftVx');
+    expect(tarotBokeh).not.toContain('requestAnimationFrame');
+  });
+
+  it('signals only known internal detail and reading transitions', () => {
+    expect(tarotLibrary).toContain('onSkyNavigation?.()');
+    expect(tarotApp).toContain('signalSkyNavigation();');
+    expect(tarotRitual).toContain('onSkyNavigation?.()');
+    expect(tarotReading).toContain('onSkyNavigation?.()');
+  });
+
+  it('updates reduced-motion preference live while retaining a static sky', () => {
+    expect(tarotDome).toContain("motionQuery.addEventListener('change', onMotionChange)");
+    expect(tarotDome).toContain('drawStaticRef.current()');
+    expect(tarotDome).toContain('document.addEventListener(\'visibilitychange\', onVisibility)');
+    expect(tarotSkyShader).toContain("motionQuery.addEventListener('change', onMotionChange)");
   });
 });
